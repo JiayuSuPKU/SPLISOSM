@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "splisosm"
+version = "1.0.0"
+description = "Spatial isoform statistical modeling (SPLISOSM)"
+authors = [
+  {name = "Jiayu Su"}
+]
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.9, <=4.0"
+
+dependencies = [
+    "numpy",
+    "pandas",
+    "torch",
+    "scipy",
+    "tqdm",
+    "scanpy",
+    "python-igraph",
+    "leidenalg",
+    "rich",
+    "pyro-ppl",
+    "scikit-bio >= 0.5.9",
+    "smoother"
+]
+
+[project.urls]
+repository = "https://github.com/JiayuSuPKU/SPLISOSM"
+
+[tool.setuptools]
+packages.find = {where = ["."], exclude = ["docs", "tests"]}
