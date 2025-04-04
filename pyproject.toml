@@ -19,13 +19,22 @@ dependencies = [
     "torch",
     "scipy",
     "tqdm",
+    "smoother-omics"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "jupyter-lab",
+    "ipykernel",
+    "ipywidgets",
+    "plotnine",
     "scanpy",
     "python-igraph",
     "leidenalg",
     "rich",
     "pyro-ppl",
-    "scikit-bio >= 0.5.9",
-    "smoother"
+    "scikit-bio >= 0.5.9", # might have compatibility issues with numpy, installing using conda?
 ]
 
 [project.urls]

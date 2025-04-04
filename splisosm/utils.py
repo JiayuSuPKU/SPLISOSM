@@ -7,17 +7,7 @@ import pandas as pd
 import torch
 from matplotlib.image import imread
 from anndata import AnnData
-
-try:
-    from skbio.stats.composition import clr, ilr, alr # for ratio transformation
-except ImportError:
-    warnings.warn("scikit-bio not found. Please install scikit-bio to use ratio transformation.")
-
-try:
-    # pip install git+https://github.com/JiayuSuPKU/Smoother.git#egg=smoother
-    from smoother import SpatialWeightMatrix, SpatialLoss
-except ImportError:
-    warnings.warn("smoother not found. Please install smoother to compute the spatial covariance matrix.")
+from smoother import SpatialWeightMatrix, SpatialLoss
 
 def get_cov_sp(coords, k=4, rho=0.99):
     """Wrapper function to get the spatial covariance matrix from spatial coordinates.
@@ -62,6 +52,13 @@ def counts_to_ratios(counts, transformation = "none", nan_filling = "mean"):
             - "none": do not fill missing values and return NaNs.
     """
     assert transformation in ["none", "clr", "ilr", "alr", "radial"]
+    if transformation in ["clr", "ilr", "alr"]:
+        try:
+            from skbio.stats.composition import clr, ilr, alr # for ratio transformation
+        except ImportError:
+            warnings.warn(f"Please install scikit-bio to use ratio transformation='{transformation}'. Switching to 'none'.")
+            transformation = "none"
+
     assert nan_filling in ["mean", "none"]
 
     # identify zero rows to fill
