@@ -14,6 +14,7 @@ from sklearn.gaussian_process.kernels import WhiteKernel
 
 from smoother.weights import coordinate_to_weights_knn_sparse
 from splisosm.utils import get_cov_sp, counts_to_ratios, false_discovery_control
+from splisosm.kernel import SpatialCovKernel
 from splisosm.likelihood import liu_sf
 
 def _run_sparkx(coordinates, counts_list):
@@ -283,21 +284,27 @@ class SplisosmNP():
         self.du_test_results = {}
 
     def __str__(self):
+        _sv_status = f"Completed ({self.sv_test_results['method']})" if len(self.sv_test_results) > 0 else "NA"
+        _du_status = f"Completed ({self.du_test_results['method']})" if len(self.du_test_results) > 0 else "NA"
         return f"=== Non-parametric SPLISOSM model for spatial isoform testings\n" + \
                 f"- Number of genes: {self.n_genes}\n" + \
                 f"- Number of spots: {self.n_spots}\n" + \
                 f"- Number of covariates: {self.n_factors}\n" + \
                 f"- Average number of isoforms per gene: {np.mean(self.n_isos) if self.n_isos is not None else None}\n" + \
                  "=== Test results\n" + \
-                f"- Spatial variability test: {f"Completed ({self.sv_test_results['method']})" if len(self.sv_test_results) > 0 else "NA"}\n" + \
-                f"- Differential usage test: {f"Completed ({self.du_test_results['method']})" if len(self.du_test_results) > 0 else "NA"}"
+                f"- Spatial variability test: {_sv_status}\n" + \
+                f"- Differential usage test: {_du_status}"
 
-    def setup_data(self, data, coordinates, design_mtx = None, gene_names = None, covariate_names = None):
+    def setup_data(self, data, coordinates, approx_rank = None,
+                   design_mtx = None, gene_names = None, covariate_names = None):
         """Setup the data for the model.
 
         Args:
             data: list of tensor(n_spots, n_isos), the observed isoform counts for each gene.
             coordinates: tensor(n_spots, 2), the spatial coordinates.
+            approx_rank: int, the rank of the low-rank approximation for the spatial covariance matrix.
+                If None, use the full-rank dense covariance matrix.
+                For larger datasets (n_spots > 5,000), the maximum rank is set to 4 * sqrt(n_spots).
             design_mtx: tensor(n_spots, n_factors), the design matrix for the fixed effects.
             gene_names: list of str, the gene names.
         """
@@ -320,7 +327,25 @@ class SplisosmNP():
             coordinates = torch.from_numpy(coordinates.values).float()
 
         self.coordinates = coordinates
-        self.corr_sp = get_cov_sp(coordinates, k = 4, rho=0.99)
+
+        # determine the maximum rank for spatial kernel computation
+        if self.n_spots > 5000:
+            # 10x Visium has 4992 spots per slide. For larger datasets (i.e. Slideseq-V2),
+            # it is recommended to use low-rank approximation
+            max_rank = np.ceil(np.sqrt(self.n_spots) * 4).astype(int)
+            approx_rank = min(approx_rank, max_rank) if approx_rank is not None else max_rank
+        else:
+            if approx_rank is not None:
+                approx_rank = approx_rank if approx_rank < self.n_spots else None
+
+        # compute the spatial kernel
+        K_sp = SpatialCovKernel(
+            coordinates, k_neighbors=4, rho=0.99, centering=True, standardize_cov=True,
+            approx_rank=approx_rank
+        )
+
+        # self.corr_sp = get_cov_sp(coordinates, k = 4, rho=0.99)
+        self.corr_sp = K_sp
 
         # check the design matrix
         if design_mtx is not None:
@@ -346,17 +371,18 @@ class SplisosmNP():
         self.covariate_names = covariate_names
 
         # store the eigendecomposition of the spatial covariance matrix
-        try:
-            corr_sp_eigvals, corr_sp_eigvecs = torch.linalg.eigh(self.corr_sp)
-        except RuntimeError:
-            # fall back to eig if eigh fails
-            # related to a pytorch bug on M1 macs, see https://github.com/pytorch/pytorch/issues/83818
-            corr_sp_eigvals, corr_sp_eigvecs = torch.linalg.eig(self.corr_sp)
-            corr_sp_eigvals = torch.real(corr_sp_eigvals)
-            corr_sp_eigvecs = torch.real(corr_sp_eigvecs)
+        # try:
+        #     corr_sp_eigvals, corr_sp_eigvecs = torch.linalg.eigh(self.corr_sp)
+        # except RuntimeError:
+        #     # fall back to eig if eigh fails
+        #     # related to a pytorch bug on M1 macs, see https://github.com/pytorch/pytorch/issues/83818
+        #     corr_sp_eigvals, corr_sp_eigvecs = torch.linalg.eig(self.corr_sp)
+        #     corr_sp_eigvals = torch.real(corr_sp_eigvals)
+        #     corr_sp_eigvecs = torch.real(corr_sp_eigvecs)
 
-        self._corr_sp_eigvals = corr_sp_eigvals
-        self._corr_sp_eigvecs = corr_sp_eigvecs
+        # self._corr_sp_eigvals = corr_sp_eigvals
+        # self._corr_sp_eigvecs = corr_sp_eigvecs
+        self._corr_sp_eigvals = self.corr_sp.eigenvalues()
 
     def get_formatted_test_results(self, test_type):
         """Get the formatted test results as data frame."""
@@ -427,19 +453,17 @@ class SplisosmNP():
         if method == 'spark-x': # run the gene-level SPARK-X test
             self.sv_test_results = _run_sparkx(self.coordinates, self.data)
         else:
-            if method != 'hsic-ir' or nan_filling == 'mean':
-                # use a global spatial kernel for all genes
-                # Non-parametric HSIC-based spatial variability test.
-                n_spots = self.n_spots
-                H = torch.eye(n_spots) - 1/n_spots
-                K_sp = H @ self.corr_sp @ H # centered spatial kernel
+            # use a global spatial kernel unless nan_filling is 'none'
+            n_spots = self.n_spots
+            # H = torch.eye(n_spots) - 1/n_spots
+            # K_sp = H @ self.corr_sp @ H # centered spatial kernel
+            K_sp = self.corr_sp # the Kernel class object was already centered
 
-                # calculate the eigenvalues of the spatial kernel
-                if not use_perm_null:
-                    lambda_sp = torch.linalg.eigvalsh(K_sp) # eigenvalues of length n_spots
-                    lambda_sp = lambda_sp[lambda_sp > 1e-5] # remove small eigenvalues
-            else:
-                n_spots, K_sp, lambda_sp = None, None, None # to be set later
+            # calculate the eigenvalues of the spatial kernel
+            if not use_perm_null:
+                # lambda_sp = torch.linalg.eigvalsh(K_sp) # eigenvalues of length n_spots
+                lambda_sp = self._corr_sp_eigvals # use precomputed eigenvalues
+                lambda_sp = lambda_sp[lambda_sp > 1e-5] # remove small eigenvalues
 
             # prepare inputs for generating the null distribution
             if use_perm_null:
@@ -448,32 +472,48 @@ class SplisosmNP():
             # iterate over genes and calculate the HSIC statistic
             hsic_list, pvals_list = [], []
             for counts in tqdm(self.data, disable=(not print_progress)):
-                if method == 'hsic-ic': # use isoform-level count data
-                    y = counts - counts.mean(0, keepdim=True) # centering per isoform
-                elif method == 'hsic-gc': # use gene-level count data
-                    y = counts.sum(1, keepdim=True)
-                    y = y - y.mean() # centering per isoform
-                else: # use isoform ratio
-                    # calculate the isoform ratio from counts
+                if method == 'hsic-ir' and nan_filling == 'none':
+                    # spetial treatment for the isoform ratio test when nan_filling is 'none'
+                    # need to adjust the effective spot number (non NaN spots) and spatial kernel
                     y = counts_to_ratios(
                         counts, transformation = ratio_transformation, nan_filling = nan_filling
                     )
-                    # if the ratio contains NaN values, fill them with the mean
-                    # NaN spots will have no contribution to the test statistic after centering
-                    if nan_filling == 'none':
-                        # remove spots with NaN values
-                        is_nan = torch.isnan(y).any(1) # spots with NaN values
-                        y = y[~is_nan] # (n_non_nan, n_isos)
+                    # remove spots with NaN values
+                    is_nan = torch.isnan(y).any(1) # spots with NaN values
+                    y = y[~is_nan] # (n_non_nan, n_isos)
 
-                        # adjust the effective number of spots and create the per-gene spatial kernel
-                        n_spots = y.shape[0]
-                        H = torch.eye(n_spots) - 1/n_spots
-                        K_sp = H @ self.corr_sp[~is_nan, :][:, ~is_nan] @ H # centered spatial kernel
+                    # adjust the effective number of spots and update the spatial kernel
+                    n_spots = y.shape[0]
+                    # H = torch.eye(n_spots) - 1/n_spots
+                    # K_sp = H @ self.corr_sp[~is_nan, :][:, ~is_nan] @ H # centered spatial kernel
+                    K_sp = self.corr_sp.realization()[~is_nan, :][:, ~is_nan]
+                    K_sp = K_sp - K_sp.mean(dim=0, keepdim=True)
+                    K_sp = K_sp - K_sp.mean(dim=1, keepdim=True)
 
-                    y = y - y.mean(0, keepdim=True) # centering per isoform
+                    # calculate the eigenvalues of the new per-gene spatial kernel
+                    if not use_perm_null:
+                        lambda_sp = torch.linalg.eigvalsh(K_sp) # eigenvalues of length n_spots
+                        lambda_sp = lambda_sp[lambda_sp > 1e-5] # remove small eigenvalues
 
-                # calculate the HSIC statistic
-                hsic_scaled = torch.trace(y.T @ K_sp @ y)
+                    # compute the hsic statistic
+                    hsic_scaled = torch.trace(y.T @ K_sp @ y)
+
+                else: # one global spatial kernel for all genes
+                    if method == 'hsic-ic': # use isoform-level count data
+                        y = counts - counts.mean(0, keepdim=True) # centering per isoform
+                    elif method == 'hsic-gc': # use gene-level count data
+                        y = counts.sum(1, keepdim=True)
+                        y = y - y.mean() # centering per isoform
+                    else: # use isoform ratio
+                        # calculate the isoform ratio from counts
+                        y = counts_to_ratios(
+                            counts, transformation = ratio_transformation, nan_filling = nan_filling
+                        )
+                        y = y - y.mean(0, keepdim=True) # centering per isoform
+
+                    # calculate the HSIC statistic
+                    hsic_scaled = torch.trace(K_sp.xtKx(y)) # equivalent to y.T @ K_sp @ y
+
                 hsic_list.append(hsic_scaled / (n_spots - 1) ** 2)
 
                 if use_perm_null: # permutation-based null distribution
@@ -488,11 +528,6 @@ class SplisosmNP():
                     pval = (null_m > hsic_scaled).sum() / n_nulls
 
                 else: # asymptotic null distribution
-                    if method == 'hsic-ir' and nan_filling == 'none':
-                        # calculate the eigenvalues of the per-gene spatial kernel
-                        lambda_sp = torch.linalg.eigvalsh(K_sp) # eigenvalues of length n_spots
-                        lambda_sp = lambda_sp[lambda_sp > 1e-5] # remove small eigenvalues
-
                     lambda_y = torch.linalg.eigvalsh(y.T @ y) # length of n_isos
                     lambda_spy = (lambda_sp.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1) # n_spots * (n_isos or 1)
                     pval = liu_sf((hsic_scaled * n_spots).numpy(), lambda_spy.numpy())
