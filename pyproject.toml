@@ -24,7 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
+    "unittest",
     "jupyter-lab",
     "ipykernel",
     "ipywidgets",

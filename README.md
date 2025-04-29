@@ -2,7 +2,11 @@
 
 ![overview](splisosm_overview.png)
 
-SPLISOSM (<u>SP</u>atia<u>L</u> <u>ISO</u>form <u>S</u>tatistical <u>M</u>odeling) is a Python package designed to analyze transcript usage patterns in spatial transcriptomics data. It provides a set of tools for hypothesis testing of spatial variability (SV) and differential isoform usage (DU). The package supports both non-parametric and parametric testing, with the latter using a multinomial linear mixed model (GLMM) to account for spatial correlation and covariate effects.
+SPLISOSM (<u>SP</u>atia<u>L</u> <u>ISO</u>form <u>S</u>tatistical <u>M</u>odeling) is a Python package for analyzing isoform usage patterns in spatial transcriptomics data. It employs optimized spatial and isoform kernels to capture complex dependencies between spatial locations and transcript usage, maximizing statistical power while maintaining well-calibrated, permutation-free test statistics even with extremely sparse data. The differential usage tests are conditioned on spatial locations to reduce false positives due to spatial autocorrelation.
+
+SPLISOSM accommodates isoform quantification results of both full-length isoforms from long-read sequencing and local transcript diversity events from short-read sequencing platforms including 10X Visium and Slide-seqV2. 
+
+*This repository is under active development. Please check back later for detailed documentations, tutorials and end-to-end analysis examples using public long-read and short-read datasets.*
 
 ## Installation
 Via GitHub (latest version):
@@ -191,44 +195,5 @@ df_du_res = model_p.get_formatted_test_results(test_type = 'du') # per gene-fact
 
 
 
-## Documentation
-See the [documentation](TODO) for more details on the statistical models and the testing procedures.
-
-<!-- ### The non-parametric model: HSIC-based tests
-
-### The generative model: Multinomial linear mixed model (GLMM):
-
-$$
-\begin{aligned}
-    Y_{s:} | \alpha_{s:} &\sim Multinomial(\sum_q Y_{sq}, \alpha_{s:}) \\
-    \eta_{sq} := log(\frac{\alpha_{sq}}{\alpha_{sQ}}) &= X_{s:}\beta_q + \nu_q, q \in \{1, ..., Q-1\} \\
-    \nu_q &\sim MVN(0, \sigma_q^2 (\theta_q \Sigma + (1 - \theta_q) I)) \\
-\end{aligned}
-$$
-
-**Notations:** For a given gene to test, we have the following notations
-1. $Y_{S \times Q} := \{y_{sq}\}$ is the expression matrix of observed counts of isoform q at spatial location s.
-2. $\alpha_{S \times Q} := \{\alpha_{s:}\} = \{(\alpha_{s1}, ..., \alpha_{sQ})\}$ is the Q-simplex representing the expected isoform usage ratio at each location s.
-3. $\eta_{S \times Q-1} := \{\eta_{:q}\} = \{(\eta_{1q}, ..., \eta_{Sq})\}$ is the set of logits modeled by a linear mixed model. 
-4. $X_{S \times (M + 1)}$ is the design matrix of M covariates and the intercept bias term.
-5. $\beta_{(M+1) \times (Q-1)}$ is the corresponding regression coefficient matrix.
-6. $\nu_q$ is the spatial random effect term to be integrated out.
-7. $\sigma_q$ is the overall variability, $\Sigma$ and is the structured spatial covariance, and $\theta_q$ is the proportion of the spatial covariance compared to unstructured white noise. 
-
-An alternative parameterization of the Gaussian variance is also available by setting `'var_parameterization_sigma_theta' == False`:
-
-$$
-\nu_q \sim MVN(0, \sigma_{sp}^2 \Sigma + \sigma_{nsp}^2 I).
-$$
-
-Also, by default we set `'share_variance' == True` to use the same variance for all isoforms:
-
-$$
-\nu_q \sim MVN(0, \sigma^2 (\theta \Sigma + (1 - \theta) I))
-$$
-
-### Goals:
-1. The DU test: Conditioned on the spatial covariance structure, test whether the isoform usage preference of a gene is associated with certain spatial covariates $X$ (domains, cell type abundances, distance to landmarks etc.). 
-$$\mathcal{H}_1 : \beta \neq 0, \mathcal{H}_o : \beta = 0$$
-2. Given noisy data with low sequencing depth, provide a more robust estimation of the isoform usage ratio.
-$$\hat{\alpha} = f(Y, X, \Sigma)$$ -->
+<!-- ## Documentation
+See the [documentation](TODO) for more details on the statistical models and the testing procedures. -->
