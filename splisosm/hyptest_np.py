@@ -615,8 +615,9 @@ class SplisosmNP():
                     else: # conditional HSIC test
                         assert hsic_eps > 0, "The regularization parameter hsic_eps must be positive."
                         # prepare the spatial kernel matrix
-                        H = torch.eye(n_spots) - 1/n_spots
-                        Kx = H @ self.corr_sp @ H # centered kernel for spatial coordinates
+                        # H = torch.eye(n_spots) - 1/n_spots
+                        # Kx = H @ self.corr_sp @ H # centered kernel for spatial coordinates
+                        Kx = self.corr_sp.realization() # the Kernel class object was already centered
                         # regularized kernel regression
                         Rx = get_kernel_regression_residual_op(Kx, hsic_eps)
 
@@ -674,9 +675,12 @@ class SplisosmNP():
                         else: # conditional HSIC test
                             assert hsic_eps > 0, "The regularization parameter hsic_eps must be positive."
                             # create the spatial kernel matrix as the principal submatrix
-                            Kx = self.corr_sp[~is_nan,:][:,~is_nan] # (n_non_nan, n_non_nan)
-                            H = torch.eye(Kx.shape[0]) - 1/Kx.shape[0]
-                            Kx = H @ Kx @ H # centered spatial kernel, (n_non_nan, n_non_nan)
+                            # Kx = self.corr_sp[~is_nan,:][:,~is_nan] # (n_non_nan, n_non_nan)
+                            # H = torch.eye(Kx.shape[0]) - 1/Kx.shape[0]
+                            # Kx = H @ Kx @ H # centered spatial kernel, (n_non_nan, n_non_nan)
+                            K_x = self.corr_sp.realization()[~is_nan, :][:, ~is_nan]
+                            K_x = K_x - K_x.mean(dim=0, keepdim=True)
+                            K_x = K_sp - K_x.mean(dim=1, keepdim=True) # (n_non_nan, n_non_nan)
 
                             # regularized kernel regression
                             Rx = get_kernel_regression_residual_op(Kx, hsic_eps)

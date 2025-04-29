@@ -3,7 +3,6 @@ import torch
 import numpy as np
 
 from splisosm.simulation import simulate_isoform_counts
-from splisosm.utils import get_cov_sp
 
 from splisosm.hyptest_glmm import (
     IsoFullModel,
