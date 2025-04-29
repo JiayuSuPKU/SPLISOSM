@@ -473,6 +473,8 @@ class SplisosmGLMM():
         self.du_test_results = {}
 
     def __str__(self):
+        _sv_status = f"Completed ({self.sv_test_results['method']})" if len(self.sv_test_results) > 0 else "NA"
+        _du_status = f"Completed ({self.du_test_results['method']})" if len(self.du_test_results) > 0 else "NA"
         return f"=== Parametric SPLISOSM model for spatial isoform testings\n" + \
                 f"- Number of genes: {self.n_genes}\n" + \
                 f"- Number of spots: {self.n_spots}\n" + \
@@ -490,8 +492,8 @@ class SplisosmGLMM():
                 f"- Fitting methods: {self.model_configs['fitting_method']}\n" + \
                 f"- Parameters: {self.model_configs['fitting_configs']}\n" + \
                  "=== Test results\n" + \
-                f"- Spatial variability test: {f"Completed ({self.sv_test_results['method']})" if len(self.sv_test_results) > 0 else None}\n" + \
-                f"- Differential usage test: {f"Completed ({self.du_test_results['method']})" if len(self.du_test_results) > 0 else None}"
+                f"- Spatial variability test: {_sv_status}\n" + \
+                f"- Differential usage test: {_du_status}"
 
     def setup_data(self, data, coordinates, design_mtx = None,
                    gene_names = None, group_gene_by_n_iso = False, covariate_names = None):

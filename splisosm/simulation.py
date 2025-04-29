@@ -109,7 +109,7 @@ def simulate_isoform_counts_single_gene(
     counts = _sample_multinom_sp_single_gene(props, total_counts_expected)
 
     ## store simulated data and ground truth
-    data = {"counts": counts, "coords": coords, "cov_s": cov_sp, "design_mtx": design_mtx}
+    data = {"counts": counts, "coords": coords, "cov_sp": cov_sp, "design_mtx": design_mtx}
 
     ## return simulation parameters
     if return_params:
@@ -198,7 +198,7 @@ def simulate_isoform_counts(
     counts = torch.stack(counts, dim = 0) # n_genes x n_spots x n_isos
 
     ## store simulated data and ground truth
-    data = {"counts": counts, "coords": coords, "cov_s": cov_sp, "design_mtx": design_mtx}
+    data = {"counts": counts, "coords": coords, "cov_sp": cov_sp, "design_mtx": design_mtx}
 
     ## return simulation parameters
     if return_params:
