@@ -2,8 +2,11 @@ import numpy as np
 from scipy.stats import ncx2
 import torch
 
-# TODO: remove pyro dependency?
-from pyro.distributions import Multinomial, DirichletMultinomial, MultivariateNormal
+try:
+    from pyro.distributions import Multinomial, DirichletMultinomial, MultivariateNormal
+except ImportError:
+    from torch.distributions import Multinomial, MultivariateNormal
+    DirichletMultinomial = None  # Placeholder if DirichletMultinomial is not available
 
 _DELTA = 1e-10
 
@@ -82,6 +85,8 @@ def log_prob_fastmult_batched(
 
 def log_prob_dm(concentration, counts):
     """Dirichlet-Multinomial log-likelihood.
+
+    This is a wrapper around Pyro's DirichletMultinomial log_prob function.
 
     Args:
             concentration: n_isoforms (1D) or n_isoforms x n_spots (2D).
