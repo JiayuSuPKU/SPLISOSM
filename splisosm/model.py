@@ -9,9 +9,7 @@ import torch.nn as nn
 from torch.autograd.functional import hessian, jacobian
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data.dataloader import default_collate
-
-# TODO: remove pyro dependency?
-from pyro.distributions import Gamma, InverseGamma
+from torch.distributions import Gamma, InverseGamma
 
 from splisosm.likelihood import (
     log_prob_fastmult,
@@ -140,9 +138,9 @@ class MultinomGLM(BaseModel, nn.Module):
     def __str__(self):
         return (
             f"A Multinomial Generalized Linear Model (GLM)\n"
-            + f"- Number of batches: {self.n_genes}\n"
-            + f"- Number of samples: {self.n_spots}\n"
-            + f"- Number of classes: {self.n_isos}\n"
+            + f"- Number of genes in the batch: {self.n_genes}\n"
+            + f"- Number of spots: {self.n_spots}\n"
+            + f"- Number of isoforms per gene: {self.n_isos}\n"
             + f"- Number of covariates: {self.n_factors}\n"
             + f"- Fitting method: {self.fitting_method}"
         )
@@ -807,9 +805,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     def __str__(self):
         return (
             f"A Multinomial Generalized Linear Mixed Model (GLMM)\n"
-            + f"- Number of batches: {self.n_genes}\n"
-            + f"- Number of samples: {self.n_spots}\n"
-            + f"- Number of classes: {self.n_isos}\n"
+            + f"- Number of genes in the batch: {self.n_genes}\n"
+            + f"- Number of spots: {self.n_spots}\n"
+            + f"- Number of isoforms per gene: {self.n_isos}\n"
             + f"- Number of covariates: {self.n_factors}\n"
             + "- Variance formulation:\n"
             + f"\t* Parameterized using sigma and theta: {self.var_parameterization_sigma_theta}\n"
