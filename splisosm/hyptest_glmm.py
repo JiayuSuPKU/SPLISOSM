@@ -524,11 +524,15 @@ class SplisosmGLMM():
 
         # check and store the design matrix
         if design_mtx is not None:
+            assert design_mtx.shape[0] == self.n_spots
+            if isinstance(design_mtx, np.ndarray):
+                design_mtx = torch.from_numpy(design_mtx)
+
             if design_mtx.dim() == 1: # in case of a single covariate
                 design_mtx = design_mtx.unsqueeze(1)
 
-            if isinstance(design_mtx, np.ndarray): # convert to tensor if numpy array
-                design_mtx = torch.from_numpy(design_mtx)
+            # convert to float tensor
+            design_mtx = design_mtx.float()
 
             assert design_mtx.shape[0] == self.n_spots, "Design matrix must match the number of spots."
 

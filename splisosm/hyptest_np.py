@@ -350,11 +350,14 @@ class SplisosmNP():
         # check the design matrix
         if design_mtx is not None:
             assert design_mtx.shape[0] == self.n_spots
+            if isinstance(design_mtx, np.ndarray):
+                design_mtx = torch.from_numpy(design_mtx)
+
             if design_mtx.dim() == 1: # in case of a single covariate
                 design_mtx = design_mtx.unsqueeze(1)
 
-            if isinstance(design_mtx, np.ndarray):
-                design_mtx = torch.from_numpy(design_mtx)
+            # convert to float tensor
+            design_mtx = design_mtx.float()
 
             if covariate_names is not None:	# set default names
                 assert len(covariate_names) == design_mtx.shape[1], "Covariate names must match the number of factors."
