@@ -13,6 +13,10 @@ Via GitHub (latest version):
 ```bash
 pip install git+https://github.com/JiayuSuPKU/SPLISOSM.git#egg=splisosm
 ```
+Via PyPI (stable version):
+```bash
+pip install splisosm
+```
 
 ## Quick start
 The basic unit of SPLISOSM analysis is the isoform-level event, which can be a full-length transcript from long-read sequencing or a local variable structure from short-read 3'end sequencing. Given spatial isoform quantification results, SPLISOSM runs two types of tests:
