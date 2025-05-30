@@ -29,10 +29,39 @@ And additionally for differential usage testing:
 
 * `covariates`: spatial variable such as RBP expression to test for association. (n_spot, n_covariate).
 
-See the [Isoform quantification and data preparation](#isoform-quantification-and-data-preparation) section below for tips on isoform quantification and data preparation.
+See the [Isoform quantification and data preparation](#isoform-quantification-and-data-preparation) section below for tips on isoform quantification and data preparation. Given an AnnData object with isoform-level quantification results, inputs for SPLISOSM can be extracted using the `extract_counts_n_ratios` function from `splisosm.utils`.
 
 The output of the SV test is a data frame of per-gene test statistics and p-values, and the output of the DU test is a data frame of per-gene-covariate-pair test statistics and p-values.
 
+### Example data
+A small demo dataset of Visium-ONT mouse olfactory bulb (SiT-MOB) can be downloaded [from here via Dropbox (~100Mb)](https://www.dropbox.com/scl/fo/dmuobtbof54jl4ht9zbjo/ALVIIEp-Ua5yYUPO8QxlIZ8?rlkey=q9o3jisd25ef5hwfqnsqdbf3i&st=vxhgokzw&dl=0) to test the package functionality.
+* `mob_ont_filtered_1107.h5ad`: AnnData object with isoform quantification results.
+* `mob_visium_rbp_1107.h5ad`: AnnData object with short-read-based RBP gene expression.
+
+```python
+import scanpy as sc
+from splisosm.utils import extract_counts_n_ratios
+
+adata_ont = sc.read("mob_ont_filtered_1107.h5ad")
+adata_rbp = sc.read("mob_visium_rbp_1107.h5ad")
+
+# prepare per gene isoform tensor list
+# data[i] = (n_spot, n_iso) tensor for gene i
+# assuming isoforms (adata_ont.var_names) are grouped by adata_ont.var['gene_symbol']
+data, _, gene_name_list, _ = extract_counts_n_ratios(
+    adata_ont, layer = 'counts', group_iso_by = 'gene_symbol'
+)
+
+# spatial coordinates
+coords = adata_ont.obs.loc[:, ['array_row', 'array_col']]
+
+# prepare covariates for differential usage testing
+adata_rbp = adata_rbp[adata_ont.obs_names, :].copy() # align the RBP data with the isoform data
+# focus on spatially variably expressed RBPs only
+# adata_rbp.var['is_visium_sve'] = adata_rbp.var['pvalue_adj_sparkx'] < 0.01
+covariates = adata_rbp[:, adata_rbp.var['is_visium_sve']].layers['log1p'].toarray()
+covariate_names = adata_rbp.var.loc[adata_rbp.var['is_visium_sve'], 'features']
+```
 
 ### Testing for spatial variability (SV)
 SPLISOSM uses Hilbert-Schmidt Independence Criterion (HSIC) to test for kernel independence between isoform quantities and spatial coordinates. Specifically, we have the following SV tests for variability in three aspects:
@@ -332,23 +361,8 @@ print(f"Average number of peaks per gene after QC: {sum(_iso_keep) / sum(_gene_k
 
 </details>
 
-Given an AnnData object with isoform-level quantification results, we provide the following functions to extract inputs for SPLISOSM:
-```python
-from splisosm.utils import extract_counts_n_ratios
-
-# per gene isoform tensor list
-# data[i] = (n_spot, n_iso) tensor for gene i
-# assuming isoforms (adata.var_names) are grouped by adata.var['gene_symbol']
-data, _, gene_name_list, _ = extract_counts_n_ratios(
-    adata, layer = 'counts', group_iso_by = 'gene_symbol'
-)
-
-# spatial coordinates
-coords = adata.obs.loc[:, ['array_row', 'array_col']]
-```
-
 ## Citation
-Su, Jiayu, et al. "A computational framework for mapping isoform landscape and regulatory mechanisms from spatial transcriptomics data." bioRxiv (2025): 2025-05.
+Su, Jiayu, et al. "A computational framework for mapping isoform landscape and regulatory mechanisms from spatial transcriptomics data." bioRxiv (2025): 2025-05. [link to preprint](https://www.biorxiv.org/content/10.1101/2025.05.02.651907v1)
 
 
 <!-- ## Documentation
