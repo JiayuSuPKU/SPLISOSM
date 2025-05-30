@@ -52,12 +52,12 @@ adata_rbp = sc.read("mob_visium_rbp_1107.h5ad")
 # prepare per gene isoform tensor list
 # data[i] = (n_spot, n_iso) tensor for gene i
 # assuming isoforms (adata_ont.var_names) are grouped by adata_ont.var['gene_symbol']
-data, _, gene_name_list, _ = extract_counts_n_ratios(
+data, _, gene_names, _ = extract_counts_n_ratios(
     adata_ont, layer = 'counts', group_iso_by = 'gene_symbol'
 )
 
 # spatial coordinates
-coords = adata_ont.obs.loc[:, ['array_row', 'array_col']]
+coordinates = adata_ont.obs.loc[:, ['array_row', 'array_col']]
 
 # prepare covariates for differential usage testing
 adata_rbp = adata_rbp[adata_ont.obs_names, :].copy() # align the RBP data with the isoform data
@@ -95,7 +95,7 @@ model_np.test_spatial_variability(
 )
 
 # extract the per-gene test statistics
-df_sv_res = model.get_formatted_test_results(test_type = 'sv')
+df_sv_res = model_np.get_formatted_test_results(test_type = 'sv')
 ```
 
 ### Testing for differential isoform usage (DU)
@@ -157,14 +157,13 @@ We implemented conditional association tests for isoform usage in both parametri
 The non-parametric test is again based on the HSIC kernel independence test and relies on Gaussian process regression for spatial conditioning. 
 
 ```python
-# from splisosm.hyptest import IsoSDE # will be deprecated in the future
 from splisosm.hyptest_np import SplisosmNP
 
 # minimal input data
 # after running the SV test, keep only SVS genes for DU testing
 data_svs = ... # list of length n_gene, each a (n_spot, n_iso) tensor
+gene_svs_names = ... # list of length n_gene, gene names
 coordinates = ..., # (n_spot, 2), spatial coordinates
-gene_names = ... # list of length n_gene, gene names
 
 # covariates for differential usage testing
 # e.g. spatial domains, RBP expression, etc.
@@ -177,7 +176,7 @@ model_np.setup_data(
     data_svs,
     coordinates,
     design_mtx = covariates,
-    gene_names = gene_names,
+    gene_names = gene_svs_names,
     covariate_names = covariate_names
 )
 
@@ -191,39 +190,38 @@ model_np.test_differential_usage(
 )
 
 # extract per gene-factor pair test statistics
-df_du_res = model.get_formatted_test_results(test_type = 'du')
+df_du_res = model_np.get_formatted_test_results(test_type = 'du')
 ```
 
 <!-- ### Parametric testing using SplisosmGLMM -->
 The parametric test is based on a generalized linear mixed model (GLMM) with the spatial random effect term following a Gaussian random field. The model is fitted using the [PyTorch Lightning](https://www.pytorchlightning.ai/) framework with marginal likelihood (i.e. integrating out the random effect) approximated by the Laplace's method at the mode.
 
 ```python
-# from splisosm.hyptest import IsoSDE # will be deprecated in the future
 from splisosm.hyptest_glmm import SplisosmGLMM
 
 # parametric model fitting
 model_p = SplisosmGLMM(
     model_type = 'glmm-full', # can be 'glmm-full', 'glmm-null', 'glm'
-    share_variance: bool = True,
-    var_parameterization_sigma_theta: bool = True,
-    var_fix_sigma: bool = False,
-    var_prior_model: str = "none",
-    var_prior_model_params: dict = {},
-    init_ratio: str = "observed",
-    fitting_method: str = "joint_gd",
-    fitting_configs: dict = {'max_epochs': -1}
+    share_variance = True,
+    var_parameterization_sigma_theta = True,
+    var_fix_sigma = False,
+    var_prior_model = "none",
+    var_prior_model_params = {},
+    init_ratio = "observed",
+    fitting_method = "joint_gd",
+    fitting_configs = {'max_epochs': -1}
 )
 model_p.setup_data(
-    data, # list of length n_genes, each element is a (n_spots, n_isos) tensor
+    data_svs, # list of length n_genes, each element is a (n_spots, n_isos) tensor
     coordinates, # (n_spots, 2), 2D array/tensor of spatial coordinates
-    design_mtx = None, # (n_spots, n_covariates), 2D array/tensor of covariates
-    gene_names = None, # list of length n_genes, gene names
-    covariate_names = None # list of length n_covariates, covariate names
-    group_gene_by_n_iso = False, # whether to group genes by the number of isoforms for batch processing
+    design_mtx = covariates, # (n_spots, n_covariates), 2D array/tensor of covariates
+    gene_names = gene_svs_names, # list of length n_genes, gene names
+    covariate_names = covariate_names, # list of length n_covariates, covariate names
+    group_gene_by_n_iso = True, # whether to group genes by the number of isoforms for batch processing
 )
 model_p.fit(
-    n_jobs = 1, # number of cores to use
-    batch_size = 1, # number of genes with the same number of isoforms to process in parallel per core
+    n_jobs = 2, # number of cores to use
+    batch_size = 20, # number of genes with the same number of isoforms to process in parallel per core
     quiet=True, print_progress=True,
     with_design_mtx = False, # fit the model without covariates for the score DU test
     from_null = False, refit_null = True, # for LLR test
@@ -233,10 +231,7 @@ model_p.save("model_p.pkl") # save the fitted model
 per_gene_glmm_models = model_p.get_fitted_models() # list of length n_genes, each element is a fitted model
 
 # differential usage testing
-model_p.test_differential_usage(
-    method = "score", # can be "wald", "score",
-    print_progress = True, return_results = False
-)
+model_p.test_differential_usage(method = "score", print_progress = True, return_results = False)
 
 # extract per gene-factor pair test statistics
 df_du_res = model_p.get_formatted_test_results(test_type = 'du')
