@@ -8,6 +8,7 @@ import torch
 from matplotlib.image import imread
 from anndata import AnnData
 from smoother import SpatialWeightMatrix, SpatialLoss
+from splisosm.likelihood import liu_sf
 
 def get_cov_sp(coords, k=4, rho=0.99):
     """Wrapper function to get the spatial covariance matrix from spatial coordinates.
@@ -22,7 +23,7 @@ def get_cov_sp(coords, k=4, rho=0.99):
     # first calculate the spatial weights matrix (swm)
     # here swm is the binary adjacency matrix of the knn graph
     weights = SpatialWeightMatrix()
-    weights.calc_weights_knn(coords, k=k)
+    weights.calc_weights_knn(coords, k=k, verbose=False)
 
     # # convert the swm to spatial covariance matrix with standardized variance (== 1)
     # spatial_loss = SpatialLoss("icar", weights, rho=rho, standardize_cov=True)
@@ -398,3 +399,133 @@ def extract_gene_level_statistics(adata: AnnData, layer = 'counts', group_iso_by
     df_gene_meta = pd.DataFrame(df_list).set_index('gene')
 
     return df_gene_meta
+
+def run_sparkx(counts_gene, coordinates):
+    """Wrapper for running the SPARK-X test for spatial gene expression variability.
+
+    Args:
+        counts_gene: array(n_spots, n_genes), the observed gene counts.
+        coordinates: array(n_spots, 2), the spatial coordinates.
+
+    Returns:
+        sv_sparkx: dict. Results of the SPARK-X spatial variability test with keys:
+            - 'statistic': np.ndarray of shape (n_genes,). Mean SPARK-X statistics.
+            - 'pvalue': np.ndarray of shape (n_genes,). Combined p-values.
+            - 'pvalue_adj': np.ndarray of shape (n_genes,). Adjusted combined p-values.
+            - 'method': str. Method name "spark-x".
+    """
+    # load packages neccessary for running SPARK-X
+    import rpy2
+    import rpy2.robjects as ro
+    from rpy2.robjects import r
+    from rpy2.robjects import numpy2ri
+    from rpy2.robjects.packages import importr
+    spark = importr('SPARK')
+
+    # prepare robject inputs
+    if isinstance(counts_gene, torch.Tensor):
+        counts_gene = counts_gene.numpy()
+    if isinstance(coordinates, torch.Tensor):
+        coordinates = coordinates.numpy()
+
+    with (ro.default_converter + numpy2ri.converter).context():
+        coords_r = ro.conversion.get_conversion().py2rpy(coordinates) # (n_spots, 2)
+        counts_r = ro.conversion.get_conversion().py2rpy(counts_gene.T) # (n_genes, n_spots)
+
+    counts_r.colnames = ro.vectors.StrVector(r['rownames'](coords_r))
+
+    # run SPARK-X and extract outputs
+    sparkx_res = spark.sparkx(counts_r, coords_r)
+    with (ro.default_converter + numpy2ri.converter).context():
+        sv_sparkx = {
+            'statistic': ro.conversion.get_conversion().rpy2py(sparkx_res.rx['stats'][0]).mean(1),
+            'pvalue': ro.conversion.get_conversion().rpy2py(sparkx_res.rx['res_mtest'][0])['combinedPval'],
+            'pvalue_adj': ro.conversion.get_conversion().rpy2py(sparkx_res.rx['res_mtest'][0])['adjustedPval'],
+            'method': 'spark-x',
+        }
+
+    return sv_sparkx
+
+def run_hsic_gc(counts_gene, coordinates, approx_rank = None, **spatial_kernel_kwargs):
+    """Function to compute HSIC-GC statistic for gene-level counts.
+
+    This function is designed to be a plugin replacement for SPARK-X.
+
+    Args:
+        counts_gene: torch.Tensor of shape (n_spots, n_genes). Gene counts.
+        coordinates: torch.Tensor of shape (n_spots, 2). Spatial coordinates of spots.
+        approx_rank: int. Approximate rank of the spatial kernel matrix.
+        spatial_kernel_kwargs: dict. Additional arguments for SpatialCovKernel.
+    Returns:
+        sv_test_results: dict. Results of the HSIC-GC spatial variability test with keys:
+            - 'statistic': np.ndarray of shape (n_genes,). HSIC-GC statistics.
+            - 'pvalue': np.ndarray of shape (n_genes,). P-values.
+            - 'pvalue_adj': np.ndarray of shape (n_genes,). Adjusted p-values.
+            - 'method': str. Method name "hsic-gc".
+    """
+
+    from splisosm.kernel import SpatialCovKernel
+    n_spots = counts_gene.shape[0]
+    n_genes = counts_gene.shape[1]
+
+    # determine the maximum rank for spatial kernel computation
+    if n_spots > 5000:
+        # 10x Visium has 4992 spots per slide. For larger datasets (i.e. Slideseq-V2),
+        # it is recommended to use low-rank approximation
+        max_rank = np.ceil(np.sqrt(n_spots) * 4).astype(int)
+        approx_rank = min(approx_rank, max_rank) if approx_rank is not None else max_rank
+    else:
+        if approx_rank is not None:
+            approx_rank = approx_rank if approx_rank < n_spots else None
+
+    # set default spatial kernel kwargs
+    default_spatial_kernel_kwargs = {
+        'k_neighbors': 4,
+        'model': 'icar',
+        'rho': 0.99,
+        'standardize_cov': True,
+        'centering': True,
+        'approx_rank': approx_rank
+    }
+    if spatial_kernel_kwargs is not None:
+        if 'centering' in spatial_kernel_kwargs:
+            warnings.warn("The 'centering' argument in spatial_kernel_kwargs will be ignored. It is always set to True for HSIC-GC.")
+            spatial_kernel_kwargs.pop('centering')
+        default_spatial_kernel_kwargs.update(spatial_kernel_kwargs)
+
+    # compute the spatial kernel
+    K_sp = SpatialCovKernel(
+        coordinates, **default_spatial_kernel_kwargs
+    )
+
+    # get the eigenvalues
+    lambda_sp = K_sp.eigenvalues() # (rank,)
+    lambda_sp = lambda_sp[lambda_sp > 1e-5] # filter small eigenvalues
+
+    # compute the HSIC-GC statistic per-gene
+    if not isinstance(counts_gene, torch.Tensor):
+        counts_gene = torch.from_numpy(counts_gene).float() # (n_spots, n_genes)
+
+    y = counts_gene - counts_gene.mean(0, keepdim=True) # center the counts, (n_spots, n_genes)
+
+    hsic_list, pvals_list = [], []
+    for i in range(n_genes):
+        counts = y[:, i:i+1] # (n_spots, 1)
+        lambda_y = counts.T @ counts # (1, 1)
+        lambda_spy = lambda_sp * lambda_y # (rank, 1)
+        hsic_scaled = torch.trace(K_sp.xtKx(counts)) # scalar
+        pval = liu_sf((hsic_scaled * n_spots).numpy(), lambda_spy.numpy())
+
+        hsic_list.append(hsic_scaled / (n_spots - 1) ** 2) # HSIC statistic
+        pvals_list.append(pval)
+
+    sv_test_results = {
+        'statistic': torch.tensor(hsic_list).numpy(),
+        'pvalue': torch.tensor(pvals_list).numpy(),
+        'method': 'hsic-gc',
+    }
+
+    # calculate adjusted p-values
+    sv_test_results['pvalue_adj'] = false_discovery_control(sv_test_results['pvalue'])
+
+    return sv_test_results

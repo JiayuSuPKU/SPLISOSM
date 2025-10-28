@@ -13,53 +13,9 @@ from sklearn.gaussian_process.kernels import ConstantKernel as C
 from sklearn.gaussian_process.kernels import WhiteKernel
 
 from smoother.weights import coordinate_to_weights_knn_sparse
-from splisosm.utils import get_cov_sp, counts_to_ratios, false_discovery_control
+from splisosm.utils import get_cov_sp, counts_to_ratios, false_discovery_control, run_sparkx
 from splisosm.kernel import SpatialCovKernel
 from splisosm.likelihood import liu_sf
-
-def _run_sparkx(coordinates, counts_list):
-    """Wrapper for running the SPARK-X test for spatial gene expression variability.
-
-    Args:
-        coordinates: tensor(n_spots, 2), the spatial coordinates.
-        counts_list: list of tensor(n_spots, n_isos), the observed isoform counts for each gene.
-
-    Returns:
-        sv_sparkx: dict, the results from the SPARK-X test.
-    """
-    # load packages neccessary for running SPARK-X
-    import rpy2
-    import rpy2.robjects as ro
-    from rpy2.robjects import r
-    from rpy2.robjects import numpy2ri
-    from rpy2.robjects import pandas2ri
-    from rpy2.robjects.packages import importr
-    numpy2ri.activate()
-    pandas2ri.activate()
-    spark = importr('SPARK')
-
-    # prepare robject inputs
-    if isinstance(coordinates, torch.Tensor):
-        coordinates = coordinates.numpy()
-    coords_r = ro.conversion.py2rpy(coordinates) # (n_spots, 2)
-
-    # merge isoform counts into gene counts
-    # isog_counts = adata_ont[:, mapping_matrix.index].layers['counts'] @ mapping_matrix
-    counts_g = torch.concat([_counts.sum(1, keepdim=True) for _counts in counts_list], axis = 1)
-    counts_r = ro.conversion.py2rpy(counts_g.T.numpy()) # (n_genes, n_spots)
-    counts_r.colnames = ro.vectors.StrVector(r['rownames'](coords_r))
-
-    # run SPARK-X and extract outputs
-    sparkx_res = spark.sparkx(counts_r, coords_r)
-    sv_sparkx = ro.conversion.rpy2py(sparkx_res.rx['res_mtest'][0])
-    sv_sparkx = {
-        'statistic': ro.conversion.rpy2py(sparkx_res.rx['stats'][0]).mean(1),
-        'pvalue': ro.conversion.rpy2py(sparkx_res.rx['res_mtest'][0])['combinedPval'].values,
-        'pvalue_adj': ro.conversion.rpy2py(sparkx_res.rx['res_mtest'][0])['adjustedPval'].values,
-        'method': 'spark-x',
-    }
-
-    return sv_sparkx
 
 def _calc_ttest_differential_usage(data, groups, combine_pval = True, combine_method = 'tippett'):
     """Calculate the two-sample t-test statistic for differential usage.
@@ -454,7 +410,9 @@ class SplisosmNP():
         assert nan_filling in valid_nan_filling, f"Invalid NaN filling method. Must be one of {valid_nan_filling}."
 
         if method == 'spark-x': # run the gene-level SPARK-X test
-            self.sv_test_results = _run_sparkx(self.coordinates, self.data)
+            # prepare the data in gene-level counts
+            counts_g = torch.concat([_counts.sum(1, keepdim=True) for _counts in self.data], axis = 1) # tensor(n_spots, n_genes)
+            self.sv_test_results = run_sparkx(counts_g.numpy(), self.coordinates.numpy())
         else:
             # use a global spatial kernel unless nan_filling is 'none'
             n_spots = self.n_spots
