@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "splisosm"
-version = "1.0.2"
+version = "1.0.3"
 description = "Spatial isoform statistical modeling (SPLISOSM)"
 authors = [
   {name = "Jiayu Su"}
@@ -21,14 +21,12 @@ dependencies = [
     "scipy",
     "tqdm",
     "smoother-omics>=1.1.0",
-    "matplotlib"
+    "matplotlib",
+    "scanpy"
 ]
 
 [project.optional-dependencies]
 dev = [
-    "scanpy",
-    "python-igraph",
-    "leidenalg",
     "plotnine", # for plotting
     "pyro-ppl", # for Dirichlet Multinomial likelihood
     "scikit-bio >= 0.5.9", # for ratio transformation. might have compatibility issues with numpy, installing using conda?
