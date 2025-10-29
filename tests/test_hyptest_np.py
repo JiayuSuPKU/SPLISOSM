@@ -4,11 +4,6 @@ import numpy as np
 from splisosm.utils import run_hsic_gc
 from splisosm.hyptest_np import SplisosmNP, _calc_ttest_differential_usage, linear_hsic_test
 from splisosm.simulation import simulate_isoform_counts
-try:
-    import rpy2
-    from rpy2.robjects.packages import importr, PackageNotInstalledError
-except (ImportError , ModuleNotFoundError):
-    PackageNotInstalledError = None
 
 def get_simulation_data(n_genes=2, n_isos=3, n_spots_per_dim=20):
     # set random seed for reproducibility
@@ -62,10 +57,13 @@ class TestSplisosmNP(unittest.TestCase):
     def _test_sparkx_installed(self):
         try:
             import rpy2
-            from rpy2.robjects.packages import importr
-            spark = importr('SPARK')
-            return True
-        except (ImportError, PackageNotInstalledError):
+            from rpy2.robjects.packages import importr, PackageNotInstalledError
+            try:
+                spark = importr('SPARK')
+                return True
+            except PackageNotInstalledError:
+                return False
+        except:
             return False
 
     def test_setup_data(self):
