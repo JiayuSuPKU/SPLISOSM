@@ -4,7 +4,11 @@ import numpy as np
 from splisosm.utils import run_hsic_gc
 from splisosm.hyptest_np import SplisosmNP, _calc_ttest_differential_usage, linear_hsic_test
 from splisosm.simulation import simulate_isoform_counts
-from rpy2.robjects.packages import importr, PackageNotInstalledError
+try:
+    import rpy2
+    from rpy2.robjects.packages import importr, PackageNotInstalledError
+except (ImportError , ModuleNotFoundError):
+    PackageNotInstalledError = None
 
 def get_simulation_data(n_genes=2, n_isos=3, n_spots_per_dim=20):
     # set random seed for reproducibility

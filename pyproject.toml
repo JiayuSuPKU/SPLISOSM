@@ -22,15 +22,15 @@ dependencies = [
     "tqdm",
     "smoother-omics>=1.1.0",
     "matplotlib",
-    "scanpy"
+    "anndata"
 ]
 
 [project.optional-dependencies]
 dev = [
+    "scanpy[leiden]",
     "plotnine", # for plotting
     "pyro-ppl", # for Dirichlet Multinomial likelihood
     "scikit-bio >= 0.5.9", # for ratio transformation. might have compatibility issues with numpy, installing using conda?
-    "rpy2", # for running SPARK-X, still need to install R and SPARK-X R package separately
 ]
 
 [project.urls]
