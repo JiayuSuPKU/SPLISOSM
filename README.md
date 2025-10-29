@@ -2,9 +2,13 @@
 
 ![overview](docs/img/splisosm_overview.png)
 
-SPLISOSM (<u>SP</u>atia<u>L</u> <u>ISO</u>form <u>S</u>tatistical <u>M</u>odeling) is a Python package for analyzing isoform usage patterns in spatial transcriptomics data. It employs optimized spatial and isoform kernels to capture complex dependencies between spatial locations and transcript usage, maximizing statistical power while maintaining well-calibrated, permutation-free test statistics even with extremely sparse data. The differential usage tests are conditioned on spatial locations to reduce false positives due to spatial autocorrelation.
+SPLISOSM (<u>SP</u>atia<u>L</u> <u>ISO</u>form <u>S</u>tatistical <u>M</u>odeling) is a Python package
+for analyzing RNA isoform patterns in spatial transcriptomics (ST) data. It employs multivariate kernel association tests to detect (i) *spatial variability* in
+isoform usage across spatial locations, and (ii) *differential association* between isoform usage and spatial covariates such as region annotation and RNA binding protein (RBP) expression.
 
-SPLISOSM accommodates isoform quantification results of both full-length isoforms from long-read sequencing and local transcript diversity events from short-read sequencing platforms including 10X Visium and Slide-seqV2. 
+
+## Documentation and tutorials
+https://splisosm.readthedocs.io/
 
 *This repository is under active development. Please check back later for detailed documentations, tutorials and end-to-end analysis examples using public long-read and short-read datasets.*
 

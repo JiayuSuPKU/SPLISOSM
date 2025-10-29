@@ -12,7 +12,7 @@ authors = [
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
-requires-python = ">=3.10, <4.0"
+requires-python = ">=3.11, <4.0"
 
 dependencies = [
     "numpy",
@@ -21,6 +21,7 @@ dependencies = [
     "scipy",
     "tqdm",
     "smoother-omics>=1.1.0"
+    "matplotlib",
 ]
 
 [project.optional-dependencies]

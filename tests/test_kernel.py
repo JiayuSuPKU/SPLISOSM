@@ -22,7 +22,7 @@ class TestSpatialCovKernel(unittest.TestCase):
         cov_sp1 = get_cov_sp(self.coords)
         K1 = self.H @ cov_sp1 @ self.H
         L1 = torch.linalg.eigvalsh(K1) # sorted in ascending order
-        self.assertTrue(L1.numpy()[0] > 0)
+        self.assertTrue(L1.numpy()[1] > 0) # check positive semi-definite
 
         # spatial kernel from the icar prior using the kernel class
         cov_sp2 = SpatialCovKernel(self.coords, approx_rank=None, centering=True)

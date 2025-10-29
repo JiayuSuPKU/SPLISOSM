@@ -20,6 +20,7 @@ Minimal software dependencies:
   scipy
   pandas
   tqdm
+  matplotlib
   smoother-omics
 
 We also provide a Python wrapper, :func:`splisosm.utils.run_sparkx`, for the gene-level spatial variability test `SPARK-X <https://xzhoulab.github.io/SPARK/04_installation/>`_. 
