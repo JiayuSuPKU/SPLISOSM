@@ -12,7 +12,7 @@ authors = [
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
-requires-python = ">=3.9, <=4.0"
+requires-python = ">=3.10, <4.0"
 
 dependencies = [
     "numpy",
@@ -20,25 +20,22 @@ dependencies = [
     "torch",
     "scipy",
     "tqdm",
-    "smoother-omics"
+    "smoother-omics>=1.1.0"
 ]
 
 [project.optional-dependencies]
 dev = [
-    "jupyter-lab",
-    "ipykernel",
-    "ipywidgets",
-    "plotnine",
     "scanpy",
     "python-igraph",
     "leidenalg",
-    "rich",
-    "pyro-ppl",
-    "scikit-bio >= 0.5.9", # might have compatibility issues with numpy, installing using conda?
+    "plotnine", # for plotting
+    "pyro-ppl", # for Dirichlet Multinomial likelihood
+    "scikit-bio >= 0.5.9", # for ratio transformation. might have compatibility issues with numpy, installing using conda?
+    "rpy2", # for running SPARK-X, still need to install R and SPARK-X R package separately
 ]
 
 [project.urls]
 repository = "https://github.com/JiayuSuPKU/SPLISOSM"
 
 [tool.setuptools]
-packages.find = {where = ["."], exclude = ["docs", "tests"]}
+packages.find = {where = ["."], exclude = ["docs", "tests", "scripts"]}

@@ -62,6 +62,9 @@ def counts_to_ratios(counts, transformation = "none", nan_filling = "mean"):
 
     assert nan_filling in ["mean", "none"]
 
+    if isinstance(counts, np.ndarray):
+        counts = torch.from_numpy(counts).float()
+
     # identify zero rows to fill
     is_nan = counts.sum(1) == 0 # (n_spots,)
 
