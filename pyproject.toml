@@ -20,8 +20,8 @@ dependencies = [
     "torch",
     "scipy",
     "tqdm",
-    "smoother-omics>=1.1.0"
-    "matplotlib",
+    "smoother-omics>=1.1.0",
+    "matplotlib"
 ]
 
 [project.optional-dependencies]
