@@ -1,6 +1,6 @@
 # SPLISOSM - Spatial Isoform Statistical Modeling
 
-![overview](splisosm_overview.png)
+![overview](docs/img/splisosm_overview.png)
 
 SPLISOSM (<u>SP</u>atia<u>L</u> <u>ISO</u>form <u>S</u>tatistical <u>M</u>odeling) is a Python package for analyzing isoform usage patterns in spatial transcriptomics data. It employs optimized spatial and isoform kernels to capture complex dependencies between spatial locations and transcript usage, maximizing statistical power while maintaining well-calibrated, permutation-free test statistics even with extremely sparse data. The differential usage tests are conditioned on spatial locations to reduce false positives due to spatial autocorrelation.
 
