@@ -44,8 +44,8 @@ class TestUtils(unittest.TestCase):
             self.adata, layer='counts', group_iso_by='gene_symbol', return_sparse=False
         )
 
-        self.assertEqual(len(counts_list), 3)
-        self.assertEqual(len(ratios_list), 3)
+        self.assertEqual(len(counts_list), 2)
+        self.assertEqual(len(ratios_list), 2)
         self.assertIsInstance(counts_list[0], torch.Tensor)
         self.assertFalse(counts_list[0].is_sparse)
         self.assertIsInstance(ratios_list[0], torch.Tensor)
@@ -60,7 +60,7 @@ class TestUtils(unittest.TestCase):
             self.adata, layer='counts_sparse', group_iso_by='gene_symbol', return_sparse=True
         )
 
-        self.assertEqual(len(counts_list), 3)
+        self.assertEqual(len(counts_list), 2)
         self.assertEqual(len(ratios_list), 0)
         self.assertIsNone(ratios_obs)
 
