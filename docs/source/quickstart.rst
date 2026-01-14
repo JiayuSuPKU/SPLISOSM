@@ -53,7 +53,9 @@ A small demo dataset of Visium-ONT mouse olfactory bulb (SiT-MOB) is available f
    # data[i] = (n_spot, n_iso) tensor for gene i
    # assuming isoforms (adata_ont.var_names) are grouped by adata_ont.var['gene_symbol']
    data, _, gene_names, _ = extract_counts_n_ratios(
-       adata_ont, layer='counts', group_iso_by='gene_symbol'
+       adata_ont, layer='counts', group_iso_by='gene_symbol',
+       return_sparse=True, # return sparse tensors to save memory
+       filter_single_iso_genes=True # filter out single-isoform genes
    )
 
    # spatial coordinates
@@ -86,8 +88,9 @@ SPLISOSM uses the Hilbert-Schmidt Independence Criterion (HSIC) to test for stat
    gene_names = ...  # list of length n_gene, gene names
 
    # initialize the model
+   # for large datasets, consider setting approx_rank to a smaller value (e.g., 50) to speed up computation
    model_np = SplisosmNP()
-   model_np.setup_data(data, coordinates, gene_names=gene_names)
+   model_np.setup_data(data, coordinates, gene_names=gene_names, approx_rank=None)
 
    # per-gene test for spatial variability
    # method can be 'hsic-ir' (isoform ratio), 'hsic-ic' (isoform counts)
@@ -133,7 +136,8 @@ The non-parametric test is based on the HSIC kernel independence test and relies
        coordinates,
        design_mtx=covariates,
        gene_names=gene_svs_names,
-       covariate_names=covariate_names
+       covariate_names=covariate_names,
+       approx_rank=None
    )
 
    # run the conditional HSIC test for differential usage

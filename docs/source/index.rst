@@ -36,7 +36,7 @@ isoform usage across spatial locations, and (ii) *differential association* betw
 
 Towards isoform-level spatial transcriptomics analysis
 ----------------------------------------------------------------
-In the associated paper (`SPLISOSM 2025 <https://www.biorxiv.org/content/10.1101/2025.05.02.651907v2>`_) we show that major ST platforms,
+In the associated paper (`SPLISOSM 2026 <https://www.nature.com/articles/s41587-025-02965-6>`_) we show that major ST platforms,
 including short-read-based `10x Visium <https://www.10xgenomics.com/products/hd-3-prime-gene-expression>`_ and imaging-based `10x Xenium Prime 5K <https://www.10xgenomics.com/products/xenium-5k-panel>`_,
 contain sufficient isoform-level information for spatial pattern discovery. These isoform-level signals can be quantified at varying resolutions:
 
@@ -82,7 +82,7 @@ Given isoform quantifications, SPLISOSM supports two types of statistical analys
 
 Building on the `Hilbert-Schmidt Independence Criterion (HSIC) <https://www.gatsby.ucl.ac.uk/~gretton/papers/GreBouSmoSch05.pdf>`_ framework for kernel-based association testing, 
 SPLISOSM achieves provably higher statistical power in sparse data while delivering well-calibrated, permutation-free p-values. 
-For methodological details, please refer to the self-contained Supplementary Notes of the `SPLISOSM paper <https://www.biorxiv.org/content/10.1101/2025.05.02.651907v2>`_.
+For methodological details, please refer to the self-contained Supplementary Notes of the `SPLISOSM paper <https://www.nature.com/articles/s41587-025-02965-6>`_.
 
 .. image:: ../img/splisosm_method.jpg
    :alt: Method
@@ -91,8 +91,7 @@ For methodological details, please refer to the self-contained Supplementary Not
 Reference
 ---------
 
-Su, Jiayu, et al. "A computational framework for mapping isoform landscape and regulatory mechanisms from spatial transcriptomics data." bioRxiv (2025): 2025-05. `link to preprint <https://www.biorxiv.org/content/10.1101/2025.05.02.651907v1>`_
-
+Su, Jiayu, et al. "Mapping isoforms and regulatory mechanisms from spatial transcriptomics data with SPLISOSM." Nature Biotechnology (2026): 1-12. `link to paper <https://www.nature.com/articles/s41587-025-02965-6>`_
 
 Frequently Asked Questions
 --------------------------

@@ -22,5 +22,5 @@ pip install splisosm
 ```
 
 ## Citation
-Su, Jiayu, et al. "A computational framework for mapping isoform landscape and regulatory mechanisms from spatial transcriptomics data." bioRxiv (2025): 2025-05. [link to preprint](https://www.biorxiv.org/content/10.1101/2025.05.02.651907v2)
-
+Su, Jiayu, et al. "Mapping isoforms and regulatory mechanisms from spatial transcriptomics data with SPLISOSM." Nature Biotechnology (2026): 1-12.
+[link to paper](https://www.nature.com/articles/s41587-025-02965-6)
