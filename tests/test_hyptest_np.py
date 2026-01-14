@@ -1,7 +1,10 @@
 import unittest
 import torch
 import numpy as np
-from splisosm.utils import run_hsic_gc
+import scipy.sparse
+import pandas as pd
+from anndata import AnnData
+from splisosm.utils import run_hsic_gc, extract_counts_n_ratios
 from splisosm.hyptest_np import SplisosmNP, _calc_ttest_differential_usage, linear_hsic_test
 from splisosm.simulation import simulate_isoform_counts
 
@@ -97,6 +100,55 @@ class TestSplisosmNP(unittest.TestCase):
                 sv_results = model.get_formatted_test_results('sv')
                 print(sv_results.head())
                 self.assertIn(method, str(model))
+
+    def test_sparse_data_handling(self):
+        # 1. Prepare sparse data using AnnData and extract_counts_n_ratios
+        n_spots = self.n_spots
+        n_genes = 2
+        n_isos_per_gene = [3, 2]
+        total_isos = sum(n_isos_per_gene)
+        
+        # Create random counts with some zeros
+        counts_dense = np.random.randint(0, 5, size=(n_spots, total_isos)).astype(np.float32)
+        counts_dense[counts_dense < 2] = 0
+        # Make it sparse
+        counts_sparse = scipy.sparse.csr_matrix(counts_dense)
+        
+        # Create var dataframe
+        gene_ids = []
+        for i, n in enumerate(n_isos_per_gene):
+            gene_ids.extend([f"gene_sparse_{i}"] * n)
+        var = pd.DataFrame({'gene_symbol': gene_ids}, index=[f"iso_{i}" for i in range(total_isos)])
+        
+        adata = AnnData(X=counts_sparse, var=var)
+        adata.layers['counts'] = counts_sparse
+        
+        # Extract sparse tensors (should return list of sparse torch tensors)
+        data_sparse, _, gene_names, _ = extract_counts_n_ratios(adata, 'counts', 'gene_symbol', return_sparse=True)
+        
+        # Verify inputs are sparse
+        for tensor in data_sparse:
+            self.assertTrue(tensor.is_sparse)
+            
+        # 2. Test SplisosmNP with sparse data
+        model = SplisosmNP()
+        model.setup_data(
+            data=data_sparse, coordinates=self.coords,
+            design_mtx=self.design_mtx, gene_names=gene_names
+        )
+        
+        # Test spatial variability - HSIC-GC (gene counts)
+        model.test_spatial_variability(method='hsic-gc', print_progress=False)
+        self.assertTrue(len(model.sv_test_results) > 0)
+        
+        # Test spatial variability - HSIC-IR (isoform ratios, requires densification)
+        model.test_spatial_variability(method='hsic-ir', print_progress=False)
+        self.assertTrue(len(model.sv_test_results) > 0)
+        
+        # Test differential usage - HSIC (isoform ratios, requires densification)
+        model.test_differential_usage(method='hsic', print_progress=False)
+        self.assertTrue(len(model.du_test_results) > 0)
+
 
     def test_hsic_gc(self):
         """Make sure the standalone hsic-gc function works as expected."""

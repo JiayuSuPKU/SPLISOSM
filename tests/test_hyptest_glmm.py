@@ -1,6 +1,10 @@
 import unittest
 import torch
 import numpy as np
+import scipy.sparse
+import pandas as pd
+from anndata import AnnData
+from splisosm.utils import extract_counts_n_ratios
 
 from splisosm.simulation import simulate_isoform_counts
 
@@ -107,6 +111,54 @@ class TestHypTestGLMM(unittest.TestCase):
         wald_stat, df = _calc_wald_differential_usage(full_model)
         self.assertIsNotNone(wald_stat)
         self.assertIsInstance(df, int)
+
+    def test_sparse_data_handling(self):
+        # 1. Prepare sparse data using AnnData and extract_counts_n_ratios
+        n_spots = self.counts[0].shape[0] # roughly 400 from get_simulation_data defaults
+        n_genes = 2
+        n_isos_per_gene = [3, 2]
+        total_isos = sum(n_isos_per_gene)
+        
+        # Create random counts with some zeros
+        counts_dense = np.random.randint(0, 5, size=(n_spots, total_isos)).astype(np.float32)
+        counts_dense[counts_dense < 2] = 0
+        counts_sparse = scipy.sparse.csr_matrix(counts_dense)
+        
+        # Create var dataframe
+        gene_ids = []
+        for i, n in enumerate(n_isos_per_gene):
+            gene_ids.extend([f"gene_sparse_{i}"] * n)
+        var = pd.DataFrame({'gene_symbol': gene_ids}, index=[f"iso_{i}" for i in range(total_isos)])
+        
+        adata = AnnData(X=counts_sparse, var=var)
+        adata.layers['counts'] = counts_sparse
+        
+        # Extract sparse tensors
+        data_sparse, _, gene_names, _ = extract_counts_n_ratios(adata, 'counts', 'gene_symbol', return_sparse=True)
+        
+        # Ensure coordinates match n_spots (self.cov_sp might be for different N if we aren't careful)
+        # In setUp, data is generated with n_spots_per_dim=20 => 400 spots.
+        # We used same n_spots.
+        
+        # Need coordinates for setup_data
+        # We can simulate coordinates or use dummy ones
+        coords = torch.rand(n_spots, 2)
+        
+        # 2. Test SplisosmGLMM with sparse data
+        # Use a very low max_epochs to speed up test
+        model = SplisosmGLMM(model_type='glmm-full', fitting_configs={'max_epochs': 1})
+        
+        # Using self.design_mtx might fail if dimensions don't match, let's create a matching one
+        design_mtx = torch.randn(n_spots, 2)
+        
+        model.setup_data(
+            data=data_sparse, coordinates=coords,
+            design_mtx=design_mtx, gene_names=gene_names
+        )
+        
+        # Fit the model
+        model.fit(quiet=True, print_progress=False)
+        self.assertTrue(model._is_trained)
 
     def test_calc_score_differential_usage(self):
         full_model = IsoFullModel(**self.model_configs)

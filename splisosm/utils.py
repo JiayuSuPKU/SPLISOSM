@@ -3,6 +3,7 @@ import json
 
 from pathlib import Path
 import numpy as np
+import scipy.sparse
 import pandas as pd
 import torch
 from matplotlib.image import imread
@@ -46,11 +47,14 @@ def counts_to_ratios(counts, transformation = "none", nan_filling = "mean"):
             https://proceedings.mlr.press/v162/park22d/park22d.pdf
 
     Args:
-        counts: torch.Tensor of shape (n_spots, n_isos). Isoform counts.
+        counts: dense torch.Tensor of shape (n_spots, n_isos). Isoform counts.
         transformation: str. Transformation applied to the proportions. One of "none", "clr", "ilr", "alr", "radial".
         nan_filling: str. Method to fill all zero rows. One of "mean", "none".
             - "mean": fill missing values with the mean of the mean per column **befor transformation**.
             - "none": do not fill missing values and return NaNs.
+
+    Returns:
+        ratios: dense torch.Tensor of shape (n_spots, n_isos) or (n_spots, n_isos - 1) if ilr or alr transformation is used.
     """
     assert transformation in ["none", "clr", "ilr", "alr", "radial"]
     if transformation in ["clr", "ilr", "alr"]:
@@ -313,7 +317,7 @@ def load_visium_sp_meta(adata: AnnData, path_to_spatial, library_id = None):
     return adata
 
 
-def extract_counts_n_ratios(adata: AnnData, layer = 'counts', group_iso_by = 'gene_symbol'):
+def extract_counts_n_ratios(adata: AnnData, layer = 'counts', group_iso_by = 'gene_symbol', return_sparse = False):
     """ Extract per-gene lists of isoform counts and ratios from anndata.
 
     Args:
@@ -326,12 +330,17 @@ def extract_counts_n_ratios(adata: AnnData, layer = 'counts', group_iso_by = 'ge
         ratios_list: List[torch.Tensor]. Isoform ratios per gene, each of (n_spots, n_isos).
         gene_name_list: List[str]. Gene names.
         ratio_obs_merged: np.ndarray. Observed isoform ratios, each of (n_spots, n_isos_total).
+        return_sparse: bool. Whether to return sparse torch tensors for counts_list.
+            if True, ratios_list will be empty and ratio_obs_merged will be None.
     """
     # extract isoform counts
     iso_counts = adata.layers[layer] # (n_spots, n_isos_total)
-    if not isinstance(iso_counts, np.ndarray):
-        # convert sparse matrix to dense
-        iso_counts = iso_counts.toarray()
+
+    # Check if input is sparse
+    is_sparse_input = scipy.sparse.issparse(iso_counts)
+    if is_sparse_input and not scipy.sparse.isspmatrix_csc(iso_counts) and not scipy.sparse.isspmatrix_csr(iso_counts):
+        # convert to csr for efficient slicing if it is other sparse format
+        iso_counts = iso_counts.tocsr()
 
     counts_list = [] # isoform counts per gene, each of (n_spots, n_isos)
     ratios_list = [] # isoform ratios per gene, each of (n_spots, n_isos)
@@ -341,18 +350,47 @@ def extract_counts_n_ratios(adata: AnnData, layer = 'counts', group_iso_by = 'ge
     for _gene, _group in adata.var.reset_index().groupby(group_iso_by, observed = True):
         # extract isoform name and index per gene
         gene_name_list.append(_gene)
-        iso_ind_list.append(_group.index.tolist())
+        iso_indices = _group.index.tolist()
+        iso_ind_list.append(iso_indices)
 
         # extract isoform counts and relative ratio
-        _counts = torch.from_numpy(iso_counts[:, _group.index.tolist()]).float() # (n_spots, n_isos)
-        _ratios = counts_to_ratios(_counts, transformation='none') # (n_spots, n_isos)
+        if is_sparse_input and return_sparse:
+            # since ratios are usually dense, we do not compute ratios for sparse input
+            # ratios_list will be empty and ratio_obs_merged will be None
 
-        counts_list.append(_counts)
-        ratios_list.append(_ratios)
+            # slice sparse matrix
+            _counts_scipy = iso_counts[:, iso_indices]
 
-    # reshape and store the observed ratio in anndata
-    ratio_obs_merged = torch.concat(ratios_list, axis = 1).numpy() # (n_spots, n_isos_total)
-    ratio_obs_merged = ratio_obs_merged[:, np.argsort(np.concatenate(iso_ind_list))] # (n_spots, n_isos_total)
+            # convert to torch sparse coo tensor
+            _counts_coo = _counts_scipy.tocoo()
+            values = _counts_coo.data
+            indices = np.vstack((_counts_coo.row, _counts_coo.col))
+
+            i = torch.LongTensor(indices)
+            v = torch.FloatTensor(values)
+            shape = _counts_coo.shape
+            _counts = torch.sparse_coo_tensor(i, v, torch.Size(shape))
+            counts_list.append(_counts)
+        else:
+            if is_sparse_input:
+                # slice sparse matrix and convert to dense
+                _counts_np = iso_counts[:, iso_indices].toarray()
+            else:
+                _counts_np = iso_counts[:, iso_indices]
+
+            # compute counts and ratios as dense tensors
+            _counts = torch.from_numpy(_counts_np).float() # (n_spots, n_isos)
+            _ratios = counts_to_ratios(_counts, transformation='none') # (n_spots, n_isos)
+
+            counts_list.append(_counts)
+            ratios_list.append(_ratios)
+
+    if is_sparse_input and return_sparse:
+        ratio_obs_merged = None
+    else:
+        # reshape and store the observed ratio in anndata
+        ratio_obs_merged = torch.concat(ratios_list, axis = 1).numpy() # (n_spots, n_isos_total)
+        ratio_obs_merged = ratio_obs_merged[:, np.argsort(np.concatenate(iso_ind_list))] # (n_spots, n_isos_total)
 
     return counts_list, ratios_list, gene_name_list, ratio_obs_merged
 
@@ -377,26 +415,60 @@ def extract_gene_level_statistics(adata: AnnData, layer = 'counts', group_iso_by
     """
     # extract isoform counts
     iso_counts = adata.layers[layer] # (n_spots, n_isos_total)
-    if not isinstance(iso_counts, np.ndarray):
-        # convert sparse matrix to dense
-        iso_counts = iso_counts.toarray()
+
+    # Check if input is sparse
+    is_sparse_input = scipy.sparse.issparse(iso_counts)
+    if is_sparse_input and not scipy.sparse.isspmatrix_csc(iso_counts) and not scipy.sparse.isspmatrix_csr(iso_counts):
+        iso_counts = iso_counts.tocsr()
 
     df_list = []
     # loop through genes
     for _gene, _group in adata.var.reset_index().groupby(group_iso_by, observed = True):
         # extract isoform counts and relative ratio
-        _counts = iso_counts[:, _group.index.tolist()] # (n_spots, n_isos)
-        _ratios_avg = (_counts.sum(0) / _counts.sum()) # (n_isos,)
+        iso_indices = _group.index.tolist()
+        _counts = iso_counts[:, iso_indices]
+
+        if is_sparse_input:
+             # Calculate statistics on sparse matrix without densifying
+             _sum_per_iso = np.asarray(_counts.sum(0)).flatten() # (n_isos,)
+             _row_sums = np.asarray(_counts.sum(1)).flatten() # (n_spots,)
+             _total_sum = _sum_per_iso.sum()
+
+             pct_spot_on = (_row_sums > 0).mean()
+             count_avg = _row_sums.mean()
+             count_std = _row_sums.std()
+        else:
+             if not isinstance(_counts, np.ndarray):
+                 _counts = np.asarray(_counts)
+
+             _sum_per_iso = _counts.sum(0)
+             _row_sums = _counts.sum(1)
+             _total_sum = _counts.sum()
+
+             pct_spot_on = (_row_sums > 0).mean()
+             count_avg = _row_sums.mean()
+             count_std = _row_sums.std()
+
+        # Avoid division by zero
+        if _total_sum == 0:
+            _ratios_avg = np.zeros_like(_sum_per_iso)
+        else:
+            _ratios_avg = (_sum_per_iso / _total_sum) # (n_isos,)
 
         # calculate and store gene-level statistics
+        # handle zeros in log
+        with np.errstate(divide='ignore', invalid='ignore'):
+             entropy = - (np.log(_ratios_avg) * _ratios_avg)
+             entropy = np.nan_to_num(entropy).sum()
+
         df_list.append({
             'gene': _gene,
             'n_iso': _group.shape[0],
-            'pct_spot_on': (_counts.sum(1) > 0).mean(),
-            'count_avg': _counts.sum(1).mean(),
-            'count_std': _counts.sum(1).std(),
-            'perplexity': np.exp(- (np.log(_ratios_avg) * _ratios_avg).sum()),
-            'major_ratio_avg': _ratios_avg.max(),
+            'pct_spot_on': pct_spot_on,
+            'count_avg': count_avg,
+            'count_std': count_std,
+            'perplexity': np.exp(entropy),
+            'major_ratio_avg': _ratios_avg.max() if _ratios_avg.size > 0 else 0.0,
         })
 
     df_gene_meta = pd.DataFrame(df_list).set_index('gene')
@@ -417,6 +489,11 @@ def run_sparkx(counts_gene, coordinates):
             - 'pvalue_adj': np.ndarray of shape (n_genes,). Adjusted combined p-values.
             - 'method': str. Method name "spark-x".
     """
+    if scipy.sparse.issparse(counts_gene):
+        raise ValueError("run_sparkx does not support sparse input for counts_gene.")
+    if isinstance(counts_gene, torch.Tensor) and counts_gene.is_sparse:
+        raise ValueError("run_sparkx does not support sparse input for counts_gene.")
+
     # load packages neccessary for running SPARK-X
     import rpy2
     import rpy2.robjects as ro
@@ -441,9 +518,9 @@ def run_sparkx(counts_gene, coordinates):
     sparkx_res = spark.sparkx(counts_r, coords_r)
     with (ro.default_converter + numpy2ri.converter).context():
         sv_sparkx = {
-            'statistic': ro.conversion.get_conversion().rpy2py(sparkx_res.rx['stats'][0]).mean(1),
-            'pvalue': ro.conversion.get_conversion().rpy2py(sparkx_res.rx['res_mtest'][0])['combinedPval'],
-            'pvalue_adj': ro.conversion.get_conversion().rpy2py(sparkx_res.rx['res_mtest'][0])['adjustedPval'],
+            'statistic': ro.conversion.get_conversion().rpy2py(sparkx_res.rx2('stats')).mean(1),
+            'pvalue': ro.conversion.get_conversion().rpy2py(sparkx_res.rx2('res_mtest'))['combinedPval'],
+            'pvalue_adj': ro.conversion.get_conversion().rpy2py(sparkx_res.rx2('res_mtest'))['adjustedPval'],
             'method': 'spark-x',
         }
 
@@ -455,8 +532,8 @@ def run_hsic_gc(counts_gene, coordinates, approx_rank = None, **spatial_kernel_k
     This function is designed to be a plugin replacement for SPARK-X.
 
     Args:
-        counts_gene: torch.Tensor of shape (n_spots, n_genes). Gene counts.
-        coordinates: torch.Tensor of shape (n_spots, 2). Spatial coordinates of spots.
+        counts_gene: dense or sparse array-like of shape (n_spots, n_genes). Gene counts.
+        coordinates: array of shape (n_spots, 2). Spatial coordinates of spots.
         approx_rank: int. Approximate rank of the spatial kernel matrix.
         spatial_kernel_kwargs: dict. Additional arguments for SpatialCovKernel.
     Returns:
@@ -497,6 +574,10 @@ def run_hsic_gc(counts_gene, coordinates, approx_rank = None, **spatial_kernel_k
         default_spatial_kernel_kwargs.update(spatial_kernel_kwargs)
 
     # compute the spatial kernel
+    # Ensure coordinates is numpy for SpatialCovKernel/smoother
+    if isinstance(coordinates, torch.Tensor):
+        coordinates = coordinates.detach().cpu().numpy()
+
     K_sp = SpatialCovKernel(
         coordinates, **default_spatial_kernel_kwargs
     )
@@ -506,14 +587,46 @@ def run_hsic_gc(counts_gene, coordinates, approx_rank = None, **spatial_kernel_k
     lambda_sp = lambda_sp[lambda_sp > 1e-5] # filter small eigenvalues
 
     # compute the HSIC-GC statistic per-gene
-    if not isinstance(counts_gene, torch.Tensor):
-        counts_gene = torch.from_numpy(counts_gene).float() # (n_spots, n_genes)
+    is_scipy_sparse = scipy.sparse.issparse(counts_gene)
+    is_torch_sparse = isinstance(counts_gene, torch.Tensor) and counts_gene.is_sparse
 
-    y = counts_gene - counts_gene.mean(0, keepdim=True) # center the counts, (n_spots, n_genes)
+    if is_scipy_sparse:
+        n_spots, n_genes = counts_gene.shape
+        # Ensure efficient column slicing
+        if not scipy.sparse.isspmatrix_csc(counts_gene) and not scipy.sparse.isspmatrix_csr(counts_gene):
+             counts_gene = counts_gene.tocsc()
+    elif is_torch_sparse:
+        n_spots, n_genes = counts_gene.shape
+        if counts_gene.dtype != torch.float32 and counts_gene.dtype != torch.float64:
+             counts_gene = counts_gene.float()
+        if not counts_gene.is_coalesced():
+            counts_gene = counts_gene.coalesce()
+        # Pre-allocate selection vector for column extraction
+        selection_vec = torch.zeros(n_genes, 1, device=counts_gene.device, dtype=counts_gene.dtype)
+    else:
+        if not isinstance(counts_gene, torch.Tensor):
+            counts_gene = torch.from_numpy(counts_gene).float() # (n_spots, n_genes)
+        n_spots, n_genes = counts_gene.shape
+        y_dense = counts_gene - counts_gene.mean(0, keepdim=True) # center the counts, (n_spots, n_genes)
 
     hsic_list, pvals_list = [], []
     for i in range(n_genes):
-        counts = y[:, i:i+1] # (n_spots, 1)
+        if is_scipy_sparse:
+             col = counts_gene[:, i].toarray() # dense (n_spots, 1)
+             counts = torch.from_numpy(col).float()
+             counts = counts - counts.mean()
+        elif is_torch_sparse:
+             # Extract column i using Sparse x Dense matrix multiplication
+             # (N, G) @ (G, 1) -> (N, 1)
+             # This is efficient and avoids densifying the full matrix
+             selection_vec.zero_()
+             selection_vec[i, 0] = 1.0
+
+             col = torch.sparse.mm(counts_gene, selection_vec)
+             counts = col - col.mean()
+        else:
+             counts = y_dense[:, i:i+1] # (n_spots, 1)
+
         lambda_y = counts.T @ counts # (1, 1)
         lambda_spy = lambda_sp * lambda_y # (rank, 1)
         hsic_scaled = torch.trace(K_sp.xtKx(counts)) # scalar

@@ -433,6 +433,9 @@ class SplisosmNP():
             # iterate over genes and calculate the HSIC statistic
             hsic_list, pvals_list = [], []
             for counts in tqdm(self.data, disable=(not print_progress)):
+                if counts.is_sparse:
+                    counts = counts.to_dense()
+
                 if method == 'hsic-ir' and nan_filling == 'none':
                     # spetial treatment for the isoform ratio test when nan_filling is 'none'
                     # need to adjust the effective spot number (non NaN spots) and spatial kernel
@@ -595,6 +598,9 @@ class SplisosmNP():
                     _hsic_ind, _pvals_ind = [], []
                     # iterate over genes and calculate the HSIC statistic
                     for counts in self.data:
+                        if counts.is_sparse:
+                            counts = counts.to_dense()
+
                         # calculate isoform usage ratio (n_spots, n_isos)
                         y = counts_to_ratios(counts, transformation = ratio_transformation, nan_filling='mean')
                         y = Rx @ y # regression residual, (n_spots, n_isos)
@@ -615,6 +621,9 @@ class SplisosmNP():
                 pvals_all = torch.stack(pvals_list, dim=1)
 
             else: # nan_filling == 'none', NaN values in the ratio
+                if counts.is_sparse:
+                    counts = counts.to_dense()
+
                 hsic_list, pvals_list = [], []
                 # iterate over genes and use different spatial kernel matrix for different genes
                 for counts in tqdm(self.data, disable=(not print_progress), dynamic_ncols=True):
@@ -727,6 +736,9 @@ class SplisosmNP():
             # run GP regression for every gene
             y_res_list = []
             for counts in tqdm(self.data, disable=(not print_progress), dynamic_ncols=True):
+                if counts.is_sparse:
+                    counts = counts.to_dense()
+
                 # calculate isoform usage ratio (n_spots, n_isos)
                 y = counts_to_ratios(counts, transformation = ratio_transformation, nan_filling = nan_filling)
 
@@ -785,6 +797,9 @@ class SplisosmNP():
                 # iterate over genes and calculate the t-test statistic
                 _du_ttest_stats, _du_ttest_pvals = [], []
                 for counts in self.data:
+                    if counts.is_sparse:
+                        counts = counts.to_dense()
+
                     # calculate isoform usage ratio (n_spots, n_isos)
                     ratios = counts_to_ratios(
                         counts, transformation = ratio_transformation, nan_filling = nan_filling

@@ -1,6 +1,18 @@
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.dataloader import default_collate
+
+def sparse_collate(batch):
+    """Custom collate function to handle sparse tensors."""
+    elem = batch[0]
+    if isinstance(elem, torch.Tensor):
+        if elem.is_sparse:
+            return torch.stack(batch)
+        return torch.stack(batch, 0, out=None)
+    elif isinstance(elem, dict):
+        return {key: sparse_collate([d[key] for d in batch]) for key in elem}
+    return default_collate(batch)
 
 class UngroupedIsoDataset(Dataset):
     """Dataset for spatial isoform expression."""
@@ -119,8 +131,8 @@ class IsoDataset():
             iter: DataLoader iterator
         """
         if not self.group_gene_by_n_iso:
-            return DataLoader(self.datasets[0], batch_size=1, shuffle=False)
+            return DataLoader(self.datasets[0], batch_size=1, shuffle=False, collate_fn=sparse_collate)
         else:
-            dataloaders = [DataLoader(ds, batch_size=batch_size, shuffle=False) for ds in self.datasets]
+            dataloaders = [DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=sparse_collate) for ds in self.datasets]
             return _iters_merger(*dataloaders)
 

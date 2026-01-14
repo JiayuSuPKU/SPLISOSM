@@ -149,6 +149,9 @@ def _fit_model_one_gene(model_configs, model_type, counts, corr_sp_eigvals, corr
     """
     assert model_type in ['glmm-full', 'glmm-null', 'glm']
 
+    if counts.is_sparse:
+        counts = counts.to_dense()
+
     # initialize and setup the model
     if model_type == 'glm':
         model = MultinomGLM()
@@ -185,6 +188,9 @@ def _fit_null_full_sv_one_gene(model_configs, counts, corr_sp_eigvals, corr_sp_e
     Returns:
         (null_pars, full_pars): dicts, the fitted parameters of the null and full models.
     """
+    if counts.is_sparse:
+        counts = counts.to_dense()
+
     # fit the null model
     null = IsoNullNoSpVar(**model_configs)
     null.setup_data(
@@ -228,6 +234,10 @@ def _fit_perm_one_gene(perm_idx, model_configs, counts, corr_sp_eigvals, corr_sp
     Returns:
         _sv_llr: tensor(1), the likelihood ratio statistic.
     """
+
+    if counts.is_sparse:
+        counts = counts.to_dense()
+
     # permute the data coordinates
     counts_perm = counts[:, perm_idx, :] # (n_genes, n_spots, n_isos)
     design_mtx_perm = design_mtx[perm_idx, :] if design_mtx is not None else None
@@ -763,6 +773,9 @@ class SplisosmGLMM():
                 _, b_counts, _ = (
                     batch['n_isos'], batch['x'], batch['gene_name']
                 )
+
+                if b_counts.is_sparse:
+                    b_counts = b_counts.to_dense()
 
                 # initialize and setup the model
                 if self.model_type == 'glm':
