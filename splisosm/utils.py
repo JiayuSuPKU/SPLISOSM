@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import numpy as np
 import scipy.sparse
+from tqdm import tqdm
 import pandas as pd
 import torch
 from matplotlib.image import imread
@@ -317,7 +318,8 @@ def load_visium_sp_meta(adata: AnnData, path_to_spatial, library_id = None):
     return adata
 
 
-def extract_counts_n_ratios(adata: AnnData, layer = 'counts', group_iso_by = 'gene_symbol', return_sparse = False):
+def extract_counts_n_ratios(adata: AnnData, layer = 'counts', group_iso_by = 'gene_symbol', 
+                            return_sparse = False, filter_single_iso_genes = True):
     """ Extract per-gene lists of isoform counts and ratios from anndata.
 
     Args:
@@ -332,6 +334,8 @@ def extract_counts_n_ratios(adata: AnnData, layer = 'counts', group_iso_by = 'ge
         ratio_obs_merged: np.ndarray. Observed isoform ratios, each of (n_spots, n_isos_total).
         return_sparse: bool. Whether to return sparse torch tensors for counts_list.
             if True, ratios_list will be empty and ratio_obs_merged will be None.
+        filter_single_iso_genes: bool. Whether to filter out genes with only one isoform.
+            By default True for compatibility with splisosm models.
     """
     # extract isoform counts
     iso_counts = adata.layers[layer] # (n_spots, n_isos_total)
@@ -347,7 +351,11 @@ def extract_counts_n_ratios(adata: AnnData, layer = 'counts', group_iso_by = 'ge
     gene_name_list = [] # of length n_genes
     iso_ind_list = [] # of length n_genes
 
-    for _gene, _group in adata.var.reset_index().groupby(group_iso_by, observed = True):
+    for _gene, _group in tqdm(adata.var.reset_index().groupby(group_iso_by, observed = True)):
+        # filter single-isoform genes if needed
+        if filter_single_iso_genes and _group.shape[0] < 2:
+            continue
+
         # extract isoform name and index per gene
         gene_name_list.append(_gene)
         iso_indices = _group.index.tolist()
@@ -423,7 +431,7 @@ def extract_gene_level_statistics(adata: AnnData, layer = 'counts', group_iso_by
 
     df_list = []
     # loop through genes
-    for _gene, _group in adata.var.reset_index().groupby(group_iso_by, observed = True):
+    for _gene, _group in tqdm(adata.var.reset_index().groupby(group_iso_by, observed = True)):
         # extract isoform counts and relative ratio
         iso_indices = _group.index.tolist()
         _counts = iso_counts[:, iso_indices]
@@ -610,7 +618,7 @@ def run_hsic_gc(counts_gene, coordinates, approx_rank = None, **spatial_kernel_k
         y_dense = counts_gene - counts_gene.mean(0, keepdim=True) # center the counts, (n_spots, n_genes)
 
     hsic_list, pvals_list = [], []
-    for i in range(n_genes):
+    for i in tqdm(range(n_genes)):
         if is_scipy_sparse:
              col = counts_gene[:, i].toarray() # dense (n_spots, 1)
              counts = torch.from_numpy(col).float()
