@@ -1,10 +1,32 @@
+from __future__ import annotations
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
+from typing import Any, Iterator, Optional
 
-def sparse_collate(batch):
-    """Custom collate function to handle sparse tensors."""
+__all__ = [
+    "sparse_collate",
+    "UngroupedIsoDataset",
+    "GroupedIsoDataset",
+    "IsoDataset",
+]
+
+
+def sparse_collate(batch: list[Any]) -> Any:
+    """Custom collate function to handle sparse tensors.
+
+    Parameters
+    ----------
+    batch : list of Any
+        Batch of data items to collate.
+
+    Returns
+    -------
+    Any
+        Collated batch.
+    """
     elem = batch[0]
     if isinstance(elem, torch.Tensor):
         if elem.is_sparse:
@@ -14,21 +36,40 @@ def sparse_collate(batch):
         return {key: sparse_collate([d[key] for d in batch]) for key in elem}
     return default_collate(batch)
 
+
 class UngroupedIsoDataset(Dataset):
-    """Dataset for spatial isoform expression."""
-    def __init__(self, data, gene_names):
+    """Dataset for spatial isoform expression.
+
+    Parameters
+    ----------
+    data : list of torch.Tensor
+        List of tensors with shape (n_spots, n_isos).
+    gene_names : list of str
+        Gene names.
+    """
+
+    def __init__(self, data: list[torch.Tensor], gene_names: list[str]) -> None:
         """Initialize the dataset.
 
-        Args:
-            data: list of tensor(n_spots, n_isos)
-            gene_names: list of str
+        Parameters
+        ----------
+        data : list of torch.Tensor
+            List of tensors with shape (n_spots, n_isos).
+        gene_names : list of str
+            Gene names.
         """
-        self.n_genes = len(data) # number of genes
-        self.n_spots = len(data[0]) # number of spots
-        self.n_isos_per_gene = [data_g.shape[1] for data_g in data] # number of isoforms for each gene
+        self.n_genes = len(data)  # number of genes
+        self.n_spots = len(data[0])  # number of spots
+        self.n_isos_per_gene = [
+            data_g.shape[1] for data_g in data
+        ]  # number of isoforms for each gene
         self.gene_names = gene_names
-        assert len(self.gene_names) == self.n_genes, "Gene names must match the number of genes."
-        assert min(self.n_isos_per_gene) > 1, "At least two isoforms are required for each gene."
+        assert (
+            len(self.gene_names) == self.n_genes
+        ), "Gene names must match the number of genes."
+        assert (
+            min(self.n_isos_per_gene) > 1
+        ), "At least two isoforms are required for each gene."
 
         self.data = data
 
@@ -37,23 +78,37 @@ class UngroupedIsoDataset(Dataset):
 
     def __getitem__(self, idx):
         return {
-            'n_isos': self.n_isos_per_gene[idx],
-            'x': self.data[idx],
-            'gene_name': self.gene_names[idx],
+            "n_isos": self.n_isos_per_gene[idx],
+            "x": self.data[idx],
+            "gene_name": self.gene_names[idx],
         }
 
 
 class GroupedIsoDataset(Dataset):
-    """Dataset for spatial isoform expression per gene group."""
-    def __init__(self, data, gene_names):
+    """Dataset for spatial isoform expression per gene group.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        Shape (n_genes, n_spots, n_isos), genes are grouped by the number of isoforms.
+    gene_names : list of str
+        Gene names.
+    """
+
+    def __init__(self, data: torch.Tensor, gene_names: list[str]) -> None:
         """Initialize the dataset.
 
-        Args:
-            data: tensor(n_genes, n_spots, n_isos), genes are grouped by the number of isoforms
-            gene_names: list of str
+        Parameters
+        ----------
+        data : torch.Tensor
+            Shape (n_genes, n_spots, n_isos), genes are grouped by number of isoforms.
+        gene_names : list of str
+            Gene names.
         """
         self.n_genes, self.n_spots, self.n_isos = data.shape
-        assert len(gene_names) == self.n_genes, "Gene names must match the number of genes."
+        assert (
+            len(gene_names) == self.n_genes
+        ), "Gene names must match the number of genes."
 
         self.data = data
         self.gene_names = gene_names
@@ -63,10 +118,11 @@ class GroupedIsoDataset(Dataset):
 
     def __getitem__(self, idx):
         return {
-            'n_isos': self.n_isos,
-            'x': self.data[idx, :, :],
-            'gene_name': self.gene_names[idx],
+            "n_isos": self.n_isos,
+            "x": self.data[idx, :, :],
+            "gene_name": self.gene_names[idx],
         }
+
 
 def _iters_merger(*iters):
     for itr in iters:
@@ -74,27 +130,58 @@ def _iters_merger(*iters):
             yield v
 
 
-class IsoDataset():
-    """Dataset for spatial isoform expression."""
-    def __init__(self, data, gene_names=None, group_gene_by_n_iso=False):
+class IsoDataset:
+    """Dataset for spatial isoform expression.
+
+    Parameters
+    ----------
+    data : list of torch.Tensor
+        List of tensors with shape (n_spots, n_isos).
+    gene_names : list of str, optional
+        Gene names.
+    group_gene_by_n_iso : bool, optional
+        Whether to group genes by the number of isoforms.
+    """
+
+    def __init__(
+        self,
+        data: list[torch.Tensor],
+        gene_names: Optional[list[str]] = None,
+        group_gene_by_n_iso: bool = False,
+    ) -> None:
         """Initialize the dataset.
 
-        Args:
-            data: list of tensor(n_spots, n_isos)
-            gene_names: list of str, gene names
-            group_gene_by_n_iso: bool, whether to group genes by the number of isoforms
+        Parameters
+        ----------
+        data : list of torch.Tensor
+            List of tensors with shape (n_spots, n_isos).
+        gene_names : list of str, optional
+            Gene names. If None, auto-generated.
+        group_gene_by_n_iso : bool, optional
+            Whether to group genes by the number of isoforms.
         """
-        self.n_genes = len(data) # number of genes
-        self.n_spots = len(data[0]) # number of spots
-        self.n_isos_per_gene = [data_g.shape[1] for data_g in data] # number of isoforms for each gene
-        self.gene_names = gene_names if gene_names is not None else [
-            f"gene_{str(i + 1).zfill(5)}" for i in range(self.n_genes)
-        ]
-        assert len(self.gene_names) == self.n_genes, "Gene names must match the number of genes."
-        assert min(self.n_isos_per_gene) > 1, "At least two isoforms are required for each gene."
+        self.n_genes = len(data)  # number of genes
+        self.n_spots = len(data[0])  # number of spots
+        self.n_isos_per_gene = [
+            data_g.shape[1] for data_g in data
+        ]  # number of isoforms for each gene
+        self.gene_names = (
+            gene_names
+            if gene_names is not None
+            else [f"gene_{str(i + 1).zfill(5)}" for i in range(self.n_genes)]
+        )
+        assert (
+            len(self.gene_names) == self.n_genes
+        ), "Gene names must match the number of genes."
+        assert (
+            min(self.n_isos_per_gene) > 1
+        ), "At least two isoforms are required for each gene."
 
         # convert numpy.array to torch.tensor float if not already
-        _data = [torch.from_numpy(arr).float() if isinstance(arr, np.ndarray) else arr for arr in data]
+        _data = [
+            torch.from_numpy(arr).float() if isinstance(arr, np.ndarray) else arr
+            for arr in data
+        ]
         self.data = _data
 
         self.datasets = None
@@ -113,26 +200,38 @@ class IsoDataset():
         n_isos_per_gene = torch.tensor(self.n_isos_per_gene)
         for _n_iso in n_isos_per_gene.unique():
             _d = [self.data[i] for i in torch.where(n_isos_per_gene == _n_iso)[0]]
-            _d = torch.stack(_d, dim=0) # (n_genes, n_spots, n_isos)
-            _gn = [self.gene_names[i] for i in torch.where(n_isos_per_gene == _n_iso)[0]]
+            _d = torch.stack(_d, dim=0)  # (n_genes, n_spots, n_isos)
+            _gn = [
+                self.gene_names[i] for i in torch.where(n_isos_per_gene == _n_iso)[0]
+            ]
 
             # create a new dataset for the grouped genes with _n_iso isoforms
             _datasets.append(GroupedIsoDataset(_d, _gn))
 
         self.datasets = _datasets
 
-    def get_dataloader(self, batch_size = 1):
+    def get_dataloader(self, batch_size: int = 1) -> Iterator[Any]:
         """Get dataloader for the dataset.
 
-        Args:
-            batch_size: int, maximum number of genes in a batch
+        Parameters
+        ----------
+        batch_size : int, optional
+            Maximum number of genes in a batch.
 
-        Returns:
-            iter: DataLoader iterator
+        Returns
+        -------
+        Iterator[Any]
+            DataLoader iterator.
         """
         if not self.group_gene_by_n_iso:
-            return DataLoader(self.datasets[0], batch_size=1, shuffle=False, collate_fn=sparse_collate)
+            return DataLoader(
+                self.datasets[0], batch_size=1, shuffle=False, collate_fn=sparse_collate
+            )
         else:
-            dataloaders = [DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=sparse_collate) for ds in self.datasets]
+            dataloaders = [
+                DataLoader(
+                    ds, batch_size=batch_size, shuffle=False, collate_fn=sparse_collate
+                )
+                for ds in self.datasets
+            ]
             return _iters_merger(*dataloaders)
-

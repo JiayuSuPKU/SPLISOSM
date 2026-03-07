@@ -19,6 +19,8 @@ from splisosm.likelihood import (
 )
 from splisosm.logger import PatienceLogger
 
+__all__ = ["BaseModel", "update_at_idx", "MultinomGLM", "MultinomGLMM"]
+
 
 class BaseModel(ABC):
     """API for the GLM and GLMM model."""
@@ -27,10 +29,14 @@ class BaseModel(ABC):
     def setup_data(self, counts, corr_sp, design_mtx=None):
         """Set up the data for the model.
 
-        Args:
-                counts: tensor(n_genes, n_spots, n_isoforms), genes with the same number of isoforms
-                corr_sp: tensor(n_spots, n_spots)
-                design_mtx: tensor(n_spots, n_covariates)
+        Parameters
+        ----------
+        counts : torch.Tensor
+            Shape (n_genes, n_spots, n_isoforms), genes with the same number of isoforms.
+        corr_sp : torch.Tensor
+            Shape (n_spots, n_spots).
+        design_mtx : torch.Tensor, optional
+            Shape (n_spots, n_covariates).
         """
         pass
 
@@ -59,11 +65,15 @@ def _melt_tensor_along_first_dim(tensor_in):
 
     tensor_in[:, i, j, k] -> matrix_out[:, i + j * n, i + k * n] where n = tensor_in.shape[1]
 
-    Args:
-            tensor_in: tensor(n_genes, n_spots, n_isos - 1, n_isos - 1)
+    Parameters
+    ----------
+    tensor_in : torch.Tensor
+        Shape (n_genes, n_spots, n_isos - 1, n_isos - 1).
 
-    Returns:
-            matrix_out: tensor(n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
+    Returns
+    -------
+    matrix_out : torch.Tensor
+        Shape (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1)).
     """
     b, n, m = tensor_in.shape[:3]
     assert tensor_in.shape == (b, n, m, m)
@@ -148,11 +158,14 @@ class MultinomGLM(BaseModel, nn.Module):
     def setup_data(self, counts, design_mtx=None, device="cpu") -> None:
         """Set up the data for the model.
 
-        Args:
-                counts: tensor(n_genes, n_spots, n_isoforms)
-                design_mtx: tensor(n_spots, n_covariates)
-                device: 'cpu', or 'cuda'
-                        'mps' currently not supported (torch.lgamma not supported on mps)
+        Parameters
+        ----------
+        counts : torch.Tensor
+            Shape (n_genes, n_spots, n_isoforms).
+        design_mtx : torch.Tensor, optional
+            Shape (n_spots, n_covariates).
+        device : str, optional
+            'cpu' or 'cuda'. 'mps' currently not supported (torch.lgamma not supported on mps).
         """
         # need to switch to a different count model (e.g., Poisson) when only one isoform is provided
         if counts.shape[-1] == 1:
@@ -164,7 +177,7 @@ class MultinomGLM(BaseModel, nn.Module):
         self.device = torch.device(device)
 
         if counts.ndim == 2:
-            counts = counts.unsqueeze(0) # (1, n_spots, n_isos)
+            counts = counts.unsqueeze(0)  # (1, n_spots, n_isos)
             print(
                 "Batched calculation has been implemented. Provide a batch of counts to speed up calculation."
             )
@@ -175,16 +188,22 @@ class MultinomGLM(BaseModel, nn.Module):
             # initialize an empty design matrix of shape (1, n_spots, 0)
             design_mtx = torch.ones(1, self.n_spots, 0)
         elif design_mtx.ndim == 2:
-            design_mtx = design_mtx.unsqueeze(0) # (1, n_spots, n_factors)
+            design_mtx = design_mtx.unsqueeze(0)  # (1, n_spots, n_factors)
         elif design_mtx.ndim == 3:
             # all genes to test should share the same design matrix
-            assert design_mtx.shape[0] == 1, "Batched design matrix is currently not supported."
+            assert (
+                design_mtx.shape[0] == 1
+            ), "Batched design matrix is currently not supported."
         else:
             raise ValueError(
                 f"design_mtx must be a 2D or 3D tensor. Got shape: {design_mtx.shape}"
             )
         self.n_factors = design_mtx.shape[-1]
-        assert design_mtx.shape == (1, self.n_spots, self.n_factors), f"Invalide design matrix shape: {design_mtx.shape}"
+        assert design_mtx.shape == (
+            1,
+            self.n_spots,
+            self.n_factors,
+        ), f"Invalide design matrix shape: {design_mtx.shape}"
 
         # (n_genes, n_spots, n_isos), int, the observed counts
         self.register_buffer("counts", counts)
@@ -304,7 +323,7 @@ class MultinomGLM(BaseModel, nn.Module):
         alpha = torch.cat(
             [eta, torch.zeros(self.n_genes, self.n_spots, 1, device=self.device)],
             dim=-1,
-        ) # (n_genes, n_spots, n_isos)
+        )  # (n_genes, n_spots, n_isos)
         alpha = torch.softmax(alpha, dim=-1)  # (n_genes, n_spots, n_isos)
         return alpha
 
@@ -334,7 +353,7 @@ class MultinomGLM(BaseModel, nn.Module):
                 torch.ones(1, self.n_spots, 1, device=self.device),
             ],
             dim=-1,
-        ) # (1, n_spots, n_factors + 1)
+        )  # (1, n_spots, n_factors + 1)
         # score of shape (n_genes, n_factors + 1, n_isos - 1)
         score = X_expand.transpose(1, 2).matmul(d_l_d_eta.detach()[..., :-1])
 
@@ -367,7 +386,7 @@ class MultinomGLM(BaseModel, nn.Module):
                 torch.ones(1, self.n_spots, 1, device=self.device),
             ],
             dim=-1,
-        ) # (1, n_spots, n_factors + 1)
+        )  # (1, n_spots, n_factors + 1)
         # (n_genes, n_spots * (n_isos - 1), (n_factors + 1) * (n_isos - 1))
         X_expand_full = torch.stack(
             [torch.block_diag(*[x] * (self.n_isos - 1)) for x in X_expand], dim=0
@@ -494,8 +513,12 @@ class MultinomGLM(BaseModel, nn.Module):
         # for stability
         W_inv = torch.linalg.inv(W + 1e-5 * torch.eye(n_isos - 1, device=self.device))
         residuals = self.counts - props * self.counts.sum(-1, keepdim=True)
-        working_y = residuals[..., :-1].unsqueeze(-1)  # (n_genes, n_spots, n_isos - 1, 1)
-        working_y = (W_inv.matmul(working_y)).squeeze(-1)  # (n_genes, n_spots, n_isos - 1)
+        working_y = residuals[..., :-1].unsqueeze(
+            -1
+        )  # (n_genes, n_spots, n_isos - 1, 1)
+        working_y = (W_inv.matmul(working_y)).squeeze(
+            -1
+        )  # (n_genes, n_spots, n_isos - 1)
         working_y += self._eta()  # (n_genes, n_spots, n_isos - 1)
 
         # calculate the IWLS update for beta and bias_eta
@@ -539,9 +562,15 @@ class MultinomGLM(BaseModel, nn.Module):
             update_at_idx(self.bias_eta, bias_eta_new, self.convergence)
         )
 
-    def fit(self, diagnose: bool = False, verbose: bool = False, quiet: bool = False, random_seed = None):
+    def fit(
+        self,
+        diagnose: bool = False,
+        verbose: bool = False,
+        quiet: bool = False,
+        random_seed=None,
+    ):
         """Fit the model using all data"""
-        if random_seed is not None: # set random seed for reproducibility
+        if random_seed is not None:  # set random seed for reproducibility
             torch.manual_seed(random_seed)
 
         if self.fitting_method == "gd":  # use gradient descent
@@ -644,9 +673,11 @@ class MultinomGLM(BaseModel, nn.Module):
     def update_params_from_dict(self, params):
         """Update a subset of model parameters with a dictionary of parameters.
 
-        Args:
-                params: a dictionary of parameters to be updated. The keys must be
-                        existing parameter names in the model.
+        Parameters
+        ----------
+        params : dict
+            A dictionary of parameters to be updated. The keys must be
+            existing parameter names in the model.
         """
         new_params = self.state_dict()
         new_params.update(params)
@@ -829,14 +860,20 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     ):
         """Set up the data for the model.
 
-        Args:
-                counts: tensor(n_genes, n_spots, n_isoforms)
-                corr_sp: tensor(n_spots, n_spots), spatial covariance matrix
-                design_mtx: tensor(n_spots, n_covariates)
-                device: 'cpu', or 'cuda'
-                        'mps' currently not supported (torch.lgamma not supported on mps)
-                corr_sp_eigvals: tensor(n_spots,)
-                corr_sp_eigvecs: tensor(n_spots, n_spots)
+        Parameters
+        ----------
+        counts : torch.Tensor
+            Shape (n_genes, n_spots, n_isoforms).
+        corr_sp : torch.Tensor, optional
+            Shape (n_spots, n_spots), spatial covariance matrix.
+        design_mtx : torch.Tensor, optional
+            Shape (n_spots, n_covariates).
+        device : str, optional
+            'cpu' or 'cuda'. 'mps' currently not supported (torch.lgamma not supported on mps).
+        corr_sp_eigvals : torch.Tensor, optional
+            Shape (n_spots,), eigenvalues of spatial covariance.
+        corr_sp_eigvecs : torch.Tensor, optional
+            Shape (n_spots, n_spots), eigenvectors of spatial covariance.
         """
         # need to switch to a different count model (e.g., Poisson) when only one isoform is provided
 
@@ -844,7 +881,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         self.device = torch.device(device)
 
         if counts.ndim == 2:
-            counts = counts.unsqueeze(0) # (1, n_spots, n_isos)
+            counts = counts.unsqueeze(0)  # (1, n_spots, n_isos)
             print(
                 "Batched calculation has been implemented. Provide a batch of counts to speed up calculation."
             )
@@ -864,16 +901,22 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             # initialize an empty design matrix of shape (1, n_spots, 0)
             design_mtx = torch.ones(1, self.n_spots, 0)
         elif design_mtx.ndim == 2:
-            design_mtx = design_mtx.unsqueeze(0) # (1, n_spots, n_factors)
+            design_mtx = design_mtx.unsqueeze(0)  # (1, n_spots, n_factors)
         elif design_mtx.ndim == 3:
             # all genes to test should share the same design matrix
-            assert design_mtx.shape[0] == 1, "Batched design matrix is currently not supported."
+            assert (
+                design_mtx.shape[0] == 1
+            ), "Batched design matrix is currently not supported."
         else:
             raise ValueError(
                 f"design_mtx must be a 2D or 3D tensor. Got shape: {design_mtx.shape}"
             )
         self.n_factors = design_mtx.shape[-1]
-        assert design_mtx.shape == (1, self.n_spots, self.n_factors), f"Invalide design matrix shape: {design_mtx.shape}"
+        assert design_mtx.shape == (
+            1,
+            self.n_spots,
+            self.n_factors,
+        ), f"Invalide design matrix shape: {design_mtx.shape}"
 
         # (n_genes, n_spots, n_isos), int, the observed counts
         self.register_buffer("counts", counts)
@@ -1019,7 +1062,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         if var_total.min() < 1e-2:
             warnings.warn("Total variance is close to zero.")
-        var_total = torch.clip(var_total, min=1e-2) # (n_genes, n_var_components)
+        var_total = torch.clip(var_total, min=1e-2)  # (n_genes, n_var_components)
         return var_total
 
     def var_sp_prop(self):
@@ -1077,11 +1120,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         """Output the eta based on the linear model."""
         # eta = X @ beta + bias_eta + nu
         # eta.shape = (n_genes, n_spots, n_isos - 1)
-        return (
-            self.nu
-            + self.X_spot.matmul(self.beta)
-            + self.bias_eta.unsqueeze(1)
-        )
+        return self.nu + self.X_spot.matmul(self.beta) + self.bias_eta.unsqueeze(1)
 
     """Functions to calculate log likelihoods.
     """
@@ -1098,10 +1137,10 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     def _calc_log_prob_joint(self):
         """Calculate log joint probability given data."""
         # add prior prob of sigma_total
-        log_prob = self._calc_log_prob_prior_sigma() # (n_genes,)
+        log_prob = self._calc_log_prob_prior_sigma()  # (n_genes,)
 
         # add mvn prob of nu ~ MVN(0, S)
-        data = self.nu.transpose(1, 2) # (n_genes, n_isos - 1, n_spots)
+        data = self.nu.transpose(1, 2)  # (n_genes, n_isos - 1, n_spots)
         # use the same variance components for all genes if cov_eigvals.shape[1] == 1
         cov_eigvals = self._cov_eigvals().expand(
             self.n_genes, data.shape[1], self.n_spots
@@ -1121,13 +1160,13 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             self._alpha().transpose(1, 2), self.counts.transpose(1, 2)
         )
 
-        return log_prob # (n_genes,)
+        return log_prob  # (n_genes,)
 
     def _calc_log_prob_marginal(self):
         """Calculate the log marginal probability (integrating out random effect nu)."""
         # by Laplace approximation, the log marginal probability is given by the following:
         # log_marginal ~= log_joint - 1/2 logdet_neg_hessian
-        log_prob = self._calc_log_prob_joint() # (n_genes,)
+        log_prob = self._calc_log_prob_joint()  # (n_genes,)
         full_hessian = (
             self._get_log_lik_hessian_nu()
         )  # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
@@ -1136,19 +1175,21 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
         self._chol_hessian_nu = torch.linalg.cholesky(-full_hessian)
         logdet_neg_hessian = 2 * torch.diagonal(
-            self._chol_hessian_nu, dim1 = -2, dim2 = -1
-        ).log().sum(-1) # (n_genes,)
+            self._chol_hessian_nu, dim1=-2, dim2=-1
+        ).log().sum(
+            -1
+        )  # (n_genes,)
 
-        return log_prob - 0.5 * logdet_neg_hessian # (n_genes,)
+        return log_prob - 0.5 * logdet_neg_hessian  # (n_genes,)
 
     def forward(self):
         """Calculate the log-likelihood or log-marginal-likelihood of the model."""
         if self.fitting_method in ["marginal_gd", "marginal_newton"]:
             # calculate log marginal prob
-            return self._calc_log_prob_marginal() # (n_genes,)
+            return self._calc_log_prob_marginal()  # (n_genes,)
         else:
             # calculate log joint prob given data
-            return self._calc_log_prob_joint() # (n_genes,)
+            return self._calc_log_prob_joint()  # (n_genes,)
 
     """Functions to calculate Hessian.
     """
@@ -1164,10 +1205,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             # (n_genes, n_isos - 1, n_spots, n_spots)
             mvn_hessian = mvn_hessian.expand(n_genes, n_isos - 1, -1, -1)
         # reshape the hessian into (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
-        full_hessian = torch.stack([
-            torch.block_diag(*[_m for _m in m_gene])
-            for m_gene in mvn_hessian
-        ], dim = 0)
+        full_hessian = torch.stack(
+            [torch.block_diag(*[_m for _m in m_gene]) for m_gene in mvn_hessian], dim=0
+        )
 
         # multinom_hessian[s] = - sum(counts[s,:]) * {diag(p) - p@p.T}
         # self._get_log_lik_hessian_eta() already reshapes the hessian into
@@ -1180,29 +1220,35 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     def _calc_log_prob_mvn_wrt_sigma(self, sigma_expand):
         """Helper function of log joint probability wrt sigmas for calculate Hessian.
 
-        Args:
-                sigma_expand: tensor(n_genes, n_var_components, 2). The two variance parameters,
-                    either (sigma, theta) or (sigma_sp, sigma_nsp), are stacked along the last dimension.
+        Parameters
+        ----------
+        sigma_expand : torch.Tensor
+            Shape (n_genes, n_var_components, 2). The two variance parameters,
+            either (sigma, theta) or (sigma_sp, sigma_nsp), are stacked along the last dimension.
         """
         if self.share_variance:  # the same variance components across isoforms
             sigma_expand = sigma_expand.expand(self.n_genes, self.n_isos - 1, -1)
 
         if self.var_parameterization_sigma_theta:
             sigma, theta_logit = sigma_expand[..., 0], sigma_expand[..., 1]
-            var_sp_prop = torch.sigmoid(theta_logit).unsqueeze(-1) # (n_genes, n_iso - 1, -1)
-            sigma_total = sigma # (n_genes, n_iso - 1)
+            var_sp_prop = torch.sigmoid(theta_logit).unsqueeze(
+                -1
+            )  # (n_genes, n_iso - 1, -1)
+            sigma_total = sigma  # (n_genes, n_iso - 1)
             # (n_genes, n_iso - 1, n_spots) * (n_genes, n_iso - 1, 1) -> (n_genes, n_iso - 1, n_spots)
-            cov_eigvals = (var_sp_prop * self.corr_sp_eigvals.unsqueeze(0) + (1 - var_sp_prop)) * \
-                sigma_total.unsqueeze(-1)
+            cov_eigvals = (
+                var_sp_prop * self.corr_sp_eigvals.unsqueeze(0) + (1 - var_sp_prop)
+            ) * sigma_total.unsqueeze(-1)
         else:
             sigma_sp, sigma_nsp = sigma_expand[..., 0], sigma_expand[..., 1]
-            sigma_total = torch.sqrt(sigma_sp**2 + sigma_nsp**2) # (n_genes, n_iso - 1)
+            sigma_total = torch.sqrt(sigma_sp**2 + sigma_nsp**2)  # (n_genes, n_iso - 1)
             # (n_genes, n_iso - 1, 1) * (1, n_spots) -> (n_genes, n_iso - 1, n_spots)
-            cov_eigvals = sigma_sp.unsqueeze(-1).pow(2) * self.corr_sp_eigvals.unsqueeze(0) + \
-                sigma_nsp.unsqueeze(-1).pow(2)
+            cov_eigvals = sigma_sp.unsqueeze(-1).pow(
+                2
+            ) * self.corr_sp_eigvals.unsqueeze(0) + sigma_nsp.unsqueeze(-1).pow(2)
 
         # MVN prior likelihood as a function of the input eta
-        data = self.nu.transpose(1, 2) # (n_genes, n_isos - 1, n_spots)
+        data = self.nu.transpose(1, 2)  # (n_genes, n_isos - 1, n_spots)
         # use the same variance components for all genes if cov_eigvals.shape[1] == 1
         cov_eigvecs = self.corr_sp_eigvecs.expand(
             1, data.shape[1], self.n_spots, self.n_spots
@@ -1243,7 +1289,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         # x = sigma_expand.clone().detach().requires_grad_(True)
         hessian_sigma_expand = jacobian(
             self._get_sum_of_grad_log_prob_mvn_wrt_sigma, sigma_expand, vectorize=True
-        ).permute(2, 0, 1, 3, 4) # (n_genes, n_var_components, 2, n_genes, n_var_components, 2)
+        ).permute(
+            2, 0, 1, 3, 4
+        )  # (n_genes, n_var_components, 2, n_genes, n_var_components, 2)
 
         # hessian_sigma_expand = hessian(
         #     self._calc_log_prob_mvn_wrt_sigma, sigma_expand
@@ -1252,7 +1300,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         n_var_comps = hessian_sigma_expand.shape[-2]
         hessian_sigma_expand = hessian_sigma_expand.reshape(
             self.n_genes, n_var_comps * 2, n_var_comps * 2
-        ) # (n_genes, n_var_components * 2, n_var_components * 2)
+        )  # (n_genes, n_var_components * 2, n_var_components * 2)
 
         return hessian_sigma_expand
 
@@ -1287,12 +1335,16 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         hessian_sigma_expand = (
             -self._get_log_lik_hessian_sigma_expand()
         )  # (n_genes, n_var_components * 2, n_var_components * 2)
-        hessian_sigma_expand += 1e-5 * torch.eye(hessian_sigma_expand.shape[-1]).unsqueeze(0).to(
+        hessian_sigma_expand += 1e-5 * torch.eye(
+            hessian_sigma_expand.shape[-1]
+        ).unsqueeze(0).to(
             self.device
         )  # for stability
         right = hessian_sigma_expand.matmul(
             sigma_expand.reshape(n_genes, -1, 1)
-        ) - sigma_expand_grad.reshape(n_genes, -1, 1)  # (n_genes, n_var_components * 2, 1)
+        ) - sigma_expand_grad.reshape(
+            n_genes, -1, 1
+        )  # (n_genes, n_var_components * 2, 1)
         sigma_expand_new = torch.linalg.solve(
             hessian_sigma_expand, right
         )  # (n_genes, n_var_components * 2, 1)
@@ -1329,7 +1381,10 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
                 sigma_expand_new: tensor(n_genes, n_var_components, 2)
         """
         n_genes, n_spots, n_isos, n_factors = (
-            self.n_genes, self.n_spots, self.n_isos, self.n_factors
+            self.n_genes,
+            self.n_spots,
+            self.n_isos,
+            self.n_factors,
         )
         step = 1  # step size of each update
 
@@ -1342,11 +1397,18 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         hessian_nu += 1e-5 * torch.eye(hessian_nu.shape[-1]).unsqueeze(0).to(
             self.device
         )  # for stability
-        gradient_nu = self.nu.grad.transpose(1, 2).reshape(n_genes, -1, 1)  # (n_genes, n_spots * (n_isos - 1), 1)
+        gradient_nu = self.nu.grad.transpose(1, 2).reshape(
+            n_genes, -1, 1
+        )  # (n_genes, n_spots * (n_isos - 1), 1)
         right = (
-            hessian_nu.matmul(self.nu.transpose(1, 2).reshape(n_genes, -1, 1)) - step * gradient_nu
+            hessian_nu.matmul(self.nu.transpose(1, 2).reshape(n_genes, -1, 1))
+            - step * gradient_nu
         )  # (n_genes, n_spots * (n_isos - 1), -1)
-        nu_new = torch.linalg.solve(hessian_nu, right).reshape(n_genes, n_isos - 1, n_spots).transpose(1, 2)
+        nu_new = (
+            torch.linalg.solve(hessian_nu, right)
+            .reshape(n_genes, n_isos - 1, n_spots)
+            .transpose(1, 2)
+        )
         # update the parameters and clear the gradients
         with torch.no_grad():
             self.nu.copy_(nu_new)
@@ -1358,9 +1420,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         hessian_beta_expand = (
             -self._get_log_lik_hessian_beta_bias()
         )  # (n_genes, (n_factors + 1) * (n_isos - 1), (n_factors + 1) * (n_isos - 1))
-        hessian_beta_expand += 1e-5 * torch.eye(hessian_beta_expand.shape[-1]).unsqueeze(0).to(
-            self.device
-        )
+        hessian_beta_expand += 1e-5 * torch.eye(
+            hessian_beta_expand.shape[-1]
+        ).unsqueeze(0).to(self.device)
 
         # combine beta and bias_eta
         # (n_genes, n_factors + 1, n_isos - 1)
@@ -1371,11 +1433,14 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         beta_expand = torch.cat([self.beta, self.bias_eta.unsqueeze(1)], dim=1)
         right = hessian_beta_expand.matmul(
             beta_expand.transpose(1, 2).reshape(n_genes, -1, 1)
-        ) - step * beta_expand.transpose(1, 2).reshape(n_genes, -1, 1)  # (n_genes, (n_factors + 1) * (n_isos - 1), 1)
+        ) - step * beta_expand.transpose(1, 2).reshape(
+            n_genes, -1, 1
+        )  # (n_genes, (n_factors + 1) * (n_isos - 1), 1)
         beta_expand_new = (
             torch.linalg.solve(hessian_beta_expand, right)
-            .reshape(n_genes, n_isos - 1, n_factors + 1).transpose(1, 2)
-        ) # (n_genes, n_factors + 1, n_isos - 1)
+            .reshape(n_genes, n_isos - 1, n_factors + 1)
+            .transpose(1, 2)
+        )  # (n_genes, n_factors + 1, n_isos - 1)
 
         # extract beta and bias_eta
         beta_new = beta_expand_new[:, :-1, :]  # (n_genes, n_factors, n_isos - 1)
@@ -1399,7 +1464,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         """Calculate the Newton update of the random effects given the hessian."""
         try:
             # use the stored hessian cholesky computed by self._calc_log_prob_margin()
-            chol = self._chol_hessian_nu # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
+            chol = (
+                self._chol_hessian_nu
+            )  # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
         except AttributeError:
             # if cholesky is not available, compute it on the fly
             chol = torch.linalg.cholesky(-self._get_log_lik_hessian_nu())
@@ -1407,9 +1474,15 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         n_genes, n_spots, n_isos = self.n_genes, self.n_spots, self.n_isos
         step = 1  # step size
 
-        hessian_nu_inv = torch.cholesky_inverse(chol) # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
-        gradient_nu = self.nu.grad.transpose(1, 2).reshape(n_genes, -1, 1)  # (n_genes, n_spots * (n_isos - 1), 1)
-        nu_new = self.nu.transpose(1, 2).reshape(n_genes, -1, 1) - (step * hessian_nu_inv).matmul(
+        hessian_nu_inv = torch.cholesky_inverse(
+            chol
+        )  # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
+        gradient_nu = self.nu.grad.transpose(1, 2).reshape(
+            n_genes, -1, 1
+        )  # (n_genes, n_spots * (n_isos - 1), 1)
+        nu_new = self.nu.transpose(1, 2).reshape(n_genes, -1, 1) - (
+            step * hessian_nu_inv
+        ).matmul(
             gradient_nu
         )  # (n_genes, n_spots * (n_isos - 1), 1)
         nu_new = nu_new.reshape(n_genes, n_isos - 1, n_spots).transpose(1, 2)
@@ -1421,7 +1494,13 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         if return_variables:
             return nu_new
 
-    def _fit(self, diagnose: bool = False, verbose: bool = False, quiet: bool = False, random_seed = None):
+    def _fit(
+        self,
+        diagnose: bool = False,
+        verbose: bool = False,
+        quiet: bool = False,
+        random_seed=None,
+    ):
         """Main fitting function to find the MAP estimates using specified fitting method."""
         # extract configs
         fitting_method = self.fitting_method
@@ -1432,7 +1511,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         max_epochs = 10000 if max_epochs == -1 else max_epochs
         patience = patience if patience > 0 else 1
 
-        if random_seed is not None: # set random seed for reproducibility
+        if random_seed is not None:  # set random seed for reproducibility
             torch.manual_seed(random_seed)
 
         # set iteration limits
@@ -1451,7 +1530,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             self.optimizer.zero_grad()
 
             # minimize the negative log-likelihood or the negative log-marginal-likelihood
-            neg_log_prob = -self() # (n_genes,)
+            neg_log_prob = -self()  # (n_genes,)
             neg_log_prob.mean().backward()  # backpropate gradients
 
             if fitting_method == "joint_newton":
@@ -1525,7 +1604,6 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         return logger.params_iter
 
-
     @torch.no_grad()
     def _final_sanity_check(self):
         """Make sure constraints are satisfied."""
@@ -1536,10 +1614,18 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             self.sigma_sp.abs_()
             self.sigma_nsp.abs_()
 
-    def fit(self, diagnose: bool = False, verbose: bool = False, quiet: bool = False, random_seed = None):
+    def fit(
+        self,
+        diagnose: bool = False,
+        verbose: bool = False,
+        quiet: bool = False,
+        random_seed=None,
+    ):
         """Fit the model using all data"""
         self._configure_optimizer(verbose=verbose)
-        diag_outputs = self._fit(diagnose=diagnose, verbose=verbose, quiet=quiet, random_seed=random_seed)
+        diag_outputs = self._fit(
+            diagnose=diagnose, verbose=verbose, quiet=quiet, random_seed=random_seed
+        )
         if diagnose:
             return diag_outputs
 

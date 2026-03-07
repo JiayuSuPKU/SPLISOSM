@@ -1,24 +1,35 @@
+from __future__ import annotations
+
 import torch
 from torch.utils.data.dataloader import default_collate
+from typing import Optional
+
+__all__ = ["PatienceLogger"]
 
 
 class PatienceLogger:
+    """Logger for tracking training patience and convergence.
+
+    Parameters
+    ----------
+    batch_size : int
+        Number of samples in the batch.
+    patience : int
+        Number of epochs to wait after the last significant improvement.
+    min_delta : float, optional
+        Minimum change in the loss to qualify as an improvement.
+    diagnose : bool, optional
+        Whether to store parameter changes during training.
+    """
+
     def __init__(
         self,
         batch_size: int,
         patience: int,
         min_delta: float = 1e-5,
         diagnose: bool = False,
-    ):
-        """
-        Initializes the logger with a specified patience and minimum delta for improvement.
-
-        Args:
-            batch_size (int): Number of samples in the batch.
-            patience (int): Number of epochs to wait after the last significant improvement.
-            min_delta (float): Minimum change in the loss to qualify as an improvement.
-            diagnose (bool): Whether to store parameter changes during training.
-        """
+    ) -> None:
+        """Initialize the logger with specified patience and minimum delta."""
         self.batch_size = batch_size
         self.patience = torch.full((batch_size,), patience, dtype=int)
         self.min_delta = min_delta
@@ -37,14 +48,15 @@ class PatienceLogger:
         self.convergence = torch.zeros(batch_size, dtype=torch.bool)
         self.epoch = 0
 
-    def log(self, loss: torch.Tensor, params: dict[str, torch.tensor]) -> None:
-        """
-        Logs the loss for a given epoch and updates the best parameters if the loss improved significantly.
+    def log(self, loss: torch.Tensor, params: dict[str, torch.Tensor]) -> None:
+        """Log loss for a given epoch and update best parameters if improved.
 
-        Args:
-            epoch (int): Current epoch number.
-            loss (torch.Tensor): Loss for the current epoch.
-            params (list): Parameters for the current epoch.
+        Parameters
+        ----------
+        loss : torch.Tensor
+            Loss for the current epoch.
+        params : dict[str, torch.Tensor]
+            Parameters for the current epoch.
         """
         big_improve = (self.best_loss - loss) >= self.min_delta
         improve = (self.best_loss - loss) > 0
@@ -76,12 +88,14 @@ class PatienceLogger:
             self.params_iter["loss"].append(loss)
             self.params_iter["params"].append(params)
 
-    def get_params_iter(self) -> list[dict] | None:
-        """
-        Returns the stored parameters during training if diagnose is True.
+    def get_params_iter(self) -> Optional[list[dict]]:
+        """Return stored parameters during training if diagnose is True.
 
-        Returns:
-            list: A list of dictionaries containing loss and parameters for each sample.
+        Returns
+        -------
+        list of dict or None
+            List of dictionaries containing loss and parameters for each sample,
+            or None if diagnose is False.
         """
         if self.diagnose:
             return default_collate(self.params_iter)

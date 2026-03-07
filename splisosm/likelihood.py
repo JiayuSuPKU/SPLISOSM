@@ -1,24 +1,52 @@
 import numpy as np
+from numpy.typing import ArrayLike
 from scipy.stats import ncx2
 import torch
+
+__all__ = [
+    "log_prob_mult",
+    "log_prob_fastmult",
+    "log_prob_fastmult_batched",
+    "log_prob_dm",
+    "log_prob_fastdm",
+    "log_prob_mvn",
+    "log_prob_fastmvn",
+    "log_prob_fastmvn_batched",
+    "liu_sf",
+]
 
 try:
     from pyro.distributions import Multinomial, DirichletMultinomial, MultivariateNormal
 except ImportError:
     from torch.distributions import Multinomial, MultivariateNormal
+
     DirichletMultinomial = None  # Placeholder if DirichletMultinomial is not available
 
 _DELTA = 1e-10
 
 
-def log_prob_mult(probs, counts):
-    """Multinomial log-likelihood.
+def log_prob_mult(probs: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    """Compute multinomial log-likelihood for one or multiple spots.
 
-    Args:
-            probs: n_isoforms (1D) or n_isoforms x n_spots (2D).
-            counts: n_isoforms (1D) or n_isoforms x n_spots (2D).
+    Parameters
+    ----------
+    probs : torch.Tensor
+        Probability tensor of shape ``(n_isoforms,)`` or ``(n_isoforms, n_spots)``.
+    counts : torch.Tensor
+        Count tensor with the same shape as ``probs``.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar log-likelihood.
+
+    Raises
+    ------
+    ValueError
+        If ``probs`` and ``counts`` shapes do not match.
     """
-    assert probs.shape == counts.shape
+    if probs.shape != counts.shape:
+        raise ValueError("`probs` and `counts` must have the same shape.")
 
     if probs.dim() == 1:  # only one sample (spot)
         log_prob = Multinomial(
@@ -35,13 +63,26 @@ def log_prob_mult(probs, counts):
     return log_prob
 
 
-def log_prob_fastmult(probs, counts, mask=None):
-    """Custom multinomial log-likelihood function.
+def log_prob_fastmult(
+    probs: torch.Tensor,
+    counts: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute optimized multinomial log-likelihood.
 
-    Args:
-            probs: n_isoforms x n_spots (2D).
-            counts: n_isoforms x n_spots (2D).
-            mask: n_spots (1D). Masked spots (True) are ignored in likelihood calculation.
+    Parameters
+    ----------
+    probs : torch.Tensor
+        Probability tensor of shape ``(n_isoforms, n_spots)``.
+    counts : torch.Tensor
+        Count tensor of shape ``(n_isoforms, n_spots)``.
+    mask : torch.Tensor, optional
+        Spot mask of shape ``(n_spots,)`` where masked spots are ignored.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar log-likelihood.
     """
     n_total = counts.sum(0)  # n_spots
     if mask is not None:
@@ -59,14 +100,26 @@ def log_prob_fastmult(probs, counts, mask=None):
 
 
 def log_prob_fastmult_batched(
-    probs: torch.Tensor, counts: torch.tensor, mask: torch.tensor = None
-) -> torch.tensor:
-    """Batched custom multinomial log-likelihood function.
+    probs: torch.Tensor,
+    counts: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute batched optimized multinomial log-likelihood.
 
-    Args:
-        probs: [batch_size, num_isoforms, num_spots]
-        counts: [batch_size, num_isoforms, num_spots]
-        mask: [batch_size, num_spots], 1 for masked, 0 for unmasked
+    Parameters
+    ----------
+    probs : torch.Tensor
+        Probability tensor of shape ``(batch_size, n_isoforms, n_spots)``.
+    counts : torch.Tensor
+        Count tensor of shape ``(batch_size, n_isoforms, n_spots)``.
+    mask : torch.Tensor, optional
+        Mask tensor of shape ``(batch_size, n_spots)``. Entries with value
+        ``1`` are treated as masked.
+
+    Returns
+    -------
+    torch.Tensor
+        Log-likelihood values of shape ``(batch_size,)``.
     """
     batch_size, num_isoforms, num_spots = probs.shape
     if mask is not None:
@@ -83,16 +136,36 @@ def log_prob_fastmult_batched(
     return log_prob
 
 
-def log_prob_dm(concentration, counts):
-    """Dirichlet-Multinomial log-likelihood.
+def log_prob_dm(concentration: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    """Compute Dirichlet-multinomial log-likelihood.
 
-    This is a wrapper around Pyro's DirichletMultinomial log_prob function.
+    Parameters
+    ----------
+    concentration : torch.Tensor
+        Concentration tensor of shape ``(n_isoforms,)`` or
+        ``(n_isoforms, n_spots)``.
+    counts : torch.Tensor
+        Count tensor with the same shape as ``concentration``.
 
-    Args:
-            concentration: n_isoforms (1D) or n_isoforms x n_spots (2D).
-            counts: n_isoforms (1D) or n_isoforms x n_spots (2D).
+    Returns
+    -------
+    torch.Tensor
+        Scalar log-likelihood.
+
+    Raises
+    ------
+    ValueError
+        If ``concentration`` and ``counts`` shapes do not match.
+    ImportError
+        If ``pyro`` is not installed and Dirichlet-multinomial likelihood is
+        requested.
     """
-    assert concentration.shape == counts.shape
+    if DirichletMultinomial is None:
+        raise ImportError(
+            "DirichletMultinomial requires `pyro-ppl`. Install `pyro-ppl` to use log_prob_dm()."
+        )
+    if concentration.shape != counts.shape:
+        raise ValueError("`concentration` and `counts` must have the same shape.")
 
     if concentration.dim() == 1:  # only one sample (spot)
         log_prob = DirichletMultinomial(concentration, counts.sum()).log_prob(counts)
@@ -107,12 +180,26 @@ def log_prob_dm(concentration, counts):
     return log_prob
 
 
-def log_prob_fastdm(concentration, counts, mask=None):
-    """Custom Dirichlet-Multinomial log-likelihood function.
+def log_prob_fastdm(
+    concentration: torch.Tensor,
+    counts: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute optimized Dirichlet-multinomial log-likelihood.
 
-    Args:
-            concentration: n_isoforms x n_spots (2D).
-            counts: n_isoforms x n_spots (2D).
+    Parameters
+    ----------
+    concentration : torch.Tensor
+        Concentration tensor of shape ``(n_isoforms, n_spots)``.
+    counts : torch.Tensor
+        Count tensor of shape ``(n_isoforms, n_spots)``.
+    mask : torch.Tensor, optional
+        Spot mask of shape ``(n_spots,)`` where masked spots are ignored.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar log-likelihood.
     """
     n_total_conc = concentration.sum(0)  # n_spots
     n_total_counts = counts.sum(0)  # n_spots
@@ -136,26 +223,42 @@ def log_prob_fastdm(concentration, counts, mask=None):
     return log_prob
 
 
-def log_prob_mvn(locs, covs, data):
-    """Multivariate normal log-likelihood.
+def log_prob_mvn(
+    locs: torch.Tensor,
+    covs: torch.Tensor,
+    data: torch.Tensor,
+) -> torch.Tensor:
+    """Compute multivariate normal log-likelihood.
 
-    If data.dim() == 2, the first dimension is assumed to be independent MVN samples (isoforms).
+    Parameters
+    ----------
+    locs : torch.Tensor
+        Mean tensor of shape ``(n_spots,)`` or ``(n_isoforms, n_spots)``.
+    covs : torch.Tensor
+        Covariance tensor of shape ``(n_spots, n_spots)`` or
+        ``(n_isoforms, n_spots, n_spots)``.
+    data : torch.Tensor
+        Observations of shape ``(n_spots,)`` or ``(n_isoforms, n_spots)``.
 
-    Args:
-            data: n_spots (1D) or n_isoforms x n_spots (2D). The observed MVN data.
-            locs: n_spots (1D) or n_isoforms x n_spots (2D). Mean.
-            covs: n_spots x n_spots (2D) or n_isoforms x n_spots x n_spots (3D). Covariance.
+    Returns
+    -------
+    torch.Tensor
+        Scalar log-likelihood.
 
-    Returns:
-            log_prob: scalar, log probability.
+    Raises
+    ------
+    ValueError
+        If batched dimensions are inconsistent.
     """
     if data.dim() == 1:  # only one sample (isoform)
         mvn = MultivariateNormal(locs, covariance_matrix=covs)
         log_prob = mvn.log_prob(data)
     else:
         n_isos = data.shape[0]
-        assert len(locs) == n_isos
-        assert len(covs) == n_isos
+        if len(locs) != n_isos or len(covs) != n_isos:
+            raise ValueError(
+                "For batched input, `locs` and `covs` must match the number of isoforms in `data`."
+            )
 
         log_prob = 0
         for mu_i, cov_i, gamma_i in zip(locs, covs, data):
@@ -166,31 +269,49 @@ def log_prob_mvn(locs, covs, data):
     return log_prob
 
 
-def log_prob_fastmvn(locs, cov_eigvals, cov_eigvecs, data, mask=None):
-    """Multivariate normal log-likelihood with pre-decomposed covariance.
+def log_prob_fastmvn(
+    locs: torch.Tensor,
+    cov_eigvals: torch.Tensor,
+    cov_eigvecs: torch.Tensor,
+    data: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute optimized MVN log-likelihood using eigendecomposed covariance.
 
-    - An order of magnitude faster than pytorch's likelihood.
-    - The first dimension (isoforms) is assumed to be independent MVN samples.
-    - If len(cov_eigvals) == len(cov_eigvecs) == 1, the covariance is
-            assumed to be the same for all isoforms.
+    Parameters
+    ----------
+    locs : torch.Tensor
+        Mean tensor of shape ``(n_isoforms, n_spots)``.
+    cov_eigvals : torch.Tensor
+        Covariance eigenvalues of shape ``(n_isoforms, n_spots)`` or
+        ``(1, n_spots)``.
+    cov_eigvecs : torch.Tensor
+        Covariance eigenvectors of shape
+        ``(n_isoforms, n_spots, n_spots)`` or ``(1, n_spots, n_spots)``.
+    data : torch.Tensor
+        Observation tensor of shape ``(n_isoforms, n_spots)``.
+    mask : torch.Tensor, optional
+        Spot mask of shape ``(n_spots,)`` where masked spots are ignored.
 
-    Args:
-            data: n_isoforms x n_spots (2D).
-            locs: n_isoforms x n_spots (2D).
-            cov_eigvals: (n_isoforms or 1) x n_spots (2D).
-            cov_eigvecs: (n_isoforms or 1) x n_spots x n_spots (3D).
-            mask: n_spots (1D)
+    Returns
+    -------
+    torch.Tensor
+        Scalar log-likelihood.
 
-    Returns:
-            log_prob: scalar, log probability.
+    Raises
+    ------
+    ValueError
+        If covariance eigendecomposition shapes are incompatible with ``data``.
     """
     n_isos, n_spots = data.shape
-    assert cov_eigvals.shape == (n_isos, n_spots) or cov_eigvals.shape == (1, n_spots)
-    assert cov_eigvecs.shape == (n_isos, n_spots, n_spots) or cov_eigvecs.shape == (
-        1,
-        n_spots,
-        n_spots,
-    )
+    if cov_eigvals.shape not in {(n_isos, n_spots), (1, n_spots)}:
+        raise ValueError(
+            "`cov_eigvals` must have shape (n_isoforms, n_spots) or (1, n_spots)."
+        )
+    if cov_eigvecs.shape not in {(n_isos, n_spots, n_spots), (1, n_spots, n_spots)}:
+        raise ValueError(
+            "`cov_eigvecs` must have shape (n_isoforms, n_spots, n_spots) or (1, n_spots, n_spots)."
+        )
 
     if mask is not None:
         mask = (1 - mask.int()).unsqueeze(0)
@@ -209,55 +330,42 @@ def log_prob_fastmvn(locs, cov_eigvals, cov_eigvecs, data, mask=None):
 
     log_prob = -0.5 * (n_spots * n_isos * np.log(2 * np.pi) + log_det_cov + quad_gamma)
 
-    # ===== below is the anwser given by GPT4 =====
-    # diff = gamma - locs[:, None]  # Shape: n_isoforms x 1 x n_spots
-
-    # # Compute the inverse of the covariance matrices using the eigendecomposition
-    # # n_isoforms x n_spots x n_spots
-    # inv_covs = cov_eigvecs @ (cov_eigvecs.transpose(1, 2) / cov_eigvals.unsqueeze(-1))
-
-    # # Compute the Mahalanobis distance
-    # # do matrix multiplication and add up diagonal elements
-    # mahal_dist = torch.einsum("ijk,ikj->i", diff @ inv_covs, diff.transpose(-1, -2))
-
-    # # Calculate the log determinant
-    # log_det = torch.sum(torch.log(cov_eigvals), dim=-1)
-
-    # # Calculate the log probability
-    # log_prob = -0.5 * (
-    #     mahal_dist
-    #     + log_det
-    #     + n_spots * np.log(2 * torch.pi)
-    # )
-
-    # return torch.sum(log_prob)
-
     return log_prob
 
 
 def log_prob_fastmvn_batched(
-    locs: torch.tensor,
-    cov_eigvals: torch.tensor,
-    cov_eigvecs: torch.tensor,
-    data: torch.tensor,
-    mask: torch.tensor = None,
-):
-    """Batched multivariate normal log-likelihood with pre-decomposed covariance.
+    locs: torch.Tensor,
+    cov_eigvals: torch.Tensor,
+    cov_eigvecs: torch.Tensor,
+    data: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute batched optimized MVN log-likelihood with eigendecomposition.
 
-    - An order of magnitude faster than pytorch's likelihood.
-    - The first dimension (isoforms) is assumed to be independent MVN samples.
-    - If len(cov_eigvals) == len(cov_eigvecs) == 1, the covariance is
-                    assumed to be the same for all isoforms.
+    Parameters
+    ----------
+    locs : torch.Tensor
+        Mean tensor of shape ``(batch_size, n_isoforms, n_spots)``.
+    cov_eigvals : torch.Tensor
+        Eigenvalue tensor of shape ``(batch_size, n_isoforms, n_spots)``.
+    cov_eigvecs : torch.Tensor
+        Eigenvector tensor of shape
+        ``(batch_size, n_isoforms, n_spots, n_spots)``.
+    data : torch.Tensor
+        Observation tensor of shape ``(batch_size, n_isoforms, n_spots)``.
+    mask : torch.Tensor, optional
+        Mask tensor of shape ``(batch_size, n_spots)``. Entries with value
+        ``1`` are treated as masked.
 
-    Args:
-        data: [batch_size, num_isoforms, num_spots]
-        locs: [batch_size, num_isoforms, num_spots]
-        cov_eigvals: [batch_size, num_isoforms, num_spots]
-        cov_eigvecs: [batch_size, num_isoforms, num_spots, num_spots]
-        mask: [batch_size, num_spots], 1 for masked, 0 for unmasked
+    Returns
+    -------
+    torch.Tensor
+        Log-likelihood values of shape ``(batch_size,)``.
 
-    Returns:
-        log_prob: [batch_size], log probability.
+    Raises
+    ------
+    ValueError
+        If covariance decomposition shapes are incompatible with input sizes.
     """
     batch_size, num_isoforms, num_spots = data.shape
     if mask is not None:
@@ -269,15 +377,10 @@ def log_prob_fastmvn_batched(
             batch_size, 1, num_spots, device=data.device, dtype=data.dtype
         )
 
-    assert cov_eigvals.shape[1:] == (
-        num_isoforms,
-        num_spots,
-    ), f"Invalid shape of cov_eigvals: {cov_eigvals.shape}"
-    assert cov_eigvecs.shape[1:] == (
-        num_isoforms,
-        num_spots,
-        num_spots,
-    ), f"Invalid shape of cov_eigvecs: {cov_eigvecs.shape}"
+    if cov_eigvals.shape[1:] != (num_isoforms, num_spots):
+        raise ValueError(f"Invalid shape of cov_eigvals: {cov_eigvals.shape}")
+    if cov_eigvecs.shape[1:] != (num_isoforms, num_spots, num_spots):
+        raise ValueError(f"Invalid shape of cov_eigvecs: {cov_eigvecs.shape}")
 
     # calculate (x - mu).T @ (VLV.T)^-1 @ (x - mu)
     # batch_size x n_isos x n_spots
@@ -287,62 +390,47 @@ def log_prob_fastmvn_batched(
 
     # calculate log_det
     log_det_cov = cov_eigvals.log().sum(dim=[1, 2])
+    log_2pi = torch.log(torch.tensor(2.0 * np.pi, device=data.device, dtype=data.dtype))
     log_prob = -0.5 * (
-        num_spots_non_mask * num_isoforms * torch.log(2 * torch.tensor(torch.pi))
-        + log_det_cov
-        + quad_gamma
+        num_spots_non_mask * num_isoforms * log_2pi + log_det_cov + quad_gamma
     )
 
     return log_prob
 
 
-def liu_sf(t, lambs, dofs=None, deltas=None, kurtosis=False):
-    """
-    Liu approximation to linear combination of noncentral chi-squared variables.
+def liu_sf(
+    t: ArrayLike,
+    lambs: ArrayLike,
+    dofs: ArrayLike | None = None,
+    deltas: ArrayLike | None = None,
+    kurtosis: bool = False,
+) -> np.ndarray:
+    """Compute pval for weighted sums of chi-squared variables using the Liu moment-matching approach.
 
     From https://github.com/limix/chiscore/blob/master/chiscore/_liu.py
 
-    Let
-
-            𝑋 = ∑λᵢχ²(hᵢ, 𝛿ᵢ)
-
-    be a linear combination of noncentral chi-squared random variables, where λᵢ, hᵢ,
-    and 𝛿ᵢ are the weights, degrees of freedom, and noncentrality parameters.
-    [1] proposes a method that approximates 𝑋 by a single noncentral chi-squared
-    random variable, χ²(l, 𝛿):
-
-            Pr(𝑋 > 𝑡) ≈ Pr(χ²(𝑙, 𝛿) > 𝑡⁺𝜎ₓ + 𝜇ₓ),
-
-    where 𝑡⁺ = (𝑡 - 𝜇₀) / 𝜎₀, 𝜇ₓ = 𝑙 + 𝛿, and 𝜎ₓ = √(𝑙 + 2𝛿).
-    The mean and standard deviation of 𝑋 are given by 𝜇₀ and 𝜎₀.
-
-    Then ``kurtosis=True``, the approximation is done by matching the kurtosis, rather
-    than the skewness, as derived in [2].
+    Let $$X = \\sum_i \\lambda_i * \\chi^2(h_i, \\delta_i)$$ be a linear combination of
+    noncentral chi-squared random variables. This function approximates
+    ``Pr(X > t)`` using the Liu moment-matching approach.
 
     Parameters
     ----------
     t : array_like
-            Points at which the survival function will be applied, Pr(𝑋 > 𝑡).
+        Points at which the survival function is evaluated.
     lambs : array_like
-            Weights λᵢ.
-    dofs : array_like
-            Degrees of freedom, hᵢ.
-    deltas : array_like
-            Noncentrality parameters, 𝛿ᵢ.
+        Weights of each chi-squared component.
+    dofs : array_like, optional
+        Degrees of freedom for each component. Defaults to all ones.
+    deltas : array_like, optional
+        Noncentrality parameters for each component. Defaults to all zeros.
     kurtosis : bool, optional
-            ``True`` for using the modified approach proposed in [2]. ``False`` for using
-            the original approach proposed in [1]. Defaults to ``False``.
+        If ``True``, uses kurtosis matching from [2]; otherwise uses skewness
+        matching from [1].
 
     Returns
     -------
-    q : float, ndarray
-            Approximated survival function applied to 𝑡: Pr(𝑋 > 𝑡).
-    dof : float
-            Degrees of freedom of χ²(𝑙, 𝛿), 𝑙.
-    ncen : float
-            Noncentrality parameter of χ²(𝑙, 𝛿), 𝛿.
-    info : dict
-            Additional information: mu_q, sigma_q, mu_x, sigma_x, and t_star.
+    np.ndarray
+        Approximated survival function values ``Pr(X > t)``.
 
     References
     ----------

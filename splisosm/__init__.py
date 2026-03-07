@@ -1,6 +1,8 @@
 from splisosm.hyptest_np import SplisosmNP
 from splisosm.hyptest_glmm import SplisosmGLMM
 
+__all__ = ["SplisosmNP", "SplisosmGLMM", "__version__"]
+
 try:
     from importlib.metadata import version, PackageNotFoundError
 except ImportError:

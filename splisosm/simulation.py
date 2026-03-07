@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 import itertools
 import sys
+from typing import Any, Optional, Union
 
 import numpy as np
 import pandas as pd
+
 try:
     import scanpy as sc
 except ImportError:
@@ -13,23 +17,28 @@ from tqdm.auto import tqdm
 
 from splisosm.utils import get_cov_sp
 
-def _sample_multinom_sp_single_gene(
-    iso_ratio_expected, total_counts_expected):
+__all__ = ["simulate_isoform_counts_single_gene", "simulate_isoform_counts"]
+
+
+def _sample_multinom_sp_single_gene(iso_ratio_expected, total_counts_expected):
     """Sample isoform counts from Multinomial distribution.
 
     Given the expected isoform ratio per spot and total counts, simulate the isoform counts
     from Y[s:] ~ Multinomial(N[s], iso_ratio_expected[s:]) where N[s] ~ Poisson(total_counts_expected).
 
-    Args:
-        iso_ratio_expected: n_spots x n_isos
-        total_counts_expected: int or vector of length n_spots
+    Parameters
+    ----------
+    iso_ratio_expected : torch.Tensor
+        Shape (n_spots, n_isos).
+    total_counts_expected : int or array-like
+        Scalar int or vector of length n_spots.
     """
     n_spots, n_isos = iso_ratio_expected.shape
 
     # simulate total counts per location from Poisson
     if isinstance(total_counts_expected, int):
         total_counts = Poisson(total_counts_expected).sample(sample_shape=(n_spots,))
-    else: # use the provided total counts
+    else:  # use the provided total counts
         assert len(total_counts_expected) == n_spots
         total_counts = Poisson(total_counts_expected).sample()
 
@@ -39,7 +48,7 @@ def _sample_multinom_sp_single_gene(
         if total_spot > 0:
             # dm = DirichletMultinomial(alpha[:, i], total_count)
             # counts.append(dm.sample(sample_shape=(1,)))
-            m = Multinomial(total_spot.int().item(), iso_ratio_expected[spot,:])
+            m = Multinomial(total_spot.int().item(), iso_ratio_expected[spot, :])
             counts.append(m.sample(sample_shape=(1,)))
         else:
             counts.append(torch.zeros(1, n_isos))
@@ -50,30 +59,48 @@ def _sample_multinom_sp_single_gene(
 
 
 def simulate_isoform_counts_single_gene(
-    grid_size=(30, 30),
-    n_isos=3,
-    total_counts_expected=100,
-    var_sp=0,
-    var_nsp=1,
-    rho=0.99,
-    design_mtx = None, # [n_spots, n_factors]
-    beta_true = None, # [n_factors, n_isoforms - 1]
-    return_params=True,
-):
-    """Generate isoform x spot count matrix for a given gene. Each gene is simulated
-        independently. For simplicity we constrain all genes to have the same number of
-        isoforms. (In fact in the current implementation all genes have the exact same
-        distribution.)
+    grid_size: tuple[int, int] = (30, 30),
+    n_isos: int = 3,
+    total_counts_expected: Union[int, torch.Tensor] = 100,
+    var_sp: float = 0,
+    var_nsp: float = 1,
+    rho: float = 0.99,
+    design_mtx: Optional[torch.Tensor] = None,
+    beta_true: Optional[torch.Tensor] = None,
+    return_params: bool = True,
+) -> Union[dict[str, Any], tuple[dict[str, Any], dict[str, Any]]]:
+    """Generate isoform x spot count matrix for a given gene.
 
-    Args:
-        grid_size (tuple): Shape of the spatial grid.
-        n_isos (int): Number of isoforms.
-        total_counts_expected (int or vector of length n_spots): Expected total gene counts per spot.
-        var_sp (float): Variance explained by spatial structure.
-        var_nsp (float): Unstructured variance (white noise).
-        design_mtx (torch.Tensor of [n_spots, n_factors]): Design matrix for the isoform usage ratio.
-        beta_true (torch.Tensor of [n_factors, n_isoforms - 1]): Factor coefficients for the design matrix.
-        return_params (bool): Whether to return simulation parameters.
+    Each gene is simulated independently. For simplicity we constrain all genes
+    to have the same number of isoforms. (In fact in the current implementation all genes
+    have the exact same distribution.)
+
+    Parameters
+    ----------
+    grid_size : tuple of int, optional
+        Shape of the spatial grid.
+    n_isos : int, optional
+        Number of isoforms.
+    total_counts_expected : int or torch.Tensor, optional
+        Expected total gene counts per spot.
+    var_sp : float, optional
+        Variance explained by spatial structure.
+    var_nsp : float, optional
+        Unstructured variance (white noise).
+    rho : float, optional
+        Spatial autocorrelation parameter.
+    design_mtx : torch.Tensor, optional
+        Shape (n_spots, n_factors). Design matrix for the isoform usage ratio.
+    beta_true : torch.Tensor, optional
+        Shape (n_factors, n_isoforms - 1). Factor coefficients for the design matrix.
+    return_params : bool, optional
+        Whether to return simulation parameters.
+
+    Returns
+    -------
+    dict or tuple of dict
+        If return_params is False, returns dict with 'counts', 'coords', 'cov_sp', 'design_mtx'.
+        If return_params is True, returns (data_dict, params_dict).
     """
     n_x, n_y = grid_size
     n_spots = n_x * n_y
@@ -85,7 +112,7 @@ def simulate_isoform_counts_single_gene(
         assert beta_true.shape == (n_factors, n_isos - 1)
         assert n_spots == design_mtx.shape[0]
 
-        eta_fixed = design_mtx @ beta_true # n_spots x (n_isos - 1)
+        eta_fixed = design_mtx @ beta_true  # n_spots x (n_isos - 1)
     else:
         eta_fixed = torch.zeros((n_spots, n_isos - 1))
 
@@ -99,17 +126,22 @@ def simulate_isoform_counts_single_gene(
     ## sample random effects from mvn
     for q in range(n_isos - 1):
         mvn = MultivariateNormal(torch.zeros(n_spots), covariance_matrix=cov_sp)
-        eta_fixed[:,q] += (mvn.sample(sample_shape=(1,))).squeeze()
+        eta_fixed[:, q] += (mvn.sample(sample_shape=(1,))).squeeze()
 
     ## convert linear predictor to proportions
     props = torch.concat([eta_fixed, torch.zeros(n_spots, 1)], dim=1)
-    props = torch.softmax(props, dim=1) # n_spots x n_isos
+    props = torch.softmax(props, dim=1)  # n_spots x n_isos
 
     ## sample from multinomial distributions
     counts = _sample_multinom_sp_single_gene(props, total_counts_expected)
 
     ## store simulated data and ground truth
-    data = {"counts": counts, "coords": coords, "cov_sp": cov_sp, "design_mtx": design_mtx}
+    data = {
+        "counts": counts,
+        "coords": coords,
+        "cov_sp": cov_sp,
+        "design_mtx": design_mtx,
+    }
 
     ## return simulation parameters
     if return_params:
@@ -130,31 +162,51 @@ def simulate_isoform_counts_single_gene(
 
 
 def simulate_isoform_counts(
-    n_genes=1,
-    grid_size=(30, 30),
-    n_isos=3,
-    total_counts_expected=100,
-    var_sp=0,
-    var_nsp=1,
-    rho=0.99,
-    design_mtx = None, # [n_spots, n_factors]
-    beta_true = None, # [n_factors, n_isoforms - 1]
-    return_params=True,
-):
-    """Generate isoform x spot count matrix for a given gene. Each gene is simulated
-        independently. For simplicity we constrain all genes to have the same number of
-        isoforms. (In fact in the current implementation all genes have the exact same
-        distribution.)
+    n_genes: int = 1,
+    grid_size: tuple[int, int] = (30, 30),
+    n_isos: int = 3,
+    total_counts_expected: Union[int, torch.Tensor] = 100,
+    var_sp: float = 0,
+    var_nsp: float = 1,
+    rho: float = 0.99,
+    design_mtx: Optional[torch.Tensor] = None,
+    beta_true: Optional[torch.Tensor] = None,
+    return_params: bool = True,
+) -> Union[dict[str, Any], tuple[dict[str, Any], dict[str, Any]]]:
+    """Generate isoform x spot count matrix for multiple genes.
 
-    Args:
-        grid_size (tuple): Shape of the spatial grid.
-        n_isos (int): Number of isoforms.
-        total_counts_expected (int or vector of length n_spots): Expected total gene counts per spot.
-        var_sp (float): Variance explained by spatial structure.
-        var_nsp (float): Unstructured variance (white noise).
-        design_mtx (torch.Tensor of [n_spots, n_factors]): Design matrix for the isoform usage ratio.
-        beta_true (torch.Tensor of [n_factors, n_isoforms - 1]): Factor coefficients for the design matrix.
-        return_params (bool): Whether to return simulation parameters.
+    Each gene is simulated independently. For simplicity we constrain all genes
+    to have the same number of isoforms. (In fact in the current implementation all genes
+    have the exact same distribution.)
+
+    Parameters
+    ----------
+    n_genes : int, optional
+        Number of genes to simulate.
+    grid_size : tuple of int, optional
+        Shape of the spatial grid.
+    n_isos : int, optional
+        Number of isoforms.
+    total_counts_expected : int or torch.Tensor, optional
+        Expected total gene counts per spot.
+    var_sp : float, optional
+        Variance explained by spatial structure.
+    var_nsp : float, optional
+        Unstructured variance (white noise).
+    rho : float, optional
+        Spatial autocorrelation parameter.
+    design_mtx : torch.Tensor, optional
+        Shape (n_spots, n_factors). Design matrix for the isoform usage ratio.
+    beta_true : torch.Tensor, optional
+        Shape (n_factors, n_isoforms - 1). Factor coefficients for the design matrix.
+    return_params : bool, optional
+        Whether to return simulation parameters.
+
+    Returns
+    -------
+    dict or tuple of dict
+        If return_params is False, returns dict with 'counts', 'coords', 'cov_sp', 'design_mtx'.
+        If return_params is True, returns (data_dict, params_dict).
     """
     n_x, n_y = grid_size
     n_spots = n_x * n_y
@@ -167,12 +219,14 @@ def simulate_isoform_counts(
         assert beta_true.shape == (n_factors, n_isos - 1)
         assert n_spots == design_mtx.shape[0]
 
-        eta_fixed = design_mtx @ beta_true # n_spots x (n_isos - 1)
+        eta_fixed = design_mtx @ beta_true  # n_spots x (n_isos - 1)
     else:
         eta_fixed = torch.zeros((n_spots, n_isos - 1))
 
     ## expand to n_genes
-    eta_fixed = eta_fixed.unsqueeze(0).repeat(n_genes, 1, 1) # n_genes x n_spots x (n_isos - 1)
+    eta_fixed = eta_fixed.unsqueeze(0).repeat(
+        n_genes, 1, 1
+    )  # n_genes x n_spots x (n_isos - 1)
 
     ## generate spatial grid and the spatial covariance matrix
     x = np.linspace(0, 1, n_x)
@@ -185,20 +239,25 @@ def simulate_isoform_counts(
     for g in range(n_genes):
         for q in range(n_isos - 1):
             mvn = MultivariateNormal(torch.zeros(n_spots), covariance_matrix=cov_sp)
-            eta_fixed[g][:,q] += (mvn.sample(sample_shape=(1,))).squeeze()
+            eta_fixed[g][:, q] += (mvn.sample(sample_shape=(1,))).squeeze()
 
     ## convert linear predictor to proportions
     props = torch.concat([eta_fixed, torch.zeros(n_genes, n_spots, 1)], dim=-1)
-    props = torch.softmax(props, dim=-1) # n_genes x n_spots x n_isos
+    props = torch.softmax(props, dim=-1)  # n_genes x n_spots x n_isos
 
     ## sample from multinomial distributions
     counts = []
     for p in props:
         counts.append(_sample_multinom_sp_single_gene(p, total_counts_expected))
-    counts = torch.stack(counts, dim = 0) # n_genes x n_spots x n_isos
+    counts = torch.stack(counts, dim=0)  # n_genes x n_spots x n_isos
 
     ## store simulated data and ground truth
-    data = {"counts": counts, "coords": coords, "cov_sp": cov_sp, "design_mtx": design_mtx}
+    data = {
+        "counts": counts,
+        "coords": coords,
+        "cov_sp": cov_sp,
+        "design_mtx": design_mtx,
+    }
 
     ## return simulation parameters
     if return_params:
