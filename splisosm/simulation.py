@@ -1,19 +1,12 @@
 from __future__ import annotations
 
 import itertools
-import sys
 from typing import Any, Optional, Union
 
 import numpy as np
-import pandas as pd
 
-try:
-    import scanpy as sc
-except ImportError:
-    pass
 import torch
 from torch.distributions import Multinomial, MultivariateNormal, Poisson
-from tqdm.auto import tqdm
 
 from splisosm.utils import get_cov_sp
 

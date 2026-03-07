@@ -605,7 +605,6 @@ def run_sparkx(
         raise ValueError("run_sparkx does not support sparse input for counts_gene.")
 
     # load packages neccessary for running SPARK-X
-    import rpy2
     import rpy2.robjects as ro
     from rpy2.robjects import r
     from rpy2.robjects import numpy2ri

@@ -1,19 +1,13 @@
 import warnings
 from abc import ABC, abstractmethod
 from timeit import default_timer as timer
-from collections import defaultdict
 
-import numpy as np
 import torch
 import torch.nn as nn
-from torch.autograd.functional import hessian, jacobian
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data.dataloader import default_collate
+from torch.autograd.functional import jacobian
 from torch.distributions import Gamma, InverseGamma
 
 from splisosm.likelihood import (
-    log_prob_fastmult,
-    log_prob_fastmvn,
     log_prob_fastmult_batched,
     log_prob_fastmvn_batched,
 )
@@ -147,7 +141,7 @@ class MultinomGLM(BaseModel, nn.Module):
 
     def __str__(self):
         return (
-            f"A Multinomial Generalized Linear Model (GLM)\n"
+            "A Multinomial Generalized Linear Model (GLM)\n"
             + f"- Number of genes in the batch: {self.n_genes}\n"
             + f"- Number of spots: {self.n_spots}\n"
             + f"- Number of isoforms per gene: {self.n_isos}\n"
@@ -414,7 +408,7 @@ class MultinomGLM(BaseModel, nn.Module):
             [optimizer.zero_grad() for optimizer in self.optimizers]
             with torch.no_grad():
                 for p in self.parameters():
-                    if not p.grad is None:
+                    if p.grad is not None:
                         p.grad.zero_()
         else:
             self.optimizer.zero_grad()
@@ -835,7 +829,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
     def __str__(self):
         return (
-            f"A Multinomial Generalized Linear Mixed Model (GLMM)\n"
+            "A Multinomial Generalized Linear Mixed Model (GLMM)\n"
             + f"- Number of genes in the batch: {self.n_genes}\n"
             + f"- Number of spots: {self.n_spots}\n"
             + f"- Number of isoforms per gene: {self.n_isos}\n"
@@ -1425,10 +1419,10 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         ).unsqueeze(0).to(self.device)
 
         # combine beta and bias_eta
-        # (n_genes, n_factors + 1, n_isos - 1)
-        gradient_beta_expand = torch.cat(
-            [self.beta.grad, self.bias_eta.grad.unsqueeze(1)], dim=1
-        )
+        # # (n_genes, n_factors + 1, n_isos - 1)
+        # gradient_beta_expand = torch.cat(
+        #     [self.beta.grad, self.bias_eta.grad.unsqueeze(1)], dim=1
+        # )
         # (n_genes, n_factors + 1, n_isos - 1)
         beta_expand = torch.cat([self.beta, self.bias_eta.unsqueeze(1)], dim=1)
         right = hessian_beta_expand.matmul(

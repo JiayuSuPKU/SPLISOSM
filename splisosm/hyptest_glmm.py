@@ -1,20 +1,18 @@
 import warnings
 from timeit import default_timer as timer
-import re
 
 import pandas as pd
 import numpy as np
-from scipy.stats import chi2, ttest_ind, combine_pvalues
+from scipy.stats import chi2
 import torch
 import torch.multiprocessing as mp
 from torch import nn
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
-from splisosm.utils import get_cov_sp, counts_to_ratios, false_discovery_control
+from splisosm.utils import get_cov_sp, false_discovery_control
 from splisosm.dataset import IsoDataset
 from splisosm.model import MultinomGLM, MultinomGLMM
-from splisosm.likelihood import liu_sf
 
 __all__ = ["IsoFullModel", "IsoNullNoSpVar", "SplisosmGLMM"]
 
@@ -460,8 +458,7 @@ def _calc_wald_differential_usage(fitted_full_model: MultinomGLM):
     df : int
         The degrees of freedom for the Wald statistic (equal to n_isos - 1).
     """
-    n_genes, n_factors, n_isos = (
-        fitted_full_model.n_genes,
+    n_factors, n_isos = (
         fitted_full_model.n_factors,
         fitted_full_model.n_isos,
     )
@@ -673,7 +670,7 @@ class SplisosmGLMM:
             else "NA"
         )
         return (
-            f"=== Parametric SPLISOSM model for spatial isoform testings\n"
+            "=== Parametric SPLISOSM model for spatial isoform testings\n"
             + f"- Number of genes: {self.n_genes}\n"
             + f"- Number of spots: {self.n_spots}\n"
             + f"- Number of covariates: {self.n_factors}\n"
@@ -1118,11 +1115,7 @@ class SplisosmGLMM:
                 self.dataset.get_dataloader(batch_size=batch_size), fitted_pars
             ):
                 # unwrap the batch
-                b_n_isos, b_counts, b_gene_names = (
-                    batch["n_isos"],
-                    batch["x"],
-                    batch["gene_name"],
-                )
+                b_counts = batch["x"]
 
                 # initialize and setup the model
                 if self.model_type == "glm":
@@ -1301,11 +1294,7 @@ class SplisosmGLMM:
                 self.dataset.get_dataloader(batch_size=batch_size), fitted_pars
             ):
                 # unwrap the batch
-                b_n_isos, b_counts, b_gene_names = (
-                    batch["n_isos"],
-                    batch["x"],
-                    batch["gene_name"],
-                )
+                b_counts = batch["x"]
 
                 # null models
                 null = IsoNullNoSpVar(**self.model_configs)
@@ -1530,7 +1519,7 @@ class SplisosmGLMM:
 
         if use_perm_null:
             # use permutation to calculate the p-value.
-            if not "sv_llr_perm_stats" in self.fitting_results.keys():
+            if "sv_llr_perm_stats" not in self.fitting_results.keys():
                 self._fit_sv_llr_perm(
                     n_perms=n_perms_per_gene if n_perms_per_gene is not None else 20,
                     print_progress=print_progress,

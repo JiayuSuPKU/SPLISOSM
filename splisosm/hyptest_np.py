@@ -4,7 +4,7 @@ from __future__ import annotations
 import warnings
 import re
 from typing import Any, Optional, Union
-from scipy.stats import chi2, ttest_ind, combine_pvalues
+from scipy.stats import ttest_ind, combine_pvalues
 import numpy as np
 import pandas as pd
 import torch
@@ -17,7 +17,6 @@ from sklearn.gaussian_process.kernels import WhiteKernel
 
 from smoother.weights import coordinate_to_weights_knn_sparse
 from splisosm.utils import (
-    get_cov_sp,
     counts_to_ratios,
     false_discovery_control,
     run_sparkx,
@@ -332,7 +331,7 @@ class SplisosmNP:
             else "NA"
         )
         return (
-            f"=== Non-parametric SPLISOSM model for spatial isoform testings\n"
+            "=== Non-parametric SPLISOSM model for spatial isoform testings\n"
             + f"- Number of genes: {self.n_genes}\n"
             + f"- Number of spots: {self.n_spots}\n"
             + f"- Number of covariates: {self.n_factors}\n"
@@ -908,7 +907,7 @@ class SplisosmNP:
                             # Kx = H @ Kx @ H # centered spatial kernel, (n_non_nan, n_non_nan)
                             K_x = self.corr_sp.realization()[~is_nan, :][:, ~is_nan]
                             K_x = K_x - K_x.mean(dim=0, keepdim=True)
-                            K_x = K_sp - K_x.mean(
+                            K_x = K_x - K_x.mean(
                                 dim=1, keepdim=True
                             )  # (n_non_nan, n_non_nan)
 
