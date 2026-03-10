@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import warnings
 from timeit import default_timer as timer
+from typing import Any, Optional, Union, Literal
 
 import pandas as pd
 import numpy as np
@@ -14,7 +17,7 @@ from splisosm.utils import get_cov_sp, false_discovery_control
 from splisosm.dataset import IsoDataset
 from splisosm.model import MultinomGLM, MultinomGLMM
 
-__all__ = ["IsoFullModel", "IsoNullNoSpVar", "SplisosmGLMM"]
+__all__ = ["SplisosmGLMM"]
 
 
 class IsoFullModel(MultinomGLMM):
@@ -42,7 +45,9 @@ class IsoFullModel(MultinomGLMM):
     """
 
     @classmethod
-    def from_trained_null_no_sp_var_model(cls, null_model):
+    def from_trained_null_no_sp_var_model(
+        cls, null_model: MultinomGLMM
+    ) -> "IsoFullModel":
         # clone the model and convert it
         new_model = null_model.clone()
         new_model.__class__ = cls
@@ -117,7 +122,7 @@ class IsoNullNoSpVar(MultinomGLMM):
             self.sigma_sp.detach_().fill_(0.0).requires_grad_(False)
 
     @classmethod
-    def from_trained_full_model(cls, full_model):
+    def from_trained_full_model(cls, full_model: MultinomGLMM) -> "IsoNullNoSpVar":
         """Initialize an IsoNullNoSpVar model from a trained full model."""
         # clone the model and convert it to the NullNoSpVar class
         new_model = full_model.clone()
@@ -589,31 +594,87 @@ def _calc_score_differential_usage(fitted_full_model: MultinomGLM, covar_to_test
 class SplisosmGLMM:
     """Parametric spatial isoform statistical modeling using GLMM.
 
+    This is a convenience class that wraps around the :class:`splisosm.model.MultinomGLMM`
+    for batched model fitting and spatial variability and differential usage testing.
+
     Examples
     --------
+    Setup data:
+
+    >>> from splisosm import SplisosmGLMM
+    >>> import torch
+    >>> # Simulate data for 10 genes with different number of isoforms
+    >>> data_3_iso = [torch.randint(low=0, high=5, size=(100, 3)) for _ in range(5)]  # 5 genes with 3 isoforms
+    >>> data_4_iso = [torch.randint(low=0, high=5, size=(100, 4)) for _ in range(5)]  # 5 genes with 4 isoforms
+    >>> data = data_3_iso + data_4_iso
+    >>> coordinates = torch.rand(100, 2)  # 100 spots with 2D coordinates
+    >>> design_mtx = torch.rand(100, 2)  # 100 spots with 2 covariates
+
     Model fitting:
 
-    >>> model = SplisosmGLMM()
-    >>> model.setup_data(data, coordinates)
-    >>> model.fit(with_design_matrix = False)
-
-    Spatial variability test:
-
-    >>> model.test_spatial_variability()
+    >>> model = SplisosmGLMM(model_type='glmm-full')
+    >>> model.setup_data(data, coordinates, design_mtx=design_mtx, group_gene_by_n_iso=True)
+    >>> model.fit(n_jobs=1, batch_size=5, with_design_mtx=False)
+    >>> fitted_models = model.get_fitted_models()
+    >>> print(fitted_models[0])  # print the fitted model for the first gene
 
     Differential usage test:
 
-    >>> model.test_diffential_usage()
-
-    Retrieve results:
-
-    >>> sv_results = model.get_formatted_test_results('sv')
+    >>> model.test_differential_usage(method='score')
     >>> du_results = model.get_formatted_test_results('du')
+    >>> print(du_results.head())
     """
+
+    n_genes: int
+    """Number of genes."""
+
+    n_spots: int
+    """Number of spots."""
+
+    n_isos_per_gene: list[int]
+    """List of numbers of isoforms per gene."""
+
+    n_factors: int
+    """Number of covariates to test for differential usage."""
+
+    sv_test_results: dict
+    """Dictionary to store the spatial variability test results after running test_spatial_variability().
+    It contains the following keys:
+    
+    - ``'method'``: str, the method used for the test.
+    - ``'statistic'``: numpy.ndarray of shape (n_genes,), the log likelihood ratio test statistic for each gene.
+    - ``'df'``: int, the degrees of freedom for the test statistic.
+    - ``'use_perm_null'``: bool, whether the null distribution is estimated using permutation.
+    - ``'pvalue'``: numpy.ndarray of shape (n_genes,), the p-value for each gene.
+    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes,), the BH adjusted p-value for each gene.
+    """
+
+    du_test_results: dict
+    """Dictionary to store the differential usage test results after running test_differential_usage(). 
+    It contains the following keys:
+    
+    - ``'method'``: str, the method used for the test.
+    - ``'statistic'``: numpy.ndarray of shape (n_genes, n_factors), the test statistic for each gene and covariate.
+    - ``'pvalue'``: numpy.ndarray of shape (n_genes, n_factors), the p-value for each gene and covariate.
+    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes, n_factors), the BH adjusted p-value for each gene and covariate. Each column/covariate is adjusted separately.
+    """
+
+    model_type: Literal["glmm-full", "glmm-null", "glm"]
+    """The type of GLM or GLMM model."""
+
+    model_configs: dict
+    """Dictionary of model configurations, with keys
+    ``share_variance``, ``var_parameterization_sigma_theta``, 
+    ``var_fix_sigma``, ``var_prior_model``, ``var_prior_model_params``, 
+    ``init_ratio``, ``fitting_method``, and ``fitting_configs``."""
+
+    fitting_results: dict
+    """Dictionary to store lists of fitted models, with keys
+    ``'glmm-full'``, ``'glmm-null'``, ``'glm'``."""
 
     def __init__(
         self,
-        model_type="glmm-full",
+        model_type: Literal["glmm-full", "glmm-null", "glm"] = "glmm-full",
         share_variance: bool = True,
         var_parameterization_sigma_theta: bool = True,
         var_fix_sigma: bool = False,
@@ -623,6 +684,54 @@ class SplisosmGLMM:
         fitting_method: str = "joint_gd",
         fitting_configs: dict = {"max_epochs": -1},
     ):
+        """
+        Parameters
+        ----------
+        model_type
+            Which model to fit. Can be one of ``'glmm-full'`` (Multinomial GLMM with spatial random effects),
+            ``'glmm-null'`` (Multinomial GLMM with white noise), ``'glm'`` (Multinomial GLM).
+        share_variance
+            Whether to share the variance component across isoforms.
+        var_parameterization_sigma_theta
+            Whether to parameterize the variance components as (``sigma``, ``theta_logit``) or (``sigma_sp``, ``sigma_nsp``).
+            If True, the variance components will be (``sigma``, ``theta_logit``), where ``sigma`` is the total variance and
+            ``theta_logit`` is the logit of the spatial variance proportion.
+            If False, the variance components will be (``sigma_sp``, ``sigma_nsp``), where ``sigma_sp`` is the spatial
+            variance and ``sigma_nsp`` is the non-spatial variance.
+        var_fix_sigma
+            Whether to fix the total variance (``sigma``) or not. If True, the total variance will be fixed to the initial value,
+            which is the average per-spot variance of isoform counts normalized by its mean expression.
+            See `MultinomGLMM._initialize_params` for details.
+        var_prior_model
+            The prior model on the total variance ``sigma``. Default is ``'none'`` with no prior.
+            Other options are ``'gamma'`` (Gamma prior) and ``'inv_gamma'`` (Inverse Gamma prior).
+        var_prior_model_params
+            The parameters for the prior model on the total variance ``sigma``.
+            For ``'gamma'``, the default parameters are ``{'alpha': 2.0, 'beta': 0.3}``.
+            For ``'inv_gamma'``, the default parameters are ``{'alpha': 3, 'beta': 0.5}``.
+        init_ratio
+            The initialization method for the logit isoform usage ratio. Options are ``'observed'`` (initialize using observed counts)
+            and ``'uniform'`` (equal isoform usage across space).
+        fitting_method
+            The fitting method to use when ``model_type='glmm-full'`` or ``'glmm-null'``.
+            Options are ``'joint_gd'`` (joint likelihood with gradient descent),
+            ``'joint_newton'`` (joint likelihood with Newton's method),
+            ``'marginal_gd'`` (marginal likelihood with gradient descent),
+            and ``'marginal_newton'`` (marginal likelihood with Newton's method).
+        fitting_configs
+            A dictionary of fitting configurations with the following keys:
+
+            - ``'lr'``: float, learning rate
+            - ``'optim'``: str, optimization method (one of ``'adam'``, ``'sgd'``, or ``'lbfgs'``)
+            - ``'tol'``: float, tolerance for convergence
+            - ``'max_epochs'``: int, maximum number of epochs
+            - ``'patience'``: int, number of epochs to wait for improvement before stopping
+            - ``'update_nu_every_k'``: int, number of iterations to update ``nu`` when using ``fitting_method='marginal_newton'``
+
+        See also
+        --------
+        :class:`splisosm.model.MultinomGLMM` for more details on the model configurations.
+        """
         # specify the model type to fit
         assert model_type in ["glmm-full", "glmm-null", "glm"]
         self.model_type = model_type
@@ -693,29 +802,29 @@ class SplisosmGLMM:
 
     def setup_data(
         self,
-        data,
-        coordinates,
-        design_mtx=None,
-        gene_names=None,
-        group_gene_by_n_iso=False,
-        covariate_names=None,
-    ):
+        data: list[torch.Tensor],
+        coordinates: Union[np.ndarray, torch.Tensor],
+        design_mtx: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        gene_names: Optional[list[str]] = None,
+        group_gene_by_n_iso: bool = False,
+        covariate_names: Optional[list[str]] = None,
+    ) -> None:
         """Setup the data for the model.
 
         Parameters
         ----------
-        data : list of torch.Tensor
+        data
             List of tensors with shape (n_spots, n_isos), the observed isoform counts for each gene.
-        coordinates : torch.Tensor
+        coordinates
             Shape (n_spots, 2), the spatial coordinates.
-        design_mtx : torch.Tensor, optional
+        design_mtx
             Shape (n_spots, n_factors), the design matrix for the fixed effects.
-        gene_names : list of str, optional
-            The gene names.
-        group_gene_by_n_iso : bool, optional
+        gene_names
+            List of gene names.
+        group_gene_by_n_iso
             Whether to group genes by the number of isoforms.
-        covariate_names : list of str, optional
-            The covariate names.
+        covariate_names
+            List of covariate names.
         """
         # create the dataset and extract statistics
         _dataset = IsoDataset(data, gene_names, group_gene_by_n_iso)
@@ -784,8 +893,21 @@ class SplisosmGLMM:
         self._corr_sp_eigvals = corr_sp_eigvals  # (n_spots,)
         self._corr_sp_eigvecs = corr_sp_eigvecs  # (n_spots, n_spots)
 
-    def get_formatted_test_results(self, test_type):
-        """Get the formatted test results as data frame."""
+    def get_formatted_test_results(
+        self, test_type: Literal["sv", "du"]
+    ) -> pd.DataFrame:
+        """Get the formatted test results as data frame.
+
+        Parameters
+        ----------
+        test_type
+            Type of test results to retrieve. Can be one of ``'sv'`` (spatial variability) or ``'du'`` (differential usage).
+
+        Returns
+        -------
+        pandas.DataFrame
+            Formatted test results.
+        """
         assert test_type in [
             "sv",
             "du",
@@ -824,36 +946,40 @@ class SplisosmGLMM:
 
     def fit(
         self,
-        n_jobs=1,
-        batch_size=1,
-        quiet=True,
-        print_progress=True,
-        with_design_mtx=False,
-        from_null=False,
-        refit_null=True,
-        random_seed=None,
-    ):
-        """Fit the full model to the data.
+        n_jobs: int = 1,
+        batch_size: int = 1,
+        quiet: bool = True,
+        print_progress: bool = True,
+        with_design_mtx: bool = False,
+        from_null: bool = False,
+        refit_null: bool = True,
+        random_seed: Optional[int] = None,
+    ) -> None:
+        """Model fitting.
 
         Parameters
         ----------
-        n_jobs : int, optional
+        n_jobs
             The number of cores to use for parallel fitting. Default to 1.
-        batch_size : int, optional
+        batch_size
             The maximum number of genes per job to fit in parallel. Default to 1.
-        quiet : bool, optional
+        quiet
             Whether to suppress the fitting logs. Default to True.
-        print_progress : bool, optional
+        print_progress
             Whether to show the progress bar. Default to True.
-        with_design_mtx : bool, optional
+        with_design_mtx
             Whether to include the design matrix for the fixed effects. Default to False.
-        from_null : bool, optional
+        from_null
             Whether to initialize the full model from a null model
-            with zero spatial variability (random effect).
-        refit_null : bool, optional
+            with zero spatial variability (white-noise random effect).
+        refit_null
             Whether to refit the null model after fitting the full model.
-        random_seed : int, optional
+        random_seed
             The random seed for reproducibility. Default to None.
+
+        See also
+        --------
+        :func:`splisosm.model.MultinomGLMM.fit` for fitting a single model.
         """
 
         if batch_size > 1 and not self.group_gene_by_n_iso:
@@ -897,12 +1023,18 @@ class SplisosmGLMM:
 
         self._is_trained = True
 
-    def save(self, path):
+    def save(self, path: str) -> None:
         """Save the fitted models to a file.
 
-        Saving using torch.save() directly will save n_genes copies of self.corr_sp because the matrix
-        is reconstructed per fitted model using self._corr_sp_eigvals and self._corr_sp_eigvecs.
+        This function is designed to overcome a limitation of ``torch.save()``,
+        which naively saves `n_genes` copies of the spatial kernel matrix ``self.corr_sp``.
+        The kernel matrix is reconstructed per fitted model using ``self._corr_sp_eigvals``
+        and ``self._corr_sp_eigvecs``.
 
+        Parameters
+        ----------
+        path
+            The path to save the fitted models.
         """
         for key in ["models_glmm-full", "models_glmm-null"]:
             if key in self.fitting_results and len(self.fitting_results[key]) > 0:
@@ -913,11 +1045,15 @@ class SplisosmGLMM:
 
         torch.save(self, path)
 
-    def get_fitted_models(self):
+    def get_fitted_models(self) -> list[Any]:
         """Get the fitted models after running fit().
 
-        Returns:
-            models: list of IsoFullModel or IsoNullNoSpVar, the fitted models.
+        Returns
+        -------
+        models: list of fitted models
+            - ``model_type='glmm-full'``: list[splisosm.hyptest_glmm.IsoFullModel]
+            - ``model_type='glmm-null'``: list[splisosm.hyptest_glmm.IsoNullNoSpVar]
+            - ``model_type='glm'``: list[splisosm.model.MultinomGLM]
         """
         if self.model_type == "glmm-full":
             return self.fitting_results["models_glmm-full"]
@@ -928,16 +1064,24 @@ class SplisosmGLMM:
         else:
             raise ValueError(f"Invalid model type {self.model_type}.")
 
-    def _ungroup_fitted_models(self, fitted_models, batch_size, with_design_mtx):
+    def _ungroup_fitted_models(
+        self, fitted_models: list[Any], batch_size: int, with_design_mtx: bool
+    ) -> list[Any]:
         """Ungroup the fitted models to match the original gene names.
 
-        Args:
-            fitted_models: list of length n_batches
-            batch_size: int, the maximum number of genes per job to fit in parallel.
-            with_design_mtx: bool, whether to include the design matrix for the fixed effects.
+        Parameters
+        ----------
+        fitted_models : list
+            List of length n_batches.
+        batch_size : int
+            The maximum number of genes per job to fit in parallel.
+        with_design_mtx : bool
+            Whether to include the design matrix for the fixed effects.
 
-        Returns:
-            fitted_models_ungrouped: list of length n_genes, the fitted models in the original order.
+        Returns
+        -------
+        list
+            Fitted models ungrouped, list of length n_genes in the original order.
         """
         data = self.dataset.get_dataloader(batch_size=batch_size)
 
@@ -1013,22 +1157,29 @@ class SplisosmGLMM:
 
     def _fit_denovo(
         self,
-        n_jobs=1,
-        batch_size=1,
-        quiet=True,
-        print_progress=True,
-        with_design_mtx=False,
-        random_seed=None,
-    ):
+        n_jobs: int = 1,
+        batch_size: int = 1,
+        quiet: bool = True,
+        print_progress: bool = True,
+        with_design_mtx: bool = False,
+        random_seed: Optional[int] = None,
+    ) -> None:
         """Fit the selected model to the data de novo.
 
-        Args:
-            n_jobs: int, the number of cores to use for parallel fitting. Default to 1.
-            batch_size: int, the maximum number of genes per job to fit in parallel. Default to 1.
-            quiet: bool, whether to suppress the fitting logs. Default to True.
-            print_progress: bool, whether to show the progress bar. Default to True.
-            with_design_mtx: bool, whether to include the design matrix for the fixed effects. Default to False.
-            random_seed: int, the random seed for reproducibility. Default to None.
+        Parameters
+        ----------
+        n_jobs : int, optional
+            The number of cores to use for parallel fitting. Default to 1.
+        batch_size : int, optional
+            The maximum number of genes per job to fit in parallel. Default to 1.
+        quiet : bool, optional
+            Whether to suppress the fitting logs. Default to True.
+        print_progress : bool, optional
+            Whether to show the progress bar. Default to True.
+        with_design_mtx : bool, optional
+            Whether to include the design matrix for the fixed effects. Default to False.
+        random_seed : int, optional
+            The random seed for reproducibility. Default to None.
         """
         # empty existing models before the new run
         fitted_models = []
@@ -1176,16 +1327,24 @@ class SplisosmGLMM:
     ):
         """Fit the null (no spatial random effect) and the full model to the data sequentially.
 
-        Args:
-            refit_null: bool, whether to refit the null model after fitting the full model.
-                Default to True.
-            n_jobs: int, the number of cores to use for parallel fitting. Default to 1.
-            batch_size: int, the maximum number of genes per job to fit in parallel. Default to 1.
-            quiet: bool, whether to suppress the fitting logs. Default to True.
-            print_progress: bool, whether to show the progress bar. Default to True.
-                Only applicable when n_jobs = 1.
-            with_design_mtx: bool, whether to include the design matrix for the fixed effects. Default to True.
-            random_seed: int, the random seed for reproducibility. Default to None.
+        Parameters
+        ----------
+        refit_null : bool, optional
+            Whether to refit the null model after fitting the full model.
+            Default to True.
+        n_jobs : int, optional
+            The number of cores to use for parallel fitting. Default to 1.
+        batch_size : int, optional
+            The maximum number of genes per job to fit in parallel. Default to 1.
+        quiet : bool, optional
+            Whether to suppress the fitting logs. Default to True.
+        print_progress : bool, optional
+            Whether to show the progress bar. Default to True.
+            Only applicable when n_jobs = 1.
+        with_design_mtx : bool, optional
+            Whether to include the design matrix for the fixed effects. Default to True.
+        random_seed : int, optional
+            The random seed for reproducibility. Default to None.
         """
         # empty existing models before the new run
         fitted_null_models_sv = []
@@ -1334,15 +1493,24 @@ class SplisosmGLMM:
             print(f"Fitting finished. Time elapsed: {t_end - t_start:.2f} seconds.")
 
     def _fit_sv_llr_perm(
-        self, n_perms=20, n_jobs=1, print_progress=True, random_seed=None
-    ):
+        self,
+        n_perms: int = 20,
+        n_jobs: int = 1,
+        print_progress: bool = True,
+        random_seed: Optional[int] = None,
+    ) -> None:
         """Calculate the null distribution of likelihood ratio using permutation.
 
-        Args:
-            n_perms: int, the number of permutations to run per gene. Default to 20.
-            n_jobs: int, the number of cores to use for parallel fitting. Default to 1.
-            print_progress: bool, whether to show the progress bar. Default to True.
-            random_seed: int, the random seed for reproducibility. Default to None.
+        Parameters
+        ----------
+        n_perms : int, optional
+            The number of permutations to run per gene. Default to 20.
+        n_jobs : int, optional
+            The number of cores to use for parallel fitting. Default to 1.
+        print_progress : bool, optional
+            Whether to show the progress bar. Default to True.
+        random_seed : int, optional
+            The random seed for reproducibility. Default to None.
         """
         # fit permutated data using the same null model
         fitting_configs = self.model_configs["fitting_configs"]
@@ -1470,26 +1638,48 @@ class SplisosmGLMM:
 
     def test_spatial_variability(
         self,
-        method="llr",
-        use_perm_null=False,
-        return_results=False,
-        print_progress=True,
-        n_perms_per_gene=None,
-        **kwargs,
-    ):
+        method: str = "llr",
+        use_perm_null: bool = False,
+        return_results: bool = False,
+        print_progress: bool = True,
+        n_perms_per_gene: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Optional[dict[str, Any]]:
         """Parametric test for spatial variability.
 
-        Note: the likelihood ratio test statistic is not well-calibrated for sparse data.
-            We recommend using the non-parametric HSIC tests of SplisosmNP instead.
+        .. caution::
+            The likelihood ratio statistic is not well-calibrated for sparse data.
+            We recommend the non-parametric HSIC-based tests in :class:`splisosm.hyptest_np.SplisosmNP`
+            for spatial variability testing.
 
-        Args:
-            method: str, the test method.
-                Currently only support "llr", the likelihood ratio test (H_0: sigma_sp = 0).
-            use_perm_null: bool, whether to generate the null distribution from permutation.
-                If False, use the chi-square with df = n_var_components as the null.
-            return_results: bool, whether to return the test statistics and p-values.
-            print_progress: bool, whether to show the progress bar for permutation. Default to True.
-            kwargs: additional arguments passed to _fit_sv_llr_perm() if use_perm_null = True.
+        Note that the parametric and non-parametric tests are assymptotically equivalent under the null.
+        See :cite:`su2026consistent` for detailed theoretical analysis.
+
+        Parameters
+        ----------
+        method
+            The test method.
+            Currently only support ``"llr"``, the likelihood ratio test (H_0: ``sigma_sp`` = 0).
+        use_perm_null
+            Whether to generate the null distribution from permutation.
+            If False, use the chi-square with df = n_var_components as the null.
+        return_results
+            Whether to return the test statistics and p-values.
+            If False, the results will be stored in ``self.sv_test_results``.
+        print_progress
+            Whether to show the progress bar for permutation. Default to True.
+        **kwargs : Any
+            Additional arguments passed to `self._fit_sv_llr_perm()` if ``use_perm_null = True``.
+
+        Returns
+        -------
+        dict or None
+            If `return_results` is True, returns dict with test statistics and p-values.
+            Otherwise returns None.
+
+        See also
+        --------
+        :func:`splisosm.hyptest_np.SplisosmNP.test_spatial_variability` for non-parametric tests.
         """
 
         valid_methods = ["llr"]
@@ -1556,18 +1746,41 @@ class SplisosmGLMM:
             return self.sv_test_results
 
     def test_differential_usage(
-        self, method="score", print_progress=True, return_results=False
-    ):
+        self,
+        method: Literal["score", "wald"] = "score",
+        print_progress: bool = True,
+        return_results: bool = False,
+    ) -> Optional[dict[str, Any]]:
         """Parametric test for spatial isoform differential usage.
 
-        Args:
-            method: str, the test method. Must be one of "score", "wald"
-                - "wald": Wald test for isoform differential usage along each factor in the design matrix.
-                    Model fitting using fit(..., with_design_mtx = True) is required.
-                - "score": Score test for isoform differential usage along each factor in the design matrix.
-                    Model fitting using fit(..., with_design_mtx = False) is required.
-            print_progress: bool, whether to show the progress bar. Default to True.
-            return_results: bool, whether to return the test statistics and p-values.
+        Before running this function, the design matrix must be set up using :func:`setup_data`.
+        Each column of the design matrix corresponds to a covariate to test for differential association
+        with the isoform usage ratios of each gene.
+        Test statistics and p-values are computed per (gene, covariate) pair separately.
+
+        Similar to :func:`splisosm.hyptest_np.SplisosmNP.test_differential_usage`, here we also support two types of association tests but **implicitly**:
+
+        - Unconditional (when ``model_type='glm'``): test the unconditional association between isoform usage ratios and the covariate of interest (H_0: ``beta`` = 0).
+        - Conditional (when ``model_type='glmm-full'``): test for association (H_0: ``beta`` = 0) conditioned on the spatial random effect.
+
+        Parameters
+        ----------
+        method
+            Depending on whether the design matrix is used for model fitting,
+            different methods must be used for hypothesis testing.
+            Use ``"wald"`` when models were fit with ``fit(..., with_design_mtx=True)``.
+            Use ``"score"`` when models were fit with ``fit(..., with_design_mtx=False)``.
+        print_progress
+            Whether to show the progress bar. Default to True.
+        return_results
+            Whether to return the test statistics and p-values.
+            If False, the results are stored in ``self.du_test_results``.
+
+        Returns
+        -------
+        dict or None
+            If `return_results` is True, returns dict with test statistics and p-values.
+            Otherwise, returns None and stores results in self.du_test_results.
         """
         if self.design_mtx is None:
             raise ValueError("No design matrix is provided. Run setup_data() first.")

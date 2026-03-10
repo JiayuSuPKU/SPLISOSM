@@ -1,6 +1,7 @@
 import warnings
 from abc import ABC, abstractmethod
 from timeit import default_timer as timer
+from typing import Optional, Literal
 
 import torch
 import torch.nn as nn
@@ -13,14 +14,19 @@ from splisosm.likelihood import (
 )
 from splisosm.logger import PatienceLogger
 
-__all__ = ["BaseModel", "update_at_idx", "MultinomGLM", "MultinomGLMM"]
+__all__ = ["MultinomGLM", "MultinomGLMM"]
 
 
 class BaseModel(ABC):
     """API for the GLM and GLMM model."""
 
     @abstractmethod
-    def setup_data(self, counts, corr_sp, design_mtx=None):
+    def setup_data(
+        self,
+        counts: torch.Tensor,
+        corr_sp: Optional[torch.Tensor],
+        design_mtx: Optional[torch.Tensor] = None,
+    ) -> None:
         """Set up the data for the model.
 
         Parameters
@@ -30,26 +36,26 @@ class BaseModel(ABC):
         corr_sp : torch.Tensor
             Shape (n_spots, n_spots).
         design_mtx : torch.Tensor, optional
-            Shape (n_spots, n_covariates).
+            Shape (n_spots, n_factors).
         """
         pass
 
-    def forward(self):
+    def forward(self) -> torch.Tensor:
         """Calculate the log-likelihood or log-marginal-likelihood of the model."""
         pass
 
     @abstractmethod
-    def fit(self):
+    def fit(self) -> None:
         """Fit the model using all data."""
         pass
 
     @abstractmethod
-    def get_isoform_ratio(self):
+    def get_isoform_ratio(self) -> torch.Tensor:
         """Extract the fitted isoform ratio across space."""
         pass
 
     @abstractmethod
-    def clone(self):
+    def clone(self) -> "BaseModel":
         """Clone the model with data and model parameters."""
         pass
 
@@ -97,22 +103,80 @@ def update_at_idx(
 class MultinomGLM(BaseModel, nn.Module):
     """The Multinomial Generalized Linear Model for spatial isoform expression.
 
-    Compared to MultinomGLMM, this model does not have a random effect term.
-            Y ~ Multinomial(alpha, Y.sum(1))
-            eta = multinomial-logit(alpha) = X @ beta + bias_eta
+    Compared to MultinomGLMM, this model does not have a random effect term::
 
-    Given isoform counts of a gene Y (n_spots, n_isos) and design matrix X (n_spots, n_factors),
+        Y ~ Multinomial(alpha, Y.sum(1))
+        eta = multinomial-logit(alpha) = X @ beta + bias_eta
+
+    Given isoform counts of a gene ``Y`` (n_spots, n_isos) and design matrix ``X`` (n_spots, n_factors),
     MultinomGLM.fit will find the MAP estimates of the following learnable parameters:
-    - beta: (n_factors, n_isos - 1) covariate coefficients of the fixed effect term.
-    - bias_eta: (n_isos - 1) intercepts of the fixed effect term.
 
-    Inference is performed by maximizing the log likelihood using one of the following methods:
-    - 'iwls': (default) Iteratively reweighted least squares.
-    - 'newton': Newton's method.
-    - 'gd': Gradient descent.
+    - ``beta``: (n_factors, n_isos - 1) covariate coefficients of the fixed effect term.
+    - ``bias_eta``: (n_isos - 1) intercepts of the fixed effect term.
+
+    Inference is performed by maximizing the log likelihood using `fitting_method` (default: ``'iwls'``)
+
+    Example
+    -------
+    >>> from splisosm.model import MultinomGLM
+    >>> import torch
+    >>> # Generate synthetic data
+    >>> counts = torch.randint(0, 10, (5, 100, 3))  # 5 genes, 100 spots, each 3 isoforms
+    >>> # Fit the GLM model
+    >>> model = MultinomGLM(fitting_method='iwls')
+    >>> model.setup_data(counts, design_mtx=None)
+    >>> model.fit()
+    >>> print(model)
+    >>> # Extract the fitted isoform ratios
+    >>> isoform_ratios = model.get_isoform_ratio()  # shape (5, 100, 3)
+    >>> # Fitted parameters
+    >>> print(model.beta.shape)  # shape (5, 0, 2)
+    >>> print(model.bias_eta.shape)  # shape (5, 2)
     """
 
-    def __init__(self, fitting_method: str = "iwls", fitting_configs: dict = {}):
+    n_spots: int
+    """Number of samples/spots"""
+
+    n_genes: int
+    """Number of genes in the batch."""
+
+    n_isos: int
+    """Number of isoforms per gene in the batch."""
+
+    n_factors: int | None
+    """Number of covariates in the design matrix"""
+
+    fitting_method: Literal["iwls", "newton", "gd"]
+    """Method for fitting the model."""
+
+    fitting_configs: dict
+    """Dictionary of fitting configurations."""
+
+    fitting_time: float
+    """Time taken for fitting the model."""
+
+    def __init__(
+        self,
+        fitting_method: Literal["iwls", "newton", "gd"] = "iwls",
+        fitting_configs: dict = {},
+    ):
+        """
+        Parameters
+        ----------
+        fitting_method
+            Method for fitting the model.
+            ``'iwls'``: Iteratively reweighted least squares.
+            ``'newton'``: Newton's method.
+            ``'gd'``: Gradient descent.
+        fitting_configs
+            Dictionary of fitting configurations. Keys include
+
+            - ``'lr'``: float, Learning rate for gradient descent or Newton's method.
+            - ``'optim'``: str, Optimizer type, one of ``'adam'``, ``'sgd'``, or ``'lbfgs'``.
+            - ``'tol'``: float, Tolerance for convergence.
+            - ``'max_epochs'``: int, Maximum number of epochs for fitting.
+            - ``'patience'``: int, Number of epochs to wait for improvement before stopping.
+        """
         super().__init__()
         # will be set up later by calling self.setup_data()
         self.n_spots = None  # number of spots
@@ -149,16 +213,23 @@ class MultinomGLM(BaseModel, nn.Module):
             + f"- Fitting method: {self.fitting_method}"
         )
 
-    def setup_data(self, counts, design_mtx=None, device="cpu") -> None:
+    def setup_data(
+        self,
+        counts: torch.Tensor,
+        design_mtx: Optional[torch.Tensor] = None,
+        device: Literal["cpu", "cuda"] = "cpu",
+    ) -> None:
         """Set up the data for the model.
 
         Parameters
         ----------
-        counts : torch.Tensor
-            Shape (n_genes, n_spots, n_isoforms).
-        design_mtx : torch.Tensor, optional
-            Shape (n_spots, n_covariates).
-        device : str, optional
+        counts
+            Shape (n_genes, n_spots, n_isos) or (n_spots, n_isos).
+            For batched calculations, all genes in the batch must have the same number of isoforms.
+        design_mtx
+            Shape (n_spots, n_factors). Design matrix of spatial covariates.
+            If None, an intercept-only design matrix will be used.
+        device
             'cpu' or 'cuda'. 'mps' currently not supported (torch.lgamma not supported on mps).
         """
         # need to switch to a different count model (e.g., Poisson) when only one isoform is provided
@@ -321,18 +392,29 @@ class MultinomGLM(BaseModel, nn.Module):
         alpha = torch.softmax(alpha, dim=-1)  # (n_genes, n_spots, n_isos)
         return alpha
 
-    def get_isoform_ratio(self):
-        """Extract the fitted isoform ratio across space."""
+    def get_isoform_ratio(self) -> torch.Tensor:
+        """Extract the fitted isoform ratio across space.
+
+        Returns
+        -------
+        ratio : torch.Tensor
+            Shape (n_genes, n_spots, n_isos), the fitted isoform ratio across space.
+        """
         return self._alpha().detach()  # (n_genes, n_spots, n_isos)
 
-    def forward(self):
-        """Calculate log probability given data."""
+    def forward(self) -> torch.Tensor:
+        """Calculate log probability given data.
+
+        Returns
+        -------
+        log_prob : torch.Tensor
+            Shape (n_genes,), the log probability for each gene.
+        """
         return log_prob_fastmult_batched(
             self._alpha().transpose(1, 2), self.counts.transpose(1, 2)
         )
 
-    """Functions to calculate Hessian.
-    """
+    # Functions to calculate Hessian.
 
     def _get_log_lik_gradient_beta_bias(self):
         """Get the gradient of the log joint probability wrt beta and bias."""
@@ -561,9 +643,26 @@ class MultinomGLM(BaseModel, nn.Module):
         diagnose: bool = False,
         verbose: bool = False,
         quiet: bool = False,
-        random_seed=None,
-    ):
-        """Fit the model using all data"""
+        random_seed: Optional[int] = None,
+    ) -> dict:
+        """Fit the model using all data
+
+        Parameters
+        ----------
+        diagnose
+            Whether to store parameter changes during training (passed to PatienceLogger).
+        verbose
+            Whether to print verbose information during fitting.
+        quiet
+            Whether to suppress output during fitting.
+        random_seed
+            Random seed for reproducibility.
+
+        Returns
+        -------
+        params_iter : dict or None
+            If `diagnose` is True, returns a dictionary of parameter changes during training. Otherwise returns None.
+        """
         if random_seed is not None:  # set random seed for reproducibility
             torch.manual_seed(random_seed)
 
@@ -654,7 +753,7 @@ class MultinomGLM(BaseModel, nn.Module):
 
         return logger.params_iter
 
-    def clone(self):
+    def clone(self) -> "MultinomGLM":
         """Clone a model with the same set of parameters."""
         new_model = type(self)(
             fitting_method=self.fitting_method, fitting_configs=self.fitting_configs
@@ -664,12 +763,12 @@ class MultinomGLM(BaseModel, nn.Module):
 
         return new_model
 
-    def update_params_from_dict(self, params):
+    def update_params_from_dict(self, params: dict) -> None:
         """Update a subset of model parameters with a dictionary of parameters.
 
         Parameters
         ----------
-        params : dict
+        params
             A dictionary of parameters to be updated. The keys must be
             existing parameter names in the model.
         """
@@ -681,57 +780,155 @@ class MultinomGLM(BaseModel, nn.Module):
 class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     """The Multinomial Generalized Linear Mixed Model for spatial isoform expression.
 
-    Y ~ Multinomial(alpha, Y.sum(1))
-    eta = multinomial-logit(alpha) = X @ beta + bias_eta + nu
-    nu ~ MVN(0, sigma^2 * (theta * V_sp + (1-theta) * I) =
-            MVN(0, sigma_sp^2 * V_sp + sigma_nsp^2 * I)
+    The model is defined as follows::
 
-    Given isoform counts of a gene Y (n_spots, n_isos) and design matrix X (n_spots, n_factors),
-    MultinomGLMM.fit will find the MAP estimates of the following learnable parameters:
-    - beta: (n_factors, n_isos - 1) covariate coefficients of the fixed effect term.
-    - bias_eta: (n_isos - 1) intercepts of the fixed effect term.
-    - nu: (n_spots, n_isos - 1) the random effect term.
-    - variance components: each of length n_isos - 1 or 1 if self.share_variance
-            if self.var_parameterization_sigma_theta: # by default, False
-                    - (sigma, theta):
-                            the total variance and the proportion of spatial variability of the random effect term.
-            else:
-                    - (sigma_sp, sigma_nsp):
-                            the spatial and non-spatial variance components of the random effect term.
+        Y ~ Multinomial(alpha, Y.sum(1))
+        eta = multinomial-logit(alpha) = X @ beta + bias_eta + nu
+        nu ~ MVN(0, sigma^2 * (theta * V_sp + (1-theta) * I) =
+             MVN(0, sigma_sp^2 * V_sp + sigma_nsp^2 * I)
+
+    Given isoform counts of a gene ``Y`` (n_spots, n_isos), design matrix ``X`` (n_spots, n_factors),
+    and spatial covariance matrix ``V_sp`` (n_spots, n_spots), the model estimates the isoform usage
+    ratio ``alpha`` (n_spots, n_isos) across space.
+    Specifically, `MultinomGLMM.fit` will find the MAP estimates of the following learnable parameters:
+
+    - ``beta``: (n_factors, n_isos - 1) covariate coefficients of the fixed effect term.
+    - ``bias_eta``: (n_isos - 1) intercepts of the fixed effect term.
+    - ``nu``: (n_spots, n_isos - 1) the random effect term.
+    - variance components: each of length n_isos - 1 (or 1 if `share_variance` is True).
+      If `var_parameterization_sigma_theta` is True, they are (``sigma``, ``theta_logit``),
+      representing total variance and logit of spatial variance proportion ``theta``.
+      Otherwise they are (``sigma_sp``, ``sigma_nsp``), representing spatial and non-spatial
+      variance components.
 
     Inference algorithms can be categorized into two types based on the optimization objective:
-    - Joint: Maximize the joint likelihood (with the random effect nu).
-            This is equivalent to the first-order Laplace approximation of the marginal likelihood.
-    - Marginal: Maximize the marginal likelihood (with the random effect nu integrated out).
-            The integral is approximated by a second-order Laplace approximation.
+
+    - Joint: Maximize the joint likelihood (with the random effect ``nu``).
+      This is equivalent to the first-order Laplace approximation of the marginal likelihood.
+    - Marginal: Maximize the marginal likelihood (with the random effect ``nu`` integrated out).
+      The integral is approximated by a second-order Laplace approximation.
 
     Methods implemented:
-    - 'joint_gd': Maximize the joint likelihood using gradient descent.
-    - 'joint_newton': Maximize the joint likelihood using Newton's method.
-    - 'marginal_gd': Maximize the marginal likelihood using gradient descent.
-    - 'marginal_newton': Maximize the marginal likelihood using Newton's method.
-            nu is first updated using Newton's method every 'update_nu_every_k' iterations, and
-            beta, bias_eta, and variance components are updated using gradient descent.
 
-    See README for complete details of the model.
+    - ``'joint_gd'``: Maximize the joint likelihood using gradient descent.
+    - ``'joint_newton'``: Maximize the joint likelihood using Newton's method.
+    - ``'marginal_gd'``: Maximize the marginal likelihood using gradient descent.
+    - ``'marginal_newton'``: Maximize the marginal likelihood using Newton's method.
+      In this method, ``nu`` is first updated using Newton's method every
+      ``'update_nu_every_k'`` iterations, and ``beta``, ``bias_eta``, and variance components
+      are updated using gradient descent.
 
-    TODO:
-    - Use a parameter to toggle between using `n_isos - 1` and `n_isos`. For `n_isos`,
-            other normalization methods are needed for Multinomial.
-    - Implement held-out likelihood for model selection.
+    Notes
+    -----
+    It is also possible to implement held-out likelihood for model selection.
+
+    Example
+    -------
+    >>> from splisosm.model import MultinomGLMM
+    >>> from splisosm.utils import get_cov_sp
+    >>> import torch
+    >>> # Generate synthetic data
+    >>> counts = torch.randint(0, 10, (5, 100, 3))  # 5 genes, 100 spots, each 3 isoforms
+    >>> coords = torch.rand(100, 2)  # 100 spots with 2D coordinates
+    >>> K_sp = get_cov_sp(coords, k=4, rho=0.9) # spatial covariance matrix of shape (100, 100)
+    >>> # Fit the GLMM model
+    >>> model = MultinomGLMM(fitting_method='joint_gd')
+    >>> model.setup_data(counts, corr_sp=K_sp, design_mtx=None)
+    >>> model.fit()
+    >>> print(model)
+    >>> # Extract the fitted isoform ratios
+    >>> isoform_ratios = model.get_isoform_ratio()  # shape (5, 100, 3)
+    >>> # Fitted parameters
+    >>> print(model.beta.shape)  # shape (5, 0, 2)
+    >>> print(model.bias_eta.shape)  # shape (5, 2)
+    >>> print(model.nu.shape)  # shape (5, 100, 2)
+    >>> print(model.sigma.shape)  # shape (5, 1)
+    >>> print(model.theta_logit.shape)  # shape (5, 1)
     """
+
+    share_variance: bool
+    """Whether to use the same variance across isoforms."""
+
+    var_parameterization_sigma_theta: bool
+    """Whether variance components are parameterized as (``sigma``, ``theta_logit``) or (``sigma_sp``, ``sigma_nsp``)."""
+
+    var_fix_sigma: bool
+    """Whether to fix the total variance (``sigma``) or not."""
+
+    var_prior_model: Literal["none", "gamma", "inv_gamma"]
+    """The prior model on the total variance ``sigma``."""
+
+    var_prior_model_params: dict
+    """The parameters for the prior model on the total variance ``sigma``."""
+
+    init_ratio: Literal["observed", "uniform"]
+    """The initialization method for the logit isoform usage ratio ``gamma``."""
+
+    fitting_method: Literal[
+        "joint_gd", "joint_newton", "marginal_gd", "marginal_newton"
+    ]
+    """The fitting method to use."""
+
+    fitting_configs: dict
+    """A dictionary of fitting configurations."""
+
+    fitting_time: float
+    """The time taken to fit the model."""
 
     def __init__(
         self,
         share_variance: bool = True,
         var_parameterization_sigma_theta: bool = True,
         var_fix_sigma: bool = True,
-        var_prior_model: str = "none",
+        var_prior_model: Literal["none", "gamma", "inv_gamma"] = "none",
         var_prior_model_params: dict = {},
-        init_ratio: str = "observed",
-        fitting_method: str = "joint_gd",
+        init_ratio: Literal["observed", "uniform"] = "observed",
+        fitting_method: Literal[
+            "joint_gd", "joint_newton", "marginal_gd", "marginal_newton"
+        ] = "joint_gd",
         fitting_configs: dict = {},
     ):
+        """
+        Parameters
+        ----------
+        share_variance
+            Whether to use the same variance across isoforms. If True, the variance components
+            will be of length 1. If False, the variance components will be of length n_isos - 1.
+        var_parameterization_sigma_theta
+            Whether to parameterize the variance components as (``sigma``, ``theta_logit``) or (``sigma_sp``, ``sigma_nsp``).
+            If True, the variance components will be (``sigma``, ``theta_logit``), where ``sigma`` is the total variance and
+            ``theta_logit`` is the logit of the spatial variance proportion.
+            If False, the variance components will be (``sigma_sp``, ``sigma_nsp``), where ``sigma_sp`` is the spatial
+            variance and ``sigma_nsp`` is the non-spatial variance.
+        var_fix_sigma
+            Whether to fix the total variance (``sigma``) or not. If True, the total variance will be fixed to the initial value,
+            which is the average per-spot variance of isoform counts normalized by its mean expression.
+            See `MultinomGLMM._initialize_params` for details.
+        var_prior_model
+            The prior model on the total variance ``sigma``. Default is ``'none'`` with no prior.
+            Other options are ``'gamma'`` (Gamma prior) and ``'inv_gamma'`` (Inverse Gamma prior).
+        var_prior_model_params
+            The parameters for the prior model on the total variance ``sigma``.
+            For ``'gamma'``, the default parameters are ``{'alpha': 2.0, 'beta': 0.3}``.
+            For ``'inv_gamma'``, the default parameters are ``{'alpha': 3, 'beta': 0.5}``.
+        init_ratio
+            The initialization method for the logit isoform usage ratio. Options are ``'observed'`` (initialize using observed counts)
+            and ``'uniform'`` (equal isoform usage across space).
+        fitting_method
+            The fitting method to use. Options are ``'joint_gd'`` (joint likelihood with gradient descent),
+            ``'joint_newton'`` (joint likelihood with Newton's method),
+            ``'marginal_gd'`` (marginal likelihood with gradient descent),
+            and ``'marginal_newton'`` (marginal likelihood with Newton's method).
+        fitting_configs
+            A dictionary of fitting configurations with the following keys:
+
+            - ``'lr'``: float, learning rate
+            - ``'optim'``: str, optimization method (one of ``'adam'``, ``'sgd'``, or ``'lbfgs'``)
+            - ``'tol'``: float, tolerance for convergence
+            - ``'max_epochs'``: int, maximum number of epochs
+            - ``'patience'``: int, number of epochs to wait for improvement before stopping
+            - ``'update_nu_every_k'``: int, number of iterations to update ``nu`` when using ``fitting_method='marginal_newton'``
+        """
         super().__init__()
 
         # specify the parameterization of variance components
@@ -837,7 +1034,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             + "- Variance formulation:\n"
             + f"\t* Parameterized using sigma and theta: {self.var_parameterization_sigma_theta}\n"
             + f"\t* Learnable variance: {not self.var_fix_sigma}\n"
-            + f"\t* Same variance across classes: {self.share_variance}\n"
+            + f"\t* Same variance across isoforms: {self.share_variance}\n"
             + f"\t* Prior on total variance: {self.var_prior_model}\n"
             + f"- Initialization method: {self.init_ratio}\n"
             + f"- Fitting method: {self.fitting_method}"
@@ -845,29 +1042,34 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
     def setup_data(
         self,
-        counts,
-        corr_sp=None,
-        design_mtx=None,
-        device="cpu",
-        corr_sp_eigvals=None,
-        corr_sp_eigvecs=None,
-    ):
+        counts: torch.Tensor,
+        corr_sp: Optional[torch.Tensor] = None,
+        design_mtx: Optional[torch.Tensor] = None,
+        device: Literal["cpu", "cuda"] = "cpu",
+        corr_sp_eigvals: Optional[torch.Tensor] = None,
+        corr_sp_eigvecs: Optional[torch.Tensor] = None,
+    ) -> None:
         """Set up the data for the model.
 
         Parameters
         ----------
-        counts : torch.Tensor
-            Shape (n_genes, n_spots, n_isoforms).
-        corr_sp : torch.Tensor, optional
+        counts
+            Shape (n_genes, n_spots, n_isoforms) or (n_spots, n_isoforms).
+            For batched calculations, all genes in the batch must have the same number of isoforms.
+        corr_sp
             Shape (n_spots, n_spots), spatial covariance matrix.
-        design_mtx : torch.Tensor, optional
-            Shape (n_spots, n_covariates).
-        device : str, optional
+            If None, the eigendecomposition of the spatial covariance matrix must be provided.
+        design_mtx
+            Shape (n_spots, n_factors). Design matrix of spatial covariates.
+            If None, an intercept-only design matrix will be used.
+        device
             'cpu' or 'cuda'. 'mps' currently not supported (torch.lgamma not supported on mps).
-        corr_sp_eigvals : torch.Tensor, optional
+        corr_sp_eigvals
             Shape (n_spots,), eigenvalues of spatial covariance.
-        corr_sp_eigvecs : torch.Tensor, optional
+            If None, the spatial covariance matrix `corr_sp` must be provided.
+        corr_sp_eigvecs
             Shape (n_spots, n_spots), eigenvectors of spatial covariance.
+            If None, the spatial covariance matrix `corr_sp` must be provided.
         """
         # need to switch to a different count model (e.g., Poisson) when only one isoform is provided
 
@@ -890,6 +1092,10 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             )
         # set model dimensions based on the input shape
         self.n_genes, self.n_spots, self.n_isos = counts.shape
+
+        # switch to float type
+        if not counts.dtype.is_floating_point:
+            counts = counts.float()
 
         if design_mtx is None:
             # initialize an empty design matrix of shape (1, n_spots, 0)
@@ -1047,8 +1253,14 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     """Below are a bunch of helper functions to update intermediate variables after each optimization step.
     """
 
-    def var_total(self):
-        """Output the total variance."""
+    def var_total(self) -> torch.Tensor:
+        """Output the total variance.
+
+        Returns
+        -------
+        var_total : torch.Tensor
+            The total variance ``sigma`` of shape (n_genes, n_var_components).
+        """
         if self.var_parameterization_sigma_theta:
             var_total = self.sigma**2
         else:
@@ -1059,8 +1271,14 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         var_total = torch.clip(var_total, min=1e-2)  # (n_genes, n_var_components)
         return var_total
 
-    def var_sp_prop(self):
-        """Output the proporptions of the spatial variance."""
+    def var_sp_prop(self) -> torch.Tensor:
+        """Output the proporptions of the spatial variance.
+
+        Returns
+        -------
+        var_sp_prop : torch.Tensor
+            The proportion ``theta`` of spatial variance of shape (n_genes, n_var_components).
+        """
         # return: (n_genes, n_var_components)
         if self.var_parameterization_sigma_theta:
             return torch.sigmoid(self.theta_logit)
@@ -1116,8 +1334,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         # eta.shape = (n_genes, n_spots, n_isos - 1)
         return self.nu + self.X_spot.matmul(self.beta) + self.bias_eta.unsqueeze(1)
 
-    """Functions to calculate log likelihoods.
-    """
+    # Functions to calculate log likelihoods.
 
     def _calc_log_prob_prior_sigma(self):
         """Calculate log prob of the prior on sigma."""
@@ -1176,8 +1393,14 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         return log_prob - 0.5 * logdet_neg_hessian  # (n_genes,)
 
-    def forward(self):
-        """Calculate the log-likelihood or log-marginal-likelihood of the model."""
+    def forward(self) -> torch.Tensor:
+        """Calculate the log-likelihood or log-marginal-likelihood of the model.
+
+        Returns
+        -------
+        log_prob : torch.Tensor
+            Shape (n_genes,), the log probability for each gene.
+        """
         if self.fitting_method in ["marginal_gd", "marginal_newton"]:
             # calculate log marginal prob
             return self._calc_log_prob_marginal()  # (n_genes,)
@@ -1185,8 +1408,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             # calculate log joint prob given data
             return self._calc_log_prob_joint()  # (n_genes,)
 
-    """Functions to calculate Hessian.
-    """
+    # Functions to calculate Hessian.
 
     def _get_log_lik_hessian_nu(self):
         """Get the Hessian matrix of the log joint probability wrt the random effect nu."""
@@ -1613,9 +1835,26 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         diagnose: bool = False,
         verbose: bool = False,
         quiet: bool = False,
-        random_seed=None,
-    ):
-        """Fit the model using all data"""
+        random_seed: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Fit the model using all data
+
+        Parameters
+        ----------
+        diagnose
+            Whether to store parameter changes during training (passed to PatienceLogger).
+        verbose
+            Whether to print verbose information during fitting.
+        quiet
+            Whether to suppress output during fitting.
+        random_seed
+            Random seed for reproducibility.
+
+        Returns
+        -------
+        params_iter : dict or None
+            If `diagnose` is True, returns a dictionary of parameter changes during training. Otherwise returns None.
+        """
         self._configure_optimizer(verbose=verbose)
         diag_outputs = self._fit(
             diagnose=diagnose, verbose=verbose, quiet=quiet, random_seed=random_seed
@@ -1623,7 +1862,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         if diagnose:
             return diag_outputs
 
-    def clone(self):
+    def clone(self) -> "MultinomGLMM":
         """Clone a Multinomial GLMM model with the same set of parameters."""
         new_model = type(self)(
             share_variance=self.share_variance,

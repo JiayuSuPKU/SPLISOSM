@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import warnings
 import json
-from typing import Any, Optional, Union
+from typing import Any, Optional, Literal
 
 from pathlib import Path
 import numpy as np
+from numpy.typing import ArrayLike
 import scipy.sparse
 from tqdm import tqdm
 import pandas as pd
@@ -27,16 +28,23 @@ __all__ = [
 ]
 
 
-def get_cov_sp(coords, k=4, rho=0.99):
+def get_cov_sp(
+    coords: np.ndarray | torch.Tensor, k: int = 4, rho: float = 0.99
+) -> torch.Tensor:
     """Wrapper function to get the spatial covariance matrix from spatial coordinates.
+
+    It will first construct a mutual-k-nearest neighbor graph from the euclidean spatial coordinates,
+    then convert the adjacency matrix to a standardized spatial covariance matrix using the
+    intrinsic conditional autoregressive (ICAR) model with spatial autocorrelation coefficient rho.
+    See :cite:`su2023smoother` for details.
 
     Parameters
     ----------
-    coords : array-like
-        Shape (n_spots, 2). Spatial coordinates of spots.
-    k : int, optional
+    coords
+        Shape (n_spots, n_dims). Euclidean spatial coordinates of spots.
+    k
         Number of nearest neighbors.
-    rho : float, optional
+    rho
         Spatial autocorrelation coefficient.
 
     Returns
@@ -62,31 +70,42 @@ def get_cov_sp(coords, k=4, rho=0.99):
     return cov_sp
 
 
-def counts_to_ratios(counts, transformation="none", nan_filling="mean"):
-    """Convert counts to proportions.
+def counts_to_ratios(
+    counts: np.ndarray | torch.Tensor,
+    transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
+    nan_filling: Literal["mean", "none"] = "mean",
+) -> torch.Tensor:
+    """Convert isoform counts to proportions.
 
-    Note: the kernel in Aitchison geometry (euclidean distance after clr transformation) is sensitive to zeroes.
-    For data with many near-zero proportions, it is recommended to using the radial transformation instead.
-    See:
-        Park, Junyoung, et al. "Kernel methods for radial transformed compositional data with many zeros."
-        International Conference on Machine Learning. PMLR, 2022.
-        https://proceedings.mlr.press/v162/park22d/park22d.pdf
+    By default, isoform ratios at zero-coverage spots are filled with the mean ratio per isoform across all spots.
+    After conversion, the isoform ratios can be further transformed using log-ratio-based transformations
+    (clr, ilr, alr) or radial transformation :cite:`park2022kernel`.
 
     Parameters
     ----------
-    counts : torch.Tensor
+    counts
         Shape (n_spots, n_isos). Isoform counts.
-    transformation : str, optional
-        Transformation applied to the proportions. One of "none", "clr", "ilr", "alr", "radial".
-    nan_filling : str, optional
-        Method to fill all zero rows. One of "mean", "none".
-        - "mean": fill missing values with the mean of the mean per column **before transformation**.
-        - "none": do not fill missing values and return NaNs.
+    transformation
+        Transformation applied to the proportions. Can be one of the following:
+        ``'none'``: no transformation, return isoform ratios.
+        ``'clr'``: centered log-ratio transformation.
+        ``'ilr'``: isometric log-ratio transformation.
+        ``'alr'``: additive log-ratio transformation.
+        ``'radial'``: radial transformation :cite:`park2022kernel`.
+    nan_filling
+        Method to fill all-zero rows.
+        ``'mean'``: fill all-zero rows with the mean of the mean per column **before transformation**.
+        ``'none'``: do not fill rows and return NaNs at all-zero rows.
 
     Returns
     -------
     ratios : torch.Tensor
         Shape (n_spots, n_isos) or (n_spots, n_isos - 1) if ilr or alr transformation is used.
+
+    Notes
+    -----
+    Log-ratio-based transformations (clr, ilr, alr) are implemented via ``scikit-bio``, with
+    a pseudocount of 1% of the global mean per isoform to avoid zeros in the ratio.
     """
     assert transformation in ["none", "clr", "ilr", "alr", "radial"]
     if transformation in ["clr", "ilr", "alr"]:
@@ -140,7 +159,9 @@ def counts_to_ratios(counts, transformation="none", nan_filling="mean"):
 
 # From scipy v1.13.1
 # https://github.com/scipy/scipy/blob/v1.13.1/scipy/stats/_morestats.py#L4737
-def false_discovery_control(ps, *, axis=0, method="bh"):
+def false_discovery_control(
+    ps: ArrayLike, *, axis: Optional[int] = 0, method: Literal["bh", "by"] = "bh"
+) -> np.ndarray:
     """Adjust p-values to control the false discovery rate.
 
     The false discovery rate (FDR) is the expected proportion of rejected null
@@ -150,69 +171,30 @@ def false_discovery_control(ps, *, axis=0, method="bh"):
 
     Parameters
     ----------
-    ps : 1D array_like
+    ps
         The p-values to adjust. Elements must be real numbers between 0 and 1.
-    axis : int
+    axis
         The axis along which to perform the adjustment. The adjustment is
         performed independently along each axis-slice. If `axis` is None, `ps`
         is raveled before performing the adjustment.
-    method : {'bh', 'by'}
+    method
         The false discovery rate control procedure to apply: ``'bh'`` is for
-        Benjamini-Hochberg [1]_ (Eq. 1), ``'by'`` is for Benjaminini-Yekutieli
-        [2]_ (Theorem 1.3). The latter is more conservative, but it is
+        Benjamini-Hochberg :cite:`benjamini1995controlling` (Eq. 1), ``'by'`` is for Benjaminini-Yekutieli
+        :cite:`benjamini2001control` (Theorem 1.3). The latter is more conservative, but it is
         guaranteed to control the FDR even when the p-values are not from
         independent tests.
 
     Returns
     -------
-    ps_adjusted : array_like
+    ps_adjusted : numpy.ndarray
         The adjusted p-values. If the null hypothesis is rejected where these
         fall below a specified level, the false discovery rate is controlled
         at that level.
 
-    See Also
-    --------
-    combine_pvalues
-    statsmodels.stats.multitest.multipletests
-
     Notes
     -----
-    In multiple hypothesis testing, false discovery control procedures tend to
-    offer higher power than familywise error rate control procedures (e.g.
-    Bonferroni correction [1]_).
-
-    If the p-values correspond with independent tests (or tests with
-    "positive regression dependencies" [2]_), rejecting null hypotheses
-    corresponding with Benjamini-Hochberg-adjusted p-values below :math:`q`
-    controls the false discovery rate at a level less than or equal to
-    :math:`q m_0 / m`, where :math:`m_0` is the number of true null hypotheses
-    and :math:`m` is the total number of null hypotheses tested. The same is
-    true even for dependent tests when the p-values are adjusted accorded to
-    the more conservative Benjaminini-Yekutieli procedure.
-
-    The adjusted p-values produced by this function are comparable to those
-    produced by the R function ``p.adjust`` and the statsmodels function
-    `statsmodels.stats.multitest.multipletests`. Please consider the latter
-    for more advanced methods of multiple comparison correction.
-
-    References
-    ----------
-    .. [1] Benjamini, Yoav, and Yosef Hochberg. "Controlling the false
-           discovery rate: a practical and powerful approach to multiple
-           testing." Journal of the Royal statistical society: series B
-           (Methodological) 57.1 (1995): 289-300.
-
-    .. [2] Benjamini, Yoav, and Daniel Yekutieli. "The control of the false
-           discovery rate in multiple testing under dependency." Annals of
-           statistics (2001): 1165-1188.
-
-    .. [3] TileStats. FDR - Benjamini-Hochberg explained - Youtube.
-           https://www.youtube.com/watch?v=rZKa4tW2NKs.
-
-    .. [4] Neuhaus, Karl-Ludwig, et al. "Improved thrombolysis in acute
-           myocardial infarction with front-loaded administration of alteplase:
-           results of the rt-PA-APSAC patency study (TAPS)." Journal of the
-           American College of Cardiology 19.5 (1992): 885-891.
+    From `scipy.stats.false_discovery_control` in SciPy v1.13.1.
+    See https://github.com/scipy/scipy/blob/v1.13.1/scipy/stats/_morestats.py#L4737.
     """
     # Input Validation and Special Cases
     ps = np.asarray(ps)
@@ -286,22 +268,22 @@ def false_discovery_control(ps, *, axis=0, method="bh"):
 # Similar to scanpy.read_visium
 # https://github.com/scverse/scanpy/blob/main/scanpy/readwrite.py#L356-L512
 def load_visium_sp_meta(
-    adata: AnnData, path_to_spatial: Union[str, Path], library_id: Optional[str] = None
+    adata: AnnData, path_to_spatial: str | Path, library_id: Optional[str] = None
 ) -> AnnData:
     """Helper function to load Visium spatial metadata.
 
     Parameters
     ----------
-    adata : AnnData
+    adata
         Annotated data matrix to store the spatial metadata.
-    path_to_spatial : str or Path
-        Path to the spatial folder generated by spaceranger.
-    library_id : str, optional
+    path_to_spatial
+        Path to the `spatial` folder generated by Space Ranger.
+    library_id
         Library ID of the spatial data.
 
     Returns
     -------
-    AnnData
+    anndata : anndata.AnnData
         AnnData with spatial metadata.
     """
     if library_id is None:  # default library_id
@@ -379,29 +361,29 @@ def extract_counts_n_ratios(
 
     Parameters
     ----------
-    adata : AnnData
+    adata
         Annotated data matrix.
-    layer : str, optional
+    layer
         Layer to extract isoform counts (adata.layers[layer]).
-    group_iso_by : str, optional
+    group_iso_by
         Gene index in adata.var to group isoforms by.
-    return_sparse : bool, optional
+    return_sparse
         Whether to return sparse torch tensors for counts_list.
-        If True, ratios_list will be empty and ratio_obs_merged will be None.
-    filter_single_iso_genes : bool, optional
+        If True, `ratios_list` will be empty and `ratio_obs_merged` will be None.
+    filter_single_iso_genes
         Whether to filter out genes with only one isoform.
         By default True for compatibility with splisosm models.
 
     Returns
     -------
-    counts_list : list of torch.Tensor
+    counts_list : list[torch.Tensor]
         Isoform counts per gene, each of shape (n_spots, n_isos).
-    ratios_list : list of torch.Tensor
+    ratios_list : list[torch.Tensor]
         Isoform ratios per gene, each of shape (n_spots, n_isos).
-    gene_name_list : list of str
+    gene_name_list : list[str]
         Gene names.
-    ratio_obs_merged : np.ndarray or None
-        Observed isoform ratios, shape (n_spots, n_isos_total), or None if return_sparse is True.
+    ratio_obs_merged : np.ndarray | None
+        Observed isoform ratios, shape (n_spots, n_isos_total), or None if `return_sparse` is True.
     """
     # extract isoform counts
     iso_counts = adata.layers[layer]  # (n_spots, n_isos_total)
@@ -488,23 +470,24 @@ def extract_gene_level_statistics(
 
     Parameters
     ----------
-    adata : AnnData
+    adata
         Annotated data matrix.
-    layer : str, optional
+    layer
         Layer to extract isoform counts (adata.layers[layer]).
-    group_iso_by : str, optional
+    group_iso_by
         Gene index in adata.var to group isoforms by.
 
     Returns
     -------
-    pd.DataFrame
+    pandas.DataFrame
         Gene-level metadata with columns:
-        - n_iso: int. Number of isoforms per gene.
-        - pct_spot_on: float. Percentage of spots with non-zero counts.
-        - count_avg: float. Average counts per gene.
-        - count_std: float. Standard deviation of counts per gene.
-        - perplexity: float. Expression-based effective number of isoforms.
-        - major_ratio_avg: float. Average ratio of the major isoform.
+
+        - ``'n_iso'``: int. Number of isoforms per gene.
+        - ``'pct_spot_on'``: float. Percentage of spots with non-zero counts.
+        - ``'count_avg'``: float. Average counts per gene.
+        - ``'count_std'``: float. Standard deviation of counts per gene.
+        - ``'perplexity'``: float. Expression-based effective number of isoforms.
+        - ``'major_ratio_avg'``: float. Average ratio of the major isoform.
     """
     # extract isoform counts
     iso_counts = adata.layers[layer]  # (n_spots, n_isos_total)
@@ -578,26 +561,29 @@ def extract_gene_level_statistics(
 
 
 def run_sparkx(
-    counts_gene: Union[np.ndarray, torch.Tensor],
-    coordinates: Union[np.ndarray, torch.Tensor],
+    counts_gene: np.ndarray | torch.Tensor,
+    coordinates: np.ndarray | torch.Tensor,
 ) -> dict[str, Any]:
     """Wrapper for running the SPARK-X test for spatial gene expression variability.
 
+    It runs the R-package SPARK :cite:`zhu2021spark` via rpy2.
+
     Parameters
     ----------
-    counts_gene : np.ndarray or torch.Tensor
+    counts_gene
         Shape (n_spots, n_genes), the observed gene counts.
-    coordinates : np.ndarray or torch.Tensor
+    coordinates
         Shape (n_spots, 2), the spatial coordinates.
 
     Returns
     -------
     dict
         Results of the SPARK-X spatial variability test with keys:
-        - 'statistic': np.ndarray of shape (n_genes,). Mean SPARK-X statistics.
-        - 'pvalue': np.ndarray of shape (n_genes,). Combined p-values.
-        - 'pvalue_adj': np.ndarray of shape (n_genes,). Adjusted combined p-values.
-        - 'method': str. Method name "spark-x".
+
+        - ``'statistic'``: np.ndarray of shape (n_genes,). Mean SPARK-X statistics.
+        - ``'pvalue'``: np.ndarray of shape (n_genes,). Combined p-values.
+        - ``'pvalue_adj'``: np.ndarray of shape (n_genes,). Adjusted combined p-values.
+        - ``'method'``: str. Method name "spark-x".
     """
     if scipy.sparse.issparse(counts_gene):
         raise ValueError("run_sparkx does not support sparse input for counts_gene.")
@@ -646,8 +632,8 @@ def run_sparkx(
 
 
 def run_hsic_gc(
-    counts_gene: Union[np.ndarray, torch.Tensor],
-    coordinates: Union[np.ndarray, torch.Tensor],
+    counts_gene: np.ndarray | torch.Tensor,
+    coordinates: np.ndarray | torch.Tensor,
     approx_rank: Optional[int] = None,
     **spatial_kernel_kwargs: Any,
 ) -> dict[str, Any]:
@@ -657,23 +643,24 @@ def run_hsic_gc(
 
     Parameters
     ----------
-    counts_gene : np.ndarray or torch.Tensor
+    counts_gene
         Shape (n_spots, n_genes). Gene counts.
-    coordinates : np.ndarray or torch.Tensor
+    coordinates
         Shape (n_spots, 2). Spatial coordinates of spots.
-    approx_rank : int, optional
+    approx_rank
         Approximate rank of the spatial kernel matrix.
-    **spatial_kernel_kwargs : Any
+    **spatial_kernel_kwargs
         Additional arguments for SpatialCovKernel.
 
     Returns
     -------
     dict
         Results of the HSIC-GC spatial variability test with keys:
-        - 'statistic': np.ndarray of shape (n_genes,). HSIC-GC statistics.
-        - 'pvalue': np.ndarray of shape (n_genes,). P-values.
-        - 'pvalue_adj': np.ndarray of shape (n_genes,). Adjusted p-values.
-        - 'method': str. Method name "hsic-gc".
+
+        - ``'statistic'``: np.ndarray of shape (n_genes,). HSIC-GC statistics.
+        - ``'pvalue'``: np.ndarray of shape (n_genes,). P-values.
+        - ``'pvalue_adj'``: np.ndarray of shape (n_genes,). Adjusted p-values.
+        - ``'method'``: str. Method name "hsic-gc".
     """
 
     from splisosm.kernel import SpatialCovKernel

@@ -1,10 +1,11 @@
 import scipy
 import numpy as np
 import torch
+from typing import Literal
 from abc import ABC, abstractmethod
 from smoother.weights import coordinate_to_weights_knn_sparse, sparse_weights_to_inv_cov
 
-__all__ = ["Kernel", "SpatialCovKernel"]
+__all__ = ["SpatialCovKernel"]
 
 
 class Kernel(ABC):
@@ -61,57 +62,53 @@ class Kernel(ABC):
 
 
 class SpatialCovKernel(Kernel):
-    """Graph-based spatial covariance kernel built from spot coordinates.
+    """Graph-based spatial covariance kernel built from spot coordinates."""
 
-    Parameters
-    ----------
-    coords : np.ndarray or torch.Tensor
-        Spot coordinates of shape ``(n_spots, 2)``.
-    k_neighbors : int, optional
-        Number of nearest neighbors used to build the graph.
-    model : str, optional
-        Spatial process model for inverse covariance construction. Supported
-        values are ``'icar'``, ``'car'``, ``'isar'``, and ``'sar'``.
-    rho : float, optional
-        Spatial autocorrelation coefficient.
-    standardize_cov : bool, optional
-        If ``True``, scales covariance to unit marginal variance.
-    centering : bool, optional
-        If ``True``, applies centering so row/column sums are approximately
-        zero.
-    approx_rank : int, optional
-        If provided, computes and stores a rank-``approx_rank`` factorization.
+    inv_cov: torch.Tensor
+    """Sparse precision matrix (aka inverse spatial kernel) of shape (n_spots, n_spots)."""
 
-    Attributes
-    ----------
-    inv_cov : torch.Tensor
-        Sparse inverse covariance matrix.
-    K_sp : torch.Tensor or None
-        Dense kernel matrix when full-rank storage is used.
-    Q : torch.Tensor or None
-        Low-rank factor such that ``K_sp ~= Q @ Q.T``.
+    K_sp: torch.Tensor | None
+    """
+    Dense kernel matrix of shape (n_spots, n_spots) when full-rank storage is used.
+    ``None`` when low-rank storage is used.
+    """
 
-    Methods
-    -------
-    realization()
-        Return dense kernel realization.
-    xtKx(x)
-        Compute ``x.T @ K @ x``.
-    eigenvalues(k=None)
-        Return leading kernel eigenvalues.
+    Q: torch.Tensor | None
+    """
+    Low-rank factor of shape (n_spots, rank) such that ``K_sp ~= Q @ Q.T``.
+    ``None`` when full-rank storage is used.
     """
 
     def __init__(
         self,
         coords: np.ndarray | torch.Tensor,
         k_neighbors: int = 4,
-        model: str = "icar",
+        model: Literal["icar", "car", "isar", "sar"] = "icar",
         rho: float = 0.99,
         standardize_cov: bool = True,
         centering: bool = False,
         approx_rank: int | None = None,
     ) -> None:
-        """Initialize a spatial covariance kernel."""
+        """
+        Parameters
+        ----------
+        coords
+            Spot coordinates of shape (n_spots, 2).
+        k_neighbors
+            Number of nearest neighbors used to build the graph.
+        model
+            Spatial process model for inverse covariance construction. Supported
+            values are ``'icar'``, ``'car'``, ``'isar'``, and ``'sar'``.
+        rho
+            Spatial autocorrelation coefficient.
+        standardize_cov
+            If True, scales covariance to unit marginal variance.
+        centering
+            If True, applies centering so row/column sums are approximately
+            zero.
+        approx_rank
+            If provided, computes and stores a rank-`approx_rank` factorization.
+        """
         # store the configurations
         self._configs = {
             "k_neighbors": k_neighbors,
@@ -225,7 +222,7 @@ class SpatialCovKernel(Kernel):
         Returns
         -------
         tuple of int
-            Pair ``(n_spots, n_spots)``.
+            Pair (n_spots, n_spots).
         """
         return self.inv_cov.shape
 
@@ -245,7 +242,7 @@ class SpatialCovKernel(Kernel):
         Returns
         -------
         torch.Tensor
-            Dense matrix of shape ``(n_spots, n_spots)``.
+            Dense matrix of shape (n_spots, n_spots).
         """
         if self.K_sp is not None:
             return self.K_sp
@@ -258,12 +255,12 @@ class SpatialCovKernel(Kernel):
         Parameters
         ----------
         x : torch.Tensor
-            Input matrix of shape ``(n_spots, d)``.
+            Input matrix of shape (n_spots, d).
 
         Returns
         -------
         torch.Tensor
-            Quadratic form of shape ``(d, d)``.
+            Quadratic form of shape (d, d).
         """
         if self.K_sp is not None:  # use the full rank kernel matrix
             return x.t() @ self.K_sp @ x
@@ -276,8 +273,8 @@ class SpatialCovKernel(Kernel):
 
         Parameters
         ----------
-        k : int, optional
-            Number of leading eigenvalues to return. If ``None``, all
+        k
+            Number of leading eigenvalues to return. If None, all
             available eigenvalues are returned.
 
         Returns

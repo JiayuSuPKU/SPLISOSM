@@ -25,6 +25,7 @@ Welcome
    :caption: API Reference
 
    autoapi/splisosm/index
+   refs
 
 `SPLISOSM (SPatiaL ISOform Statistical Modeling) <https://github.com/JiayuSuPKU/splisosm>`_ is a Python package
 for analyzing RNA isoform patterns in spatial transcriptomics (ST) data. It employs multivariate kernel association tests to detect (i) *spatial variability* in

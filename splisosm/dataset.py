@@ -6,12 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
 from typing import Any, Iterator, Optional
 
-__all__ = [
-    "sparse_collate",
-    "UngroupedIsoDataset",
-    "GroupedIsoDataset",
-    "IsoDataset",
-]
+__all__ = ["IsoDataset"]
 
 
 def sparse_collate(batch: list[Any]) -> Any:
@@ -38,25 +33,25 @@ def sparse_collate(batch: list[Any]) -> Any:
 
 
 class UngroupedIsoDataset(Dataset):
-    """Dataset for spatial isoform expression.
+    """Per-gene dataset for training GLM and GLMM model.
 
-    Parameters
-    ----------
-    data : list of torch.Tensor
-        List of tensors with shape (n_spots, n_isos).
-    gene_names : list of str
-        Gene names.
+    Genes are not grouped by the number of isoforms and are stored separatedly
+    as a list of per-gene tensors.
+    Each iteration returns a dictionary containing the following keys:
+
+    - ``x``: torch.Tensor, isoform counts of the gene, shape (n_spots, n_isos).
+    - ``n_isos``: int, number of isoforms for the gene.
+    - ``gene_name``: str, name of the gene.
     """
 
     def __init__(self, data: list[torch.Tensor], gene_names: list[str]) -> None:
-        """Initialize the dataset.
-
+        """
         Parameters
         ----------
-        data : list of torch.Tensor
-            List of tensors with shape (n_spots, n_isos).
-        gene_names : list of str
-            Gene names.
+        data
+            List of tensors each with shape (n_spots, n_isos).
+        gene_names
+            List of gene names.
         """
         self.n_genes = len(data)  # number of genes
         self.n_spots = len(data[0])  # number of spots
@@ -85,25 +80,25 @@ class UngroupedIsoDataset(Dataset):
 
 
 class GroupedIsoDataset(Dataset):
-    """Dataset for spatial isoform expression per gene group.
+    """Grouped dataset for training GLM and GLMM model.
 
-    Parameters
-    ----------
-    data : torch.Tensor
-        Shape (n_genes, n_spots, n_isos), genes are grouped by the number of isoforms.
-    gene_names : list of str
-        Gene names.
+    Genes with the same number of isoforms are grouped and stored together
+    as a 3D tensor of shape (n_genes, n_spots, n_isos).
+    Each iteration returns a dictionary containing the following keys:
+
+    - ``x``: torch.Tensor, isoform counts of the gene, shape (n_spots, n_isos).
+    - ``n_isos``: int, number of isoforms for the gene.
+    - ``gene_name``: str, name of the gene.
     """
 
     def __init__(self, data: torch.Tensor, gene_names: list[str]) -> None:
-        """Initialize the dataset.
-
+        """
         Parameters
         ----------
-        data : torch.Tensor
+        data
             Shape (n_genes, n_spots, n_isos), genes are grouped by number of isoforms.
-        gene_names : list of str
-            Gene names.
+        gene_names
+            List of gene names.
         """
         self.n_genes, self.n_spots, self.n_isos = data.shape
         assert (
@@ -131,17 +126,52 @@ def _iters_merger(*iters):
 
 
 class IsoDataset:
-    """Dataset for spatial isoform expression.
+    """Dataset for batched training of GLM and GLMM models.
 
-    Parameters
-    ----------
-    data : list of torch.Tensor
-        List of tensors with shape (n_spots, n_isos).
-    gene_names : list of str, optional
-        Gene names.
-    group_gene_by_n_iso : bool, optional
-        Whether to group genes by the number of isoforms.
+    `IsoDataset.get_dataloader` returns a DataLoader that yields batches of genes for training.
+
+    If `group_gene_by_n_iso` is True, genes with the same number of isoforms are grouped together
+    and stored as a 3D tensor of shape (n_genes, n_spots, n_isos).
+    Otherwise, genes are stored as a list of per-gene tensors of shape (n_spots, n_isos).
+
+    Example
+    -------
+    >>> from splisosm.dataset import IsoDataset
+    >>> import torch
+    >>> # Simulate data for 10 genes with different number of isoforms
+    >>> data_3_iso = [torch.randn(100, 3) for _ in range(5)]  # 5 genes with 3 isoforms
+    >>> data_4_iso = [torch.randn(100, 4) for _ in range(5)]  # 5 genes with 4 isoforms
+    >>> data = data_3_iso + data_4_iso
+    >>> gene_names = [f"gene_{i}" for i in range(10)]
+    >>> dataset = IsoDataset(data, gene_names, group_gene_by_n_iso=True)
+    >>> # Get dataloader for batched training
+    >>> dataloader = dataset.get_dataloader(batch_size=2)
+    >>> batch = next(iter(dataloader))
     """
+
+    data: list[torch.Tensor]
+    """Input list of per-gene isoform count tensor."""
+
+    group_by_n_iso: bool
+    """Whether to group genes by the number of isoforms."""
+
+    dataset: list[Dataset]
+    """
+    If `group_by_n_iso` is True, a list of ``GroupedIsoDataset`` where isoform counts are stored as 3D tensors.
+    Otherwise, a list of ``UngroupedIsoDataset`` where isoform counts are stored as a list of 2D tensors.
+    """
+
+    gene_name: list[str]
+    """List of gene names."""
+
+    n_genes: int
+    """Number of genes."""
+
+    n_spots: int
+    """Number of spots."""
+
+    n_isos_per_gene: list[int]
+    """List of numbers of isoforms per gene."""
 
     def __init__(
         self,
@@ -149,15 +179,14 @@ class IsoDataset:
         gene_names: Optional[list[str]] = None,
         group_gene_by_n_iso: bool = False,
     ) -> None:
-        """Initialize the dataset.
-
+        """
         Parameters
         ----------
-        data : list of torch.Tensor
+        data
             List of tensors with shape (n_spots, n_isos).
-        gene_names : list of str, optional
-            Gene names. If None, auto-generated.
-        group_gene_by_n_iso : bool, optional
+        gene_names
+            List of gene names. If None, auto-generated.
+        group_gene_by_n_iso
             Whether to group genes by the number of isoforms.
         """
         self.n_genes = len(data)  # number of genes
@@ -215,7 +244,7 @@ class IsoDataset:
 
         Parameters
         ----------
-        batch_size : int, optional
+        batch_size
             Maximum number of genes in a batch.
 
         Returns

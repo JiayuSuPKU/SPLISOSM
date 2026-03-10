@@ -3,8 +3,8 @@ scipy>=1.9.1
 scikit-learn>=1.1.2
 pandas>=1.5.0
 tqdm>=4.65.0
-sphinx_rtd_theme
+sphinx-book-theme
+sphinxcontrib-bibtex
 sphinx-autoapi
-nbsphinx
 IPython
 sphinx-gallery

@@ -10,16 +10,7 @@ __all__ = ["PatienceLogger"]
 class PatienceLogger:
     """Logger for tracking training patience and convergence.
 
-    Parameters
-    ----------
-    batch_size : int
-        Number of samples in the batch.
-    patience : int
-        Number of epochs to wait after the last significant improvement.
-    min_delta : float, optional
-        Minimum change in the loss to qualify as an improvement.
-    diagnose : bool, optional
-        Whether to store parameter changes during training.
+    For training MultinomGLM and MultinomGLMM.
     """
 
     def __init__(
@@ -29,7 +20,18 @@ class PatienceLogger:
         min_delta: float = 1e-5,
         diagnose: bool = False,
     ) -> None:
-        """Initialize the logger with specified patience and minimum delta."""
+        """
+        Parameters
+        ----------
+        batch_size
+            Number of samples in the batch.
+        patience
+            Number of epochs to wait after the last significant improvement.
+        min_delta
+            Minimum change in the loss to qualify as an improvement.
+        diagnose
+            Whether to store parameter changes during training.
+        """
         self.batch_size = batch_size
         self.patience = torch.full((batch_size,), patience, dtype=int)
         self.min_delta = min_delta
@@ -53,9 +55,9 @@ class PatienceLogger:
 
         Parameters
         ----------
-        loss : torch.Tensor
+        loss
             Loss for the current epoch.
-        params : dict[str, torch.Tensor]
+        params
             Parameters for the current epoch.
         """
         big_improve = (self.best_loss - loss) >= self.min_delta
@@ -93,7 +95,7 @@ class PatienceLogger:
 
         Returns
         -------
-        list of dict or None
+        list[dict] or None
             List of dictionaries containing loss and parameters for each sample,
             or None if diagnose is False.
         """

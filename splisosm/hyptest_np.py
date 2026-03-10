@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import warnings
 import re
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, Literal
 from scipy.stats import ttest_ind, combine_pvalues
 import numpy as np
 import pandas as pd
@@ -26,8 +26,6 @@ from splisosm.likelihood import liu_sf
 
 __all__ = [
     "linear_hsic_test",
-    "get_kernel_regression_residual_op",
-    "get_knn_regression_residual_op",
     "fit_kernel_gpr",
     "SplisosmNP",
 ]
@@ -82,16 +80,16 @@ def linear_hsic_test(
 ) -> tuple[float, float]:
     """The linear HSIC test.
 
-    Equivalent to a multivariate extension of pearson correlation.
+    Equivalent to a multivariate extension of Pearson correlation.
 
     Parameters
     ----------
-    X : torch.Tensor
+    X
         Shape (n_samples, n_features_x).
-    Y : torch.Tensor
+    Y
         Shape (n_samples, n_features_y).
-    centering : bool, optional
-        Whether to center the data.
+    centering
+        Whether to center the data. If False, assume the data is already centered.
 
     Returns
     -------
@@ -205,32 +203,39 @@ def fit_kernel_gpr(
 ) -> Union[tuple[torch.Tensor, float], torch.Tensor]:
     """Fit a Gaussian process regression to learn parameters for kernel regression.
 
+    Y ~ GaussianProcessRegressor(X, kernel = ConstantKernel * RBF + WhiteNoise)
+
     Parameters
     ----------
-    X : torch.Tensor
+    X
         Shape (n_samples, d). Input data of d features.
-    Y : torch.Tensor
+    Y
         Shape (n_samples, m). Output data of m targets.
-    normalize_x : bool, optional
-        Normalize the input data.
-    normalize_y : bool, optional
-        Normalize the output data.
-    return_residuals : bool, optional
-        Return the residuals.
-    constant_value : float, optional
+    normalize_x
+        Whether to normalize the input data.
+    normalize_y
+        Whether to normalize the output data.
+    return_residuals
+        Whether to return the regression residuals ``Y_residuals`` :math:`Y - \\hat{Y}`.
+    constant_value
         Constant kernel value.
-    constant_value_bounds : tuple of float, optional
-        Bounds for the constant kernel.
-    length_scale : float, optional
+    constant_value_bounds
+        Bounds for the constant kernel value to search.
+    length_scale
         Length scale for the RBF kernel.
-    length_scale_bounds : tuple of float, optional
-        Bounds for the length scale.
+    length_scale_bounds
+        Bounds for the RBF length scale to search.
 
     Returns
     -------
-    tuple of torch.Tensor and float, or torch.Tensor
-        If return_residuals is False, returns (Kxy, epsilon).
-        If return_residuals is True, returns Y_residuals of shape (n_samples, m).
+    tuple[torch.Tensor, float] or torch.Tensor
+        If `return_residuals` is False, returns the estimated kernel and regularization strength (``Kxy``, ``epsilon``).
+        If `return_residuals` is True, returns the regression residual ``Y_residuals`` of shape (n_samples, m).
+
+    Notes
+    -----
+    This function is a wrapper of `sklearn.gaussian_process.GaussianProcessRegressor`.
+    It is possible to speed up model fitting via more efficient implementations of Gaussian process regression, e.g., `GPyTorch`.
     """
     # remove samples that contains NaN values in Y
     n_samples_original = Y.shape[0]
@@ -286,26 +291,67 @@ class SplisosmNP:
 
     Examples
     --------
+    Setup data:
+
+    >>> from splisosm import SplisosmNP
+    >>> import torch
+    >>> # Simulate data for 10 genes with different number of isoforms
+    >>> data_3_iso = [torch.randint(low=0, high=5, size=(100, 3)) for _ in range(5)]  # 5 genes with 3 isoforms
+    >>> data_4_iso = [torch.randint(low=0, high=5, size=(100, 4)) for _ in range(5)]  # 5 genes with 4 isoforms
+    >>> data = data_3_iso + data_4_iso
+    >>> coordinates = torch.rand(100, 2)  # 100 spots with 2D coordinates
+    >>> design_mtx = torch.rand(100, 2)  # 100 spots with 2 covariates
+
     Spatial variability test:
 
     >>> model = SplisosmNP()
     >>> model.setup_data(data, coordinates)
     >>> model.test_spatial_variability(method = 'hsic-ir')
+    >>> sv_results = model.get_formatted_test_results('sv')
+    >>> print(sv_results.head())
 
     Differential usage test:
 
     >>> model = SplisosmNP()
-    >>> model.setup_data(data, coordinates, design_mtx)
-    >>> model.test_diffential_usage(method = 'hsic')
-
-    Retrieve results:
-
-    >>> sv_results = model.get_formatted_test_results('sv')
+    >>> model.setup_data(data, coordinates, design_mtx=design_mtx)
+    >>> model.test_differential_usage(method = 'hsic')
     >>> du_results = model.get_formatted_test_results('du')
+    >>> print(du_results.head())
+    """
+
+    n_genes: int
+    """Number of genes."""
+
+    n_spots: int
+    """Number of spots."""
+
+    n_isos: list[int]
+    """List of numbers of isoforms per gene."""
+
+    n_factors: int
+    """Number of covariates to test for differential usage."""
+
+    sv_test_results: dict
+    """Dictionary to store the spatial variability test results after running test_spatial_variability().
+    It contains the following keys:
+    
+    - ``'method'``: str, the method used for the test.
+    - ``'statistic'``: numpy.ndarray of shape (n_genes,), the test statistic for each gene.
+    - ``'pvalue'``: numpy.ndarray of shape (n_genes,), the p-value for each gene.
+    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes,), the BH adjusted p-value for each gene.
+    """
+
+    du_test_results: dict
+    """Dictionary to store the differential usage test results after running test_differential_usage(). 
+    It contains the following keys:
+    
+    - ``'method'``: str, the method used for the test.
+    - ``'statistic'``: numpy.ndarray of shape (n_genes, n_factors), the test statistic for each gene and covariate.
+    - ``'pvalue'``: numpy.ndarray of shape (n_genes, n_factors), the p-value for each gene and covariate.
+    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes, n_factors), the BH adjusted p-value for each gene and covariate. Each column/covariate is adjusted separately.
     """
 
     def __init__(self) -> None:
-        """Initialize the SplisosmNP model."""
         # to be set after running setup_data()
         self.n_genes = None  # number of genes
         self.n_spots = None  # number of spots
@@ -350,24 +396,24 @@ class SplisosmNP:
         gene_names: Optional[list[str]] = None,
         covariate_names: Optional[list[str]] = None,
     ) -> None:
-        """Setup the data for the model.
+        """Setup isoform-level spatial data for hypothesis testing.
 
         Parameters
         ----------
-        data : list of torch.Tensor
+        data
             List of tensors with shape (n_spots, n_isos), the observed isoform counts for each gene.
-        coordinates : torch.Tensor, np.ndarray, or pd.DataFrame
+        coordinates
             Shape (n_spots, 2), the spatial coordinates.
-        approx_rank : int, optional
+        approx_rank
             The rank of the low-rank approximation for the spatial covariance matrix.
             If None, use the full-rank dense covariance matrix.
-            For larger datasets (n_spots > 5,000), the maximum rank is set to 4 * sqrt(n_spots).
-        design_mtx : torch.Tensor, optional
+            For larger datasets (n_spots > 5,000), the maximum rank is set to ``4 * sqrt(n_spots)``.
+        design_mtx
             Shape (n_spots, n_factors), the design matrix for the fixed effects.
-        gene_names : list of str, optional
-            The gene names.
-        covariate_names : list of str, optional
-            The covariate names.
+        gene_names
+            List of gene names.
+        covariate_names
+            List of covariate names.
         """
         self.n_genes = len(data)  # number of genes
         self.n_spots = len(data[0])  # number of spots
@@ -473,17 +519,19 @@ class SplisosmNP:
         # self._corr_sp_eigvecs = corr_sp_eigvecs
         self._corr_sp_eigvals = self.corr_sp.eigenvalues()
 
-    def get_formatted_test_results(self, test_type: str) -> pd.DataFrame:
+    def get_formatted_test_results(
+        self, test_type: Literal["sv", "du"]
+    ) -> pd.DataFrame:
         """Get the formatted test results as data frame.
 
         Parameters
         ----------
-        test_type : str
-            Type of test results to retrieve: 'sv' for spatial variability or 'du' for differential usage.
+        test_type
+            Type of test results to retrieve. Can be one of ``'sv'`` (spatial variability) or ``'du'`` (differential usage).
 
         Returns
         -------
-        pd.DataFrame
+        pandas.DataFrame
             Formatted test results.
         """
         assert test_type in [
@@ -524,9 +572,9 @@ class SplisosmNP:
 
     def test_spatial_variability(
         self,
-        method: str = "hsic-ir",
-        ratio_transformation: str = "none",
-        nan_filling: str = "mean",
+        method: Literal["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"] = "hsic-ir",
+        ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
+        nan_filling: Literal["mean", "none"] = "mean",
         use_perm_null: bool = False,
         n_perms_per_gene: Optional[int] = None,
         return_results: bool = False,
@@ -534,46 +582,45 @@ class SplisosmNP:
     ) -> Optional[dict[str, Any]]:
         """Test for spatial variability.
 
+        Kernel-based multivariate hypothesis testing for spatial variability in
+
+        - gene-level total counts (``"hsic-gc"`` or ``"spark-x"`` :cite:`zhu2021spark`)
+        - isoform usage ratios (``"hsic-ir"``)
+        - isoform counts (``"hsic-ic"``)
+
+        Test statistics and p-values are computed per gene for each gene separately.
+
         Parameters
         ----------
-        method : str, optional
-            The test method. Must be one of "hsic-ir", "hsic-ic", "hsic-gc", "spark-x".
-            Isoform-level tests (still one test per gene):
-            - "hsic-ir": HSIC test between multivariate isoform ratios (IR) and spatial locations.
-            - "hsic-ic": HSIC test between multivariate isoform counts (IC) and spatial locations.
-            Gene-level tests:
-            - "hsic-gc": HSIC test between univariate gene-level counts (GC) and spatial locations.
-            - "spark-x": the SPARK-X test for variable gene expression. See [1].
-        ratio_transformation : str, optional
-            If using the isoform ratio ("hsic-ic"), what compositional transformation to use.
-            Can be one of 'none', 'clr', 'ilr', 'alr', 'radial'[2].
-        nan_filling : str, optional
-            How to fill the NaN values in the isoform ratios. Can be 'mean' or 'none'.
-        use_perm_null : bool, optional
+        method
+            Must be one of ``"hsic-ir"``, ``"hsic-ic"``, ``"hsic-gc"``, or ``"spark-x"``.
+        ratio_transformation
+            If using isoform ratios, the compositional transformation to apply.
+            Can be one of ``'none'``, ``'clr'``, ``'ilr'``, ``'alr'``, or ``'radial'`` :cite:`park2022kernel`.
+            See :func:`splisosm.utils.counts_to_ratios` for more details.
+        nan_filling
+            How to fill the NaN values in the isoform ratios. Can be one of ``'mean'`` or ``'none'``.
+            See :func:`splisosm.utils.counts_to_ratios` for more details.
+        use_perm_null
             Whether to generate the null distribution from permutation.
-            If False, use the asymptotic distributions of chi-square mixtures with df = 1. See [3].
-        n_perms_per_gene : int, optional
+            If False, use the asymptotic distribution of chi-square mixtures with Liu's method :cite:`liu2009new`.
+        n_perms_per_gene
             Number of permutations per gene for permutation test.
-        return_results : bool, optional
+        return_results
             Whether to return the test statistics and p-values.
-        print_progress : bool, optional
+            Default to False, in which case the results are stored in ``self.sv_test_results``.
+        print_progress
             Whether to show the progress bar. Default to True.
 
         Returns
         -------
         dict or None
-            If return_results is True, returns dict with test statistics and p-values.
+            If `return_results` is True, returns dict with test statistics and p-values.
             Otherwise, returns None and stores results in self.sv_test_results.
 
-        References
-        ----------
-        .. [1] Zhu, Jiaqiang, Shiquan Sun, and Xiang Zhou. "SPARK-X: non-parametric modeling enables scalable
-               and robust detection of spatial expression patterns for large spatial transcriptomic studies."
-               Genome biology 22.1 (2021): 184.
-        .. [2] Park, Junyoung, et al. "Kernel methods for radial transformed compositional data with many zeros."
-               International Conference on Machine Learning. PMLR, 2022.
-        .. [3] Zhang, Kun, et al. "Kernel-based conditional independence test and application in causal discovery."
-               arXiv preprint arXiv:1202.3775 (2012).
+        Notes
+        -----
+        To run the SPARK-X test, the R-package `SPARK` must be installed and accessible from Python via `rpy2`.
         """
 
         valid_methods = ["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"]
@@ -721,59 +768,80 @@ class SplisosmNP:
 
     def test_differential_usage(
         self,
-        method: str = "hsic-gp",
-        ratio_transformation: str = "none",
-        nan_filling: str = "mean",
-        hsic_eps: float = 1e-3,
+        method: Literal[
+            "hsic", "hsic-knn", "hsic-gp", "t-fisher", "t-tippett"
+        ] = "hsic-gp",
+        ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
+        nan_filling: Literal["mean", "none"] = "mean",
+        hsic_eps: Optional[float] = 1e-3,
         gp_configs: Optional[dict[str, Any]] = None,
         print_progress: bool = True,
         return_results: bool = False,
     ) -> Optional[dict[str, Any]]:
         """Test for spatial isoform differential usage.
 
+        Before running this function, the design matrix must be set up using :func:`setup_data`.
+        Each column of the design matrix corresponds to a covariate to test for differential association
+        with the isoform usage ratios of each gene.
+        Test statistics and p-values are computed per (gene, covariate) pair separately.
+
+        Two types of association tests are supported:
+
+        - Unconditional (``"hsic"`` with ``hsic_eps=None``, ``"t-fisher"``, ``"t-tippett"``): test the unconditional association between isoform usage ratios and the covariate of interest.
+        - Conditional (``"hsic"`` with ``hsic_eps>0``, ``"hsic-knn"``, ``"hsic-gp"``): test the association conditioned on the spatial coordinates. See :cite:`zhang2012kernel` for more details.
+
         Parameters
         ----------
-        method : str, optional
-            The test method. Must be one of "hsic", "hsic-knn", "hsic-gp", "t-fisher", "t-tippett".
-            HSIC tests:
-            - "hsic": HSIC test for isoform differential usage along each factor in the design matrix.
+        method
+            Method for association testing can be one of the HSIC tests
+
+            * ``"hsic"``: HSIC test for isoform differential usage along each factor in the design matrix.
               For continuous factors, it is equivalent to the (partial) pearson correlation test.
               For binary factors, it is equivalent to the two-sample t-test.
-            - "hsic-knn": conditional HSIC test using KNN regression to remove spatial effect.
-            - "hsic-gp": conditional HSIC test using kernels learned from Gaussian process regression.
-            T-tests (binary factors only): "t-fisher", "t-tippett".
-            - Two-sample t-test for isoform differential usage along each factor in the design matrix.
-            - The test is applied to the ratio of each isoform independently and combined using one of 'fisher' or 'tippett'.
-        ratio_transformation : str, optional
+            * ``"hsic-knn"``: conditional HSIC test using KNN regression to remove spatial effect.
+            * ``"hsic-gp"``: conditional HSIC test using kernels learned from Gaussian process regression.
+
+            Or, one of T-tests (binary factors only), ``"t-fisher"``, ``"t-tippett"``, where each isoform
+            is tested independently for association with the factor of interest,
+            and the p-values are combined to gene-level using either Fisher's or Tippett's approach.
+        ratio_transformation
             What compositional transformation to use for isoform ratio.
-            Can be one of 'none', 'clr', 'ilr', 'alr', 'radial' [2].
-        nan_filling : str, optional
-            How to fill the NaN values in the isoform ratios. Can be 'mean' or 'none'.
-        hsic_eps : float, optional
-            The regularization parameter for HSIC.
-            A kernel regression is used to remove the spatial effect from y and z. See [1].
-            If None, test the unconditional H_0: y independent z.
-            Otherwise, test the conditional H_0: y independent z | x where x is the spatial coordinates.
-        gp_configs : dict, optional
-            The kernel configurations for the GP regression to pass to fit_kernel_gpr().
-            Using fixed length scale by default for efficiency.
-        print_progress : bool, optional
+            Can be one of ``'none'``, ``'clr'``, ``'ilr'``, ``'alr'``, or ``'radial'`` :cite:`park2022kernel`.
+            See :func:`splisosm.utils.counts_to_ratios` for more details.
+        nan_filling
+            How to fill the NaN values in the isoform ratios. Can be one of ``'mean'`` or ``'none'``.
+            See :func:`splisosm.utils.counts_to_ratios` for more details.
+        hsic_eps
+            The regularization parameter for conditional HSIC when ``method='hsic'``.
+            If None, the test is unconditional. This parameter does not apply to ``method='hsic-knn'`` or ``method='hsic-gp'``.
+        gp_configs
+            The kernel configurations for the Gaussian process regression.
+            See :func:`splisosm.hyptest_np.fit_kernel_gpr` for more details.
+            If `None`, defaults to the configuration below. For efficiency,
+            we fix some parameters to be constant::
+
+                {
+                    "constant_value_covariate": 1.0,
+                    "length_scale_covariate": 1.0,
+                    "constant_value_bounds_covariate": (1e-3, 1e3),
+                    "length_scale_bounds_covariate": "fixed",
+                    "constant_value_isoform": 1e-3,
+                    "length_scale_isoform": 1.0,
+                    "constant_value_bounds_isoform": "fixed",
+                    "length_scale_bounds_isoform": "fixed",
+                }
+
+        print_progress
             Whether to show the progress bar. Default to True.
-        return_results : bool, optional
+        return_results
             Whether to return the test statistics and p-values.
+            If False, the results are stored in ``self.du_test_results``.
 
         Returns
         -------
         dict or None
-            If return_results is True, returns dict with test statistics and p-values.
+            If `return_results` is True, returns dict with test statistics and p-values.
             Otherwise, returns None and stores results in self.du_test_results.
-
-        References
-        ----------
-        .. [1] Park, Junyoung, et al. "Kernel methods for radial transformed compositional data with many zeros."
-               International Conference on Machine Learning. PMLR, 2022.
-        .. [2] Zhang, Kun, et al. "Kernel-based conditional independence test and application in causal discovery."
-               arXiv preprint arXiv:1202.3775 (2012).
         """
         if self.design_mtx is None:
             raise ValueError(

@@ -54,7 +54,7 @@ def _sample_multinom_sp_single_gene(iso_ratio_expected, total_counts_expected):
 def simulate_isoform_counts_single_gene(
     grid_size: tuple[int, int] = (30, 30),
     n_isos: int = 3,
-    total_counts_expected: Union[int, torch.Tensor] = 100,
+    total_counts_expected: int | torch.Tensor = 100,
     var_sp: float = 0,
     var_nsp: float = 1,
     rho: float = 0.99,
@@ -62,7 +62,7 @@ def simulate_isoform_counts_single_gene(
     beta_true: Optional[torch.Tensor] = None,
     return_params: bool = True,
 ) -> Union[dict[str, Any], tuple[dict[str, Any], dict[str, Any]]]:
-    """Generate isoform x spot count matrix for a given gene.
+    """Generate isoform-by-spot count matrix for a given gene.
 
     Each gene is simulated independently. For simplicity we constrain all genes
     to have the same number of isoforms. (In fact in the current implementation all genes
@@ -70,30 +70,30 @@ def simulate_isoform_counts_single_gene(
 
     Parameters
     ----------
-    grid_size : tuple of int, optional
+    grid_size
         Shape of the spatial grid.
-    n_isos : int, optional
+    n_isos
         Number of isoforms.
-    total_counts_expected : int or torch.Tensor, optional
+    total_counts_expected
         Expected total gene counts per spot.
-    var_sp : float, optional
+    var_sp
         Variance explained by spatial structure.
-    var_nsp : float, optional
+    var_nsp
         Unstructured variance (white noise).
-    rho : float, optional
+    rho
         Spatial autocorrelation parameter.
-    design_mtx : torch.Tensor, optional
+    design_mtx
         Shape (n_spots, n_factors). Design matrix for the isoform usage ratio.
-    beta_true : torch.Tensor, optional
+    beta_true
         Shape (n_factors, n_isoforms - 1). Factor coefficients for the design matrix.
-    return_params : bool, optional
+    return_params
         Whether to return simulation parameters.
 
     Returns
     -------
-    dict or tuple of dict
-        If return_params is False, returns dict with 'counts', 'coords', 'cov_sp', 'design_mtx'.
-        If return_params is True, returns (data_dict, params_dict).
+    dict or tuple[dict]
+        If `return_params` is False, returns `datadict` with ``'counts'``, ``'coords'``, ``'cov_sp'``, ``'design_mtx'``.
+        If `return_params` is True, returns (`data_dict`, `params_dict`).
     """
     n_x, n_y = grid_size
     n_spots = n_x * n_y
@@ -158,7 +158,7 @@ def simulate_isoform_counts(
     n_genes: int = 1,
     grid_size: tuple[int, int] = (30, 30),
     n_isos: int = 3,
-    total_counts_expected: Union[int, torch.Tensor] = 100,
+    total_counts_expected: int | torch.Tensor = 100,
     var_sp: float = 0,
     var_nsp: float = 1,
     rho: float = 0.99,
@@ -166,7 +166,7 @@ def simulate_isoform_counts(
     beta_true: Optional[torch.Tensor] = None,
     return_params: bool = True,
 ) -> Union[dict[str, Any], tuple[dict[str, Any], dict[str, Any]]]:
-    """Generate isoform x spot count matrix for multiple genes.
+    """Generate isoform-by-spot count matrix for multiple genes.
 
     Each gene is simulated independently. For simplicity we constrain all genes
     to have the same number of isoforms. (In fact in the current implementation all genes
@@ -174,32 +174,32 @@ def simulate_isoform_counts(
 
     Parameters
     ----------
-    n_genes : int, optional
+    n_genes
         Number of genes to simulate.
-    grid_size : tuple of int, optional
+    grid_size
         Shape of the spatial grid.
-    n_isos : int, optional
+    n_isos
         Number of isoforms.
-    total_counts_expected : int or torch.Tensor, optional
+    total_counts_expected
         Expected total gene counts per spot.
-    var_sp : float, optional
+    var_sp
         Variance explained by spatial structure.
-    var_nsp : float, optional
+    var_nsp
         Unstructured variance (white noise).
-    rho : float, optional
+    rho
         Spatial autocorrelation parameter.
-    design_mtx : torch.Tensor, optional
+    design_mtx
         Shape (n_spots, n_factors). Design matrix for the isoform usage ratio.
-    beta_true : torch.Tensor, optional
+    beta_true
         Shape (n_factors, n_isoforms - 1). Factor coefficients for the design matrix.
-    return_params : bool, optional
+    return_params
         Whether to return simulation parameters.
 
     Returns
     -------
-    dict or tuple of dict
-        If return_params is False, returns dict with 'counts', 'coords', 'cov_sp', 'design_mtx'.
-        If return_params is True, returns (data_dict, params_dict).
+    dict or tuple[dict]
+        If `return_params` is False, returns `datadict` with ``'counts'``, ``'coords'``, ``'cov_sp'``, ``'design_mtx'``.
+        If `return_params` is True, returns (`data_dict`, `params_dict`).
     """
     n_x, n_y = grid_size
     n_spots = n_x * n_y
