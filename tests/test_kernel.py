@@ -2,7 +2,6 @@ import unittest
 import numpy as np
 import torch
 import itertools
-import scipy
 from splisosm.kernel import SpatialCovKernel
 from splisosm.utils import get_cov_sp
 
@@ -21,8 +20,8 @@ class TestSpatialCovKernel(unittest.TestCase):
         # spatial kernel from the icar prior directly
         cov_sp1 = get_cov_sp(self.coords)
         K1 = self.H @ cov_sp1 @ self.H
-        L1 = torch.linalg.eigvalsh(K1) # sorted in ascending order
-        self.assertTrue(L1.numpy()[1] > 0) # check positive semi-definite
+        L1 = torch.linalg.eigvalsh(K1)  # sorted in ascending order
+        self.assertTrue(L1.numpy()[1] > 0)  # check positive semi-definite
 
         # spatial kernel from the icar prior using the kernel class
         cov_sp2 = SpatialCovKernel(self.coords, approx_rank=None, centering=True)
@@ -32,13 +31,17 @@ class TestSpatialCovKernel(unittest.TestCase):
         # check eigenvalues
         K2 = cov_sp2.realization()
         L2 = cov_sp2.eigenvalues()
-        L2 = torch.flip(L2, dims=(0,)) # sort in descending order
+        L2 = torch.flip(L2, dims=(0,))  # sort in descending order
         self.assertTrue(torch.allclose(K1, K2, atol=1e-4))
         self.assertTrue(torch.allclose(L1, L2, atol=1e-4))
 
     def test_low_rank_approximation(self):
-        cov_sp1 = SpatialCovKernel(self.coords, approx_rank=800, centering=True, standardize_cov=False)
-        cov_sp2 = SpatialCovKernel(self.coords, approx_rank=100, centering=True, standardize_cov=False)
+        cov_sp1 = SpatialCovKernel(
+            self.coords, approx_rank=800, centering=True, standardize_cov=False
+        )
+        cov_sp2 = SpatialCovKernel(
+            self.coords, approx_rank=100, centering=True, standardize_cov=False
+        )
         self.assertTrue(cov_sp1.rank() == 800)
         self.assertTrue(cov_sp2.rank() == 100)
 
@@ -48,10 +51,17 @@ class TestSpatialCovKernel(unittest.TestCase):
         self.assertTrue((L1[:100] - L2).abs().mean() < 0.1)
 
     def test_kernel_realization(self):
-        cov_sp1 = SpatialCovKernel(self.coords, approx_rank=None, centering=True, standardize_cov=False)
-        cov_sp2 = SpatialCovKernel(self.coords, approx_rank=100, centering=True, standardize_cov=False)
+        cov_sp1 = SpatialCovKernel(
+            self.coords, approx_rank=None, centering=True, standardize_cov=False
+        )
+        cov_sp2 = SpatialCovKernel(
+            self.coords, approx_rank=100, centering=True, standardize_cov=False
+        )
 
-        self.assertTrue((cov_sp1.realization() - cov_sp2.realization()).abs().mean() < 0.1)
+        self.assertTrue(
+            (cov_sp1.realization() - cov_sp2.realization()).abs().mean() < 0.1
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

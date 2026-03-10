@@ -1767,9 +1767,15 @@ class SplisosmGLMM:
         ----------
         method
             Depending on whether the design matrix is used for model fitting,
-            different methods must be used for hypothesis testing.
-            Use ``"wald"`` when models were fit with ``fit(..., with_design_mtx=True)``.
-            Use ``"score"`` when models were fit with ``fit(..., with_design_mtx=False)``.
+            different methods must be used for hypothesis testing:
+
+            - ``"wald"`` when models were fit with ``fit(..., with_design_mtx=True)``.
+            - ``"score"`` when models were fit with ``fit(..., with_design_mtx=False)``.
+
+            .. caution::
+                The Wald statistic with GLM/GLMM is empirically anti-conserved (i.e., lots of false positives).
+                Always use ``method="score"`` when possible.
+
         print_progress
             Whether to show the progress bar. Default to True.
         return_results

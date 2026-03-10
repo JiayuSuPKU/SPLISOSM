@@ -7,7 +7,7 @@ from splisosm.likelihood import (
     log_prob_fastmult,
     log_prob_fastmult_batched,
     log_prob_fastdm,
-    log_prob_dm, # requires pyro
+    log_prob_dm,  # requires pyro
     log_prob_mvn,
     log_prob_mult,
 )
@@ -60,7 +60,9 @@ class TestLikelihood(unittest.TestCase):
             self.config["num_spots"],
         )
         probs = torch.rand(num_genes, num_isos, num_spots, generator=self.rng)
-        counts = torch.randint(1, 10, (num_genes, num_isos, num_spots), generator=self.rng)
+        counts = torch.randint(
+            1, 10, (num_genes, num_isos, num_spots), generator=self.rng
+        )
         mask = torch.randint(0, 2, (num_genes, num_spots), generator=self.rng)
         return probs, counts, mask
 
@@ -72,7 +74,9 @@ class TestLikelihood(unittest.TestCase):
         )
         locs = torch.randn(num_genes, num_isos, num_spots, generator=self.rng)
         cov_eigvals = torch.rand(num_genes, num_isos, num_spots, generator=self.rng)
-        cov_eigvecs = torch.randn(num_genes, num_isos, num_spots, num_spots, generator=self.rng)
+        cov_eigvecs = torch.randn(
+            num_genes, num_isos, num_spots, num_spots, generator=self.rng
+        )
         data = torch.randn(num_genes, num_isos, num_spots, generator=self.rng)
         mask = torch.randint(0, 2, (num_genes, num_spots), generator=self.rng)
         return locs, cov_eigvals, cov_eigvecs, data, mask
@@ -96,9 +100,7 @@ class TestLikelihood(unittest.TestCase):
     def test_dm_fast_return_same(self):
         probs, counts, _ = self.generate_probs_counts_mask()
         self.assertTrue(
-            torch.allclose(
-                log_prob_dm(probs, counts), log_prob_fastdm(probs, counts)
-            ),
+            torch.allclose(log_prob_dm(probs, counts), log_prob_fastdm(probs, counts)),
             "Dirichlet-Multinomial log-likelihoods do not match",
         )
 
@@ -108,7 +110,10 @@ class TestLikelihood(unittest.TestCase):
             torch.allclose(
                 log_prob_mvn(locs=locs, covs=covs, data=gamma),
                 log_prob_fastmvn(
-                    locs=locs, cov_eigvals=eigenvalues, cov_eigvecs=eigenvectors, data=gamma
+                    locs=locs,
+                    cov_eigvals=eigenvalues,
+                    cov_eigvecs=eigenvectors,
+                    data=gamma,
                 ),
                 rtol=1e-3,
             ),
