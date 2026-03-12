@@ -3,6 +3,7 @@ from __future__ import annotations
 import warnings
 import json
 from typing import Any, Optional, Literal
+import re
 
 from pathlib import Path
 import numpy as np
@@ -21,6 +22,7 @@ __all__ = [
     "counts_to_ratios",
     "false_discovery_control",
     "load_visium_sp_meta",
+    "load_visiumhd_spatialdata",
     "extract_counts_n_ratios",
     "extract_gene_level_statistics",
     "run_sparkx",
@@ -348,6 +350,305 @@ def load_visium_sp_meta(
     )
 
     return adata
+
+
+def _normalize_visiumhd_bin_name(bin_size: int | str) -> str:
+    """Normalize Visium HD bin identifier to ``square_XXXum`` format."""
+    if isinstance(bin_size, int):
+        return f"square_{bin_size:03}um"
+
+    bin_size_str = str(bin_size)
+    if bin_size_str.startswith("square_") and bin_size_str.endswith("um"):
+        return bin_size_str
+
+    if re.fullmatch(r"\d+", bin_size_str):
+        return f"square_{int(bin_size_str):03}um"
+
+    raise ValueError(
+        f"Unsupported bin size format: {bin_size!r}. Use int (e.g. 8) or 'square_008um'."
+    )
+
+
+def _aggregate_visiumhd_probe_counts(
+    adata_2um: AnnData,
+    barcode_mappings: pd.DataFrame,
+    source_col: str,
+    target_col: str,
+    target_obs_names: pd.Index,
+) -> scipy.sparse.csr_matrix:
+    """Aggregate 2um probe counts into target bins according to mapping."""
+    mapping_pairs = (
+        barcode_mappings[[source_col, target_col]].dropna().drop_duplicates()
+    )
+    src_barcode = mapping_pairs[source_col].astype(str).to_numpy()
+    tgt_barcode = mapping_pairs[target_col].astype(str).to_numpy()
+
+    src_idx = adata_2um.obs_names.get_indexer(src_barcode)
+    tgt_index = pd.Index(target_obs_names.astype(str))
+    tgt_idx = tgt_index.get_indexer(tgt_barcode)
+
+    valid = (src_idx >= 0) & (tgt_idx >= 0)
+    if valid.sum() == 0:
+        return scipy.sparse.csr_matrix(
+            (len(tgt_index), adata_2um.n_vars), dtype=np.float32
+        )
+
+    aggregation = scipy.sparse.csr_matrix(
+        (
+            np.ones(valid.sum(), dtype=np.float32),
+            (src_idx[valid], tgt_idx[valid]),
+        ),
+        shape=(adata_2um.n_obs, len(tgt_index)),
+        dtype=np.float32,
+    )
+
+    x_2um = adata_2um.X
+    if scipy.sparse.issparse(x_2um):
+        x_2um = x_2um.tocsr()
+    else:
+        x_2um = scipy.sparse.csr_matrix(np.asarray(x_2um, dtype=np.float32))
+
+    # (n_obs_2um, n_vars) -> (n_obs_target, n_vars)
+    x_target = (x_2um.T @ aggregation).T
+    return x_target.tocsr()
+
+
+def load_visiumhd_spatialdata(
+    path: str | Path,
+    dataset_id: Optional[str] = None,
+    bin_sizes: Optional[list[int | str]] = None,
+    bins_as_squares: bool = True,
+    fullres_image_file: Optional[str | Path] = None,
+    load_all_images: bool = False,
+    var_names_make_unique: bool = True,
+    filtered_counts_file: bool = True,
+    counts_layer_name: str = "counts",
+) -> Any:
+    """Load Visium HD outputs as SpatialData with probe-level binned tables.
+
+    This wrapper uses ``binned_outputs/square_002um/raw_probe_bc_matrix.h5`` as the
+    source matrix and aggregates counts to coarser bins (for example ``square_008um``
+    and ``square_016um``) using ``barcode_mappings.parquet``.
+
+    Parameters
+    ----------
+    path
+        Path to Space Ranger ``outs`` directory for Visium HD.
+    dataset_id
+        Optional dataset ID passed to the SpatialData reader.
+    bin_sizes
+        Bin resolutions to include. Each entry can be ``int`` (for example ``8``)
+        or Visium HD bin string (for example ``"square_008um"``). If ``None``,
+        all available ``square_*um`` bins under ``binned_outputs`` are used.
+    bins_as_squares
+        Whether bins are represented as squares when loading shapes.
+    fullres_image_file
+        Path to the full-resolution image.
+    load_all_images
+        Whether to load all optional images via ``spatialdata_io`` reader.
+    var_names_make_unique
+        Whether to call ``var_names_make_unique()`` on probe table variables.
+    filtered_counts_file
+        Whether to keep only in-tissue 2um barcodes prior to aggregation.
+        If ``True``, barcodes are taken from the source bin table loaded by
+        ``visium_hd`` (``square_002um``). If unavailable, the function falls
+        back to ``binned_outputs/square_002um/filtered_feature_bc_matrix.h5``.
+    counts_layer_name
+        Layer name used to store aggregated probe counts in each output table.
+
+    Returns
+    -------
+    SpatialData
+        A SpatialData object with probe-level tables for requested bins.
+
+    Raises
+    ------
+    ImportError
+        If required optional dependencies are not installed.
+    ValueError
+        If required files or requested bins are missing.
+    """
+    try:
+        import scanpy as sc
+    except ImportError as e:
+        raise ImportError(
+            "scanpy is required for load_visiumhd_spatialdata(). Install it via `pip install scanpy`."
+        ) from e
+
+    try:
+        from spatialdata_io.readers.visium_hd import visium_hd
+    except ImportError as e:
+        raise ImportError(
+            "spatialdata-io is required for load_visiumhd_spatialdata(). Install it via `pip install spatialdata-io`."
+        ) from e
+
+    path = Path(path)
+    if not path.exists():
+        raise ValueError(f"Path does not exist: {path}")
+
+    binned_outputs = path / "binned_outputs"
+    if not binned_outputs.exists():
+        raise ValueError(f"Cannot find binned_outputs under: {path}")
+
+    available_bins = sorted(
+        [
+            p.name
+            for p in binned_outputs.iterdir()
+            if p.is_dir() and p.name.startswith("square_")
+        ]
+    )
+    if len(available_bins) == 0:
+        raise ValueError(f"No square_*um bins found under: {binned_outputs}")
+
+    if bin_sizes is None:
+        requested_bins = available_bins
+    else:
+        requested_bins = [_normalize_visiumhd_bin_name(b) for b in bin_sizes]
+        missing_bins = [b for b in requested_bins if b not in available_bins]
+        if missing_bins:
+            raise ValueError(
+                f"Requested bins not found: {missing_bins}. Available bins: {available_bins}"
+            )
+
+    source_bin = "square_002um"
+    if source_bin not in available_bins:
+        raise ValueError("square_002um is required but not found in binned_outputs.")
+
+    raw_probe_path = binned_outputs / source_bin / "raw_probe_bc_matrix.h5"
+    if not raw_probe_path.exists():
+        raise ValueError(f"Cannot find raw probe matrix at: {raw_probe_path}")
+
+    mapping_path = path / "barcode_mappings.parquet"
+    if not mapping_path.exists():
+        # in case of file with a prefix, search recursively for the first match
+        mapping_candidates = list(path.glob("*barcode_mappings.parquet"))
+        if len(mapping_candidates) == 0:
+            raise ValueError(f"Cannot find barcode_mappings.parquet under: {path}")
+        mapping_path = mapping_candidates[0]
+
+    # Load SpatialData geometry/images/tables template from Space Ranger outputs.
+    requested_bins_um = [int(re.search(r"(\d{3})", b).group(1)) for b in requested_bins]
+    sdata = visium_hd(
+        path=path,
+        dataset_id=dataset_id,
+        filtered_counts_file=filtered_counts_file,
+        load_segmentations_only=False,
+        load_nucleus_segmentations=False,
+        bin_size=requested_bins_um,
+        bins_as_squares=bins_as_squares,
+        annotate_table_by_labels=False,
+        fullres_image_file=fullres_image_file,
+        load_all_images=load_all_images,
+        var_names_make_unique=False,
+    )
+
+    # Load 2um raw probe matrix and mapping.
+    adata_2um = sc.read_10x_h5(raw_probe_path, gex_only=False)
+    adata_2um.obs_names = adata_2um.obs_names.astype(str)
+    if var_names_make_unique:
+        adata_2um.var_names_make_unique()
+
+    if filtered_counts_file:
+        tissue_barcodes: pd.Index | None = None
+
+        if source_bin in sdata.tables:
+            tissue_barcodes = pd.Index(sdata.tables[source_bin].obs_names.astype(str))
+        else:
+            filtered_counts_path = (
+                binned_outputs / source_bin / "filtered_feature_bc_matrix.h5"
+            )
+            if not filtered_counts_path.exists():
+                raise ValueError(
+                    "filtered_counts_file=True but no in-tissue barcode source was found. "
+                    f"Expected table '{source_bin}' in SpatialData or file: {filtered_counts_path}"
+                )
+            adata_filtered = sc.read_10x_h5(filtered_counts_path, gex_only=False)
+            tissue_barcodes = pd.Index(adata_filtered.obs_names.astype(str))
+
+        in_tissue_mask = adata_2um.obs_names.isin(tissue_barcodes)
+        adata_2um = adata_2um[in_tissue_mask].copy()
+        if adata_2um.n_obs == 0:
+            raise ValueError(
+                "No in-tissue 2um barcodes remained after filtering raw_probe_bc_matrix.h5."
+            )
+
+    mapping_cols = [source_bin, *requested_bins]
+    barcode_mappings = pd.read_parquet(mapping_path)
+    for col in mapping_cols:
+        if col not in barcode_mappings.columns:
+            raise ValueError(
+                f"Column '{col}' not found in barcode mappings: {mapping_path}"
+            )
+        if barcode_mappings[col].dtype == object:
+            barcode_mappings[col] = barcode_mappings[col].map(
+                lambda v: v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else v
+            )
+
+    # Replace per-bin tables with probe-level aggregated counts.
+    for bin_name in requested_bins:
+        if bin_name not in sdata.tables:
+            warnings.warn(
+                f"Bin table '{bin_name}' not found in SpatialData object; skipping.",
+                UserWarning,
+            )
+            continue
+
+        template_table = sdata.tables[bin_name]
+
+        if bin_name == source_bin:
+            # The 2um table is the source itself; reindex to match template obs order.
+            reindex = adata_2um.obs_names.get_indexer(
+                template_table.obs_names.astype(str)
+            )
+            missing = reindex == -1
+            if missing.any():
+                x_source = (
+                    adata_2um.X.tocsr()
+                    if scipy.sparse.issparse(adata_2um.X)
+                    else scipy.sparse.csr_matrix(
+                        np.asarray(adata_2um.X, dtype=np.float32)
+                    )
+                )
+                rows = np.where(~missing, reindex, 0)
+                x_target = x_source[rows]
+                if missing.any():
+                    x_target = x_target.tolil()
+                    x_target[missing] = 0
+                    x_target = x_target.tocsr()
+            else:
+                x_source = adata_2um.X
+                if scipy.sparse.issparse(x_source):
+                    x_target = x_source.tocsr()[reindex]
+                else:
+                    x_target = scipy.sparse.csr_matrix(
+                        np.asarray(x_source, dtype=np.float32)[reindex]
+                    )
+        else:
+            x_target = _aggregate_visiumhd_probe_counts(
+                adata_2um=adata_2um,
+                barcode_mappings=barcode_mappings,
+                source_col=source_bin,
+                target_col=bin_name,
+                target_obs_names=template_table.obs_names,
+            )
+
+        probe_table = AnnData(
+            X=x_target,
+            obs=template_table.obs.copy(),
+            var=adata_2um.var.copy(),
+        )
+
+        for key, value in template_table.obsm.items():
+            probe_table.obsm[key] = value.copy() if hasattr(value, "copy") else value
+        for key, value in template_table.uns.items():
+            probe_table.uns[key] = value.copy() if hasattr(value, "copy") else value
+
+        probe_table.layers[counts_layer_name] = (
+            probe_table.X.copy() if hasattr(probe_table.X, "copy") else probe_table.X
+        )
+        sdata.tables[bin_name] = probe_table
+
+    return sdata
 
 
 def extract_counts_n_ratios(

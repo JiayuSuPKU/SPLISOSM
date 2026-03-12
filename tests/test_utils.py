@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import warnings
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import scipy.sparse
@@ -15,6 +16,7 @@ from splisosm.utils import (
     counts_to_ratios,
     false_discovery_control,
     load_visium_sp_meta,
+    load_visiumhd_spatialdata,
     extract_counts_n_ratios,
     extract_gene_level_statistics,
     run_hsic_gc,
@@ -467,6 +469,143 @@ class TestUtils(unittest.TestCase):
         self.assertIn("method", out)
         self.assertEqual(out["method"], "spark-x")
         self.assertEqual(len(out["pvalue"]), 2)
+
+    def test_load_visiumhd_spatialdata_wrapper_probe_binning(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "binned_outputs" / "square_002um").mkdir(parents=True)
+            (root / "binned_outputs" / "square_008um").mkdir(parents=True)
+            (root / "binned_outputs" / "square_016um").mkdir(parents=True)
+            (
+                root / "binned_outputs" / "square_002um" / "raw_probe_bc_matrix.h5"
+            ).touch()
+            (
+                root
+                / "binned_outputs"
+                / "square_002um"
+                / "filtered_feature_bc_matrix.h5"
+            ).touch()
+            (root / "barcode_mappings.parquet").touch()
+
+            probe_obs = [
+                "s_002um_00000_00000-1",
+                "s_002um_00000_00001-1",
+                "s_002um_00001_00000-1",
+                "s_002um_00001_00001-1",
+            ]
+            probe_var = ["probe_1", "probe_2"]
+            probe_x = scipy.sparse.csr_matrix(
+                np.array(
+                    [
+                        [1.0, 0.0],
+                        [2.0, 1.0],
+                        [3.0, 0.0],
+                        [4.0, 1.0],
+                    ],
+                    dtype=np.float32,
+                )
+            )
+            probe_adata = AnnData(
+                X=probe_x,
+                obs=pd.DataFrame(index=probe_obs),
+                var=pd.DataFrame(index=probe_var),
+            )
+
+            class _FakeSData:
+                def __init__(self):
+                    self.tables = {
+                        "square_002um": AnnData(
+                            X=scipy.sparse.csr_matrix((3, 1), dtype=np.float32),
+                            # Simulate in-tissue 2um barcodes loaded by visium_hd.
+                            obs=pd.DataFrame(index=probe_obs[:3]),
+                            var=pd.DataFrame(index=["gene_a"]),
+                        ),
+                        "square_008um": AnnData(
+                            X=scipy.sparse.csr_matrix((2, 1), dtype=np.float32),
+                            obs=pd.DataFrame(
+                                index=["s_008um_00000_00000-1", "s_008um_00000_00001-1"]
+                            ),
+                            var=pd.DataFrame(index=["gene_a"]),
+                        ),
+                        "square_016um": AnnData(
+                            X=scipy.sparse.csr_matrix((1, 1), dtype=np.float32),
+                            obs=pd.DataFrame(index=["s_016um_00000_00000-1"]),
+                            var=pd.DataFrame(index=["gene_a"]),
+                        ),
+                    }
+
+            def _fake_visium_hd(**kwargs):
+                return _FakeSData()
+
+            mapping_df = pd.DataFrame(
+                {
+                    "square_002um": probe_obs,
+                    "square_008um": [
+                        "s_008um_00000_00000-1",
+                        "s_008um_00000_00000-1",
+                        "s_008um_00000_00001-1",
+                        "s_008um_00000_00001-1",
+                    ],
+                    "square_016um": ["s_016um_00000_00000-1"] * 4,
+                }
+            )
+
+            scanpy_mod = types.ModuleType("scanpy")
+            scanpy_mod.read_10x_h5 = lambda *args, **kwargs: probe_adata
+
+            sdio_mod = types.ModuleType("spatialdata_io")
+            sdio_readers_mod = types.ModuleType("spatialdata_io.readers")
+            sdio_visium_hd_mod = types.ModuleType("spatialdata_io.readers.visium_hd")
+            sdio_visium_hd_mod.visium_hd = _fake_visium_hd
+
+            with patch.dict(
+                sys.modules,
+                {
+                    "scanpy": scanpy_mod,
+                    "spatialdata_io": sdio_mod,
+                    "spatialdata_io.readers": sdio_readers_mod,
+                    "spatialdata_io.readers.visium_hd": sdio_visium_hd_mod,
+                },
+            ):
+                with patch("splisosm.utils.pd.read_parquet", return_value=mapping_df):
+                    out_filtered = load_visiumhd_spatialdata(
+                        root,
+                        bin_sizes=[2, 8, 16],
+                        counts_layer_name="counts",
+                    )
+                    out_unfiltered = load_visiumhd_spatialdata(
+                        root,
+                        bin_sizes=[2, 8, 16],
+                        filtered_counts_file=False,
+                        counts_layer_name="counts",
+                    )
+
+            x_008_filtered = out_filtered.tables["square_008um"].X.toarray()
+            x_016_filtered = out_filtered.tables["square_016um"].X.toarray()
+            x_008_unfiltered = out_unfiltered.tables["square_008um"].X.toarray()
+            x_016_unfiltered = out_unfiltered.tables["square_016um"].X.toarray()
+
+            # Default filtered_counts_file=True keeps only first 3 source barcodes.
+            np.testing.assert_allclose(
+                x_008_filtered, np.array([[3.0, 1.0], [3.0, 0.0]])
+            )
+            np.testing.assert_allclose(x_016_filtered, np.array([[6.0, 1.0]]))
+
+            # filtered_counts_file=False uses all 4 source barcodes.
+            np.testing.assert_allclose(
+                x_008_unfiltered, np.array([[3.0, 1.0], [7.0, 1.0]])
+            )
+            np.testing.assert_allclose(x_016_unfiltered, np.array([[10.0, 2.0]]))
+
+            self.assertIn("counts", out_filtered.tables["square_008um"].layers)
+            self.assertEqual(
+                list(out_filtered.tables["square_002um"].var_names), probe_var
+            )
+
+            # 2um bin should be populated directly from adata_2um without aggregation.
+            # filtered run: only first 3 source barcodes are in-tissue.
+            x_002_filtered = out_filtered.tables["square_002um"].X.toarray()
+            np.testing.assert_allclose(x_002_filtered, probe_x.toarray()[:3])
 
 
 if __name__ == "__main__":
