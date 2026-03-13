@@ -4,7 +4,7 @@ import numpy as np
 from anndata import AnnData
 
 import splisosm.hyptest_fft as hyptest_fft
-from splisosm.hyptest_fft import SplisosmFFT
+from splisosm.hyptest_fft import FFTKernel, SplisosmFFT
 
 
 class _SpatialDataStub:
@@ -67,6 +67,52 @@ class _SpatialDataModuleStub:
             out[:, row[i], col[i]] += counts[i, :]
 
         return _RasterLayerStub(out, adata.var_names.astype(str).tolist())
+
+
+class TestFFTKernel(unittest.TestCase):
+
+    def test_power_spectral_density_1d_constant_spectrum(self):
+        kernel = FFTKernel(shape=(6, 5), rho=0.0, neighbor_degree=1)
+
+        freq_bins, psd_1d = kernel.power_spectral_density_1d(bins=8)
+
+        self.assertGreater(len(freq_bins), 0)
+        self.assertEqual(freq_bins.shape, psd_1d.shape)
+        self.assertTrue(np.all(np.diff(freq_bins) > 0))
+        np.testing.assert_allclose(psd_1d, np.ones_like(psd_1d))
+
+    def test_power_spectral_density_1d_matches_manual_bin_average(self):
+        kernel = FFTKernel(shape=(5, 4), rho=0.9, neighbor_degree=2)
+        bins = 6
+
+        freq_bins, psd_1d = kernel.power_spectral_density_1d(bins=bins)
+
+        fy = np.fft.fftfreq(kernel.ny, d=kernel.dy)
+        fx = np.fft.fftfreq(kernel.nx, d=kernel.dx)
+        fy_grid, fx_grid = np.meshgrid(fy, fx, indexing="ij")
+        radial_freq = np.sqrt(fy_grid**2 + fx_grid**2).ravel()
+        spectrum = kernel.spectrum
+        bin_edges = np.linspace(0, radial_freq.max(), bins + 1)
+
+        expected_bins = []
+        expected_psd = []
+        for left, right in zip(bin_edges[:-1], bin_edges[1:]):
+            if right == bin_edges[-1]:
+                mask = (radial_freq >= left) & (radial_freq <= right)
+            else:
+                mask = (radial_freq >= left) & (radial_freq < right)
+            if np.any(mask):
+                expected_bins.append((left + right) / 2.0)
+                expected_psd.append(float(np.mean(spectrum[mask])))
+
+        np.testing.assert_allclose(freq_bins, np.asarray(expected_bins))
+        np.testing.assert_allclose(psd_1d, np.asarray(expected_psd))
+
+    def test_power_spectral_density_1d_rejects_invalid_bins(self):
+        kernel = FFTKernel(shape=(4, 4), rho=0.9, neighbor_degree=1)
+
+        with self.assertRaises(ValueError):
+            kernel.power_spectral_density_1d(bins=0)
 
 
 def _build_test_sdata(table_name: str = "isoform_table") -> _SpatialDataStub:
@@ -142,6 +188,32 @@ class TestSplisosmFFT(unittest.TestCase):
         )
         # Display names come from gene_id column, first value per group.
         self.assertEqual(sorted(model.gene_names), ["GID1", "GID2"])
+
+    def test_docstring_example_workflow(self):
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            sdata=self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+            layer="counts",
+            group_iso_by="gene_symbol",
+            gene_names="gene_id",
+            min_counts=10,
+            min_bin_pct=0.0,
+        )
+        model.test_spatial_variability(
+            method="hsic-ir",
+            n_jobs=1,
+            print_progress=False,
+        )
+        sv_results = model.get_formatted_test_results(test_type="sv")
+
+        self.assertEqual(len(sv_results), model.n_genes)
+        self.assertTrue(
+            {"statistic", "pvalue", "pvalue_adj"}.issubset(sv_results.columns)
+        )
 
     def test_setup_data_min_counts_filters_isoforms(self):
         """Isoforms below min_counts threshold should be excluded."""
