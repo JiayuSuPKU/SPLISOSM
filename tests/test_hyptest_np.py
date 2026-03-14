@@ -62,6 +62,34 @@ class TestSplisosmNP(unittest.TestCase):
         self.n_spots = coords.shape[0]
         self.n_genes = len(counts)
 
+        iso_name_list = []
+        iso_gene_ids = []
+        iso_gene_labels = []
+        counts_merged = []
+        for _gene_name, _counts in zip(self.gene_names, self.counts):
+            n_iso = _counts.shape[1]
+            counts_merged.append(_counts)
+            for _iso_idx in range(n_iso):
+                iso_name_list.append(f"{_gene_name}_iso_{_iso_idx}")
+                iso_gene_ids.append(_gene_name)
+                iso_gene_labels.append(f"{_gene_name}_label")
+
+        adata_counts = torch.concat(counts_merged, dim=1).numpy().astype(np.float32)
+        adata_var = pd.DataFrame(
+            {"gene_symbol": iso_gene_ids, "gene_label": iso_gene_labels},
+            index=iso_name_list,
+        )
+        design_np = np.asarray(self.design_mtx)
+        adata_obs = pd.DataFrame(
+            {
+                "cov_1": design_np[:, 0],
+                "cov_2": design_np[:, 1],
+            }
+        )
+        self.adata = AnnData(X=adata_counts, obs=adata_obs, var=adata_var)
+        self.adata.layers["counts"] = adata_counts
+        self.adata.obsm["spatial"] = np.asarray(self.coords).astype(np.float32)
+
         self._is_sparkx_installed = self._test_sparkx_installed()
 
     def _test_sparkx_installed(self):
@@ -73,7 +101,9 @@ class TestSplisosmNP(unittest.TestCase):
                 return True
             except PackageNotInstalledError:
                 return False
-        except ImportError:
+            except Exception:
+                return False
+        except Exception:
             return False
 
     def test_setup_data(self):
@@ -93,6 +123,112 @@ class TestSplisosmNP(unittest.TestCase):
         stats, pval = _calc_ttest_differential_usage(data, groups)
         self.assertIsInstance(stats, np.floating)
         self.assertIsInstance(pval, np.floating)
+
+    def test_setup_data_from_anndata(self):
+        model = SplisosmNP()
+        self.adata.obsm["xy"] = self.adata.obsm["spatial"].copy()
+
+        model.setup_data(
+            adata=self.adata,
+            spatial_key="xy",
+            layer="counts",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+        )
+
+        self.assertEqual(model.n_genes, self.n_genes)
+        self.assertEqual(model.n_spots, self.n_spots)
+        self.assertEqual(model.covariate_names, ["cov_1", "cov_2"])
+        self.assertEqual(model.gene_names[0], f"{self.gene_names[0]}_label")
+
+    def test_setup_data_from_anndata_with_filtering(self):
+        counts = np.array(
+            [
+                [5, 3, 1, 2],
+                [4, 2, 0, 2],
+                [3, 1, 0, 2],
+                [2, 1, 0, 2],
+                [3, 1, 0, 1],
+                [4, 2, 0, 1],
+            ],
+            dtype=np.float32,
+        )
+        var = pd.DataFrame(
+            {
+                "gene_symbol": ["g1", "g1", "g2", "g2"],
+                "gene_label": ["Gene 1", "Gene 1", "Gene 2", "Gene 2"],
+            },
+            index=["g1_i1", "g1_i2", "g2_i1", "g2_i2"],
+        )
+        obs = pd.DataFrame(index=[f"spot_{i}" for i in range(counts.shape[0])])
+        adata = AnnData(X=counts, obs=obs, var=var)
+        adata.layers["counts"] = counts
+        adata.obsm["spatial"] = np.stack(
+            [np.arange(counts.shape[0]), np.arange(counts.shape[0])], axis=1
+        ).astype(np.float32)
+
+        model = SplisosmNP()
+        model.setup_data(
+            adata=adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            gene_names="gene_label",
+            min_counts=2,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=True,
+        )
+
+        self.assertEqual(model.n_genes, 1)
+        self.assertEqual(model.n_isos, [2])
+        self.assertEqual(model.gene_names, ["Gene 1"])
+
+    def test_setup_data_from_anndata_with_single_covariate_name(self):
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata,
+            spatial_key="spatial",
+            layer="counts",
+            group_iso_by="gene_symbol",
+            design_mtx="cov_1",
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+        )
+
+        self.assertEqual(model.setup_input_mode, "anndata")
+        self.assertIs(model.adata, self.adata)
+        self.assertEqual(model.n_factors, 1)
+        self.assertEqual(model.covariate_names, ["cov_1"])
+
+    def test_docstring_example_spatial_variability_workflow(self):
+        model = SplisosmNP()
+        model.setup_data(data=self.counts, coordinates=self.coords)
+        model.test_spatial_variability(method="hsic-ir", print_progress=False)
+        sv_results = model.get_formatted_test_results("sv")
+
+        self.assertEqual(len(sv_results), self.n_genes)
+        self.assertTrue(
+            {"statistic", "pvalue", "pvalue_adj"}.issubset(sv_results.columns)
+        )
+
+    def test_docstring_example_differential_usage_workflow(self):
+        model = SplisosmNP()
+        model.setup_data(
+            data=self.counts,
+            coordinates=self.coords,
+            design_mtx=self.design_mtx,
+        )
+        model.test_differential_usage(method="hsic", print_progress=False)
+        du_results = model.get_formatted_test_results("du")
+
+        self.assertEqual(len(du_results), self.n_genes * self.design_mtx.shape[1])
+        self.assertTrue(
+            {"statistic", "pvalue", "pvalue_adj"}.issubset(du_results.columns)
+        )
 
     def test_spatial_variability(self):
         model = SplisosmNP()

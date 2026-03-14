@@ -231,6 +231,35 @@ class TestSplisosmGLMM(unittest.TestCase):
         self.gene_names = gene_names
         self.coords = coords
         self.design_mtx = design_mtx
+        self.n_spots = coords.shape[0]
+
+        iso_name_list = []
+        iso_gene_ids = []
+        iso_gene_labels = []
+        counts_merged = []
+        for _gene_name, _counts in zip(self.gene_names, self.counts):
+            n_iso = _counts.shape[1]
+            counts_merged.append(_counts)
+            for _iso_idx in range(n_iso):
+                iso_name_list.append(f"{_gene_name}_iso_{_iso_idx}")
+                iso_gene_ids.append(_gene_name)
+                iso_gene_labels.append(f"{_gene_name}_label")
+
+        adata_counts = torch.concat(counts_merged, dim=1).numpy().astype(np.float32)
+        adata_var = pd.DataFrame(
+            {"gene_symbol": iso_gene_ids, "gene_label": iso_gene_labels},
+            index=iso_name_list,
+        )
+        design_np = np.asarray(self.design_mtx)
+        adata_obs = pd.DataFrame(
+            {
+                "cov_1": design_np[:, 0],
+                "cov_2": design_np[:, 1],
+            }
+        )
+        self.adata = AnnData(X=adata_counts, obs=adata_obs, var=adata_var)
+        self.adata.layers["counts"] = adata_counts
+        self.adata.obsm["spatial"] = np.asarray(self.coords).astype(np.float32)
 
     def test_splisosm_glmm_setup_data(self):
         model = SplisosmGLMM()
@@ -243,6 +272,56 @@ class TestSplisosmGLMM(unittest.TestCase):
         )
         self.assertIsNotNone(model.design_mtx)
         self.assertIsNotNone(model.coordinates)
+
+    def test_splisosm_glmm_setup_data_from_anndata(self):
+        model = SplisosmGLMM()
+        model.setup_data(
+            adata=self.adata,
+            spatial_key="spatial",
+            layer="counts",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            group_gene_by_n_iso=True,
+        )
+
+        self.assertEqual(model.setup_input_mode, "anndata")
+        self.assertIs(model.adata, self.adata)
+        self.assertEqual(model.n_genes, len(self.gene_names))
+        self.assertEqual(model.n_spots, self.n_spots)
+        self.assertEqual(model.covariate_names, ["cov_1", "cov_2"])
+
+    def test_docstring_example_workflow(self):
+        data_3_iso = get_simulation_data(n_genes=3, n_isos=3, n_spots_per_dim=8)
+        data_4_iso = get_simulation_data(n_genes=3, n_isos=4, n_spots_per_dim=8)
+        counts = [g for g in data_3_iso["counts"]] + [g for g in data_4_iso["counts"]]
+        coordinates = data_3_iso["coords"]
+        design_mtx = data_3_iso["design_mtx"]
+
+        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
+        model.setup_data(
+            data=counts,
+            coordinates=coordinates,
+            design_mtx=design_mtx,
+            group_gene_by_n_iso=True,
+        )
+        model.fit(
+            n_jobs=1,
+            batch_size=3,
+            with_design_mtx=False,
+            quiet=True,
+            print_progress=False,
+        )
+
+        fitted_models = model.get_fitted_models()
+        self.assertEqual(len(fitted_models), 6)
+        self.assertIsInstance(fitted_models[0], MultinomGLMM)
+
+        model.test_differential_usage(method="score")
+        du_results = model.get_formatted_test_results("du")
+        self.assertEqual(len(du_results), 6 * design_mtx.shape[1])
 
     def test_splisosm_glm_fit(self):
         model = SplisosmGLMM(model_type="glm")

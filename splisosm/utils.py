@@ -23,6 +23,7 @@ __all__ = [
     "false_discovery_control",
     "load_visium_sp_meta",
     "load_visiumhd_spatialdata",
+    "prepare_inputs_from_anndata",
     "extract_counts_n_ratios",
     "extract_gene_level_statistics",
     "run_sparkx",
@@ -649,6 +650,206 @@ def load_visiumhd_spatialdata(
         sdata.tables[bin_name] = probe_table
 
     return sdata
+
+
+def prepare_inputs_from_anndata(
+    adata: AnnData,
+    layer: str,
+    group_iso_by: str,
+    spatial_key: str,
+    min_counts: int,
+    min_bin_pct: float,
+    filter_single_iso_genes: bool,
+    gene_names: Optional[str],
+    design_mtx: Optional[Any],
+    covariate_names: Optional[list[str]],
+) -> tuple[
+    list[torch.Tensor],
+    torch.Tensor,
+    list[str],
+    Optional[Any],
+    Optional[list[str]],
+]:
+    """Extract and filter isoform count tensors from an AnnData object.
+
+    Shared helper used by both :class:`splisosm.hyptest_np.SplisosmNP` and
+    :class:`splisosm.hyptest_glmm.SplisosmGLMM` to prepare legacy-compatible
+    tensors from an AnnData input.  Feature filtering, sparse/dense handling,
+    coordinate extraction, and design-matrix resolution are all performed here.
+
+    Parameters
+    ----------
+    adata
+        Annotated data matrix.
+    layer
+        Key in ``adata.layers`` containing raw isoform counts.
+    group_iso_by
+        Column in ``adata.var`` used to group isoforms by gene.
+    spatial_key
+        Key in ``adata.obsm`` for spatial coordinates.
+    min_counts
+        Minimum total isoform count across spots required to retain an isoform.
+    min_bin_pct
+        Minimum fraction/percentage of spots with non-zero expression for an
+        isoform.  Values in ``[0, 1]`` are treated as fractions; values in
+        ``(1, 100]`` are treated as percentages.
+    filter_single_iso_genes
+        Whether to discard genes with fewer than two retained isoforms.
+    gene_names
+        Column name in ``adata.var`` used as display names for grouped genes.
+        If ``None``, the grouped gene IDs are used.
+    design_mtx
+        Design matrix for differential-usage tests.  Accepts a
+        tensor/array/dataframe of shape ``(n_spots, n_factors)``, a single
+        obs-column name (str), or a list of obs-column names.
+    covariate_names
+        Explicit covariate names.  When ``design_mtx`` is given as column
+        name(s) and this is ``None``, the column names are used automatically.
+
+    Returns
+    -------
+    counts_list : list[torch.Tensor]
+        Per-gene isoform count tensors, each of shape ``(n_spots, n_isos)``.
+        Sparse ``adata.layers[layer]`` input yields sparse COO tensors.
+    coordinates : torch.Tensor
+        Shape ``(n_spots, 2)`` spatial coordinates, dtype float32.
+    resolved_gene_names : list[str]
+        Display names for each gene in ``counts_list``.
+    resolved_design : np.ndarray or tensor or None
+        Resolved design matrix, or the original object if it was already
+        array-like; ``None`` when ``design_mtx`` is ``None``.
+    resolved_covariates : list[str] or None
+        Resolved covariate names, or ``None`` when ``design_mtx`` is ``None``.
+
+    Raises
+    ------
+    ValueError
+        If required fields are missing from ``adata``, no isoforms survive
+        filtering, or argument values are out of range.
+    """
+    if not isinstance(adata, AnnData):
+        raise ValueError("`adata` must be an AnnData object.")
+    if layer not in adata.layers:
+        raise ValueError(f"Layer `{layer}` was not found in `adata.layers`.")
+    if group_iso_by not in adata.var.columns:
+        raise ValueError(f"`{group_iso_by}` was not found in `adata.var`.")
+    if spatial_key not in adata.obsm:
+        raise ValueError(f"`{spatial_key}` was not found in `adata.obsm`.")
+    if min_counts < 0:
+        raise ValueError("`min_counts` must be >= 0.")
+    if min_bin_pct < 0 or min_bin_pct > 100:
+        raise ValueError("`min_bin_pct` must be between 0 and 1, or between 0 and 100.")
+    if isinstance(gene_names, list):
+        raise ValueError(
+            "In AnnData mode, `gene_names` must be a var-column name (str) or None."
+        )
+
+    iso_counts = adata.layers[layer]
+    min_bin_frac = float(min_bin_pct)
+    if min_bin_frac > 1.0:
+        min_bin_frac /= 100.0
+
+    total_counts = np.asarray(iso_counts.sum(axis=0)).ravel()
+    if hasattr(iso_counts, "toarray"):
+        bin_pct = np.asarray((iso_counts > 0).sum(axis=0)).ravel() / adata.n_obs
+    else:
+        bin_pct = np.count_nonzero(np.asarray(iso_counts) > 0, axis=0) / adata.n_obs
+
+    var_df = adata.var.copy()
+    var_df["__iso_name__"] = adata.var_names.astype(str)
+    var_df["__total_counts__"] = total_counts
+    var_df["__bin_pct__"] = bin_pct
+
+    var_df = var_df[
+        (var_df["__total_counts__"] >= min_counts)
+        & (var_df["__bin_pct__"] >= min_bin_frac)
+    ]
+    if var_df.shape[0] == 0:
+        raise ValueError(
+            "No isoforms remained after applying `min_counts`/`min_bin_pct` filtering."
+        )
+
+    if filter_single_iso_genes:
+        n_iso_per_gene = var_df.groupby(group_iso_by, observed=True).size()
+        keep_genes = n_iso_per_gene[n_iso_per_gene >= 2].index
+        var_df = var_df[var_df[group_iso_by].isin(keep_genes)]
+        if var_df.shape[0] == 0:
+            raise ValueError("No genes with >=2 isoforms remained after filtering.")
+
+    is_sparse_input = scipy.sparse.issparse(iso_counts)
+    if (
+        is_sparse_input
+        and not scipy.sparse.isspmatrix_csr(iso_counts)
+        and not scipy.sparse.isspmatrix_csc(iso_counts)
+    ):
+        iso_counts = iso_counts.tocsr()
+
+    iso_name_to_col = {name: i for i, name in enumerate(adata.var_names)}
+
+    counts_list: list[torch.Tensor] = []
+    grouped_genes: list[str] = []
+    for gene_id, group in var_df.groupby(group_iso_by, observed=True, sort=False):
+        iso_indices = [iso_name_to_col[name] for name in group["__iso_name__"]]
+        if is_sparse_input:
+            _counts_coo = iso_counts[:, iso_indices].tocoo()
+            _i = torch.LongTensor(np.vstack((_counts_coo.row, _counts_coo.col)))
+            _v = torch.FloatTensor(_counts_coo.data)
+            _counts = torch.sparse_coo_tensor(_i, _v, torch.Size(_counts_coo.shape))
+        else:
+            _counts_np = np.asarray(iso_counts[:, iso_indices], dtype=np.float32)
+            _counts = torch.from_numpy(_counts_np)
+        counts_list.append(_counts)
+        grouped_genes.append(gene_id)
+
+    if len(counts_list) == 0:
+        raise ValueError("No genes remained after extracting isoform counts.")
+
+    if gene_names is not None:
+        if gene_names not in adata.var.columns:
+            raise ValueError(
+                f"`gene_names` column `{gene_names}` was not found in `adata.var`."
+            )
+        gene_name_map = var_df.groupby(group_iso_by, observed=True)[gene_names].first()
+        resolved_gene_names = [str(gene_name_map.loc[_g]) for _g in grouped_genes]
+    else:
+        resolved_gene_names = [str(_g) for _g in grouped_genes]
+
+    coordinates = adata.obsm[spatial_key]
+    coordinates = torch.as_tensor(np.asarray(coordinates), dtype=torch.float32)
+    if coordinates.dim() != 2:
+        raise ValueError("Coordinates in `adata.obsm[spatial_key]` must be a 2D array.")
+
+    resolved_design = design_mtx
+    resolved_covariates = covariate_names
+    if isinstance(design_mtx, str):
+        if design_mtx not in adata.obs.columns:
+            raise ValueError(
+                f"`{design_mtx}` was not found in `adata.obs` for design_mtx."
+            )
+        resolved_design = adata.obs[[design_mtx]].to_numpy()
+        if resolved_covariates is None:
+            resolved_covariates = [design_mtx]
+    elif (
+        isinstance(design_mtx, list)
+        and len(design_mtx) > 0
+        and all(isinstance(_x, str) for _x in design_mtx)
+    ):
+        missing = [col for col in design_mtx if col not in adata.obs.columns]
+        if len(missing) > 0:
+            raise ValueError(
+                f"Columns {missing} were not found in `adata.obs` for design_mtx."
+            )
+        resolved_design = adata.obs[design_mtx].to_numpy()
+        if resolved_covariates is None:
+            resolved_covariates = list(design_mtx)
+
+    return (
+        counts_list,
+        coordinates,
+        resolved_gene_names,
+        resolved_design,
+        resolved_covariates,
+    )
 
 
 def extract_counts_n_ratios(

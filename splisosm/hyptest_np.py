@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
+from anndata import AnnData
 
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF
@@ -19,6 +20,7 @@ from smoother.weights import coordinate_to_weights_knn_sparse
 from splisosm.utils import (
     counts_to_ratios,
     false_discovery_control,
+    prepare_inputs_from_anndata,
     run_sparkx,
 )
 from splisosm.kernel import SpatialCovKernel
@@ -357,6 +359,8 @@ class SplisosmNP:
         self.n_spots = None  # number of spots
         self.n_isos = None  # list of number of isoforms for each gene
         self.n_factors = None  # number of covariates to test for differential usage
+        self.adata = None  # optional anndata source for the new setup path
+        self.setup_input_mode = None  # "legacy" or "anndata"
 
         # to store the spatial variability test results after running test_spatial_variability()
         self.sv_test_results = {}
@@ -389,32 +393,138 @@ class SplisosmNP:
 
     def setup_data(
         self,
-        data: list[torch.Tensor],
-        coordinates: Union[torch.Tensor, np.ndarray, pd.DataFrame],
+        data: Optional[list[Union[torch.Tensor, np.ndarray]]] = None,
+        coordinates: Optional[Union[torch.Tensor, np.ndarray, pd.DataFrame]] = None,
         approx_rank: Optional[int] = None,
-        design_mtx: Optional[torch.Tensor] = None,
-        gene_names: Optional[list[str]] = None,
+        design_mtx: Optional[
+            Union[torch.Tensor, np.ndarray, pd.DataFrame, str, list[str]]
+        ] = None,
+        gene_names: Optional[Union[list[str], str]] = None,
         covariate_names: Optional[list[str]] = None,
+        *,
+        adata: Optional[AnnData] = None,
+        spatial_key: str = "spatial",
+        layer: str = "counts",
+        group_iso_by: str = "gene_symbol",
+        min_counts: int = 10,
+        min_bin_pct: float = 0.0,
+        filter_single_iso_genes: bool = True,
     ) -> None:
         """Setup isoform-level spatial data for hypothesis testing.
+
+        This method supports two input modes for backward compatibility.
+
+        - Legacy mode: pass ``data`` and ``coordinates`` directly.
+        - AnnData mode: pass ``adata``, where counts are extracted from
+          ``adata.layers[layer]`` grouped by ``group_iso_by``, and coordinates
+          are read from ``adata.obsm[spatial_key]``.
+          See :func:`splisosm.utils.prepare_inputs_from_anndata` for details.
 
         Parameters
         ----------
         data
-            List of tensors with shape (n_spots, n_isos), the observed isoform counts for each gene.
+            Legacy mode only. List of tensors/arrays with shape
+            ``(n_spots, n_isos)`` containing isoform counts for each gene.
         coordinates
-            Shape (n_spots, 2), the spatial coordinates.
+            Legacy mode only. Shape ``(n_spots, 2)``, spatial coordinates.
         approx_rank
             The rank of the low-rank approximation for the spatial covariance matrix.
             If None, use the full-rank dense covariance matrix.
             For larger datasets (n_spots > 5,000), the maximum rank is set to ``4 * sqrt(n_spots)``.
         design_mtx
-            Shape (n_spots, n_factors), the design matrix for the fixed effects.
+            Design matrix for differential usage tests.
+
+            - Legacy mode: tensor/array/dataframe of shape ``(n_spots, n_factors)``.
+            - AnnData mode: tensor/array/dataframe, or one obs-column name
+              (str), or a list of obs-column names.
         gene_names
-            List of gene names.
+            Gene names.
+
+            - Legacy mode: list of gene names.
+            - AnnData mode: optional column name in ``adata.var`` used as
+              display names for grouped genes; if None, use grouped gene IDs.
         covariate_names
             List of covariate names.
+        adata
+            AnnData object used in the new input mode.
+        spatial_key
+            Key in ``adata.obsm`` for spatial coordinates.
+        layer
+            Counts layer in ``adata.layers``.
+        group_iso_by
+            Column in ``adata.var`` used to group isoforms by gene.
+        min_counts
+            Minimum total isoform count across spots required to retain an isoform
+            in AnnData mode.
+        min_bin_pct
+            Minimum percentage/fraction of spots where an isoform is expressed in
+            AnnData mode. Values in ``[0, 1]`` are treated as fractions; values in
+            ``(1, 100]`` are treated as percentages.
+        filter_single_iso_genes
+            AnnData mode only. Whether to remove genes with fewer than two retained
+            isoforms.
+
+        Raises
+        ------
+        ValueError
+            If input arguments are invalid or required fields are missing.
         """
+        if adata is not None:
+            if data is not None or coordinates is not None:
+                raise ValueError(
+                    "When `adata` is provided, `data` and `coordinates` should not be provided."
+                )
+
+            (
+                extracted_data,
+                extracted_coordinates,
+                extracted_gene_names,
+                extracted_design_mtx,
+                extracted_covariate_names,
+            ) = prepare_inputs_from_anndata(
+                adata=adata,
+                design_mtx=design_mtx,
+                gene_names=gene_names,
+                covariate_names=covariate_names,
+                spatial_key=spatial_key,
+                layer=layer,
+                group_iso_by=group_iso_by,
+                min_counts=min_counts,
+                min_bin_pct=min_bin_pct,
+                filter_single_iso_genes=filter_single_iso_genes,
+            )
+
+            data = extracted_data
+            coordinates = extracted_coordinates
+            design_mtx = extracted_design_mtx
+            gene_names = extracted_gene_names
+            covariate_names = extracted_covariate_names
+
+            self.adata = adata
+            self.setup_input_mode = "anndata"
+        else:
+            if data is None or coordinates is None:
+                raise ValueError(
+                    "Provide either (`data`, `coordinates`) for legacy mode, or `adata` for AnnData mode."
+                )
+
+            if isinstance(gene_names, str):
+                raise ValueError(
+                    "In legacy mode, `gene_names` must be a list of names or None."
+                )
+
+            if isinstance(design_mtx, str) or (
+                isinstance(design_mtx, list)
+                and len(design_mtx) > 0
+                and isinstance(design_mtx[0], str)
+            ):
+                raise ValueError(
+                    "In legacy mode, `design_mtx` must be a matrix-like object, not column names."
+                )
+
+            self.adata = None
+            self.setup_input_mode = "legacy"
+
         self.n_genes = len(data)  # number of genes
         self.n_spots = len(data[0])  # number of spots
         self.n_isos = [
@@ -425,10 +535,10 @@ class SplisosmNP:
             if gene_names is not None
             else [f"gene_{i + 1}" for i in range(self.n_genes)]
         )
-        assert (
-            len(self.gene_names) == self.n_genes
-        ), "Gene names must match the number of genes."
-        assert min(self.n_isos) > 1, "At least two isoforms are required for each gene."
+        if len(self.gene_names) != self.n_genes:
+            raise ValueError("Gene names must match the number of genes.")
+        if min(self.n_isos) <= 1:
+            raise ValueError("At least two isoforms are required for each gene.")
 
         # convert numpy.array to torch.tensor float if not already
         _data = [
@@ -440,7 +550,10 @@ class SplisosmNP:
         ]  # [tensor(n_spots, n_isos)] * n_genes
 
         # create spatial covariance matrix from the coordinates
-        assert coordinates.shape[0] == self.n_spots
+        if coordinates.shape[0] != self.n_spots:
+            raise ValueError(
+                "The number of coordinate rows must match the number of spots."
+            )
         if isinstance(coordinates, np.ndarray):
             coordinates = torch.from_numpy(coordinates).float()
         elif isinstance(coordinates, pd.DataFrame):
@@ -475,9 +588,15 @@ class SplisosmNP:
 
         # check the design matrix
         if design_mtx is not None:
-            assert design_mtx.shape[0] == self.n_spots
-            if isinstance(design_mtx, np.ndarray):
+            if isinstance(design_mtx, pd.DataFrame):
+                design_mtx = torch.from_numpy(design_mtx.values)
+            elif isinstance(design_mtx, np.ndarray):
                 design_mtx = torch.from_numpy(design_mtx)
+
+            if design_mtx.shape[0] != self.n_spots:
+                raise ValueError(
+                    "The design matrix must have the same number of rows as spots."
+                )
 
             if design_mtx.dim() == 1:  # in case of a single covariate
                 design_mtx = design_mtx.unsqueeze(1)
@@ -486,9 +605,10 @@ class SplisosmNP:
             design_mtx = design_mtx.float()
 
             if covariate_names is not None:  # set default names
-                assert (
-                    len(covariate_names) == design_mtx.shape[1]
-                ), "Covariate names must match the number of factors."
+                if len(covariate_names) != design_mtx.shape[1]:
+                    raise ValueError(
+                        "Covariate names must match the number of factors."
+                    )
             else:
                 covariate_names = [
                     f"factor_{i + 1}" for i in range(design_mtx.shape[1])

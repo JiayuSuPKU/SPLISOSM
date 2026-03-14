@@ -246,6 +246,11 @@ class MultinomGLM(BaseModel, nn.Module):
             print(
                 "Batched calculation has been implemented. Provide a batch of counts to speed up calculation."
             )
+
+        # convert sparse tensors to dense tensors
+        if counts.is_sparse:
+            counts = counts.to_dense()
+
         # set model dimensions based on the input shape
         self.n_genes, self.n_spots, self.n_isos = counts.shape
 
@@ -1096,6 +1101,10 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         # switch to float type
         if not counts.dtype.is_floating_point:
             counts = counts.float()
+
+        # convert sparse tensors to dense tensors
+        if counts.is_sparse:
+            counts = counts.to_dense()
 
         if design_mtx is None:
             # initialize an empty design matrix of shape (1, n_spots, 0)
