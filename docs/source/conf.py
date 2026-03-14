@@ -1,14 +1,35 @@
 # Configuration file for the Sphinx documentation builder.
 from datetime import datetime
-from importlib.metadata import metadata
+from importlib.metadata import PackageNotFoundError, metadata
+from pathlib import Path
+import tomllib
 
 # -- Project information
-info = metadata("splisosm")
-project_name = info["Name"]
-author = info["Author"]
+def _load_project_info() -> tuple[str, str, str]:
+    """Load (name, author, version) from installed metadata or pyproject.toml."""
+    try:
+        info = metadata("splisosm")
+        return info["Name"], info["Author"], info["Version"]
+    except PackageNotFoundError:
+        pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        with pyproject_path.open("rb") as f:
+            pyproject = tomllib.load(f)
+        project_cfg = pyproject.get("project", {})
+        name = project_cfg.get("name", "splisosm")
+        version = project_cfg.get("version", "0.0.0")
+        authors = project_cfg.get("authors", [])
+        author = (
+            authors[0].get("name", "")
+            if authors and isinstance(authors[0], dict)
+            else ""
+        )
+        return name, author, version
+
+
+project_name, author, version = _load_project_info()
+project = project_name
 copyright = f"{datetime.now():%Y}, {author}"
-version = info["Version"]
-release = info["Version"]
+release = version
 
 # -- General configuration
 
