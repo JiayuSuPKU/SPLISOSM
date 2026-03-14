@@ -68,3 +68,11 @@ docs/_build
 
 # distribution
 dist/
+
+# pytest cache
+.pytest_cache/
+.coverage
+.hypothesis/
+
+# copilot 
+.github/copilot-instructions.md
