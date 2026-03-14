@@ -13,15 +13,19 @@ release = info["Version"]
 # -- General configuration
 
 extensions = [
+    'myst_nb',
+    'myst_sphinx_gallery',
     'sphinx.ext.autodoc',
     'sphinx.ext.autosummary',
     'sphinx.ext.intersphinx',
     'sphinx.ext.autosectionlabel',
     'autoapi.extension',
     'sphinx.ext.napoleon',
-    'sphinx_gallery.load_style',
     'sphinxcontrib.bibtex',
 ]
+
+# MyST configuration
+nb_execution_mode = "off"
 
 # Citation bibtex file
 bibtex_bibfiles = ["refs.bib"]

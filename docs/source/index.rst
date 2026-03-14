@@ -48,7 +48,7 @@ contain sufficient isoform-level information for spatial pattern discovery. Thes
 .. list-table::
    :header-rows: 1
    :align: center
-   :widths: 50 33 17
+   :widths: 44 30 25
 
    * - Full-length isoform (long-read)
      - TREND event (short-read)
@@ -92,7 +92,7 @@ For methodological details, please refer to the self-contained Supplementary Not
 Reference
 ---------
 
-Su, Jiayu, et al. "Mapping isoforms and regulatory mechanisms from spatial transcriptomics data with SPLISOSM." Nature Biotechnology (2026): 1-12. `link to paper <https://www.nature.com/articles/s41587-025-02965-6>`_
+:cite:`su2026mapping` Su, Jiayu, et al. "Mapping isoforms and regulatory mechanisms from spatial transcriptomics data with SPLISOSM." Nature Biotechnology (2026): 1-12. `link to paper <https://www.nature.com/articles/s41587-025-02965-6>`_
 
 Frequently Asked Questions
 --------------------------

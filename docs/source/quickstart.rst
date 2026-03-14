@@ -1,200 +1,208 @@
 Quick Start
 ===========
 
-This guide provides step-by-step instructions on how to run SPLISOSM to test for spatial variability (SV) and differential isoform usage (DU) using both non-parametric and parametric methods.
+This guide walks through running SPLISOSM for spatial variability (SV) and differential isoform usage (DU) testing.
 
-Inputs
+Choosing a model class
+----------------------
+
+SPLISOSM provides three model classes:
+
+- :class:`~splisosm.SplisosmNP` — Non-parametric HSIC tests with low-rank kernel approximation. Works on both regular and irregular geometries (e.g., segmented spatial data or even single-cell data).
+- :class:`~splisosm.SplisosmGLMM` — Parametric GLMM-based DU test with spatial random effects.
+- :class:`~splisosm.SplisosmFFT` — FFT-accelerated HSIC tests on **regular grids** (Visium HD, Xenium binned data). Shares the same statistical model as ``:class:`~splisosm.SplisosmNP``. Recommended for large datasets for fast computation and memory efficiency.
+
+Inputs and outputs
 ------------------
 
-SPLISOSM requires the following inputs:
-
-- ``data``: A list containing per-gene isoform quantification for ``n_gene`` genes. Each element is a ``(n_spot, n_iso)`` tensor, where ``n_spot`` is the number of spatial spots and ``n_iso`` is the number of isoforms (or TREND events) for that gene.
-- ``coordinates``: A ``(n_spot, 2)`` tensor containing the spatial coordinates for each spot.
-
-For differential usage (DU) testing, an additional input is required:
-
-- ``covariates``: A ``(n_spot, n_covariate)`` tensor of spatial variables (e.g., RBP expression levels) for association testing.
-
-If your isoform quantification data is stored in an AnnData object (for instance, by following the :doc:`steps in the preprocessing documentation <txquant>`), you can use the helper function :func:`splisosm.utils.extract_counts_n_ratios` to prepare the inputs for SPLISOSM.
+:class:`~splisosm.SplisosmNP` and :class:`~splisosm.SplisosmGLMM` accept isoform-level quantification as either an ``AnnData`` object or as raw tensors.
+See :doc:`Isoform Quantification page <txquant>` for guidance on preparing input data for different platforms.
 
 .. code-block:: python
 
-   from splisosm.utils import extract_counts_n_ratios
-
-   adata = ...  # AnnData object of (n_spot, n_isoform) with adata.var['gene_symbol'] indicating gene assignment
-   data, ratio_data, gene_names, iso_names = extract_counts_n_ratios(
-       adata, layer='counts', group_iso_by='gene_symbol'
+   model.setup_data(
+       adata,                    # AnnData of shape (n_spots, n_isoforms)
+       spatial_key="spatial",    # key in adata.obsm for spatial coordinates
+       layer="counts",           # layer containing raw isoform counts
+       group_iso_by="gene_symbol",  # adata.var column grouping isoforms by gene
+       gene_names="gene_symbol",  # adata.var column for gene names
+       min_counts=10,
+       min_bin_pct=0.01,
+       design_mtx=covariates,        # (n_spots, n_factors) optional for DU testing
+       covariate_names=covariate_names,  # list of covariate names
    )
-   coordinates = adata.obs.loc[:, ['array_row', 'array_col']] # spatial coordinates
 
-Outputs
-------------------
+.. note::
+    For versions of SPLISOSM prior to v1.0.4, `setup_data` takes the legacy arguments 
+    ``data``, ``coordinates``, which can be computed from `adata` via :func:`splisosm.utils.extract_counts_n_ratios`.
+    Please check the API documentation :func:`SplisosmNP.setup_data` for details.
 
-- **SV tests**: A pandas DataFrame containing per-gene test statistics and p-values.
-- **DU tests**: A pandas DataFrame containing test statistics and p-values for each gene-covariate pair.
+For :class:`~splisosm.SplisosmFFT`, pass a ``SpatialData`` object with isoform-level counts to ``setup_data``.
+
+.. code-block:: python
+
+   model.setup_data(
+       sdata,                    # SpatialData object
+       bins="Visium_HD_Mouse_Brain_square_016um",  # SpatialData bin element name
+       table_name="square_016um", # adata containing isoform-level counts
+       col_key="array_col",
+       row_key="array_row",
+       layer="counts",
+       group_iso_by="gene_ids",  # adata.var column grouping isoforms by gene
+       gene_names="gene_name",    # adata.var column for gene names
+       min_counts=10,
+       min_bin_pct=0.01,
+   )
+
+
+All model classes share the same output convention:
+
+- **SV results**: a ``DataFrame`` with per-gene test statistics and p-values.
+- **DU results**: a ``DataFrame`` with test statistics and p-values for each gene-covariate pair.
+
 
 Example data
----------------
+------------
 
-A small demo dataset of Visium-ONT mouse olfactory bulb (SiT-MOB) is available for download `from Dropbox (~100Mb) <https://www.dropbox.com/scl/fo/dmuobtbof54jl4ht9zbjo/ALVIIEp-Ua5yYUPO8QxlIZ8?rlkey=q9o3jisd25ef5hwfqnsqdbf3i&st=vxhgokzw&dl=0>`_ to test the package functionality.
+A demo Visium-ONT mouse olfactory bulb dataset (SiT-MOB) is available `from Dropbox (~100 MB) <https://www.dropbox.com/scl/fo/dmuobtbof54jl4ht9zbjo/ALVIIEp-Ua5yYUPO8QxlIZ8?rlkey=q9o3jisd25ef5hwfqnsqdbf3i&st=vxhgokzw&dl=0>`_:
 
-- ``mob_ont_filtered_1107.h5ad``: An AnnData object with isoform quantification results.
-- ``mob_visium_rbp_1107.h5ad``: An AnnData object with short-read-based RBP gene expression.
+- ``mob_ont_filtered_1107.h5ad``: isoform quantification (AnnData).
+- ``mob_visium_rbp_1107.h5ad``: short-read RBP gene expression (AnnData).
 
 .. code-block:: python
 
    import scanpy as sc
-   from splisosm.utils import extract_counts_n_ratios
 
    adata_ont = sc.read("mob_ont_filtered_1107.h5ad")
    adata_rbp = sc.read("mob_visium_rbp_1107.h5ad")
 
-   # prepare per gene isoform tensor list
-   # data[i] = (n_spot, n_iso) tensor for gene i
-   # assuming isoforms (adata_ont.var_names) are grouped by adata_ont.var['gene_symbol']
-   data, _, gene_names, _ = extract_counts_n_ratios(
-       adata_ont, layer='counts', group_iso_by='gene_symbol',
-       return_sparse=True, # return sparse tensors to save memory
-       filter_single_iso_genes=True # filter out single-isoform genes
-   )
-
-   # spatial coordinates
-   coordinates = adata_ont.obs.loc[:, ['array_row', 'array_col']]
-
-   # prepare covariates for differential usage testing
-   adata_rbp = adata_rbp[adata_ont.obs_names, :].copy()  # align the RBP data with the isoform data
-   # focus on spatially variably expressed RBPs only
-   # adata_rbp.var['is_visium_sve'] = adata_rbp.var['pvalue_adj_sparkx'] < 0.01
+   # Align RBP data and extract spatially variable RBPs as covariates
+   adata_rbp = adata_rbp[adata_ont.obs_names, :].copy()
    covariates = adata_rbp[:, adata_rbp.var['is_visium_sve']].layers['log1p'].toarray()
    covariate_names = adata_rbp.var.loc[adata_rbp.var['is_visium_sve'], 'features']
 
 
 Testing for spatial variability (SV)
-----------------------------------------
+-------------------------------------
 
-SPLISOSM uses the Hilbert-Schmidt Independence Criterion (HSIC) to test for statistical independence between isoform expression patterns and spatial coordinates. Specifically, SPLISOSM provides the following SV tests, which assess variability in three different aspects of expression:
+SPLISOSM tests for statistical independence between isoform expression and spatial location using the Hilbert-Schmidt Independence Criterion (HSIC). Three SV tests are available:
 
-1.  **HSIC-GC (Gene Counts)**: Tests for SV in total gene expression. This test can also be called directly via :func:`splisosm.utils.run_hsic_gc`. It is designed as a drop-in replacement for `SPARK-X <https://genomebiology.biomedcentral.com/articles/10.1186/s13059-021-02404-0>`_, optimizing statistical power through an improved spatial kernel design.
-2.  **HSIC-IR (Isoform Ratios)**: Tests for SV in relative isoform usage.
-3.  **HSIC-IC (Isoform Counts)**: Tests for SV in individual isoform expression. Biologically, this variability is a joint result of changes in total gene expression and relative isoform usage. In practice, the results from HSIC-IC and HSIC-GC are often similar.
+1. **HSIC-IR** — tests SV of relative isoform usage (spatially variably processed genes, SVP).
+2. **HSIC-GC** — tests SV of total gene expression (spatially variably expressed genes, SVE). Drop-in replacement for `SPARK-X <https://genomebiology.biomedcentral.com/articles/10.1186/s13059-021-02404-0>`_ with improved power.
+3. **HSIC-IC** — tests SV of individual isoform counts; reflects joint changes in expression and usage.
+
+**SplisosmNP** (any geometries — AnnData input)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: python
 
    from splisosm import SplisosmNP
 
-   # minimal input data, extracted from AnnData as shown above
-   data = ...  # list of length n_gene, each a (n_spot, n_iso) tensor
-   coordinates = ...  # (n_spot, 2), spatial coordinates
-   gene_names = ...  # list of length n_gene, gene names
-
-   # initialize the model
-   # for large datasets, consider setting approx_rank to a smaller value (e.g., 50) to speed up computation
-   model_np = SplisosmNP()
-   model_np.setup_data(data, coordinates, gene_names=gene_names, approx_rank=None)
-
-   # per-gene test for spatial variability
-   # method can be 'hsic-ir' (isoform ratio), 'hsic-ic' (isoform counts)
-   # 'hsic-gc' (gene counts), 'spark-x' (gene counts)
-   model_np.test_spatial_variability(
-       method="hsic-ir",
-       ratio_transformation='none',  # only for 'hsic-ir': 'none', 'clr', 'ilr', 'alr', 'radial'
-       nan_filling='mean',           # 'mean' (global mean) or 'none' (ignore NaN spots)
+   model = SplisosmNP()
+   model.setup_data(
+       adata=adata_ont,
+       spatial_key="spatial",
+       layer="counts",
+       group_iso_by="gene_symbol",
+       approx_rank=100,   # lower rank speeds up computation for large datasets
+       min_counts=10,
+       min_bin_pct=0.01,
    )
+   model.test_spatial_variability(
+       method="hsic-ir",
+       ratio_transformation="none",  # 'none', 'clr', 'ilr', 'alr', 'radial'
+       nan_filling="mean",
+   )
+   df_sv_res = model.get_formatted_test_results(test_type="sv")
 
-   # extract the per-gene test statistics
-   df_sv_res = model_np.get_formatted_test_results(test_type='sv')
-
-
-Testing for differential isoform usage (DU)
-----------------------------------------------
-
-SPLISOSM implements conditional association tests to identify genes whose isoform usage patterns are associated with specific covariates (e.g., RBP expression), while accounting for spatial correlation. These tests are available in both non-parametric and parametric forms.
-
-Non-parametric DU test
-~~~~~~~~~~~~~~~~~~~~~~~~
-The non-parametric test is based on the HSIC kernel independence test and relies on Gaussian process regression for spatial conditioning.
+**SplisosmFFT** (regular grids only — binned Visium HD, Xenium)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: python
 
-   from splisosm.hyptest_np import SplisosmNP
+   from splisosm import SplisosmFFT
 
-   # minimal input data
-   # after running the SV test, keep only SVS genes for DU testing
-   data_svs = ...  # list of length n_gene, each a (n_spot, n_iso) tensor
-   gene_svs_names = ...  # list of length n_gene, gene names
-   coordinates = ...  # (n_spot, 2), spatial coordinates
+   model = SplisosmFFT(neighbor_degree=1, rho=0.99)
+   model.setup_data(
+       sdata=sdata,
+       bins="Visium_HD_Mouse_Brain_square_016um",  # SpatialData bin element name
+       table_name="square_016um",
+       col_key="array_col",
+       row_key="array_row",
+       layer="counts",
+       group_iso_by="gene_ids",
+       gene_names="gene_name",
+       min_counts=10,
+       min_bin_pct=0.01,
+   )
+   model.test_spatial_variability(method="hsic-ir", n_jobs=-1)
+   df_sv_res = model.get_formatted_test_results(test_type="sv")
 
-   # covariates for differential usage testing
-   # e.g. spatial domains, RBP expression, etc.
-   covariates = ...  # (n_spot, n_factor), design matrix of covariates
-   covariate_names = ...  # list of length n_factor, covariate names
+Testing for differential isoform usage (DU)
+--------------------------------------------
 
-   # initialize the model with covariates
-   model_np = SplisosmNP()
-   model_np.setup_data(
-       data_svs,
-       coordinates,
-       design_mtx=covariates,
-       gene_names=gene_svs_names,
+DU tests identify genes whose isoform usage is associated with a covariate (e.g., spatial domain, RBP expression), conditioned on spatial correlation. Two approaches are available.
+
+**SplisosmNP** (non-parametric, HSIC-based)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Uses conditional HSIC with Gaussian process (GP) spatial detrending:
+
+.. code-block:: python
+
+   from splisosm import SplisosmNP
+
+   # Focus on SVP genes from the SV step
+   svp_genes = df_sv_res.loc[df_sv_res['pvalue_adj'] < 0.05, 'gene'].tolist()
+   adata_svp = adata_ont[:, adata_ont.var['gene_symbol'].isin(svp_genes)].copy()
+
+   # Run DU test for each covariate (e.g., RBP expression)
+   model = SplisosmNP()
+   model.setup_data(
+       adata=adata_svp,
+       spatial_key="spatial",
+       layer="counts",
+       design_mtx=covariates,        # (n_spots, n_factors)
+       group_iso_by="gene_symbol",
        covariate_names=covariate_names,
        approx_rank=None
    )
-
-   # run the conditional HSIC test for differential usage
-   model_np.test_differential_usage(
-       method="hsic-gp",  # options: 'hsic', 'hsic-knn', 'hsic-gp', 't-fisher', 't-tippett'
-       ratio_transformation='none', nan_filling='mean',
-       hsic_eps=1e-3,      # regularization for kernel regression (for 'hsic'); None => unconditional HSIC
-       gp_configs=None,    # dict for GP regression config (for 'hsic-gp')
-       print_progress=True, return_results=False
+   model.test_differential_usage(
+       method="hsic-gp",  # 'hsic', 'hsic-knn', 'hsic-gp', 't-fisher', 't-tippett'
+       ratio_transformation="none",
+       nan_filling="mean",
+       print_progress=True,
    )
-
-   # extract per gene-factor pair test statistics
-   df_du_res = model_np.get_formatted_test_results(test_type='du')
+   df_du_res = model.get_formatted_test_results(test_type="du")
 
 
-Parametric DU test (GLMM)
-~~~~~~~~~~~~~~~~~~~~~~~~~
+**SplisosmGLMM** (parametric, GLM/GLMM-based)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The parametric test is based on a Generalized Linear Mixed Model (GLMM), where the spatial correlation is modeled as a random effect term following a Gaussian random field. Models are fitted using the `PyTorch Lightning <https://www.pytorchlightning.ai/>`_ framework. The marginal likelihood, which integrates out the random effect, is approximated using the Laplace approximation at the mode.
+Fits a multinomial GLMM with a Gaussian random field spatial random effect. The marginal likelihood is approximated via Laplace at the mode.
 
 .. code-block:: python
 
-   from splisosm.hyptest_glmm import SplisosmGLMM
+   from splisosm import SplisosmGLMM
 
-   # parametric model fitting
    model_p = SplisosmGLMM(
-       model_type='glmm-full',  # 'glmm-full', 'glmm-null', 'glm'
-       share_variance=True,
-       var_parameterization_sigma_theta=True,
-       var_fix_sigma=False,
-       var_prior_model="none",
-       var_prior_model_params={},
-       init_ratio="observed",
+       model_type="glmm-full",  # 'glmm-full', 'glmm-null', 'glm'
        fitting_method="joint_gd",
-       fitting_configs={'max_epochs': -1}
    )
    model_p.setup_data(
-       data_svs,                # list length n_genes, each (n_spots, n_isos) tensor
-       coordinates,             # (n_spots, 2)
-       design_mtx=covariates,   # (n_spots, n_covariates)
-       gene_names=gene_svs_names,
+       adata=adata_svp,
+       spatial_key="spatial",
+       layer="counts",
+       design_mtx=covariates,        # (n_spots, n_factors)
+       group_iso_by="gene_symbol",
        covariate_names=covariate_names,
        group_gene_by_n_iso=True,
    )
    model_p.fit(
-       n_jobs=2,
-       batch_size=20,
-       quiet=True, print_progress=True,
-       with_design_mtx=False,   # fit without covariates for score DU test
-       from_null=False, refit_null=True,  # for LLR test
-       random_seed=None
+       n_jobs=2, batch_size=20,
+       with_design_mtx=False,  # fit null model first for score test
+       refit_null=True,
+       print_progress=True,
    )
-   model_p.save("model_p.pkl")
-   per_gene_glmm_models = model_p.get_fitted_models()
-
-   # differential usage testing
-   model_p.test_differential_usage(method="score", print_progress=True, return_results=False)
-
-   # extract per gene-factor pair test statistics
-   df_du_res = model_p.get_formatted_test_results(test_type='du')
+   model_p.test_differential_usage(method="score", print_progress=True)
+   df_du_res = model_p.get_formatted_test_results(test_type="du")

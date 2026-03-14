@@ -1,46 +1,80 @@
 Isoform Quantification for ST Data
-===========================================
+====================================
 
-This page provides guidance on obtaining isoform-level quantifications from various spatial transcriptomics (ST) platforms, a prerequisite for running SPLISOSM. If you already have isoform-level quantification results, feel free to skip this section.
+This page describes how to obtain isoform-level quantifications for various spatial transcriptomics (ST) platforms as input to SPLISOSM. 
+If you already have a compatible ``AnnData`` or ``SpatialData`` object, skip ahead to :ref:`the expected data format <txquant:expected data format>`.
 
-We recommend storing isoform quantification results in an AnnData object with the shape ``(n_spot, n_isoform)``, separate from any gene-level AnnData object. SPLISOSM expects the isoform-level AnnData object to have the following structure:
+Platform overview
+-----------------
 
-- ``adata.layers['counts']``: A layer containing the raw isoform-level counts.
-- ``adata.var``: An isoform-level metadata table with at least the following columns:
-    - ``gene_symbol``: The gene symbol corresponding to each isoform.
-    - A unique feature identifier, stored in ``adata.var_names`` or a column like ``feature_id`` (e.g., transcript ID, peak ID, codeword ID).
-- ``adata.obs``: A spot- or cell-level metadata table with at least the following columns for spatial information:
-    - ``array_row``: The spatial row coordinate.
-    - ``array_col``: The spatial column coordinate.
+The table below summarizes the supported ST platforms, the type of isoform feature used, and the recommended quantification approach.
 
+.. list-table::
+   :header-rows: 1
+   :widths: 22 28 22 28
 
-Long-read spatial transcriptomics data
--------------------------------------------
+   * - Platform type
+     - Example platforms
+     - Feature
+     - Quantification approach
+   * - **Long-read ST**
+     - ONT + Visium (e.g., SiT :cite:`lebrigand2023spatial`)
+     - Full-length transcript isoform
+     - Any long-read aligner/quantifier (e.g., `IsoQuant <https://ablab.github.io/IsoQuant/>`_, `kallisto <https://pachterlab.github.io/kallisto/>`_)
+   * - **Short-read 3\' end**
+     - 10x Visium/Visium HD (fresh-frozen), Slide-seqV2
+     - 3\' end diversity (TREND) event / peak
+     - `Sierra <https://github.com/VCCRI/Sierra>`_ for *de novo* peak calling
+   * - **Short-read targeted**
+     - 10x Visium/Visium HD (FFPE), 10x Flex
+     - Exon/junction probe
+     - Space Ranger output directly
+   * - **In situ targeted**
+     - 10x Xenium Prime 5K
+     - Exon/junction probe (codeword)
+     - Custom extraction script (see below)
 
-If you are working with long-read spatial transcriptomics data, you have likely already performed full-length isoform quantification. SPLISOSM is compatible with *any* upstream long-read isoform quantification tool that produces a count matrix of isoforms across spatial spots or cells. Popular options include `IsoQuant <https://ablab.github.io/IsoQuant/>`_ and `kallisto <https://pachterlab.github.io/kallisto/>`_.
+Expected data format
+--------------------
 
-When selecting a quantification tool and its parameters, remember that SPLISOSM's detection power is sensitive to sequencing depth. Specifically, :ref:`the number of significant results increases linearly with the number of captured UMIs per spot <faq:umi-depth>`. Therefore, any method that improves the recovery of RNA reads is expected to enhance SPLISOSM's performance.
+SPLISOSM expects isoform-level data in an ``AnnData`` of shape ``(n_spots, n_isoforms)``:
 
-Short-read 3' end spatial transcriptomics data
--------------------------------------------------
+- ``adata.layers['counts']``: raw isoform counts.
+- ``adata.var``: isoform metadata with at least:
 
-If you have 3' end short-read spatial transcriptomics data, we recommend using `Sierra <https://github.com/VCCRI/Sierra/tree/master>`_ to extract transcriptome 3' end diversity (TREND) events *de novo*. For detailed instructions on installing and running Sierra, please refer to its `official documentation <https://github.com/VCCRI/Sierra/wiki/Sierra-Vignette>`_.
+  - ``gene_symbol/gene_id``: gene assignment for each isoform.
+  - A unique feature identifier in ``adata.var_names`` (e.g., transcript ID, peak ID, codeword ID).
+
+- Spatial coordinates in one of:
+
+  - ``adata.obsm['spatial']``: preferred; a ``(n_spots, 2)`` array with ``[x (col), y (row)]`` columns, compatible with Scanpy/Squidpy conventions.
+  - ``adata.obs[['array_row', 'array_col']]``: legacy pixel-coordinate format.
+
+  See :func:`splisosm.utils.prepare_inputs_from_anndata` for parsing details.
+
+Long-read ST data
+-----------------
+
+SPLISOSM is compatible with any long-read quantification tool that produces an isoform-by-spot count matrix. Popular options include `IsoQuant <https://ablab.github.io/IsoQuant/>`_ and `kallisto <https://pachterlab.github.io/kallisto/>`_.
 
 .. note::
+   Detection power scales linearly with sequencing depth (:ref:`FAQ <faq:umi-depth>`). Any processing choice that increases captured UMIs per spot will improve results.
 
-    If you are processing multiple samples, we strongly advise against using Sierra's ``MergePeakCoordinates`` function, as it can sometimes generate overlapping peak definitions.
+Short-read 3' end ST data
+--------------------------
+
+Use `Sierra <https://github.com/VCCRI/Sierra/tree/master>`_ to call 3' end diversity (TREND) events *de novo* from Space Ranger BAM files. See the `Sierra vignette <https://github.com/VCCRI/Sierra/wiki/Sierra-Vignette>`_ for installation and usage details.
+
+Tested platforms: 10x Visium (fresh-frozen), Slide-seqV2.
 
 .. warning::
-    
-    Some ST protocols, such as 10x Visium FFPE, use targeted gene panels, and thus do not provide information on 3' end variability.
+   When processing multiple samples, avoid Sierra's ``MergePeakCoordinates`` function — it can produce overlapping peak definitions.
 
-We have successfully tested Sierra on the following ST protocols and expect it to work on other similar platforms:
+.. note::
+   There is an known issue with running Sierra's ``CountPeaks`` on Visium HD 3\' data. We are working on a fix.
 
-- 10x Visium (fresh-frozen)
-- Slide-seqV2
-
-Running Sierra on BAM generated by 10x SpaceRanger
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Running Sierra on Space Ranger BAM
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. code-block:: r
 
@@ -66,8 +100,8 @@ Running Sierra on BAM generated by 10x SpaceRanger
    )
 
 
-Converting Sierra outputs to AnnData
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Converting Sierra output to AnnData
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. code-block:: python
 
@@ -107,8 +141,7 @@ Converting Sierra outputs to AnnData
     adata = load_visium_sp_meta(adata, f"{sp_meta_dir}/", library_id='adata_peak')
     adata = adata[adata.obs['in_tissue'].astype(bool), :].copy()
 
-SPLISOSM is agnostic to the specific structure of isoforms or TREND events and will compare all events associated with the same gene. 
-For computational efficiency, we recommend filtering out low-abundance isoforms or events before running the analysis.
+SPLISOSM compares all events associated with the same gene and is agnostic to their specific structure. Filter out low-abundance features before testing to reduce computation and improve power.
 
 .. code-block:: python
 
@@ -158,12 +191,36 @@ For computational efficiency, we recommend filtering out low-abundance isoforms 
     print(f"Average number of peaks per gene after QC: {sum(_iso_keep) / sum(_gene_keep)}")
 
 
-In situ hybridization-based spatial transcriptomics data
-----------------------------------------------------------
-When working with imaging-based ST data that uses exon- or junction-specific probes, SPLISOSM can be run on either segmented cell-level data or spatially binned spot-level data.
+Short-read targeted ST data
+----------------------------
 
-For data from platforms like the `10x Xenium Prime 5K panel <https://www.10xgenomics.com/products/xenium-5k-panel>`_, we provide a `helper script to extract codeword-level quantifications from the 'transcripts.zarr.zip' file <https://github.com/JiayuSuPKU/SPLISOSM/blob/main/scripts/extract_xenium_codeword_dist.py>`_. 
-This script bins the transcript data into spots of a user-defined size. It has been tested with outputs from Xenium Ranger v3.1.1.
+10x Visium HD FFPE uses a fixed pan-genome probe for read enrichment. SPLISOSM treats probe-level counts as the isoform-level quantification — probes targeting the same gene are grouped and tested jointly.
+
+Given Space Ranger output, the following code creates a ``SpatialData`` object with probe-level counts (from ``raw_probe_bc_matrix.h5``):
+
+.. code-block:: python
+
+   import scanpy as sc
+   from splisosm.utils import load_visiumhd_spatialdata
+
+   sdata = load_visiumhd_spatialdata(
+        path=visium_hd_outs,
+        bin_sizes=[2, 8, 16],
+        filtered_counts_file=True,
+        load_all_images=False,
+        var_names_make_unique=True,
+        counts_layer_name="counts",
+    )
+
+See the :doc:`Visium HD FFPE tutorial <tutorials/visiumhd_ffpe>` for a complete step-by-step workflow.
+
+
+In situ targeted ST data
+-------------------------
+
+For imaging-based platforms with exon- or junction-specific probes (e.g., `10x Xenium Prime 5K <https://www.10xgenomics.com/products/xenium-5k-panel>`_), SPLISOSM uses codeword-level counts as isoform proxies. Data can be analysed at single-cell resolution (segmented cells) or on spatially binned spots.
+
+We provide a `helper script <https://github.com/JiayuSuPKU/SPLISOSM/blob/main/scripts/extract_xenium_codeword_dist.py>`_ to extract codeword counts from the ``transcripts.zarr.zip`` output of Xenium Ranger (tested on v3.1.1) and bin them into spots of a user-defined size.
 
 .. code-block:: zsh
 

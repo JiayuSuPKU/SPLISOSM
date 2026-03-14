@@ -7,4 +7,5 @@ sphinx-book-theme
 sphinxcontrib-bibtex
 sphinx-autoapi
 IPython
-sphinx-gallery
+myst-nb
+myst-sphinx-gallery
