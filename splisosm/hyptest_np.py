@@ -1,4 +1,5 @@
-# Non-parametric hypothesis testing for spatial splicing patterns
+"""Non-parametric hypothesis tests for spatial isoform usage."""
+
 from __future__ import annotations
 
 import warnings

@@ -1,3 +1,5 @@
+"""Likelihood functions and pvalue-approximation utilities."""
+
 import numpy as np
 from typing import Optional
 from numpy.typing import ArrayLike

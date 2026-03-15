@@ -1,3 +1,5 @@
+"""Simulation utilities for generating spatial isoform count data."""
+
 from __future__ import annotations
 
 import itertools

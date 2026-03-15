@@ -1,3 +1,5 @@
+"""GLMM-based hypothesis tests for spatial isoform usage."""
+
 from __future__ import annotations
 
 import warnings

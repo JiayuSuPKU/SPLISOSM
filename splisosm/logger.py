@@ -1,3 +1,5 @@
+"""Training logger utilities for GLM/GLMM optimization."""
+
 from __future__ import annotations
 
 import torch

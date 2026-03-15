@@ -1,3 +1,5 @@
+"""Multinomial GLM/GLMM model implementations for SPLISOSM."""
+
 import warnings
 from abc import ABC, abstractmethod
 from timeit import default_timer as timer
