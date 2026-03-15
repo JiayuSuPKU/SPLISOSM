@@ -12,3 +12,4 @@ Explore notebook tutorials for running SPLISOSM on various spatial transcriptomi
   :tooltip:
 
   visiumhd_ffpe
+  xenium_prime_5k

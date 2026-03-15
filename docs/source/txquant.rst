@@ -24,15 +24,15 @@ The table below summarizes the supported ST platforms, the type of isoform featu
    * - **Short-read 3\' end**
      - 10x Visium/Visium HD (fresh-frozen), Slide-seqV2
      - 3\' end diversity (TREND) event / peak
-     - `Sierra <https://github.com/VCCRI/Sierra>`_ for *de novo* peak calling
+     - `Sierra <https://github.com/VCCRI/Sierra>`__ for *de novo* peak calling
    * - **Short-read targeted**
      - 10x Visium/Visium HD (FFPE), 10x Flex
      - Exon/junction probe
-     - Space Ranger output directly
+     - Space Ranger output directly (``raw_probe_bc_matrix.h5``)
    * - **In situ targeted**
      - 10x Xenium Prime 5K
      - Exon/junction probe (codeword)
-     - Custom extraction script (see below)
+     - Xenium Ranger output directly (``transcripts.zarr.zip``)
 
 Expected data format
 --------------------
@@ -52,6 +52,10 @@ SPLISOSM expects isoform-level data in an ``AnnData`` of shape ``(n_spots, n_iso
 
   See :func:`splisosm.utils.prepare_inputs_from_anndata` for parsing details.
 
+The spot-by-isoform ``AnnData`` can also be a table of a ``SpatialData`` object. In such cases, we will typically run 
+`spatialdata.rasterize_bins <https://spatialdata.scverse.org/en/latest/api/operations.html#spatialdata.rasterize_bins>`_ to 
+rasterize counts into square bins of varying sizes, which can speed up computation. See :func:`~splisosm.SplisosmFFT.setup_data` for details.
+
 Long-read ST data
 -----------------
 
@@ -63,7 +67,7 @@ SPLISOSM is compatible with any long-read quantification tool that produces an i
 Short-read 3' end ST data
 --------------------------
 
-Use `Sierra <https://github.com/VCCRI/Sierra/tree/master>`_ to call 3' end diversity (TREND) events *de novo* from Space Ranger BAM files. See the `Sierra vignette <https://github.com/VCCRI/Sierra/wiki/Sierra-Vignette>`_ for installation and usage details.
+Use `Sierra <https://github.com/VCCRI/Sierra/>`__ to call 3' end diversity (TREND) events *de novo* from Space Ranger BAM files. See the `Sierra vignette <https://github.com/VCCRI/Sierra/wiki/Sierra-Vignette>`_ for installation and usage details.
 
 Tested platforms: 10x Visium (fresh-frozen), Slide-seqV2.
 
@@ -200,7 +204,6 @@ Given Space Ranger output, the following code creates a ``SpatialData`` object w
 
 .. code-block:: python
 
-   import scanpy as sc
    from splisosm.io import load_visiumhd_probe
 
    sdata = load_visiumhd_probe(
@@ -212,30 +215,89 @@ Given Space Ranger output, the following code creates a ``SpatialData`` object w
      counts_layer_name="counts",
    )
 
+The generated ``SpatialData`` object has the following structure (example):
+
+.. code-block:: text
+
+     SpatialData object
+     ├── Images
+     │     ├── 'Visium_HD_Mouse_Brain_full_image': DataTree[cyx] (3, 23947, 18872), (3, 11973, 9436), (3, 5986, 4718), (3, 2993, 2359), (3, 1496, 1179)
+     │     ├── 'Visium_HD_Mouse_Brain_hires_image': DataArray[cyx] (3, 6000, 4729)
+     │     └── 'Visium_HD_Mouse_Brain_lowres_image': DataArray[cyx] (3, 600, 473)
+     ├── Shapes
+     │     ├── 'Visium_HD_Mouse_Brain_cell_segmentations': GeoDataFrame shape: (40222, 2) (2D shapes)
+     │     ├── 'Visium_HD_Mouse_Brain_square_002um': GeoDataFrame shape: (6296688, 1) (2D shapes)
+     │     ├── 'Visium_HD_Mouse_Brain_square_008um': GeoDataFrame shape: (393543, 1) (2D shapes)
+     │     └── 'Visium_HD_Mouse_Brain_square_016um': GeoDataFrame shape: (98917, 1) (2D shapes)
+     └── Tables
+       ├── 'cell_segmentations': AnnData (40222, 19070)
+       ├── 'square_002um': AnnData (6296688, 55538)
+       ├── 'square_008um': AnnData (393543, 55538)
+       └── 'square_016um': AnnData (98917, 55538)
+     with coordinate systems:
+       ▸ 'Visium_HD_Mouse_Brain', with elements:
+         Visium_HD_Mouse_Brain_full_image (Images), Visium_HD_Mouse_Brain_hires_image (Images), Visium_HD_Mouse_Brain_lowres_image (Images), Visium_HD_Mouse_Brain_cell_segmentations (Shapes), Visium_HD_Mouse_Brain_square_002um (Shapes), Visium_HD_Mouse_Brain_square_008um (Shapes), Visium_HD_Mouse_Brain_square_016um (Shapes)
+       ▸ 'Visium_HD_Mouse_Brain_downscaled_hires', with elements:
+         Visium_HD_Mouse_Brain_hires_image (Images), Visium_HD_Mouse_Brain_cell_segmentations (Shapes), Visium_HD_Mouse_Brain_square_002um (Shapes), Visium_HD_Mouse_Brain_square_008um (Shapes), Visium_HD_Mouse_Brain_square_016um (Shapes)
+       ▸ 'Visium_HD_Mouse_Brain_downscaled_lowres', with elements:
+         Visium_HD_Mouse_Brain_lowres_image (Images), Visium_HD_Mouse_Brain_cell_segmentations (Shapes), Visium_HD_Mouse_Brain_square_002um (Shapes), Visium_HD_Mouse_Brain_square_008um (Shapes), Visium_HD_Mouse_Brain_square_016um (Shapes)
+
 See the :doc:`Visium HD FFPE tutorial <tutorials/visiumhd_ffpe>` for a complete step-by-step workflow.
 
 
 In situ targeted ST data
 -------------------------
 
-For imaging-based platforms with exon- or junction-specific probes (e.g., `10x Xenium Prime 5K <https://www.10xgenomics.com/products/xenium-5k-panel>`_), SPLISOSM uses codeword-level counts as isoform proxies. Data can be analysed at single-cell resolution (segmented cells) or on spatially binned spots.
+For imaging-based platforms with exon- or junction-specific probes (e.g., `10x Xenium Prime 5K <https://www.10xgenomics.com/products/xenium-5k-panel>`_), SPLISOSM uses codeword-level counts as isoform proxies. 
+Data can be analysed at single-cell resolution (segmented cells) or on spatially binned spots.
 
-We provide a `helper script <https://github.com/JiayuSuPKU/SPLISOSM/blob/main/scripts/extract_xenium_codeword_dist.py>`_ to extract codeword counts from the ``transcripts.zarr.zip`` output of Xenium Ranger (tested on v3.1.1) and bin them into spots of a user-defined size.
+Given Xenium Ranger output, the following code creates a binned ``SpatialData`` object with codeword-level counts (from ``transcripts.zarr.zip``):
 
-.. code-block:: zsh
+.. code-block:: python
 
-   # download the 'transcripts.zarr.zip' file from 10x Xenium data
-   $ wget <Xenium_transcripts_zarr_url> -O transcripts.zarr.zip
+   from splisosm.io import load_xenium_codeword
 
-   # run the helper script to extract codeword counts and bin into spots
-   # estimated runtime: ~15 minutes for a full Xenium 5K dataset, 64GB RAM recommended
-   $ python scripts/extract_xenium_codeword_dist.py \
-       --data_dir <where_transcripts_zarr_zip_is> \
-       --res_dir <output_directory> \
-       --spatial_resolution 20 # specify the desired spot size in microns
-       --n_jobs 16 # number of parallel threads
+   sdata = load_xenium_codeword(
+     path=xenium_ranger_outs,
+     spatial_resolutions=[8.0, 16.0],
+     quality_threshold=20.0,
+     n_jobs=-1,
+     chunk_batch_size=64,
+     counts_layer_name="counts",
+     create_square_shapes=True,
+   )
 
-   # the output file '<output_directory>/codeword_quant_res_20um.h5ad' is an AnnData object of (n_spot, n_codeword)
-   # and can be used as input to SPLISOSM
+See the :doc:`Xenium Prime 5K tutorial <tutorials/xenium_prime_5k>` for a complete step-by-step workflow.
+
+.. note::
+
+    If your Xenium Output Bundle was generated by older Xenium Ranger versions before v3.1.0, please re-run the
+    `Xenium Ranger relabel pipeline <https://www.10xgenomics.com/support/software/xenium-ranger/latest/analysis/running-pipelines/XR-relabel>`_
+    to get an updated ``transcripts.zarr.zip`` file.
+
+The generated ``SpatialData`` object has the following structure (example):
+
+.. code-block:: text
+
+   SpatialData object
+   ├── Images
+   │     └── 'morphology_focus': DataTree[cyx] (4, 23912, 34154), (4, 11956, 17077), (4, 5978, 8538), (4, 2989, 4269), (4, 1494, 2134)
+   ├── Labels
+   │     ├── 'cell_labels': DataTree[yx] (23912, 34154), (11956, 17077), (5978, 8538), (2989, 4269), (1494, 2134)
+   │     └── 'nucleus_labels': DataTree[yx] (23912, 34154), (11956, 17077), (5978, 8538), (2989, 4269), (1494, 2134)
+   ├── Points
+   │     └── 'transcripts': DataFrame with shape: (<Delayed>, 13) (3D points)
+   ├── Shapes
+   │     ├── 'cell_boundaries': GeoDataFrame shape: (63173, 1) (2D shapes)
+   │     ├── 'nucleus_boundaries': GeoDataFrame shape: (63036, 1) (2D shapes)
+   │     ├── 'square_008um_bins': GeoDataFrame shape: (576580, 1) (2D shapes)
+   │     └── 'square_016um_bins': GeoDataFrame shape: (144372, 1) (2D shapes)
+   └── Tables
+     ├── 'square_008um': AnnData (576580, 11163)
+     ├── 'square_016um': AnnData (144372, 11163)
+     └── 'table': AnnData (63173, 5006)
+   with coordinate systems:
+     ▸ 'global', with elements:
+       morphology_focus (Images), cell_labels (Labels), nucleus_labels (Labels), transcripts (Points), cell_boundaries (Shapes), nucleus_boundaries (Shapes), square_008um_bins (Shapes), square_016um_bins (Shapes)
 
 
