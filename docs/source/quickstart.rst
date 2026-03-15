@@ -10,7 +10,7 @@ SPLISOSM provides three model classes:
 
 - :class:`~splisosm.SplisosmNP` — Non-parametric HSIC tests with low-rank kernel approximation. Works on both regular and irregular geometries (e.g., segmented spatial data or even single-cell data).
 - :class:`~splisosm.SplisosmGLMM` — Parametric GLMM-based DU test with spatial random effects.
-- :class:`~splisosm.SplisosmFFT` — FFT-accelerated HSIC tests on **regular grids** (Visium HD, Xenium binned data). Shares the same statistical model as ``:class:`~splisosm.SplisosmNP``. Recommended for large datasets for fast computation and memory efficiency.
+- :class:`~splisosm.SplisosmFFT` — FFT-accelerated HSIC tests on **regular grids** (Visium HD, Xenium binned data). Shares the same statistical model as :class:`~splisosm.SplisosmNP`. Recommended for large datasets for fast computation and memory efficiency.
 
 Inputs and outputs
 ------------------

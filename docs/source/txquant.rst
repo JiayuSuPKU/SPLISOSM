@@ -75,7 +75,7 @@ Tested platforms: 10x Visium (fresh-frozen), Slide-seqV2.
    When processing multiple samples, avoid Sierra's ``MergePeakCoordinates`` function — it can produce overlapping peak definitions.
 
 .. note::
-   There is an known issue with running Sierra's ``CountPeaks`` on Visium HD 3\' data. We are working on a fix.
+  There is a known issue with running Sierra's ``CountPeaks`` on Visium HD 3\' data. We are working on a fix.
 
 Running Sierra on Space Ranger BAM
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -89,7 +89,7 @@ Running Sierra on Space Ranger BAM
      gtf.file = '${gtf_file}', # SpaceRanger reference gtf file
      bamfile = '${bam_file}',  # bam file from SpaceRanger
      junctions.file = '${junc_file}', # junctions bed files extracted using regtools junctions extract
-   # optional arguments for retainning low-abundance peaks
+   # optional arguments for retaining low-abundance peaks
    #   min.jcutoff.prop = 0.0,
    #   min.cov.prop = 0.0,
    #   min.peak.prop = 0.0
@@ -249,7 +249,7 @@ In situ targeted ST data
 -------------------------
 
 For imaging-based platforms with exon- or junction-specific probes (e.g., `10x Xenium Prime 5K <https://www.10xgenomics.com/products/xenium-5k-panel>`_), SPLISOSM uses codeword-level counts as isoform proxies. 
-Data can be analysed at single-cell resolution (segmented cells) or on spatially binned spots.
+Data can be analyzed at single-cell resolution (segmented cells) or on spatially binned spots.
 
 Given Xenium Ranger output, the following code creates a binned ``SpatialData`` object with codeword-level counts (from ``transcripts.zarr.zip``):
 

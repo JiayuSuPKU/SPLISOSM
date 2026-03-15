@@ -55,7 +55,7 @@ Running SPLISOSM
 **5. Which differential usage test method should I use: parametric or non-parametric?**
 
   We recommend using the non-parametric test (:class:`splisosm.hyptest_np.SplisosmNP` with ``method='hsic-gp'``) as the default choice. It is more robust to model misspecification and generally provides better control of the false positive rate.
-  The parametric test (:class:`splisosm.hyptest.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
+  The parametric test (:class:`splisosm.hyptest_glmm.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
 
   Note that both conditional tests ('hsic-gp' and 'glmm') are computationally intensive and may take hours to run on large datasets. The faster unconditional tests ('hsic' or 'glm') do not account for spatial autocorrelation in the null model, which can lead to inflated p-values. 
   They may be suitable for exploratory analyses where speed is a priority.
@@ -63,7 +63,7 @@ Running SPLISOSM
   .. code-block:: python
 
     from splisosm.hyptest_np import SplisosmNP
-    from splisosm.hyptest import SplisosmGLMM
+    from splisosm.hyptest_glmm import SplisosmGLMM
 
     # non-parametric DU test (unconditional)
     model_np = SplisosmNP()
@@ -107,7 +107,7 @@ Interpretation of Results
 
 .. note::
 
-  This per-isoform ranking is for exploratory purposes only. The adjusted p-values from this analysis should not be considered as formal hypothesis testing, as the usage ratios of isoforms from the same gene are inherently correlated.
+   This per-isoform ranking is for exploratory purposes only. The adjusted p-values from this analysis should not be considered as formal hypothesis testing, as the usage ratios of isoforms from the same gene are inherently correlated.
 
 
 **7. How many spatially variably expressed (SVE) genes or spatially variably processed (SVP) genes should I expect to find?**
@@ -126,7 +126,7 @@ Interpretation of Results
    **Number of significant genes versus sequencing depth in down-sampling experiments.**
    Each black dot represents a short-read Visium coronal brain section (CBS) sample down-sampled to specific depth. 
    ONT-CBS1 and ONT-CBS2 are two long-read SiT (Visium-ONT) CBS samples.
-   SR-Hippocampus: Slide-seqV2 hippocampus sample with higher spatial resolution but fewer UMI per spot.
+   SR-Hippocampus: Slide-seqV2 hippocampus sample with higher spatial resolution but fewer UMIs per spot.
   
 **8. I have finished running SPLISOSM, what should I do next?**
 

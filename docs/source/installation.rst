@@ -8,7 +8,7 @@ SPLISOSM can be installed via pip:
   # from PyPI (stable version)
   $ pip install splisosm
 
-  # or from github (latest version)
+  # or from GitHub (latest version)
   $ pip install git+https://github.com/JiayuSuPKU/SPLISOSM.git#egg=splisosm
 
 
