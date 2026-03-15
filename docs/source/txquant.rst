@@ -201,16 +201,16 @@ Given Space Ranger output, the following code creates a ``SpatialData`` object w
 .. code-block:: python
 
    import scanpy as sc
-   from splisosm.utils import load_visiumhd_spatialdata
+   from splisosm.io import load_visiumhd_probe
 
-   sdata = load_visiumhd_spatialdata(
-        path=visium_hd_outs,
-        bin_sizes=[2, 8, 16],
-        filtered_counts_file=True,
-        load_all_images=False,
-        var_names_make_unique=True,
-        counts_layer_name="counts",
-    )
+   sdata = load_visiumhd_probe(
+     path=visium_hd_outs,
+     bin_sizes=[2, 8, 16],
+     filtered_counts_file=True,
+     load_all_images=False,
+     var_names_make_unique=True,
+     counts_layer_name="counts",
+   )
 
 See the :doc:`Visium HD FFPE tutorial <tutorials/visiumhd_ffpe>` for a complete step-by-step workflow.
 
