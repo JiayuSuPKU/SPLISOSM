@@ -48,6 +48,8 @@ def _aggregate_visiumhd_probe_counts(
     target_obs_names: pd.Index,
 ) -> scipy.sparse.csr_matrix:
     """Aggregate 2um probe counts into target bins according to mapping."""
+    # Table mapping 2um barcodes to 8um and 16um bins is available as
+    # `barcode_mappings.parquet` in the Space Ranger output
     mapping_pairs = (
         barcode_mappings[[source_col, target_col]].dropna().drop_duplicates()
     )
@@ -64,6 +66,7 @@ def _aggregate_visiumhd_probe_counts(
             (len(tgt_index), adata_2um.n_vars), dtype=np.float32
         )
 
+    # Define a sparse aggregation matrix that maps 2um barcodes to target bins
     aggregation = scipy.sparse.csr_matrix(
         (
             np.ones(valid.sum(), dtype=np.float32),
@@ -129,7 +132,7 @@ def load_visiumhd_probe(
 
     Returns
     -------
-    SpatialData
+    spatialdata.SpatialData
         A SpatialData object with probe-level tables for requested bins.
 
     Raises
@@ -196,6 +199,7 @@ def load_visiumhd_probe(
             raise ValueError(f"Cannot find barcode_mappings.parquet under: {path}")
         mapping_path = mapping_candidates[0]
 
+    # Call visium_hd() to load the SpatialData object with requested bins
     requested_bins_um = [int(re.search(r"(\d{3})", b).group(1)) for b in requested_bins]
     sdata = visium_hd(
         path=path,
@@ -211,6 +215,7 @@ def load_visiumhd_probe(
         var_names_make_unique=False,
     )
 
+    # Load probe-level 2um counts and filter to in-tissue barcodes if requested
     adata_2um = sc.read_10x_h5(raw_probe_path, gex_only=False)
     adata_2um.obs_names = adata_2um.obs_names.astype(str)
     if var_names_make_unique:
@@ -240,6 +245,7 @@ def load_visiumhd_probe(
                 "No in-tissue 2um barcodes remained after filtering raw_probe_bc_matrix.h5."
             )
 
+    # Aggregate 2um probe counts into requested resolution bins
     mapping_cols = [source_bin, *requested_bins]
     barcode_mappings = pd.read_parquet(mapping_path)
     for col in mapping_cols:
@@ -298,6 +304,7 @@ def load_visiumhd_probe(
                 target_obs_names=template_table.obs_names,
             )
 
+        # Save aggregated counts into a new table (AnnData) in the SpatialData object
         probe_table = AnnData(
             X=x_target,
             obs=template_table.obs.copy(),
@@ -341,6 +348,7 @@ def _compute_xenium_bins_from_meta(
     native_ncols: int,
     spatial_resolution: float,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Bin X/Y coordinates into square bins at requested resolution."""
     x_min = float(grid_origin["x"])
     y_min = float(grid_origin["y"])
     x_max = x_min + int(native_ncols) * float(native_grid_size[0])
@@ -370,12 +378,13 @@ def _chunk_to_codeword_triplets(
     # https://www.10xgenomics.com/support/software/xenium-onboard-analysis/latest/advanced/xoa-output-zarr#transcripts
     # `codeword_to_target_col` maps a raw Xenium codeword ID to the output matrix
     # column index. Non-target codewords are encoded as -1. This avoids repeated
-    # `np.isin()` checks and dictionary lookups for every transcript in every chunk.
+    # `np.isin()` checks and dictionary lookups for every transcript in every chunk
     q_scores = np.asarray(chunk["quality_score"][:]).ravel()
     codeword_ids = np.asarray(chunk["codeword_identity"][:])
     if codeword_ids.ndim > 1:
         codeword_ids = codeword_ids[:, 0]
 
+    # Transcript locations are stored as (x, y, z) coordinates in microns. We only need x and y
     locs = np.asarray(chunk["location"][:])
     if locs.ndim != 2 or locs.shape[1] < 2:
         return (
@@ -406,6 +415,7 @@ def _chunk_to_codeword_triplets(
     codeword_ids = codeword_ids[in_range]
     locs_xy = locs_xy[in_range]
 
+    # Map transcript id to target column index. Non-target codewords are encoded as -1
     target_cols = codeword_to_target_col[codeword_ids.astype(np.int64)]
     in_target = target_cols >= 0
     if not np.any(in_target):
@@ -432,13 +442,18 @@ def _chunk_to_codeword_triplets(
     y_idx = y_idx[valid]
     target_cols = target_cols[valid].astype(np.int64)
 
+    # Each spatial bin is identified by a unique integer index based on its (row, col) position in the grid
     spot_idx = (y_idx * ncols + x_idx).astype(np.int64)
     n_target = int((codeword_to_target_col >= 0).sum())
 
+    # Each (bin, codeword) pair is identified by a unique integer index based on its (spot_idx, target_col) pair
+    # such that we can use np.unique to count occurrences of each unique pair
     pair_key = spot_idx * n_target + target_cols
     unique_key, counts = np.unique(pair_key, return_counts=True)
-    rows = unique_key // n_target
-    cols = unique_key % n_target
+
+    # Parse the unique_key back into spatial and transcript indices
+    rows = unique_key // n_target  # spot_idx, spatial bin indices
+    cols = unique_key % n_target  # target_cols, transcript indices
     vals = counts.astype(np.float32)
     return rows, cols, vals
 
@@ -476,6 +491,7 @@ def _assemble_xenium_codeword_table(
         for c in range(ncols)
     ]
     grid_cols, grid_rows = np.meshgrid(np.arange(ncols), np.arange(nrows))
+    # Compute the center coordinates of each bin in microns
     x_centers = (x_bins[:-1] + x_bins[1:]) * 0.5
     y_centers = (y_bins[:-1] + y_bins[1:]) * 0.5
 
@@ -489,11 +505,13 @@ def _assemble_xenium_codeword_table(
         index=obs_names,
     )
 
+    # Feature metadata for each codeword, including gene symbol and feature ID
     var_metadata = [
         {
-            "var_name": str(cw),
+            "var_name": f"{codeword_id_to_gene[cw]}|{cw}",
+            "codeword_id": str(cw),
             "gene_symbol": str(codeword_id_to_gene[cw]),
-            "feature_id": f"{codeword_id_to_gene[cw]}-{cw}",
+            "feature_id": f"{codeword_id_to_gene[cw]}|{cw}",
         }
         for cw in cw_ids
     ]
@@ -533,6 +551,8 @@ def _build_xenium_codeword_table_for_resolution(
     total_spots = nrows * ncols
     n_target = len(target_codewords)
 
+    # Map each codeword ID to its corresponding column index in the output matrix.
+    # Non-target codewords are encoded as -1
     codeword_to_target_col = np.full(len(codeword_id_to_gene), -1, dtype=np.int64)
     codeword_to_target_col[np.asarray(target_codewords, dtype=np.int64)] = np.arange(
         n_target, dtype=np.int64
@@ -544,6 +564,9 @@ def _build_xenium_codeword_table_for_resolution(
         Parallel = None
         delayed = None
 
+    # Process a single chunk to extract (row, col, value) triplets for the sparse counts matrix
+    # See https://www.10xgenomics.com/support/software/xenium-onboard-analysis/latest/advanced/xoa-output-zarr#transcripts
+    # for the Zarr chunk structure.
     def process_key(key: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         chunk_path = f"grids/0/{key}"
         if chunk_path not in root:
@@ -614,7 +637,7 @@ def _build_xenium_codeword_table_for_resolution(
 
 def load_xenium_codeword(
     path: str | Path,
-    spatial_resolutions: Sequence[float] = (2.0, 8.0, 16.0),
+    spatial_resolutions: Sequence[float] = (8.0, 16.0),
     quality_threshold: float = 20.0,
     n_jobs: int = -1,
     chunk_batch_size: int = 64,
@@ -689,7 +712,7 @@ def load_xenium_codeword(
 
     Returns
     -------
-    SpatialData
+    spatialdata.SpatialData
         SpatialData object augmented with codeword-count tables at each
         requested resolution.
 
@@ -748,6 +771,7 @@ def load_xenium_codeword(
     if any(r <= 0 for r in resolutions):
         raise ValueError("All `spatial_resolutions` values must be > 0.")
 
+    # Call spatialdata-io reader to load Xenium Ranger outputs into a SpatialData object
     outs_path = _xenium_locate_outs_path(path)
     sdata = xenium(
         path=outs_path,
@@ -764,12 +788,22 @@ def load_xenium_codeword(
         gex_only=gex_only,
     )
 
+    # Binning transcripts into square bins at requested resolutions using transcript-level chunk data
     zarr_path = outs_path / "transcripts.zarr.zip"
     store = ZipStore(zarr_path, mode="r")
     root = zarr.open(store, mode="r")
 
     try:
-        codeword_names_raw = root["density"]["codeword"].attrs.get("codeword_names", [])
+        try:
+            codeword_names_raw = root["density"]["codeword"].attrs.get(
+                "codeword_names", []
+            )
+        except KeyError:
+            raise ValueError(
+                "Could not find `density/codeword` group in transcripts.zarr.zip. "
+                "Consider re-running the Xenium Ranger (>=v3.1.0) relabel pipeline. "
+                "https://www.10xgenomics.com/support/software/xenium-ranger/latest/analysis/running-pipelines/XR-relabel"
+            )
         codeword_id_to_gene = [
             x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x)
             for x in codeword_names_raw
