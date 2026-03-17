@@ -7,9 +7,12 @@ Explore notebook tutorials for running SPLISOSM on various spatial transcriptomi
 
   More tutorials under development. Please check back later for updates.
 
+Spatial variability analysis for large-scale data
+--------------------------------------------------
 .. base-gallery::
   :caption: Available notebooks
   :tooltip:
 
   visiumhd_ffpe
+  visiumhd_3prime
   xenium_prime_5k

@@ -23,7 +23,7 @@ The table below summarizes the supported ST platforms, the type of isoform featu
      - Any long-read aligner/quantifier (e.g., `IsoQuant <https://ablab.github.io/IsoQuant/>`_, `kallisto <https://pachterlab.github.io/kallisto/>`_)
    * - **Short-read 3\' end**
      - 10x Visium/Visium HD (fresh-frozen), Slide-seqV2
-     - 3\' end diversity (TREND) event / peak
+     - 3\' end diversity (TREND) event (peak)
      - `Sierra <https://github.com/VCCRI/Sierra>`__ for *de novo* peak calling
    * - **Short-read targeted**
      - 10x Visium/Visium HD (FFPE), 10x Flex
@@ -69,16 +69,62 @@ Short-read 3' end ST data
 
 Use `Sierra <https://github.com/VCCRI/Sierra/>`__ to call 3' end diversity (TREND) events *de novo* from Space Ranger BAM files. See the `Sierra vignette <https://github.com/VCCRI/Sierra/wiki/Sierra-Vignette>`_ for installation and usage details.
 
-Tested platforms: 10x Visium (fresh-frozen), Slide-seqV2.
+Tested platforms: 
+
+- 10x Visium (fresh-frozen)
+- Slide-seqV2
+- 10x Visium HD 3' (fresh-frozen).
 
 .. warning::
    When processing multiple samples, avoid Sierra's ``MergePeakCoordinates`` function — it can produce overlapping peak definitions.
 
 .. note::
-  There is a known issue with running Sierra's ``CountPeaks`` on Visium HD 3\' data. We are working on a fix.
+  There is a known issue with running Sierra's ``CountPeaks`` on Visium HD 3\' data. See the workaround workflow below and under 
+  `scripts/visiumhd_3p_trend_quant.sh <https://github.com/JiayuSuPKU/SPLISOSM/blob/main/scripts/visiumhd_3p_trend_quant.sh>`_ for details.
 
-Running Sierra on Space Ranger BAM
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Visium HD 3' data (custom quantification)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For 10x Visium HD 3' data, we recommend running a hybrid workflow:
+
+0. Run ``spaceranger count`` with ``create-bam=true`` to get the BAM file.
+1. Run Sierra ``FindPeaks`` (plus ``AnnotatePeaksFromGTF``) on the Space Ranger BAM.
+2. Convert peak definitions to SAF/BED and run ``featureCounts -R BAM`` to add peak-level tags using `Subread <https://github.com/ShiLab-Bioinformatics/subread>`_.
+3. Count UMIs per peak per barcode with ``umi_tools count``. 
+4. Build a 10x-compatible feature-barcode matrix and save as ``raw_probe_bc_matrix.h5`` under the output directory ``outs/binned_outputs/square_002um``.
+5. Load peak-level data into ``SpatialData`` with :func:`splisosm.io.load_visiumhd_probe`.
+
+An end-to-end implementation of the above quantification workflow is available in ``scripts/visiumhd_3p_trend_quant.bash`` under the 
+`scripts directory <https://github.com/JiayuSuPKU/SPLISOSM/tree/main/scripts>`_. The generated ``SpatialData`` object has the following structure (example):
+
+.. code-block:: text
+
+  SpatialData object, with associated Zarr store: /Users/jysumac/Projects/SPLISOSM_paper/data/visiumhd_3p_mouse_cbs/sdata_peak.filtered.zarr
+  ├── Images
+  │     ├── '_hires_image': DataArray[cyx] (3, 5492, 6000)
+  │     └── '_lowres_image': DataArray[cyx] (3, 549, 600)
+  ├── Shapes
+  │     ├── '_cell_segmentations': GeoDataFrame shape: (84031, 2) (2D shapes)
+  │     ├── '_square_002um': GeoDataFrame shape: (5998466, 1) (2D shapes)
+  │     ├── '_square_008um': GeoDataFrame shape: (376419, 1) (2D shapes)
+  │     └── '_square_016um': GeoDataFrame shape: (94592, 1) (2D shapes)
+  └── Tables
+        ├── 'cell_segmentations': AnnData (84031, 33696)
+        ├── 'square_002um': AnnData (5998466, 19575)
+        ├── 'square_008um': AnnData (376419, 19575)
+        └── 'square_016um': AnnData (94592, 19575)
+  with coordinate systems:
+      ▸ '', with elements:
+          _hires_image (Images), _lowres_image (Images), _cell_segmentations (Shapes), _square_002um (Shapes), _square_008um (Shapes), _square_016um (Shapes)
+      ▸ '_downscaled_hires', with elements:
+          _hires_image (Images), _cell_segmentations (Shapes), _square_002um (Shapes), _square_008um (Shapes), _square_016um (Shapes)
+      ▸ '_downscaled_lowres', with elements:
+          _lowres_image (Images), _cell_segmentations (Shapes), _square_002um (Shapes), _square_008um (Shapes), _square_016um (Shapes)
+
+For downstream analysis of TREND spatial patterns, see the :doc:`Visium HD 3' tutorial <tutorials/visiumhd_3prime>`.
+
+Running Sierra on Space Ranger BAM (10x Visium etc.)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. code-block:: r
 
