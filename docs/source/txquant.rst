@@ -87,7 +87,7 @@ Visium HD 3' data (custom quantification)
 
 For 10x Visium HD 3' data, we recommend running a hybrid workflow:
 
-0. Run ``spaceranger count`` with ``create-bam=true`` to get the BAM file.
+0. Run ``spaceranger count`` (>=v4.0) with ``create-bam=true`` to get the BAM file.
 1. Run Sierra ``FindPeaks`` (plus ``AnnotatePeaksFromGTF``) on the Space Ranger BAM.
 2. Convert peak definitions to SAF/BED and run ``featureCounts -R BAM`` to add peak-level tags using `Subread <https://github.com/ShiLab-Bioinformatics/subread>`_.
 3. Count UMIs per peak per barcode with ``umi_tools count``. 
@@ -109,7 +109,7 @@ An end-to-end implementation of the above quantification workflow is available i
   │     ├── '_square_008um': GeoDataFrame shape: (376419, 1) (2D shapes)
   │     └── '_square_016um': GeoDataFrame shape: (94592, 1) (2D shapes)
   └── Tables
-        ├── 'cell_segmentations': AnnData (84031, 33696)
+        ├── 'cell_segmentations': AnnData (84031, 19575)
         ├── 'square_002um': AnnData (5998466, 19575)
         ├── 'square_008um': AnnData (376419, 19575)
         └── 'square_016um': AnnData (94592, 19575)
@@ -261,34 +261,43 @@ Given Space Ranger output, the following code creates a ``SpatialData`` object w
      counts_layer_name="counts",
    )
 
+.. note::
+
+    :func:`splisosm.io.load_visiumhd_probe` uses the ``barcode_mappings.parquet`` file, 
+    which contains the spatial mapping information of 2um barcodes to coarser bins and segmented cells. 
+    See `10x documentation <https://www.10xgenomics.com/support/software/space-ranger/latest/analysis/outputs/segmented-outputs>`_ for details.
+    If you don't have this file, please re-run the
+    `Space Ranger count pipeline <https://www.10xgenomics.com/support/software/space-ranger/latest/analysis/running-pipelines/space-ranger-count>`_
+    with Space Ranger v4.0+.
+
 The generated ``SpatialData`` object has the following structure (example):
 
 .. code-block:: text
 
-     SpatialData object
-     ├── Images
-     │     ├── 'Visium_HD_Mouse_Brain_full_image': DataTree[cyx] (3, 23947, 18872), (3, 11973, 9436), (3, 5986, 4718), (3, 2993, 2359), (3, 1496, 1179)
-     │     ├── 'Visium_HD_Mouse_Brain_hires_image': DataArray[cyx] (3, 6000, 4729)
-     │     └── 'Visium_HD_Mouse_Brain_lowres_image': DataArray[cyx] (3, 600, 473)
-     ├── Shapes
-     │     ├── 'Visium_HD_Mouse_Brain_cell_segmentations': GeoDataFrame shape: (40222, 2) (2D shapes)
-     │     ├── 'Visium_HD_Mouse_Brain_square_002um': GeoDataFrame shape: (6296688, 1) (2D shapes)
-     │     ├── 'Visium_HD_Mouse_Brain_square_008um': GeoDataFrame shape: (393543, 1) (2D shapes)
-     │     └── 'Visium_HD_Mouse_Brain_square_016um': GeoDataFrame shape: (98917, 1) (2D shapes)
-     └── Tables
-       ├── 'cell_segmentations': AnnData (40222, 19070)
-       ├── 'square_002um': AnnData (6296688, 55538)
-       ├── 'square_008um': AnnData (393543, 55538)
-       └── 'square_016um': AnnData (98917, 55538)
-     with coordinate systems:
-       ▸ 'Visium_HD_Mouse_Brain', with elements:
-         Visium_HD_Mouse_Brain_full_image (Images), Visium_HD_Mouse_Brain_hires_image (Images), Visium_HD_Mouse_Brain_lowres_image (Images), Visium_HD_Mouse_Brain_cell_segmentations (Shapes), Visium_HD_Mouse_Brain_square_002um (Shapes), Visium_HD_Mouse_Brain_square_008um (Shapes), Visium_HD_Mouse_Brain_square_016um (Shapes)
-       ▸ 'Visium_HD_Mouse_Brain_downscaled_hires', with elements:
-         Visium_HD_Mouse_Brain_hires_image (Images), Visium_HD_Mouse_Brain_cell_segmentations (Shapes), Visium_HD_Mouse_Brain_square_002um (Shapes), Visium_HD_Mouse_Brain_square_008um (Shapes), Visium_HD_Mouse_Brain_square_016um (Shapes)
-       ▸ 'Visium_HD_Mouse_Brain_downscaled_lowres', with elements:
-         Visium_HD_Mouse_Brain_lowres_image (Images), Visium_HD_Mouse_Brain_cell_segmentations (Shapes), Visium_HD_Mouse_Brain_square_002um (Shapes), Visium_HD_Mouse_Brain_square_008um (Shapes), Visium_HD_Mouse_Brain_square_016um (Shapes)
+  SpatialData object
+  ├── Images
+  │     ├── 'Visium_HD_Mouse_Brain_full_image': DataTree[cyx] (3, 23947, 18872), (3, 11973, 9436), (3, 5986, 4718), (3, 2993, 2359), (3, 1496, 1179)
+  │     ├── 'Visium_HD_Mouse_Brain_hires_image': DataArray[cyx] (3, 6000, 4729)
+  │     └── 'Visium_HD_Mouse_Brain_lowres_image': DataArray[cyx] (3, 600, 473)
+  ├── Shapes
+  │     ├── 'Visium_HD_Mouse_Brain_cell_segmentations': GeoDataFrame shape: (40222, 2) (2D shapes)
+  │     ├── 'Visium_HD_Mouse_Brain_square_002um': GeoDataFrame shape: (6296688, 1) (2D shapes)
+  │     ├── 'Visium_HD_Mouse_Brain_square_008um': GeoDataFrame shape: (393543, 1) (2D shapes)
+  │     └── 'Visium_HD_Mouse_Brain_square_016um': GeoDataFrame shape: (98917, 1) (2D shapes)
+  └── Tables
+        ├── 'cell_segmentations': AnnData (40222, 55538)
+        ├── 'square_002um': AnnData (6296688, 55538)
+        ├── 'square_008um': AnnData (393543, 55538)
+        └── 'square_016um': AnnData (98917, 55538)
+  with coordinate systems:
+      ▸ 'Visium_HD_Mouse_Brain', with elements:
+          Visium_HD_Mouse_Brain_full_image (Images), Visium_HD_Mouse_Brain_hires_image (Images), Visium_HD_Mouse_Brain_lowres_image (Images), Visium_HD_Mouse_Brain_cell_segmentations (Shapes), Visium_HD_Mouse_Brain_square_002um (Shapes), Visium_HD_Mouse_Brain_square_008um (Shapes), Visium_HD_Mouse_Brain_square_016um (Shapes)
+      ▸ 'Visium_HD_Mouse_Brain_downscaled_hires', with elements:
+          Visium_HD_Mouse_Brain_hires_image (Images), Visium_HD_Mouse_Brain_cell_segmentations (Shapes), Visium_HD_Mouse_Brain_square_002um (Shapes), Visium_HD_Mouse_Brain_square_008um (Shapes), Visium_HD_Mouse_Brain_square_016um (Shapes)
+      ▸ 'Visium_HD_Mouse_Brain_downscaled_lowres', with elements:
+          Visium_HD_Mouse_Brain_lowres_image (Images), Visium_HD_Mouse_Brain_cell_segmentations (Shapes), Visium_HD_Mouse_Brain_square_002um (Shapes), Visium_HD_Mouse_Brain_square_008um (Shapes), Visium_HD_Mouse_Brain_square_016um (Shapes)
 
-See the :doc:`Visium HD FFPE tutorial <tutorials/visiumhd_ffpe>` for a complete step-by-step workflow.
+For downstream analysis, see the :doc:`Visium HD FFPE tutorial <tutorials/visiumhd_ffpe>`.
 
 
 In situ targeted ST data
@@ -310,10 +319,9 @@ Given Xenium Ranger output, the following code creates a binned ``SpatialData`` 
      n_jobs=-1,
      chunk_batch_size=64,
      counts_layer_name="counts",
+     build_cell_codeword_table=True,
      create_square_shapes=True,
    )
-
-See the :doc:`Xenium Prime 5K tutorial <tutorials/xenium_prime_5k>` for a complete step-by-step workflow.
 
 .. note::
 
@@ -325,25 +333,26 @@ The generated ``SpatialData`` object has the following structure (example):
 
 .. code-block:: text
 
-   SpatialData object
-   ├── Images
-   │     └── 'morphology_focus': DataTree[cyx] (4, 23912, 34154), (4, 11956, 17077), (4, 5978, 8538), (4, 2989, 4269), (4, 1494, 2134)
-   ├── Labels
-   │     ├── 'cell_labels': DataTree[yx] (23912, 34154), (11956, 17077), (5978, 8538), (2989, 4269), (1494, 2134)
-   │     └── 'nucleus_labels': DataTree[yx] (23912, 34154), (11956, 17077), (5978, 8538), (2989, 4269), (1494, 2134)
-   ├── Points
-   │     └── 'transcripts': DataFrame with shape: (<Delayed>, 13) (3D points)
-   ├── Shapes
-   │     ├── 'cell_boundaries': GeoDataFrame shape: (63173, 1) (2D shapes)
-   │     ├── 'nucleus_boundaries': GeoDataFrame shape: (63036, 1) (2D shapes)
-   │     ├── 'square_008um_bins': GeoDataFrame shape: (576580, 1) (2D shapes)
-   │     └── 'square_016um_bins': GeoDataFrame shape: (144372, 1) (2D shapes)
-   └── Tables
-     ├── 'square_008um': AnnData (576580, 11163)
-     ├── 'square_016um': AnnData (144372, 11163)
-     └── 'table': AnnData (63173, 5006)
-   with coordinate systems:
-     ▸ 'global', with elements:
-       morphology_focus (Images), cell_labels (Labels), nucleus_labels (Labels), transcripts (Points), cell_boundaries (Shapes), nucleus_boundaries (Shapes), square_008um_bins (Shapes), square_016um_bins (Shapes)
+  SpatialData object
+  ├── Images
+  │     └── 'morphology_focus': DataTree[cyx] (4, 23912, 34154), (4, 11956, 17077), (4, 5978, 8538), (4, 2989, 4269), (4, 1494, 2134)
+  ├── Labels
+  │     ├── 'cell_labels': DataTree[yx] (23912, 34154), (11956, 17077), (5978, 8538), (2989, 4269), (1494, 2134)
+  │     └── 'nucleus_labels': DataTree[yx] (23912, 34154), (11956, 17077), (5978, 8538), (2989, 4269), (1494, 2134)
+  ├── Points
+  │     └── 'transcripts': DataFrame with shape: (<Delayed>, 13) (3D points)
+  ├── Shapes
+  │     ├── 'cell_boundaries': GeoDataFrame shape: (63173, 1) (2D shapes)
+  │     ├── 'nucleus_boundaries': GeoDataFrame shape: (63036, 1) (2D shapes)
+  │     ├── 'square_008um_bins': GeoDataFrame shape: (576580, 1) (2D shapes)
+  │     └── 'square_016um_bins': GeoDataFrame shape: (144372, 1) (2D shapes)
+  └── Tables
+        ├── 'square_008um': AnnData (576580, 11163)
+        ├── 'square_016um': AnnData (144372, 11163)
+        ├── 'table': AnnData (63173, 5006)
+        └── 'table_codeword': AnnData (63173, 11163)
+  with coordinate systems:
+      ▸ 'global', with elements:
+          morphology_focus (Images), cell_labels (Labels), nucleus_labels (Labels), transcripts (Points), cell_boundaries (Shapes), nucleus_boundaries (Shapes), square_008um_bins (Shapes), square_016um_bins (Shapes)
 
-
+For downstream analysis, see the :doc:`Xenium Prime 5K tutorial <tutorials/xenium_prime_5k>`.
