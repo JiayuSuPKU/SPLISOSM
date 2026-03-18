@@ -97,14 +97,15 @@ def load_visiumhd_probe(
     var_names_make_unique: bool = True,
     filtered_counts_file: bool = True,
     counts_layer_name: str = "counts",
+    path_to_feature_2um_h5: Optional[str | Path] = None,
 ) -> Any:
     """Load Visium HD outputs as SpatialData with probe-level binned tables.
 
-    This wrapper uses ``binned_outputs/square_002um/raw_probe_bc_matrix.h5`` as the
-    source matrix and aggregates counts to coarser bins (for example ``square_008um``
-    and ``square_016um``) using ``barcode_mappings.parquet`` (Space Ranger v4.0+ required).
-    If available, also aggregates probe counts to cell-level segmentation using the
-    ``Cell_id`` column from ``barcode_mappings.parquet``.
+    This wrapper uses ``binned_outputs/square_002um/raw_probe_bc_matrix.h5``
+    (or a custom ``path_to_feature_2um_h5``) as the source feature count matrix.
+    It aggregates probe/peak/isoform counts to coarser bins or cells (``square_008um``,
+    ``square_016um`` and, when available, ``cell_id``) according to the spatial mapping
+    ``barcode_mappings.parquet`` (Space Ranger v4.0+ required).
 
     Parameters
     ----------
@@ -131,6 +132,9 @@ def load_visiumhd_probe(
         back to ``binned_outputs/square_002um/filtered_feature_bc_matrix.h5``.
     counts_layer_name
         Layer name used to store aggregated probe counts in each output table.
+    path_to_feature_2um_h5
+        Optional path to the raw 2um probe/peak/isoform counts matrix H5 or H5AD.
+        If not provided, will look for ``binned_outputs/square_002um/raw_feature_bc_matrix.h5``.
 
     Returns
     -------
@@ -191,9 +195,15 @@ def load_visiumhd_probe(
     if source_bin not in available_bins:
         raise ValueError("square_002um is required but not found in binned_outputs.")
 
-    raw_probe_path = binned_outputs / source_bin / "raw_probe_bc_matrix.h5"
+    if path_to_feature_2um_h5 is None:
+        raw_probe_path = binned_outputs / source_bin / "raw_probe_bc_matrix.h5"
+    else:
+        raw_probe_path = Path(path_to_feature_2um_h5)
+
     if not raw_probe_path.exists():
-        raise ValueError(f"Cannot find raw probe matrix at: {raw_probe_path}")
+        raise ValueError(
+            f"Cannot find raw probe/peak/isoform matrix at: {raw_probe_path}"
+        )
 
     mapping_path = path / "barcode_mappings.parquet"
     if not mapping_path.exists():
@@ -223,7 +233,17 @@ def load_visiumhd_probe(
     )
 
     # Load probe-level 2um counts and filter to in-tissue barcodes if requested
-    adata_2um = sc.read_10x_h5(raw_probe_path, gex_only=False)
+    # If already h5ad, load directly
+    if raw_probe_path.suffix == ".h5ad":
+        adata_2um = sc.read_h5ad(raw_probe_path)
+    elif raw_probe_path.suffix in [".h5", ".hdf5"]:
+        # Otherwise, assume it's in 10x H5 format and load with scanpy
+        adata_2um = sc.read_10x_h5(raw_probe_path, gex_only=False)
+    else:
+        raise ValueError(
+            f"Unsupported file format for raw probe matrix: {raw_probe_path.suffix}"
+        )
+
     adata_2um.obs_names = adata_2um.obs_names.astype(str)
     if var_names_make_unique:
         adata_2um.var_names_make_unique()
@@ -249,14 +269,15 @@ def load_visiumhd_probe(
         adata_2um = adata_2um[in_tissue_mask].copy()
         if adata_2um.n_obs == 0:
             raise ValueError(
-                "No in-tissue 2um barcodes remained after filtering raw_probe_bc_matrix.h5."
+                "No in-tissue 2um barcodes remained after filtering raw_probe_bc_matrix.h5. "
+                "Please make sure barcodes are formatted correctly, e.g., 's_002um_xxxxx_xxxxx-1'."
             )
 
     # Aggregate 2um probe counts into requested resolution bins
     mapping_cols = [source_bin, *requested_bins]
     barcode_mappings = pd.read_parquet(mapping_path)
 
-    # Check if Cell_id column exists for cell-level aggregation
+    # Check if cell_id column exists for cell-level aggregation
     has_cell_mapping = "cell_id" in barcode_mappings.columns
     if has_cell_mapping:
         mapping_cols.append("cell_id")
@@ -287,6 +308,7 @@ def load_visiumhd_probe(
             )
             missing = reindex == -1
             if missing.any():
+                # Some barcodes in the template table are missing from the source 2um data; we will fill them with zeros
                 x_source = (
                     adata_2um.X.tocsr()
                     if scipy.sparse.issparse(adata_2um.X)
@@ -294,12 +316,24 @@ def load_visiumhd_probe(
                         np.asarray(adata_2um.X, dtype=np.float32)
                     )
                 )
-                rows = np.where(~missing, reindex, 0)
-                x_target = x_source[rows]
-                if missing.any():
-                    x_target = x_target.tolil()
-                    x_target[missing] = 0
-                    x_target = x_target.tocsr()
+                # Extract only valid rows (barcodes that exist in adata_2um)
+                valid_mask = ~missing
+                valid_indices_in_template = np.where(valid_mask)[0]
+                valid_indices_in_source = reindex[valid_mask]
+
+                # Extract valid rows from source
+                x_valid = x_source.tocsr()[valid_indices_in_source]
+
+                # Build output matrix using COO format to avoid memory bloat from LIL boolean indexing
+                coo_valid = scipy.sparse.coo_matrix(x_valid)
+                x_target = scipy.sparse.coo_matrix(
+                    (
+                        coo_valid.data,
+                        (valid_indices_in_template[coo_valid.row], coo_valid.col),
+                    ),
+                    shape=(len(reindex), x_source.shape[1]),
+                    dtype=np.float32,
+                ).tocsr()
             else:
                 x_source = adata_2um.X
                 if scipy.sparse.issparse(x_source):
