@@ -1,9 +1,9 @@
 #!/bin/bash
 set -eo pipefail
 
-# ==========================================
+# ====================================================
 # DEPENDENCIES:
-# - Space Ranger (10x Genomics)
+# - Space Ranger (>=v4.0 for barcode_mappings.parquet)
 # - regtools
 # - samtools
 # - Subread (featureCounts)
@@ -14,7 +14,7 @@ set -eo pipefail
 #   - h5py
 #   - umi_tools
 #   - splisosm (>=v1.0.4 for load_visiumhd_probe)
-# ==========================================
+# ====================================================
 
 # ==========================================
 # CONFIGURATION (Update these paths)
@@ -68,7 +68,7 @@ JUNC_FILE="${PEAK_DIR}/possorted_genome_bam.junc.bed"
 echo "1a. Extracting junctions..."
 regtools junctions extract "$BAM_FILE" -o "$JUNC_FILE" -s 0
 
-echo "1b. Running Sierra FindPeaksin R..."
+echo "1b. Running Sierra FindPeaks in R..."
 Rscript -e "
 library(Sierra)
 FindPeaks(output.file='${PEAK_FILE}', gtf.file='${GTF_FILE}', bamfile='${BAM_FILE}', junctions.file='${JUNC_FILE}', ncores=${THREADS}, min.jcutoff.prop = 0.0, min.cov.prop = 0.0, min.peak.prop = 0.0)
@@ -95,18 +95,18 @@ seen_bed_regions = set()
 with open(input_file, "r") as fin, \
      open(saf_file, "w") as fout_saf, \
      open(bed_file, "w") as fout_bed:
-    
+
     # Skip header
     fin.readline()
-    
+
     # Write SAF header
     fout_saf.write("GeneID\tChr\tStart\tEnd\tStrand\n")
-    
+
     for line in fin:
         p = line.strip().split("\t")
-        if len(p) < 14: 
+        if len(p) < 14:
             continue
-            
+
         # Extract fields based on the column indices
         chrom = p[1]
         strand_raw = p[2]
@@ -116,7 +116,7 @@ with open(input_file, "r") as fin, \
         exon_intron = p[10]
         exon_pos = p[11]
         polyA_ID = p[13]
-        
+
         # ---------------------------------------------------------
         # 1. SAF Format Logic
         # ---------------------------------------------------------
@@ -126,7 +126,7 @@ with open(input_file, "r") as fin, \
                 fout_saf.write(f"{polyA_ID}\t{chrom}\t{s}\t{e}\t{strand}\n")
         else:
             fout_saf.write(f"{polyA_ID}\t{chrom}\t{fit_start}\t{fit_end}\t{strand}\n")
-            
+
         # ---------------------------------------------------------
         # 2. BED12 Format Logic
         # ---------------------------------------------------------
@@ -135,7 +135,7 @@ with open(input_file, "r") as fin, \
         if bed_key in seen_bed_regions:
             continue
         seen_bed_regions.add(bed_key)
-        
+
         if exon_intron == "no-junctions" or exon_pos == "NA":
             block_sizes = [fit_end - fit_start]
             block_starts = [0]
@@ -143,30 +143,30 @@ with open(input_file, "r") as fin, \
             # Parse the (start,end)(start,end) string
             blocks = exon_pos.strip("()").split(")(")
             exons = [list(map(int, b.split(","))) for b in blocks]
-            
+
             # Update the first and last exon boundaries
             exons[0][0] = fit_start
             exons[-1][1] = fit_end
-            
+
             block_sizes = []
             block_starts = []
-            
+
             # Calculate sizes and relative starts, filtering out lengths <= 0
             for s, e in exons:
                 size = e - s
                 if size > 0:
                     block_sizes.append(size)
                     block_starts.append(s - fit_start)
-        
+
         # Skip if no valid blocks remain after cleaning
         if not block_sizes:
             continue
-            
+
         # Format BED12 columns
         b_count = len(block_sizes)
         b_sizes_str = ",".join(map(str, block_sizes))
         b_starts_str = ",".join(map(str, block_starts))
-        
+
         # Write BED12 line (12 columns)
         fout_bed.write(
             f"{chrom}\t{fit_start}\t{fit_end}\t{polyA_ID}\t0\t{strand}\t"
@@ -225,7 +225,7 @@ features_str = df["gene"].cat.categories.astype(str).tolist()
 
 annot_df = pd.read_csv(annot_file, sep="\t", index_col=0).reindex(features_str).fillna("")
 
-mat = coo_matrix((df["count"], (df["gene"].cat.codes, df["cell"].cat.codes)), 
+mat = coo_matrix((df["count"], (df["gene"].cat.codes, df["cell"].cat.codes)),
                  shape=(len(features), len(barcodes))).tocsc()
 
 with h5py.File(output_h5, "w") as f:
@@ -235,13 +235,13 @@ with h5py.File(output_h5, "w") as f:
     grp.create_dataset("indices", data=mat.indices)
     grp.create_dataset("indptr", data=mat.indptr)
     grp.create_dataset("shape", data=np.array(mat.shape, dtype=np.int32))
-    
+
     feat_grp = grp.create_group("features")
     feat_grp.create_dataset("id", data=features)
     feat_grp.create_dataset("name", data=features)
     feat_grp.create_dataset("feature_type", data=np.array([b"Gene Expression"] * len(features)))
     feat_grp.create_dataset("genome", data=np.array([b""] * len(features)))
-    
+
     for col in annot_df.columns:
         feat_grp.create_dataset(col, data=annot_df[col].astype(str).values.astype("S"))
 
@@ -274,6 +274,15 @@ sdata = load_visiumhd_probe(
 sdata.write(sdata_zarr, overwrite=True)
 ' "$OUT_DIR/outs" "$ZARR_OUT"
 
-zip -0 -r "$ZARR_OUT.zip" "$ZARR_OUT"
+# Optional: Zip the Zarr folder for easier sharing
+ZARR_ZIP="${OUT_DIR}/$(basename $ZARR_OUT).zip"
+if [ -f "$ZARR_ZIP" ]; then
+    echo "Warning: $ZARR_ZIP already exists. Will overwrite it."
+    rm "$ZARR_ZIP"
+fi
+
+cd "$ZARR_OUT"
+zip -0 -r "../$(basename $ZARR_OUT).zip" .
+# unzip "$ZARR_ZIP" -d "path/to/zarr.zarr"
 
 echo "Pipeline complete! Peak-level count matrix saved to $H5_OUT and SpatialData saved to $ZARR_OUT"

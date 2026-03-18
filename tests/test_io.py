@@ -616,6 +616,7 @@ class TestIO(unittest.TestCase):
                     n_jobs=1,
                     chunk_batch_size=1,
                     show_progress=False,
+                    build_cell_codeword_table=False,
                 )
 
             self.assertIn("square_001um", out.tables)
@@ -639,6 +640,210 @@ class TestIO(unittest.TestCase):
             self.assertIn("gene_symbol", adata_1.var.columns)
             self.assertIn("spatial", adata_1.obsm)
             self.assertEqual(adata_1.obsm["spatial"].shape, (adata_1.n_obs, 2))
+
+    def test_load_xenium_codeword_builds_cell_codeword_table(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            outs = root / "outs"
+            outs.mkdir(parents=True)
+            (outs / "transcripts.zarr.zip").touch()
+            (outs / "transcripts.parquet").touch()
+
+            class _FakeArray:
+                def __init__(self, arr):
+                    self._arr = np.asarray(arr)
+
+                def __getitem__(self, item):
+                    return self._arr[item]
+
+            class _FakeChunk(dict):
+                pass
+
+            class _FakeGroup:
+                def __init__(self, attrs):
+                    self.attrs = attrs
+
+            class _FakeDensityGene:
+                attrs = {
+                    "grid_size": [1.0, 1.0],
+                    "origin": {"x": 0.0, "y": 0.0},
+                    "rows": 1,
+                    "cols": 1,
+                }
+
+            class _FakeDensityCodeword:
+                attrs = {
+                    "codeword_names": [
+                        "GeneA",
+                        "GeneB",
+                        "UnassignedCodeword_0",
+                    ]
+                }
+
+            class _FakeDensityGroup:
+                def __getitem__(self, key):
+                    if key == "gene":
+                        return _FakeDensityGene()
+                    if key == "codeword":
+                        return _FakeDensityCodeword()
+                    raise KeyError(key)
+
+            class _FakeRoot:
+                def __init__(self):
+                    self._chunks = {
+                        "grids/0/chunk_0": _FakeChunk(
+                            {
+                                "quality_score": _FakeArray([30.0]),
+                                "codeword_identity": _FakeArray([[0]]),
+                                "location": _FakeArray([[0.5, 0.5]]),
+                            }
+                        )
+                    }
+
+                def __contains__(self, key):
+                    return key in self._chunks
+
+                def __getitem__(self, key):
+                    if key == "grids":
+                        return _FakeGroup(attrs={"grid_keys": [["chunk_0"]]})
+                    if key == "density":
+                        return _FakeDensityGroup()
+                    return self._chunks[key]
+
+            class _FakeZipStore:
+                def __init__(self, *_args, **_kwargs):
+                    self.closed = False
+
+                def close(self):
+                    self.closed = True
+
+            class _FakeSData:
+                def __init__(self):
+                    self.tables = {
+                        "table": AnnData(
+                            X=scipy.sparse.csr_matrix((2, 1), dtype=np.float32),
+                            obs=pd.DataFrame(
+                                {
+                                    "cell_id": ["cell_1", "cell_2"],
+                                    "cluster": ["A", "B"],
+                                },
+                                index=["obs_1", "obs_2"],
+                            ),
+                            var=pd.DataFrame(index=["gene"]),
+                        )
+                    }
+                    self.shapes = {
+                        "cell_boundaries": pd.DataFrame(index=["cell_1", "cell_2"])
+                    }
+
+            class _FakeTableModel:
+                @staticmethod
+                def parse(adata, **_kwargs):
+                    return adata
+
+            class _FakeComputed:
+                def __init__(self, series):
+                    self._series = series
+
+                def compute(self):
+                    return self._series
+
+            class _FakeGroupBy:
+                def __init__(self, df):
+                    self._df = df
+
+                def size(self):
+                    return _FakeComputed(self._df.size())
+
+            class _FakeDaskFrame:
+                def __init__(self, df):
+                    self._df = df
+
+                @property
+                def columns(self):
+                    return self._df.columns
+
+                def __getitem__(self, key):
+                    if isinstance(key, str):
+                        return self._df[key]
+                    return _FakeDaskFrame(self._df[key])
+
+                def groupby(self, keys):
+                    return _FakeGroupBy(self._df.groupby(keys))
+
+            tx_df = pd.DataFrame(
+                {
+                    "cell_id": [
+                        "cell_1",
+                        "cell_1",
+                        "cell_1",
+                        "cell_2",
+                        "cell_3",
+                        "cell_2",
+                    ],
+                    "codeword_index": [0, 0, 1, 1, 0, 2],
+                    "qv": [30.0, 35.0, 10.0, 25.0, 30.0, 40.0],
+                }
+            )
+
+            fake_zarr = types.ModuleType("zarr")
+            fake_zarr.open = lambda *_args, **_kwargs: _FakeRoot()
+
+            fake_zarr_storage = types.ModuleType("zarr.storage")
+            fake_zarr_storage.ZipStore = _FakeZipStore
+
+            fake_dask = types.ModuleType("dask")
+            fake_dask_dataframe = types.ModuleType("dask.dataframe")
+            fake_dask_dataframe.read_parquet = lambda *_args, **_kwargs: _FakeDaskFrame(
+                tx_df.copy()
+            )
+            fake_dask.dataframe = fake_dask_dataframe
+
+            sdio_mod = types.ModuleType("spatialdata_io")
+            sdio_readers_mod = types.ModuleType("spatialdata_io.readers")
+            sdio_xenium_mod = types.ModuleType("spatialdata_io.readers.xenium")
+            sdio_xenium_mod.xenium = lambda **_kwargs: _FakeSData()
+
+            spatialdata_mod = types.ModuleType("spatialdata")
+            spatialdata_models_mod = types.ModuleType("spatialdata.models")
+            spatialdata_models_mod.TableModel = _FakeTableModel
+
+            with patch.dict(
+                sys.modules,
+                {
+                    "dask": fake_dask,
+                    "dask.dataframe": fake_dask_dataframe,
+                    "zarr": fake_zarr,
+                    "zarr.storage": fake_zarr_storage,
+                    "spatialdata_io": sdio_mod,
+                    "spatialdata_io.readers": sdio_readers_mod,
+                    "spatialdata_io.readers.xenium": sdio_xenium_mod,
+                    "spatialdata": spatialdata_mod,
+                    "spatialdata.models": spatialdata_models_mod,
+                },
+            ):
+                out = load_xenium_codeword(
+                    root,
+                    spatial_resolutions=[1.0],
+                    quality_threshold=20.0,
+                    n_jobs=1,
+                    chunk_batch_size=1,
+                    create_square_shapes=False,
+                    build_cell_codeword_table=True,
+                    show_progress=False,
+                )
+
+            self.assertIn("table_codeword", out.tables)
+            table_codeword = out.tables["table_codeword"]
+
+            self.assertEqual(table_codeword.shape, (2, 2))
+            np.testing.assert_allclose(
+                table_codeword.X.toarray(),
+                np.array([[2.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+            )
+            self.assertIn("counts", table_codeword.layers)
+            self.assertIn("cluster", table_codeword.obs.columns)
+            self.assertEqual(list(table_codeword.var_names), ["GeneA|0", "GeneB|1"])
 
 
 if __name__ == "__main__":

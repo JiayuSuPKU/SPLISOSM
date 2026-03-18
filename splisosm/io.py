@@ -102,7 +102,9 @@ def load_visiumhd_probe(
 
     This wrapper uses ``binned_outputs/square_002um/raw_probe_bc_matrix.h5`` as the
     source matrix and aggregates counts to coarser bins (for example ``square_008um``
-    and ``square_016um``) using ``barcode_mappings.parquet``.
+    and ``square_016um``) using ``barcode_mappings.parquet`` (Space Ranger v4.0+ required).
+    If available, also aggregates probe counts to cell-level segmentation using the
+    ``Cell_id`` column from ``barcode_mappings.parquet``.
 
     Parameters
     ----------
@@ -133,7 +135,8 @@ def load_visiumhd_probe(
     Returns
     -------
     spatialdata.SpatialData
-        A SpatialData object with probe-level tables for requested bins.
+        A SpatialData object with probe-level tables for requested bins and,
+        if available, cell-level segmentation.
 
     Raises
     ------
@@ -196,7 +199,11 @@ def load_visiumhd_probe(
     if not mapping_path.exists():
         mapping_candidates = list(path.glob("*barcode_mappings.parquet"))
         if len(mapping_candidates) == 0:
-            raise ValueError(f"Cannot find barcode_mappings.parquet under: {path}")
+            raise ValueError(
+                f"Cannot find barcode_mappings.parquet under: {path}. "
+                "Consider re-running Space Ranger with v4.0+ to generate this file. "
+                "https://www.10xgenomics.com/support/software/space-ranger/latest/analysis/outputs/segmented-outputs"
+            )
         mapping_path = mapping_candidates[0]
 
     # Call visium_hd() to load the SpatialData object with requested bins
@@ -248,6 +255,12 @@ def load_visiumhd_probe(
     # Aggregate 2um probe counts into requested resolution bins
     mapping_cols = [source_bin, *requested_bins]
     barcode_mappings = pd.read_parquet(mapping_path)
+
+    # Check if Cell_id column exists for cell-level aggregation
+    has_cell_mapping = "cell_id" in barcode_mappings.columns
+    if has_cell_mapping:
+        mapping_cols.append("cell_id")
+
     for col in mapping_cols:
         if col not in barcode_mappings.columns:
             raise ValueError(
@@ -321,6 +334,45 @@ def load_visiumhd_probe(
         )
         sdata.tables[bin_name] = probe_table
 
+    # Aggregate 2um probe counts to cell segmentation level if available
+    if has_cell_mapping and "cell_segmentations" in sdata.tables:
+        cell_seg_table = sdata.tables["cell_segmentations"]
+
+        # Get unique cell IDs in the cell_segmentations table
+        target_cell_ids = pd.Index(cell_seg_table.obs_names.astype(str))
+
+        # Aggregate probe counts from 2um barcodes to cells
+        x_cells = _aggregate_visiumhd_probe_counts(
+            adata_2um=adata_2um,
+            barcode_mappings=barcode_mappings,
+            source_col=source_bin,
+            target_col="cell_id",
+            target_obs_names=target_cell_ids,
+        )
+
+        # Create probe-level table for cells
+        probe_table_cells = AnnData(
+            X=x_cells,
+            obs=cell_seg_table.obs.copy(),
+            var=adata_2um.var.copy(),
+        )
+
+        for key, value in cell_seg_table.obsm.items():
+            probe_table_cells.obsm[key] = (
+                value.copy() if hasattr(value, "copy") else value
+            )
+        for key, value in cell_seg_table.uns.items():
+            probe_table_cells.uns[key] = (
+                value.copy() if hasattr(value, "copy") else value
+            )
+
+        probe_table_cells.layers[counts_layer_name] = (
+            probe_table_cells.X.copy()
+            if hasattr(probe_table_cells.X, "copy")
+            else probe_table_cells.X
+        )
+        sdata.tables["cell_segmentations"] = probe_table_cells
+
     return sdata
 
 
@@ -339,6 +391,133 @@ def _xenium_locate_outs_path(path: str | Path) -> Path:
         "Could not locate transcripts.zarr.zip. Expected one of: "
         f"{outs_path / 'transcripts.zarr.zip'} or {p / 'transcripts.zarr.zip'}."
     )
+
+
+def _xenium_specs_and_transcripts_filenames() -> tuple[str, str]:
+    """Resolve Xenium specs and transcripts parquet filenames."""
+    specs_file = "experiment.xenium"
+    transcripts_file = "transcripts.parquet"
+    try:
+        from spatialdata_io._constants._constants import XeniumKeys
+
+        specs_file = str(XeniumKeys.XENIUM_SPECS)
+        transcripts_file = str(XeniumKeys.TRANSCRIPTS_FILE)
+    except Exception:
+        # Keep defaults when spatialdata-io internals are not importable.
+        pass
+    return specs_file, transcripts_file
+
+
+def _add_xenium_cell_codeword_table_from_parquet(
+    sdata: Any,
+    outs_path: Path,
+    codeword_id_to_gene: Sequence[str],
+    target_codewords: Sequence[int],
+    quality_threshold: float,
+    counts_layer_name: str,
+) -> None:
+    """Build and attach a cell-by-codeword table directly from transcripts parquet."""
+    # See https://www.10xgenomics.com/support/software/xenium-onboard-analysis/latest/analysis/xoa-output-understanding-outputs#transcript-file
+    # for the structure of the transcripts parquet file.
+    _, transcripts_file = _xenium_specs_and_transcripts_filenames()
+    transcripts_path = outs_path / transcripts_file
+    if not transcripts_path.exists():
+        warnings.warn(
+            f"Could not find Xenium transcripts parquet at {transcripts_path}; "
+            "skipping `table_codeword` generation.",
+            UserWarning,
+        )
+        return
+
+    try:
+        import dask.dataframe as dd
+    except ImportError as e:
+        raise ImportError(
+            "dask is required to build Xenium cell-by-codeword table from transcripts parquet. "
+            "Install it via `pip install dask[dataframe]`."
+        ) from e
+
+    try:
+        from spatialdata.models import TableModel
+    except ImportError as e:
+        raise ImportError(
+            "spatialdata is required to parse Xenium cell-by-codeword table. "
+            "Install it via `pip install spatialdata`."
+        ) from e
+
+    target_cw_index = pd.Index(np.asarray(target_codewords, dtype=np.int64))
+    read_cols = ["cell_id", "codeword_index"]
+    if quality_threshold > 0:
+        read_cols.append("qv")
+
+    tx = dd.read_parquet(transcripts_path, columns=read_cols)
+    if quality_threshold > 0 and "qv" in tx.columns:
+        tx = tx[tx["qv"] >= float(quality_threshold)]
+
+    tx = tx[
+        (tx["codeword_index"] >= 0)
+        & (tx["codeword_index"].isin(target_cw_index.to_list()))
+    ]
+    grouped = tx.groupby(["cell_id", "codeword_index"]).size().compute()
+
+    target_cell_ids = pd.Index(sdata.shapes["cell_boundaries"].index.astype(str))
+
+    if grouped.shape[0] == 0:
+        x_cells = scipy.sparse.csr_matrix(
+            (len(target_cell_ids), len(target_cw_index)), dtype=np.float32
+        )
+    else:
+        cell_vals = grouped.index.get_level_values(0)
+        cell_series = pd.Series(cell_vals, dtype="object")
+        if cell_series.size > 0 and isinstance(cell_series.iloc[0], (bytes, bytearray)):
+            cell_ids = cell_series.str.decode("utf-8").to_numpy()
+        else:
+            cell_ids = cell_series.astype(str).to_numpy()
+
+        cw_vals = grouped.index.get_level_values(1).to_numpy(dtype=np.int64, copy=False)
+        rows = target_cell_ids.get_indexer(cell_ids)
+        cols = target_cw_index.get_indexer(cw_vals)
+        vals = grouped.to_numpy(dtype=np.float32, copy=False)
+
+        valid = (rows >= 0) & (cols >= 0)
+        x_cells = scipy.sparse.coo_matrix(
+            (vals[valid], (rows[valid], cols[valid])),
+            shape=(len(target_cell_ids), len(target_cw_index)),
+            dtype=np.float32,
+        ).tocsr()
+
+    var_df = pd.DataFrame(
+        {
+            "var_name": [f"{codeword_id_to_gene[cw]}|{cw}" for cw in target_cw_index],
+            "codeword_id": [str(cw) for cw in target_cw_index],
+            "gene_symbol": [str(codeword_id_to_gene[cw]) for cw in target_cw_index],
+            "feature_id": [f"{codeword_id_to_gene[cw]}|{cw}" for cw in target_cw_index],
+        }
+    ).set_index("var_name")
+
+    adata_cells = AnnData(
+        X=x_cells,
+        obs=pd.DataFrame(index=target_cell_ids),
+        var=var_df,
+    )
+    adata_cells.layers[counts_layer_name] = (
+        adata_cells.X.copy() if hasattr(adata_cells.X, "copy") else adata_cells.X
+    )
+    adata_cells.obs["region"] = pd.Categorical(["cell_boundaries"] * adata_cells.n_obs)
+    adata_cells.obs["instance_id"] = adata_cells.obs_names.astype(str)
+    sdata.tables["table_codeword"] = TableModel.parse(
+        adata_cells,
+        region="cell_boundaries",
+        region_key="region",
+        instance_key="instance_id",
+    )
+
+    # Add cell meta in sdata.tables['table'].obs to sdata.tables['table_codeword'].obs
+    if "table" in sdata.tables:
+        cell_meta = sdata.tables["table"].obs.set_index("cell_id")
+        sdata.tables["table_codeword"].obs = sdata.tables["table_codeword"].obs.join(
+            cell_meta, how="left", rsuffix="_from_table"
+        )
 
 
 def _compute_xenium_bins_from_meta(
@@ -642,6 +821,7 @@ def load_xenium_codeword(
     n_jobs: int = -1,
     chunk_batch_size: int = 64,
     counts_layer_name: str = "counts",
+    build_cell_codeword_table: bool = True,
     create_square_shapes: bool = True,
     cells_boundaries: bool = True,
     nucleus_boundaries: bool = True,
@@ -668,6 +848,11 @@ def load_xenium_codeword(
     with a ``_bins`` suffix are added to ``sdata.shapes`` so the tables can be
     used directly with :func:`spatialdata.rasterize_bins`.
 
+    ``transcripts.zarr.zip`` is expected to contain the ``density/codeword`` group
+    for codeword indexing (Xenium Ranger v3.1+ required).
+    If ``build_cell_codeword_table=True`` and the ``transcripts.parquet`` file is available,
+    a cell-by-codeword anndata named ``table_codeword`` will also be built and added to ``sdata.tables``.
+
     Parameters
     ----------
     path
@@ -683,6 +868,8 @@ def load_xenium_codeword(
         Number of transcript chunks submitted per processing batch.
     counts_layer_name
         Layer name used to store codeword counts in each output table.
+    build_cell_codeword_table
+        Whether to build a cell-by-codeword table from the transcripts parquet file.
     create_square_shapes
         Whether to create square bin shapes for each table key.
     cells_boundaries
@@ -713,8 +900,9 @@ def load_xenium_codeword(
     Returns
     -------
     spatialdata.SpatialData
-        SpatialData object augmented with codeword-count tables at each
-        requested resolution.
+        SpatialData object augmented with bin-by-codeword count tables at each
+        requested resolution and, when requested, a cell-by-codeword table
+        named ``table_codeword``.
 
     Raises
     ------
@@ -818,6 +1006,18 @@ def load_xenium_codeword(
         ]
         if len(target_codewords) == 0:
             raise ValueError("No assigned codewords found in transcripts.zarr.zip.")
+
+        # If transcripts.parquet is available,
+        # build a cell-by-codeword table directly from the parquet file.
+        if build_cell_codeword_table:
+            _add_xenium_cell_codeword_table_from_parquet(
+                sdata=sdata,
+                outs_path=outs_path,
+                codeword_id_to_gene=codeword_id_to_gene,
+                target_codewords=target_codewords,
+                quality_threshold=quality_threshold,
+                counts_layer_name=counts_layer_name,
+            )
 
         level0_keys: list[str] = []
         try:
