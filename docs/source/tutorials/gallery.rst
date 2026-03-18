@@ -15,4 +15,5 @@ Spatial variability analysis for large-scale data
 
   visiumhd_ffpe
   visiumhd_3prime
+  visiumhd_ont
   xenium_prime_5k

@@ -1,7 +1,7 @@
-Isoform Quantification for ST Data
+Feature Quantification
 ====================================
 
-This page describes how to obtain isoform-level quantifications for various spatial transcriptomics (ST) platforms as input to SPLISOSM. 
+This page describes how to obtain probe/peak/isoform-level quantification for various spatial transcriptomics (ST) platforms as input to SPLISOSM. 
 If you already have a compatible ``AnnData`` or ``SpatialData`` object, skip ahead to :ref:`the expected data format <txquant:expected data format>`.
 
 Platform overview
@@ -52,9 +52,10 @@ SPLISOSM expects isoform-level data in an ``AnnData`` of shape ``(n_spots, n_iso
 
   See :func:`splisosm.utils.prepare_inputs_from_anndata` for parsing details.
 
-The spot-by-isoform ``AnnData`` can also be a table of a ``SpatialData`` object. In such cases, we will typically run 
-`spatialdata.rasterize_bins <https://spatialdata.scverse.org/en/latest/api/operations.html#spatialdata.rasterize_bins>`_ to 
-rasterize counts into square bins of varying sizes, which can speed up computation. See :func:`~splisosm.SplisosmFFT.setup_data` for details.
+The spot-by-isoform ``AnnData`` can also be a table of a ``SpatialData`` object, which is the required input format for :class:`splisosm.SplisosmFFT` (FFT-accelerated tests). 
+In such cases, we rely on `spatialdata.rasterize_bins <https://spatialdata.scverse.org/en/latest/api/operations.html#spatialdata.rasterize_bins>`_ to 
+rasterize counts into square bins (i.e., padding unobserved spots with zeros) to improve memory efficiency and computation speed. 
+See :func:`splisosm.SplisosmFFT.setup_data` for details.
 
 Long-read ST data
 -----------------
@@ -63,6 +64,39 @@ SPLISOSM is compatible with any long-read quantification tool that produces an i
 
 .. note::
    Detection power scales linearly with sequencing depth (:ref:`FAQ <faq:umi-depth>`). Any processing choice that increases captured UMIs per spot will improve results.
+
+Tested platforms:
+
+- 10x Visium + ONT (SiT :cite:`lebrigand2023spatial`)
+- 10x Visium HD + ONT (the EPI2ME dataset)
+
+`Visium HD ONT tutorial <tutorials/visiumhd_ont>`_ shows an example workflow of loading preprocessed ONT + Visium HD data and running SPLISOSM. 
+The dataset is publicly accessible and can be downloaded from `EPI2ME <https://epi2me.nanoporetech.com/visium_hd_2025.06/>`_. 
+Transcript assignment and quantification were performed using ``minimap2``, ``Stringtie``, and ``FLAMES``. See the `EPI2ME workflow documentation <https://epi2me.nanoporetech.com/epi2me-docs/workflows/wf-single-cell/#transcript-assignment>`_ for details.
+The generated ``SpatialData`` object has the following structure (example):
+
+.. code-block:: text
+
+  SpatialData object, with associated Zarr store: /Users/jysumac/Projects/SPLISOSM_paper/data/visiumhd_ont_mouse_cbs/sdata_tx.filtered.zarr
+  ├── Images
+  │     ├── '_hires_image': DataArray[cyx] (3, 3000, 3200)
+  │     └── '_lowres_image': DataArray[cyx] (3, 563, 600)
+  ├── Shapes
+  │     ├── '_square_002um': GeoDataFrame shape: (7857218, 1) (2D shapes)
+  │     ├── '_square_008um': GeoDataFrame shape: (492663, 1) (2D shapes)
+  │     └── '_square_016um': GeoDataFrame shape: (123658, 1) (2D shapes)
+  └── Tables
+        ├── 'square_002um': AnnData (7857218, 48001)
+        ├── 'square_008um': AnnData (492663, 48001)
+        └── 'square_016um': AnnData (123658, 48001)
+  with coordinate systems:
+      ▸ '', with elements:
+          _hires_image (Images), _lowres_image (Images), _square_002um (Shapes), _square_008um (Shapes), _square_016um (Shapes)
+      ▸ '_downscaled_hires', with elements:
+          _hires_image (Images), _square_002um (Shapes), _square_008um (Shapes), _square_016um (Shapes)
+      ▸ '_downscaled_lowres', with elements:
+          _lowres_image (Images), _square_002um (Shapes), _square_008um (Shapes), _square_016um (Shapes)
+
 
 Short-read 3' end ST data
 --------------------------
@@ -73,7 +107,7 @@ Tested platforms:
 
 - 10x Visium (fresh-frozen)
 - Slide-seqV2
-- 10x Visium HD 3' (fresh-frozen).
+- 10x Visium HD 3' (fresh-frozen)
 
 .. warning::
    When processing multiple samples, avoid Sierra's ``MergePeakCoordinates`` function — it can produce overlapping peak definitions.
@@ -246,6 +280,10 @@ Short-read targeted ST data
 
 10x Visium HD FFPE uses a fixed pan-genome probe for read enrichment. SPLISOSM treats probe-level counts as the isoform-level quantification — probes targeting the same gene are grouped and tested jointly.
 
+Tested platform: 
+
+- 10x Visium HD FFPE
+
 Given Space Ranger output, the following code creates a ``SpatialData`` object with probe-level counts (from ``raw_probe_bc_matrix.h5``):
 
 .. code-block:: python
@@ -305,6 +343,10 @@ In situ targeted ST data
 
 For imaging-based platforms with exon- or junction-specific probes (e.g., `10x Xenium Prime 5K <https://www.10xgenomics.com/products/xenium-5k-panel>`_), SPLISOSM uses codeword-level counts as isoform proxies. 
 Data can be analyzed at single-cell resolution (segmented cells) or on spatially binned spots.
+
+Tested platform:
+
+- 10x Xenium Prime 5K
 
 Given Xenium Ranger output, the following code creates a binned ``SpatialData`` object with codeword-level counts (from ``transcripts.zarr.zip``):
 
