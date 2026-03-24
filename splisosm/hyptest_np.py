@@ -12,11 +12,6 @@ import torch
 from tqdm import tqdm
 from anndata import AnnData
 
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF
-from sklearn.gaussian_process.kernels import ConstantKernel as C
-from sklearn.gaussian_process.kernels import WhiteKernel
-
 from smoother.weights import coordinate_to_weights_knn_sparse
 from splisosm.utils import (
     counts_to_ratios,
@@ -26,6 +21,12 @@ from splisosm.utils import (
 )
 from splisosm.kernel import SpatialCovKernel
 from splisosm.likelihood import liu_sf
+from splisosm.kernel_gpr import (
+    linear_hsic_test,
+    fit_kernel_gpr,
+    make_kernel_gpr,
+    _DEFAULT_GPR_CONFIGS,
+)
 
 __all__ = [
     "linear_hsic_test",
@@ -78,82 +79,12 @@ def _calc_ttest_differential_usage(
     return stats, pval
 
 
-def linear_hsic_test(
-    X: torch.Tensor, Y: torch.Tensor, centering: bool = True
-) -> tuple[float, float]:
-    """The linear HSIC test.
-
-    Equivalent to a multivariate extension of Pearson correlation.
-
-    Parameters
-    ----------
-    X
-        Shape (n_samples, n_features_x).
-    Y
-        Shape (n_samples, n_features_y).
-    centering
-        Whether to center the data. If False, assume the data is already centered.
-
-    Returns
-    -------
-    hsic : float
-        The HSIC statistic.
-    pvalue : float
-        The p-value.
-    """
-    # if a sample contains NaN values in either X or Y, remove it
-    is_nan = torch.isnan(X).any(1) | torch.isnan(Y).any(1)
-    X = X[~is_nan]
-    Y = Y[~is_nan]
-
-    if centering:
-        X = X - X.mean(0)
-        Y = Y - Y.mean(0)
-
-    n_samples = X.shape[0]
-    eigv_th = 1e-5
-
-    # calculate the HSIC statistic
-    hsic_scaled = torch.norm(Y.T @ X, p="fro").pow(2)
-
-    # find the eigenvalues of the kernel matrices
-    lambda_x = torch.linalg.eigvalsh(X.T @ X)  # length of n_features_x
-    lambda_x = lambda_x[lambda_x > eigv_th]  # remove small eigenvalues
-    lambda_y = torch.linalg.eigvalsh(Y.T @ Y)  # length of n_features_y
-    lambda_y = lambda_y[lambda_y > eigv_th]  # remove small eigenvalues
-
-    # asymptotic null distribution
-    lambda_xy = (lambda_x.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(
-        -1
-    )  # length of n_features_x * n_features_y
-    pval = liu_sf((hsic_scaled * n_samples).numpy(), lambda_xy.numpy())
-
-    return (hsic_scaled / (n_samples - 1) ** 2), pval
-
-
-def get_kernel_regression_residual_op(Kx: torch.Tensor, epsilon: float) -> torch.Tensor:
-    """Calculate the residuals of kernel regression.
-
-    Parameters
-    ----------
-    Kx : torch.Tensor
-        Shape (n_samples, n_samples), the kernel matrix of X.
-    epsilon : float
-        Regularization parameter.
-
-    Returns
-    -------
-    torch.Tensor
-        Shape (n_samples, n_samples), residual operator. Residuals(Y) := Y - Y_pred(X) = Rx @ Y.
-    """
-    Kx = 0.5 * (Kx + Kx.T)  # symmetrize
-    Rx = epsilon * torch.linalg.inv(Kx + epsilon * torch.eye(Kx.shape[0]))
-
-    return Rx
-
-
 def get_knn_regression_residual_op(X: torch.Tensor, k: int = 6) -> torch.Tensor:
     """Calculate the residuals of KNN regression.
+
+    .. deprecated::
+        ``method='hsic-knn'`` has been retired.  This function is kept for
+        backward compatibility and will be removed in a future release.
 
     Parameters
     ----------
@@ -191,102 +122,6 @@ def get_knn_regression_residual_op(X: torch.Tensor, k: int = 6) -> torch.Tensor:
     ).coalesce()
 
     return Rx
-
-
-def fit_kernel_gpr(
-    X: torch.Tensor,
-    Y: torch.Tensor,
-    normalize_x: bool = True,
-    normalize_y: bool = True,
-    return_residuals: bool = True,
-    constant_value: float = 1.0,
-    constant_value_bounds: tuple[float, float] = (1e-3, 1e3),
-    length_scale: float = 1.0,
-    length_scale_bounds: tuple[float, float] = (1e-2, 1e2),
-) -> Union[tuple[torch.Tensor, float], torch.Tensor]:
-    """Fit a Gaussian process regression to learn parameters for kernel regression.
-
-    Y ~ GaussianProcessRegressor(X, kernel = ConstantKernel * RBF + WhiteNoise)
-
-    Parameters
-    ----------
-    X
-        Shape (n_samples, d). Input data of d features.
-    Y
-        Shape (n_samples, m). Output data of m targets.
-    normalize_x
-        Whether to normalize the input data.
-    normalize_y
-        Whether to normalize the output data.
-    return_residuals
-        Whether to return the regression residuals ``Y_residuals`` :math:`Y - \\hat{Y}`.
-    constant_value
-        Constant kernel value.
-    constant_value_bounds
-        Bounds for the constant kernel value to search.
-    length_scale
-        Length scale for the RBF kernel.
-    length_scale_bounds
-        Bounds for the RBF length scale to search.
-
-    Returns
-    -------
-    tuple[torch.Tensor, float] or torch.Tensor
-        If `return_residuals` is False, returns the estimated kernel and regularization strength (``Kxy``, ``epsilon``).
-        If `return_residuals` is True, returns the regression residual ``Y_residuals`` of shape (n_samples, m).
-
-    Notes
-    -----
-    This function is a wrapper of `sklearn.gaussian_process.GaussianProcessRegressor`.
-    It is possible to speed up model fitting via more efficient implementations of Gaussian process regression, e.g., `GPyTorch`.
-    """
-    # remove samples that contains NaN values in Y
-    n_samples_original = Y.shape[0]
-    is_nan = torch.isnan(Y).any(1)
-    X = X[~is_nan]
-    Y = Y[~is_nan]
-    n_samples = Y.shape[0]
-
-    # normalize the input and target data if needed
-    if normalize_x:
-        X = (X - X.mean(0)) / X.std(0)
-        X[torch.isinf(X)] = 0  # for constant columns
-
-    if normalize_y:
-        Y = (Y - Y.mean(0)) / Y.std(0)
-        Y[torch.isinf(Y)] = 0  # for constant columns
-
-    # specify the kernel choice
-    # KernelX = C(1.0, (1e-3, 1e3)) * RBF(1.0, (1e-2, 1e2)) + WhiteKernel(0.1, (1e-10, 1e+1))
-    KernelX = C(constant_value, constant_value_bounds) * RBF(
-        length_scale, length_scale_bounds
-    ) + WhiteKernel(0.1, (1e-5, 1e1))
-    gpx = GaussianProcessRegressor(kernel=KernelX)
-
-    # fit Gaussian process, including hyperparameter optimization
-    gpx.fit(X, Y)
-
-    # get the kernel matrix and regularization parameter
-    Kxy = torch.from_numpy(gpx.kernel_.k1(X, X)).float()
-    epsilon = np.exp(gpx.kernel_.theta[-1])
-
-    if not return_residuals:
-        return Kxy, epsilon
-
-    # calculate the residuals
-    Rx = get_kernel_regression_residual_op(Kxy, epsilon)
-    Y_residuals = Rx @ Y
-
-    if n_samples_original == n_samples:
-        return Y_residuals
-
-    # insert NaN values back to the residuals in the original order
-    Y_residuals_full = torch.full(
-        (n_samples_original, Y_residuals.shape[1]), float("nan")
-    )
-    Y_residuals_full[~is_nan] = Y_residuals
-
-    return Y_residuals_full
 
 
 class SplisosmNP:
@@ -889,80 +724,87 @@ class SplisosmNP:
 
     def test_differential_usage(
         self,
-        method: Literal[
-            "hsic", "hsic-knn", "hsic-gp", "t-fisher", "t-tippett"
-        ] = "hsic-gp",
+        method: Literal["hsic", "hsic-gp", "t-fisher", "t-tippett"] = "hsic-gp",
         ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
         nan_filling: Literal["mean", "none"] = "mean",
-        hsic_eps: Optional[float] = 1e-3,
-        gp_configs: Optional[dict[str, Any]] = None,
+        gpr_backend: Literal["sklearn", "gpytorch"] = "sklearn",
+        gpr_configs: Optional[dict[str, Any]] = None,
         print_progress: bool = True,
         return_results: bool = False,
     ) -> Optional[dict[str, Any]]:
         """Test for spatial isoform differential usage.
 
         Before running this function, the design matrix must be set up using :func:`setup_data`.
-        Each column of the design matrix corresponds to a covariate to test for differential association
-        with the isoform usage ratios of each gene.
+        Each column of the design matrix corresponds to a covariate to test for differential
+        association with the isoform usage ratios of each gene.
         Test statistics and p-values are computed per (gene, covariate) pair separately.
 
         Two types of association tests are supported:
 
-        - Unconditional (``"hsic"`` with ``hsic_eps=None``, ``"t-fisher"``, ``"t-tippett"``): test the unconditional association between isoform usage ratios and the covariate of interest.
-        - Conditional (``"hsic"`` with ``hsic_eps>0``, ``"hsic-knn"``, ``"hsic-gp"``): test the association conditioned on the spatial coordinates. See :cite:`zhang2012kernel` for more details.
+        - Unconditional (``"hsic"``, ``"t-fisher"``, ``"t-tippett"``): test the
+          unconditional association between isoform usage ratios and the covariate.
+        - Conditional (``"hsic-gp"``): test the association conditioned on spatial
+          coordinates via Gaussian process regression.  See :cite:`zhang2012kernel`
+          for more details.
 
         Parameters
         ----------
-        method
-            Method for association testing can be one of the HSIC tests
+        method : str, optional
+            Method for association testing:
 
-            * ``"hsic"``: HSIC test for isoform differential usage along each factor in the design matrix.
-              For continuous factors, it is equivalent to the (partial) pearson correlation test.
-              For binary factors, it is equivalent to the two-sample t-test.
-            * ``"hsic-knn"``: conditional HSIC test using KNN regression to remove spatial effect.
-            * ``"hsic-gp"``: conditional HSIC test using kernels learned from Gaussian process regression.
+            * ``"hsic"``: Unconditional HSIC test (multivariate RV coefficient).
+              For continuous factors, equivalent to the multivariate Pearson correlation
+              test.  For binary factors, equivalent to the two-sample Hotelling T**2 test.
+            * ``"hsic-gp"``: Conditional HSIC test.  Spatial effects are removed via
+              Gaussian process regression before computing the HSIC statistic.
 
-            Or, one of T-tests (binary factors only), ``"t-fisher"``, ``"t-tippett"``, where each isoform
-            is tested independently for association with the factor of interest,
-            and the p-values are combined to gene-level using either Fisher's or Tippett's approach.
-        ratio_transformation
-            What compositional transformation to use for isoform ratio.
-            Can be one of ``'none'``, ``'clr'``, ``'ilr'``, ``'alr'``, or ``'radial'`` :cite:`park2022kernel`.
-            See :func:`splisosm.utils.counts_to_ratios` for more details.
-        nan_filling
-            How to fill the NaN values in the isoform ratios. Can be one of ``'mean'`` or ``'none'``.
-            See :func:`splisosm.utils.counts_to_ratios` for more details.
-        hsic_eps
-            The regularization parameter for conditional HSIC when ``method='hsic'``.
-            If None, the test is unconditional. This parameter does not apply to ``method='hsic-knn'`` or ``method='hsic-gp'``.
-        gp_configs
-            The kernel configurations for the Gaussian process regression.
-            See :func:`splisosm.hyptest_np.fit_kernel_gpr` for more details.
-            If `None`, defaults to the configuration below. For efficiency,
-            we fix some parameters to be constant::
+            Or one of the T-tests (binary factors only):
+
+            * ``"t-fisher"``, ``"t-tippett"``: each isoform is tested independently
+              and p-values are combined gene-wise via Fisher's or Tippett's method.
+        ratio_transformation : str, optional
+            Compositional transformation for isoform ratios.
+            One of ``'none'``, ``'clr'``, ``'ilr'``, ``'alr'``, ``'radial'``
+            :cite:`park2022kernel`.  See :func:`splisosm.utils.counts_to_ratios`.
+        nan_filling : str, optional
+            How to fill NaN values in isoform ratios.  One of ``'mean'`` or ``'none'``.
+            See :func:`splisosm.utils.counts_to_ratios`.
+        gpr_backend : str, optional
+            GPR backend to use for ``method='hsic-gp'``.
+            One of ``'sklearn'`` (default) or ``'gpytorch'``.
+        gpr_configs : dict, optional
+            Nested configuration dict for the GPR objects, with optional keys
+            ``'covariate'`` and/or ``'isoform'``.  Each sub-dict is forwarded to
+            :func:`splisosm.kernel_gpr.make_kernel_gpr`.  Unspecified keys use the
+            defaults from :data:`splisosm.kernel_gpr._DEFAULT_GPR_CONFIGS`::
 
                 {
-                    "constant_value_covariate": 1.0,
-                    "length_scale_covariate": 1.0,
-                    "constant_value_bounds_covariate": (1e-3, 1e3),
-                    "length_scale_bounds_covariate": "fixed",
-                    "constant_value_isoform": 1e-3,
-                    "length_scale_isoform": 1.0,
-                    "constant_value_bounds_isoform": "fixed",
-                    "length_scale_bounds_isoform": "fixed",
+                    "covariate": {
+                        "constant_value": 1.0,
+                        "constant_value_bounds": (1e-3, 1e3),
+                        "length_scale": 1.0,
+                        "length_scale_bounds": "fixed",
+                    },
+                    "isoform": {
+                        "constant_value": 1e-3,
+                        "constant_value_bounds": "fixed",
+                        "length_scale": 1.0,
+                        "length_scale_bounds": "fixed",
+                    },
                 }
 
-        print_progress
+        print_progress : bool, optional
             Whether to show the progress bar. Default to True.
-        return_results
+        return_results : bool, optional
             Whether to return the test statistics and p-values.
             If False, the results are stored in ``self.du_test_results``.
 
         Returns
         -------
-        dict or None
-            If `return_results` is True, returns dict with test statistics and p-values.
-            Otherwise, returns None and stores results in self.du_test_results.
+        results : dict or None
+            If ``return_results`` is True, returns dict with test statistics and
+            p-values. Otherwise, returns None and stores results in
+            ``self.du_test_results``.
         """
         if self.design_mtx is None:
             raise ValueError(
@@ -972,7 +814,7 @@ class SplisosmNP:
         n_spots, n_factors = self.design_mtx.shape
 
         # check the validity of the specified method and transformation
-        valid_methods = ["hsic", "hsic-knn", "hsic-gp", "t-fisher", "t-tippett"]
+        valid_methods = ["hsic", "hsic-gp", "t-fisher", "t-tippett"]
         valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
         valid_nan_filling = ["none", "mean"]
         assert (
@@ -985,276 +827,100 @@ class SplisosmNP:
             nan_filling in valid_nan_filling
         ), f"Invalid nan_filling. Must be one of {valid_nan_filling}."
 
-        # TODO
-        if method in ["hsic", "hsic-knn"]:  # HSIC-based test with pre-specified kernel
-            # x: spatial coordinates, z: factor of interest, y: isoform usage
-            # need to first regress out the spatial effect x from x and y
-
-            if nan_filling == "mean":  # no NaN values in the ratio
-                # use the same spatial kernel matrix for all genes
-                if method == "hsic-knn":  # use KNN regression
-                    Rx = get_knn_regression_residual_op(self.coordinates, k=4)
-                else:  # use kernel regression
-                    # calculate the residual operator Rx
-                    # if hsic_eps is None, testing the unconditional H_0: y \independent z
-                    # otherwise, testing the conditional H_0: y \independent z | x
-                    if hsic_eps is None:  # unconditional HSIC test
-                        Rx = torch.eye(n_spots)
-                    else:  # conditional HSIC test
-                        assert (
-                            hsic_eps > 0
-                        ), "The regularization parameter hsic_eps must be positive."
-                        # prepare the spatial kernel matrix
-                        # H = torch.eye(n_spots) - 1/n_spots
-                        # Kx = H @ self.corr_sp @ H # centered kernel for spatial coordinates
-                        Kx = (
-                            self.corr_sp.realization()
-                        )  # the Kernel class object was already centered
-                        # regularized kernel regression
-                        Rx = get_kernel_regression_residual_op(Kx, hsic_eps)
-
-                hsic_list, pvals_list = [], []
-                # iterate over factors
-                for _ind in tqdm(
-                    range(n_factors), disable=(not print_progress), dynamic_ncols=True
-                ):
-                    # center the factor of interest
-                    z = self.design_mtx[:, _ind].clone()  # len of n_spots
-                    assert (
-                        z.std() > 0
-                    ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
-                    z = Rx @ z  # regression residual
-                    z = (
-                        z - z.mean()
-                    ) / z.std()  # normalize the factor of interest for stability
-                    z = z.unsqueeze(1)  # (n_spots, 1)
-
-                    _hsic_ind, _pvals_ind = [], []
-                    # iterate over genes and calculate the HSIC statistic
-                    for counts in self.data:
-                        if counts.is_sparse:
-                            counts = counts.to_dense()
-
-                        # calculate isoform usage ratio (n_spots, n_isos)
-                        y = counts_to_ratios(
-                            counts,
-                            transformation=ratio_transformation,
-                            nan_filling="mean",
-                        )
-                        y = Rx @ y  # regression residual, (n_spots, n_isos)
-                        y = y - y.mean(0, keepdim=True)  # centering per isoform
-
-                        # calculate the HSIC statistic
-                        _hsic, _pval = linear_hsic_test(z, y, centering=True)
-
-                        _hsic_ind.append(_hsic)
-                        _pvals_ind.append(_pval)
-
-                    # stack the results
-                    hsic_list.append(torch.tensor(_hsic_ind))
-                    pvals_list.append(torch.tensor(_pvals_ind))
-
-                # combine results
-                hsic_all = torch.stack(hsic_list, dim=1)
-                pvals_all = torch.stack(pvals_list, dim=1)
-
-            else:  # nan_filling == 'none', NaN values in the ratio
+        if method == "hsic":  # unconditional HSIC test (multivariate RV coefficient)
+            # Precompute isoform ratios for all genes
+            y_list = []
+            for counts in self.data:
                 if counts.is_sparse:
                     counts = counts.to_dense()
+                y = counts_to_ratios(
+                    counts, transformation=ratio_transformation, nan_filling=nan_filling
+                )
+                y_list.append(y)
 
-                hsic_list, pvals_list = [], []
-                # iterate over genes and use different spatial kernel matrix for different genes
-                for counts in tqdm(
-                    self.data, disable=(not print_progress), dynamic_ncols=True
-                ):
-                    # calculate isoform usage ratio (n_spots, n_isos)
-                    y = counts_to_ratios(
-                        counts, transformation=ratio_transformation, nan_filling="none"
-                    )
+            n_genes = len(y_list)
+            hsic_all = torch.empty(n_genes, n_factors)
+            pvals_all = torch.empty(n_genes, n_factors)
 
-                    # remove NaN spots
-                    is_nan = torch.isnan(y).any(1)  # spots with NaN values, (n_spots,)
+            for _ind in tqdm(
+                range(n_factors), disable=(not print_progress), dynamic_ncols=True
+            ):
+                z = self.design_mtx[:, _ind].clone().unsqueeze(1)  # (n_spots, 1)
+                assert (
+                    z.std() > 0
+                ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
 
-                    # calculate the residual operator Rx
-                    if method == "hsic-knn":  # use KNN regression
-                        Rx = get_knn_regression_residual_op(
-                            self.coordinates[~is_nan], k=4
-                        )
-                    else:  # use kernel regression
-                        # calculate the residual operator Rx
-                        # if hsic_eps is None, testing the unconditional H_0: y \independent z
-                        # otherwise, testing the conditional H_0: y \independent z | x
-                        if hsic_eps is None:  # unconditional HSIC test
-                            Rx = torch.eye(n_spots - is_nan.sum())
-                        else:  # conditional HSIC test
-                            assert (
-                                hsic_eps > 0
-                            ), "The regularization parameter hsic_eps must be positive."
-                            # create the spatial kernel matrix as the principal submatrix
-                            # Kx = self.corr_sp[~is_nan,:][:,~is_nan] # (n_non_nan, n_non_nan)
-                            # H = torch.eye(Kx.shape[0]) - 1/Kx.shape[0]
-                            # Kx = H @ Kx @ H # centered spatial kernel, (n_non_nan, n_non_nan)
-                            K_x = self.corr_sp.realization()[~is_nan, :][:, ~is_nan]
-                            K_x = K_x - K_x.mean(dim=0, keepdim=True)
-                            K_x = K_x - K_x.mean(
-                                dim=1, keepdim=True
-                            )  # (n_non_nan, n_non_nan)
+                for _g, y in enumerate(y_list):
+                    # linear_hsic_test handles NaN rows internally
+                    _hsic, _pval = linear_hsic_test(z, y, centering=True)
+                    hsic_all[_g, _ind] = _hsic
+                    pvals_all[_g, _ind] = _pval
 
-                            # regularized kernel regression
-                            Rx = get_kernel_regression_residual_op(Kx, hsic_eps)
-
-                    # calculate the residuals
-                    y = Rx @ y[~is_nan]  # regression residual, (n_non_nan, n_isos)
-
-                    # center the factor of interest
-                    y = y - y.mean(0, keepdim=True)  # centering per isoform
-
-                    _hsic_ind, _pvals_ind = [], []
-                    # iterate over factors
-                    for _ind in range(n_factors):
-                        # center the factor of interest
-                        z = self.design_mtx[~is_nan, _ind].clone()  # (n_non_nan,)
-                        assert (
-                            z.std() > 0
-                        ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
-                        z = Rx @ z  # regression residual, (n_non_nan,)
-                        z = (
-                            z - z.mean()
-                        ) / z.std()  # normalize the factor of interest for stability
-                        z = z.unsqueeze(1)  # (n_non_nan, 1)
-
-                        # calculate the HSIC statistic
-                        _hsic, _pval = linear_hsic_test(z, y, centering=True)
-
-                        _hsic_ind.append(_hsic)
-                        _pvals_ind.append(_pval)
-
-                    # stack the results
-                    hsic_list.append(torch.tensor(_hsic_ind))
-                    pvals_list.append(torch.tensor(_pvals_ind))
-
-                # combine results
-                hsic_all = torch.stack(hsic_list, dim=0)  # (n_genes, n_factors)
-                pvals_all = torch.stack(pvals_list, dim=0)  # (n_genes, n_factors)
-
-            # store the results
             self.du_test_results = {
-                "statistic": hsic_all.numpy(),  # (n_genes, n_factors)
-                "pvalue": pvals_all.numpy(),  # (n_genes, n_factors)
+                "statistic": hsic_all.numpy(),
+                "pvalue": pvals_all.numpy(),
                 "method": method,
             }
 
-        elif (
-            method == "hsic-gp"
-        ):  # HSIC-based test with kernel learned by Gaussian process regression
-            # specify the GP kernel configurations
-            _default_gp_configs = {
-                "constant_value_covariate": 1.0,
-                "length_scale_covariate": 1.0,
-                "constant_value_bounds_covariate": (1e-3, 1e3),
-                "length_scale_bounds_covariate": "fixed",
-                "constant_value_isoform": 1e-3,
-                "length_scale_isoform": 1.0,
-                "constant_value_bounds_isoform": "fixed",
-                "length_scale_bounds_isoform": "fixed",
-            }
-            if gp_configs is None:
-                gp_configs = _default_gp_configs
-            else:  # update the config
-                gp_configs = {**_default_gp_configs, **gp_configs}
+        elif method == "hsic-gp":  # conditional HSIC via GP regression residuals
+            # Build GPR configs
+            cov_config = {**_DEFAULT_GPR_CONFIGS["covariate"]}
+            iso_config = {**_DEFAULT_GPR_CONFIGS["isoform"]}
+            if gpr_configs is not None:
+                if "covariate" in gpr_configs:
+                    cov_config.update(gpr_configs["covariate"])
+                if "isoform" in gpr_configs:
+                    iso_config.update(gpr_configs["isoform"])
 
-            # normalize the spatial coordinates
+            gpr_cov = make_kernel_gpr(gpr_backend, **cov_config)
+            gpr_iso = make_kernel_gpr(gpr_backend, **iso_config)
+
+            # Normalize spatial coordinates
             x = self.coordinates.clone()  # (n_spots, 2)
-            x = (x - x.mean(0)) / x.std(0)  # normalize the spatial coordinates
-            x[torch.isinf(x)] = 0  # for constant columns
+            x = (x - x.mean(0)) / x.std(0)
+            x[torch.isinf(x)] = 0  # guard against constant coordinate axes
 
-            # run GP regression for every factor
+            # Residualize all factors
             z_res_list = []
             for _ind in tqdm(
                 range(n_factors), disable=(not print_progress), dynamic_ncols=True
             ):
-                # center the factor of interest
                 z = self.design_mtx[:, _ind].clone()  # (n_spots,)
                 assert (
                     z.std() > 0
                 ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
                 z = (z - z.mean()) / z.std()
                 z = z.unsqueeze(1)  # (n_spots, 1)
+                z_res_list.append(gpr_cov.fit_residuals(x, z))
 
-                # fit the kernel regression and store results
-                z_res = fit_kernel_gpr(
-                    x,
-                    z,
-                    normalize_x=False,
-                    normalize_y=False,
-                    return_residuals=True,
-                    constant_value=gp_configs["constant_value_covariate"],
-                    constant_value_bounds=gp_configs["constant_value_bounds_covariate"],
-                    length_scale=gp_configs["length_scale_covariate"],
-                    length_scale_bounds=gp_configs["length_scale_bounds_covariate"],
-                )
-                z_res_list.append(z_res)
-
-            # run GP regression for every gene
-            y_res_list = []
+            # Compute isoform ratios for all genes
+            y_list = []
             for counts in tqdm(
                 self.data, disable=(not print_progress), dynamic_ncols=True
             ):
                 if counts.is_sparse:
                     counts = counts.to_dense()
-
-                # calculate isoform usage ratio (n_spots, n_isos)
                 y = counts_to_ratios(
                     counts, transformation=ratio_transformation, nan_filling=nan_filling
                 )
+                y_list.append(y)
 
-                # center the isoform usage for non-NaN spots
-                if nan_filling == "none":
-                    is_nan = torch.isnan(y).any(1)  # spots with NaN values
-                    y[~is_nan] = y[~is_nan] - y[~is_nan].mean(
-                        0, keepdim=True
-                    )  # y still of (n_spots, n_isos)
-                else:
-                    y = y - y.mean(0, keepdim=True)  # (n_spots, n_isos)
+            # Residualize all genes (amortizes shared eigendecomp when bounds fixed)
+            y_res_list = gpr_iso.fit_residuals_batch(x, y_list)
 
-                # fit the kernel regression and store results
-                y_res = fit_kernel_gpr(
-                    x,
-                    y,
-                    normalize_x=False,
-                    normalize_y=False,
-                    return_residuals=True,
-                    constant_value=gp_configs["constant_value_isoform"],
-                    constant_value_bounds=gp_configs["constant_value_bounds_isoform"],
-                    length_scale=gp_configs["length_scale_isoform"],
-                    length_scale_bounds=gp_configs["length_scale_bounds_isoform"],
-                )
-                y_res_list.append(y_res)
-
-            # calculate the HSIC statistic
-            hsic_list, pvals_list = [], []
-            # iterate over factors
-            for _z in z_res_list:
-                _hsic_ind, _pvals_ind = [], []
-                # iterate over genes and calculate the HSIC statistic
-                for _y in y_res_list:
-                    # calculate the HSIC statistic
+            # Compute HSIC for all (gene, factor) pairs
+            n_genes = len(y_res_list)
+            hsic_all = torch.empty(n_genes, n_factors)
+            pvals_all = torch.empty(n_genes, n_factors)
+            for _f, _z in enumerate(z_res_list):
+                for _g, _y in enumerate(y_res_list):
                     _hsic, _pval = linear_hsic_test(_z, _y, centering=True)
-                    _hsic_ind.append(_hsic)
-                    _pvals_ind.append(_pval)
+                    hsic_all[_g, _f] = _hsic
+                    pvals_all[_g, _f] = _pval
 
-                # stack the results
-                hsic_list.append(torch.tensor(_hsic_ind))
-                pvals_list.append(torch.tensor(_pvals_ind))
-
-            # combine results
-            hsic_all = torch.stack(hsic_list, dim=1)
-            pvals_all = torch.stack(pvals_list, dim=1)
-
-            # store the results
             self.du_test_results = {
-                "statistic": hsic_all.numpy(),  # (n_genes, n_factors)
-                "pvalue": pvals_all.numpy(),  # (n_genes, n_factors)
+                "statistic": hsic_all.numpy(),
+                "pvalue": pvals_all.numpy(),
                 "method": method,
             }
 

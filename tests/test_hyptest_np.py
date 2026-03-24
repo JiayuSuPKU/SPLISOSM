@@ -338,11 +338,11 @@ class TestSplisosmNP(unittest.TestCase):
             design_mtx=self.design_mtx,
             gene_names=self.gene_names,
         )
-        for method in ["hsic", "hsic-knn", "hsic-gp"]:
+        for method in ["hsic", "hsic-gp"]:
             with self.subTest(method=method):
-                model.test_differential_usage(method=method, hsic_eps=1e-3)
+                model.test_differential_usage(method=method, print_progress=False)
                 du_results = model.get_formatted_test_results("du")
-                print(du_results.head())
+                self.assertGreater(len(du_results), 0)
                 self.assertIn(method, str(model))
 
     def test_spatial_variability_with_none_transformation(self):
@@ -430,7 +430,7 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertEqual(len(du_results), self.n_genes * 1)
 
     def test_differential_usage_unconditional_hsic(self):
-        """Test differential usage with unconditional HSIC (hsic_eps=None)."""
+        """Test unconditional HSIC (method='hsic', no spatial conditioning)."""
         model = SplisosmNP()
         model.setup_data(
             data=self.counts,
@@ -438,9 +438,7 @@ class TestSplisosmNP(unittest.TestCase):
             design_mtx=self.design_mtx,
             gene_names=self.gene_names,
         )
-        model.test_differential_usage(
-            method="hsic", hsic_eps=None, print_progress=False
-        )
+        model.test_differential_usage(method="hsic", print_progress=False)
         du_results = model.get_formatted_test_results("du")
         self.assertEqual(len(du_results), self.n_genes * self.design_mtx.shape[1])
 

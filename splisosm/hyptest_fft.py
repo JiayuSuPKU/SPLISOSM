@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional, Union
 
 # Suppress deprecations from SpatialData stack before importing it.
 warnings.filterwarnings(
@@ -30,10 +30,18 @@ from anndata import AnnData
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
+from scipy.optimize import minimize_scalar
+from scipy.stats import ttest_ind, combine_pvalues
+
+from splisosm.kernel_gpr import (
+    SpatialKernelOp,
+    KernelGPR,
+    linear_hsic_test,
+)
 from splisosm.likelihood import liu_sf
 from splisosm.utils import counts_to_ratios, false_discovery_control
 
-__all__ = ["FFTKernel", "SplisosmFFT"]
+__all__ = ["FFTKernel", "FFTKernelOp", "FFTKernelGPR", "SplisosmFFT"]
 
 
 class FFTKernel:
@@ -208,6 +216,45 @@ class FFTKernel:
             return evals
         return evals[:k]
 
+    def apply_residual_op(self, x: np.ndarray, epsilon: float) -> np.ndarray:
+        """Apply the kernel regression residual operator ``R = epsilon * (K + epsilon * I)**(-1)``.
+
+        Computed in O(N log N) via FFT as::
+
+            R @ v = IFFT2( epsilon / (lambda + epsilon) * FFT2(v) )
+
+        Parameters
+        ----------
+        x
+            Input with shape ``(ny, nx)`` or ``(ny, nx, m)``.
+        epsilon
+            Regularization / noise level.
+
+        Returns
+        -------
+        np.ndarray
+            Residuals of the same shape as ``x``.
+        """
+        x = np.asarray(x, dtype=float)
+        scalar = x.ndim == 2
+        if scalar:
+            x = x[..., None]
+        if x.ndim != 3:
+            raise ValueError("`x` must have shape (ny, nx) or (ny, nx, m).")
+
+        ny, nx, _ = x.shape
+        if ny != self.ny or nx != self.nx:
+            raise ValueError(
+                f"Input shape ({ny}, {nx}) does not match kernel shape ({self.ny}, {self.nx})."
+            )
+
+        x_hat = scipy.fft.fft2(x, axes=(0, 1), workers=self.workers)
+        scale = epsilon / (self._spectrum_2d[:, :, None] + epsilon)
+        result = np.real(
+            scipy.fft.ifft2(scale * x_hat, axes=(0, 1), workers=self.workers)
+        )
+        return result[..., 0] if scalar else result
+
     def trace(self) -> float:
         """Return ``trace(K)``."""
         return float(np.sum(self.spectrum))
@@ -215,6 +262,490 @@ class FFTKernel:
     def square_trace(self) -> float:
         """Return ``trace(K^2)``."""
         return float(np.sum(self.spectrum**2))
+
+
+# ---------------------------------------------------------------------------
+# FFT-based SpatialKernelOp and KernelGPR
+# ---------------------------------------------------------------------------
+
+
+class FFTKernelOp(SpatialKernelOp):
+    """Implicit kernel linear operator backed by :class:`FFTKernel`.
+
+    All operations are O(N log N) via FFT convolution.  The n x n kernel
+    matrix is never formed.
+
+    Parameters
+    ----------
+    kernel : FFTKernel
+        Spatial kernel instance defining the grid and spectrum.
+
+    Attributes
+    ----------
+    n : int
+        Total number of grid cells.
+
+    Methods
+    -------
+    matvec(v)
+        Compute K @ v in O(N log N).
+    solve(v, epsilon)
+        Solve (K + epsilon * I) u = v in O(N log N).
+    residuals(v, epsilon)
+        Apply the residual operator epsilon * (K + epsilon * I)**(-1).
+    eigenvalues(k)
+        Return kernel eigenvalues in descending order.
+    lml_1d(v_cube)
+        Build a 1-D log-marginal-likelihood function for epsilon search.
+    """
+
+    def __init__(self, kernel: FFTKernel) -> None:
+        self._kernel = kernel
+
+    @property
+    def n(self) -> int:
+        return self._kernel.n_grid
+
+    def _to_cube(self, v: np.ndarray) -> np.ndarray:
+        """Reshape flat (n,) or (n, m) to (ny, nx) or (ny, nx, m)."""
+        ny, nx = self._kernel.ny, self._kernel.nx
+        if v.ndim == 1:
+            return v.reshape(ny, nx)
+        return v.reshape(ny, nx, v.shape[1])
+
+    def _from_cube(self, cube: np.ndarray, scalar: bool) -> np.ndarray:
+        if scalar:
+            return cube.ravel()
+        return cube.reshape(self._kernel.n_grid, -1)
+
+    def matvec(self, v: np.ndarray) -> np.ndarray:
+        """Compute ``K @ v`` in O(N log N).
+
+        Parameters
+        ----------
+        v : np.ndarray, shape (n,) or (n, m)
+            Input vector or matrix.
+
+        Returns
+        -------
+        np.ndarray, shape (n,) or (n, m)
+            Result of K @ v.
+        """
+        scalar = v.ndim == 1
+        cube = self._to_cube(v)
+        if cube.ndim == 2:
+            cube = cube[..., None]
+        x_hat = scipy.fft.fft2(cube, axes=(0, 1), workers=self._kernel.workers)
+        kv_hat = x_hat * self._kernel._spectrum_2d[:, :, None]
+        kv_cube = np.real(
+            scipy.fft.ifft2(kv_hat, axes=(0, 1), workers=self._kernel.workers)
+        )
+        kv_cube /= self._kernel.n_grid
+        return self._from_cube(kv_cube[..., 0] if scalar else kv_cube, scalar)
+
+    def solve(self, v: np.ndarray, epsilon: float) -> np.ndarray:
+        """Solve ``(K + epsilon * I) u = v`` in O(N log N) via spectral division.
+
+        Parameters
+        ----------
+        v : np.ndarray, shape (n,) or (n, m)
+            Right-hand side vector or matrix.
+        epsilon : float
+            Regularization level (> 0).
+
+        Returns
+        -------
+        np.ndarray, shape (n,) or (n, m)
+            Solution u.
+        """
+        scalar = v.ndim == 1
+        cube = self._to_cube(v)
+        if cube.ndim == 2:
+            cube = cube[..., None]
+        v_hat = scipy.fft.fft2(cube, axes=(0, 1), workers=self._kernel.workers)
+        scale = 1.0 / (
+            self._kernel._spectrum_2d[:, :, None] / self._kernel.n_grid + epsilon
+        )
+        u_hat = scale * v_hat
+        u_cube = np.real(
+            scipy.fft.ifft2(u_hat, axes=(0, 1), workers=self._kernel.workers)
+        )
+        return self._from_cube(u_cube[..., 0] if scalar else u_cube, scalar)
+
+    def residuals(self, v: np.ndarray, epsilon: float) -> np.ndarray:
+        """Apply ``epsilon * (K + epsilon * I)**(-1)`` in O(N log N).
+
+        Parameters
+        ----------
+        v : np.ndarray, shape (n,) or (n, m)
+            Input vector or matrix.
+        epsilon : float
+            Regularization level (> 0).
+
+        Returns
+        -------
+        np.ndarray, shape (n,) or (n, m)
+            Residual vector or matrix.
+        """
+        return epsilon * self.solve(v, epsilon)
+
+    def eigenvalues(self, k: Optional[int] = None) -> np.ndarray:
+        """Return kernel eigenvalues in descending order (from FFT spectrum).
+
+        Parameters
+        ----------
+        k : int or None
+            Number of leading eigenvalues to return. None returns all.
+
+        Returns
+        -------
+        np.ndarray, shape (k,) or (n,)
+            Eigenvalues in descending order.
+        """
+        evals = np.sort(self._kernel.spectrum / self._kernel.n_grid)[::-1]
+        if k is not None:
+            return evals[:k]
+        return evals
+
+    def lml_1d(self, v_cube: np.ndarray) -> "Callable[[float], float]":
+        """Build a 1-D log-marginal-likelihood function for epsilon search.
+
+        Parameters
+        ----------
+        v_cube : np.ndarray, shape (ny, nx) or (ny, nx, m)
+            Target data (already centred; NaN replaced with 0).
+
+        Returns
+        -------
+        callable
+            Negative log-marginal-likelihood function neg_lml(epsilon) -> float.
+        """
+        if v_cube.ndim == 2:
+            v_cube = v_cube[..., None]
+        v_hat = scipy.fft.fft2(v_cube, axes=(0, 1), workers=self._kernel.workers)
+        power = (np.abs(v_hat) ** 2).sum(axis=2)  # (ny, nx) - sum over channels
+        lam = self._kernel._spectrum_2d / self._kernel.n_grid  # (ny, nx)
+        n = self._kernel.n_grid
+        m = v_cube.shape[2]
+
+        def neg_lml(epsilon: float) -> float:
+            lam_eps = lam + epsilon
+            ll = m * np.sum(np.log(lam_eps)) + np.sum(power / lam_eps)
+            return 0.5 * ll / n
+
+        return neg_lml
+
+
+class FFTKernelGPR(KernelGPR):
+    """FFT-based GPR residualizer for regular ``(ny, nx)`` grids.
+
+    Hyperparameters are learned by 1-D log-marginal-likelihood maximisation
+    in the spectral domain - O(N log N) per evaluation.  The n x n kernel
+    matrix is never formed.
+
+    This is the default backend for :class:`SplisosmFFT`.
+
+    Parameters
+    ----------
+    kernel : FFTKernel
+        Spatial kernel instance (shared with the :class:`SplisosmFFT` model).
+    epsilon_bounds : tuple[float, float]
+        Search bounds for the white-noise / regularization level.
+
+    Attributes
+    ----------
+    epsilon_bounds : tuple[float, float]
+        Search bounds for the regularization level.
+
+    Methods
+    -------
+    get_kernel_op(coords)
+        Return the FFTKernelOp for this kernel.
+    find_epsilon(data_cube)
+        Find the optimal regularization epsilon via LML search.
+    fit_residuals_cube(data_cube, epsilon)
+        Residualize a raster cube in O(N log N).
+    """
+
+    def __init__(
+        self,
+        kernel: FFTKernel,
+        epsilon_bounds: tuple[float, float] = (1e-5, 1e1),
+    ) -> None:
+        self._kernel = kernel
+        self._epsilon_bounds = epsilon_bounds
+        self._op = FFTKernelOp(kernel)
+
+    def get_kernel_op(self, coords=None) -> FFTKernelOp:
+        """Return the FFTKernelOp for this kernel.
+
+        Returns
+        -------
+        FFTKernelOp
+            The kernel operator backed by this instance's FFTKernel.
+        """
+        return self._op
+
+    def fit_residuals(self, coords, Y) -> torch.Tensor:
+        """Fit GP residuals (not implemented for FFT backend).
+
+        This method raises TypeError because FFTKernelGPR operates on raster
+        cubes rather than coordinate arrays. Use fit_residuals_cube() instead.
+
+        Parameters
+        ----------
+        coords : torch.Tensor
+            Spatial coordinates (not used).
+        Y : torch.Tensor
+            Target values (not used).
+
+        Returns
+        -------
+        torch.Tensor
+            Not returned; raises TypeError.
+
+        Raises
+        ------
+        TypeError
+            Always raised; use fit_residuals_cube() for raster data.
+        """
+        raise TypeError(
+            "FFTKernelGPR operates on raster cubes, not coordinate arrays. "
+            "Use fit_residuals_cube() for raster data."
+        )
+
+    def find_epsilon(self, data_cube: np.ndarray) -> float:
+        """Find the optimal regularization epsilon for the given raster data.
+
+        Parameters
+        ----------
+        data_cube : np.ndarray, shape (ny, nx) or (ny, nx, m)
+            Centred, NaN-imputed raster data.
+
+        Returns
+        -------
+        float
+            Optimal regularization level.
+        """
+        neg_lml = self._op.lml_1d(data_cube)
+        lo, hi = self._epsilon_bounds
+        result = minimize_scalar(neg_lml, bounds=(lo, hi), method="bounded")
+        return float(result.x)
+
+    def fit_residuals_cube(
+        self,
+        data_cube: np.ndarray,
+        epsilon: Optional[float] = None,
+    ) -> tuple[np.ndarray, float]:
+        """Residualize a raster cube in O(N log N).
+
+        Centers the data, optionally searches for the optimal epsilon, then
+        applies ``R = epsilon * (K + epsilon * I)**(-1)``.
+
+        Parameters
+        ----------
+        data_cube : np.ndarray, shape (ny, nx) or (ny, nx, m)
+            Raster data to residualize.
+        epsilon : float or None
+            Regularization level. If None, found via LML search.
+
+        Returns
+        -------
+        residuals : np.ndarray, same shape as data_cube
+            Spatially residualized data.
+        epsilon : float
+            Regularization level used.
+        """
+        cube = np.asarray(data_cube, dtype=float)
+        scalar = cube.ndim == 2
+        if scalar:
+            cube = cube[..., None]
+
+        # Centre and NaN-impute
+        cube = cube - np.nanmean(cube, axis=(0, 1), keepdims=True)
+        cube = np.nan_to_num(cube, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if epsilon is None:
+            epsilon = self.find_epsilon(cube)
+
+        # Use apply_residual_op directly - it natively handles (ny, nx, m) cubes
+        # and is O(N log N) via FFT without materialising the n x n kernel matrix.
+        res = self._kernel.apply_residual_op(cube, epsilon)  # (ny, nx, m)
+        return (res[..., 0] if scalar else res), epsilon
+
+
+def _du_worker_fft(
+    raster_layer: Any,
+    iso_names: list[str],
+    gpr_iso: "FFTKernelGPR",
+    z_res_list: list[np.ndarray],
+    ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute DU HSIC statistics and p-values for one gene against all factors.
+
+    Uses ``FFTKernelGPR`` to residualize the isoform ratios (per-gene epsilon
+    search), then measures residual linear association with the pre-residualized
+    covariates via the linear HSIC statistic.
+
+    Parameters
+    ----------
+    raster_layer : xarray.DataArray
+        SpatialData raster image with channel dimension first ``(c, ny, nx)``.
+    iso_names : list of str
+        Channel names (isoforms) to select from ``raster_layer``.
+    gpr_iso : FFTKernelGPR
+        ``FFTKernelGPR`` instance used for per-gene isoform residualization.
+        Performs an O(N log N) epsilon search followed by residualization.
+    z_res_list : list of np.ndarray
+        Per-factor spatially-residualized covariate grids, each shape ``(ny, nx)``.
+        Pre-computed once before the per-gene loop.
+    ratio_transformation : str
+        Compositional transformation for isoform ratios.
+
+    Returns
+    -------
+    stats : np.ndarray, shape (n_factors,)
+    pvals : np.ndarray, shape (n_factors,)
+    """
+    n_factors = len(z_res_list)
+    stats = np.zeros(n_factors)
+    pvals = np.ones(n_factors)
+
+    # SpatialData raster channel order is (c, y, x), convert to (y, x, c)
+    data = raster_layer.sel(c=iso_names).values
+    counts_cube = np.moveaxis(np.asarray(data, dtype=float), 0, -1)
+    kernel = gpr_iso._kernel
+
+    counts_flat = counts_cube.reshape(kernel.n_grid, counts_cube.shape[2])
+    ratios = counts_to_ratios(
+        torch.from_numpy(counts_flat).float(),
+        transformation=ratio_transformation,
+        nan_filling="none",
+    )
+    y_cube = ratios.numpy().reshape(kernel.ny, kernel.nx, -1)
+
+    # Spatially residualize isoform ratios via FFT + per-gene epsilon search
+    y_res_cube, _ = gpr_iso.fit_residuals_cube(y_cube)  # (ny, nx, n_isos)
+    y_res = y_res_cube.reshape(kernel.n_grid, -1)  # (n_grid, n_isos)
+
+    # Pre-compute gram matrix eigenvalues for y (shared across factors)
+    gram_y = y_res.T @ y_res
+    if not np.isfinite(gram_y).all():
+        return stats, pvals
+    try:
+        lambda_y = np.linalg.eigvalsh(gram_y)
+    except np.linalg.LinAlgError:
+        return stats, pvals
+    lambda_y = lambda_y[lambda_y > 1e-8]
+
+    for _f, z_res_cube in enumerate(z_res_list):
+        z_flat = z_res_cube.ravel()[:, None]  # (n_grid, 1)
+
+        # HSIC = ||y_res^T z_res||_F^2
+        cross = y_res.T @ z_flat  # (n_isos, 1)
+        hsic_scaled = float(np.sum(cross**2))
+        stats[_f] = hsic_scaled / (kernel.n_grid - 1) ** 2
+
+        lambda_z = np.linalg.eigvalsh(z_flat.T @ z_flat)
+        lambda_z = lambda_z[lambda_z > 1e-8]
+
+        if lambda_z.size == 0 or lambda_y.size == 0:
+            pvals[_f] = 1.0
+            continue
+
+        lambda_mix = (lambda_z[:, None] * lambda_y[None, :]).reshape(-1)
+        pvals[_f] = float(liu_sf(hsic_scaled * kernel.n_grid, lambda_mix))
+
+    return stats, pvals
+
+
+def _du_worker_spot(
+    raster_layer: Any,
+    iso_names: list[str],
+    rows: np.ndarray,
+    cols: np.ndarray,
+    z_list: list[np.ndarray],
+    ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"],
+    method: Literal["hsic", "t-fisher", "t-tippett"],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute DU statistics for one gene at spot level (no spatial residualization).
+
+    Used for the unconditional HSIC test (``method='hsic'``) and the
+    T-test variants (``method='t-fisher'``, ``method='t-tippett'``).
+
+    Parameters
+    ----------
+    raster_layer : xarray.DataArray
+        SpatialData raster image ``(c, ny, nx)``.
+    iso_names : list of str
+        Channel names (isoforms) to select.
+    rows : np.ndarray
+        Grid row indices for each observation (0-based, offset applied).
+    cols : np.ndarray
+        Grid column indices for each observation (0-based, offset applied).
+    z_list : list of np.ndarray
+        Per-factor covariate vectors, each shape ``(n_obs,)``.
+    ratio_transformation : str
+        Compositional transformation for isoform ratios.
+    method : str
+        ``'hsic'``, ``'t-fisher'``, or ``'t-tippett'``.
+
+    Returns
+    -------
+    stats : np.ndarray, shape (n_factors,)
+    pvals : np.ndarray, shape (n_factors,)
+    """
+    n_factors = len(z_list)
+    stats = np.zeros(n_factors)
+    pvals = np.ones(n_factors)
+
+    # Extract counts at spot positions: (n_iso, ny, nx) → (n_obs, n_iso)
+    data = raster_layer.sel(c=iso_names).values  # (n_iso, ny, nx)
+    counts_spots = np.asarray(data, dtype=float)[:, rows, cols].T  # (n_obs, n_iso)
+
+    ratios = counts_to_ratios(
+        torch.from_numpy(counts_spots).float(),
+        transformation=ratio_transformation,
+        nan_filling="none",
+    )  # torch.Tensor, (n_obs, n_iso)
+
+    if method == "hsic":
+        for _f, z_vec in enumerate(z_list):
+            z = torch.from_numpy(z_vec).float().unsqueeze(1)  # (n_obs, 1)
+            _hsic, _pval = linear_hsic_test(z, ratios, centering=True)
+            stats[_f] = _hsic
+            pvals[_f] = _pval
+    else:
+        # T-test per isoform, combined p-values
+        combine_method = method.split("-")[1]  # 'fisher' or 'tippett'
+        y_np = ratios.numpy()
+        n_isos = y_np.shape[1]
+        for _f, z_vec in enumerate(z_list):
+            groups = np.unique(z_vec[~np.isnan(z_vec)])
+            if len(groups) != 2:
+                continue
+            iso_pvals = []
+            iso_stats_list = []
+            for _i in range(n_isos):
+                y0 = y_np[z_vec == groups[0], _i]
+                y1 = y_np[z_vec == groups[1], _i]
+                y0 = y0[~np.isnan(y0)]
+                y1 = y1[~np.isnan(y1)]
+                if len(y0) < 2 or len(y1) < 2:
+                    iso_pvals.append(1.0)
+                    iso_stats_list.append(0.0)
+                    continue
+                t, p = ttest_ind(y0, y1)
+                iso_pvals.append(float(p) if np.isfinite(p) else 1.0)
+                iso_stats_list.append(float(t) if np.isfinite(t) else 0.0)
+            if iso_pvals:
+                combined_stat, combined_pval = combine_pvalues(
+                    iso_pvals, method=combine_method
+                )
+                stats[_f] = float(combined_stat) if np.isfinite(combined_stat) else 0.0
+                pvals[_f] = float(combined_pval) if np.isfinite(combined_pval) else 1.0
+
+    return stats, pvals
 
 
 def _sv_worker_fft(
@@ -724,17 +1255,188 @@ class SplisosmFFT:
             return self.sv_test_results
         return None
 
-    def test_differential_usage(self, *args: Any, **kwargs: Any) -> None:
-        """Placeholder for FFT-based differential usage testing.
+    def test_differential_usage(
+        self,
+        design_matrix: Union[np.ndarray, "pd.DataFrame"],
+        method: Literal["hsic", "hsic-gp", "t-fisher", "t-tippett"] = "hsic-gp",
+        ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
+        n_jobs: int = -1,
+        return_results: bool = False,
+        print_progress: bool = True,
+    ) -> Optional[dict[str, Any]]:
+        """Test for differential isoform usage.
+
+        Four methods are supported:
+
+        * ``"hsic-gp"`` (default): conditional HSIC test.  Both covariates and
+          isoform ratios are residualized against the FFT spatial kernel using
+          ``FFTKernelGPR`` (O(N log N) per gene, with per-gene epsilon search).
+        * ``"hsic"``: unconditional HSIC test (multivariate RV coefficient) -
+          no spatial conditioning.  Computed at spot level.
+        * ``"t-fisher"``, ``"t-tippett"``: per-isoform two-sample t-tests whose
+          p-values are combined gene-wise via Fisher's or Tippett's method.
+          Requires binary (0/1) factors.  Computed at spot level.
+
+        Parameters
+        ----------
+        design_matrix : np.ndarray or pd.DataFrame, shape (n_obs, n_factors)
+            Covariates of shape ``(n_obs, n_factors)``. Must be aligned with
+            ``adata.obs`` (same row order). Accepts a numpy array or a pandas
+            DataFrame whose columns name the factors.
+        method : str, optional
+            Association test method. One of ``"hsic"``, ``"hsic-gp"``,
+            ``"t-fisher"``, ``"t-tippett"``.
+        ratio_transformation : str, optional
+            Compositional transformation for isoform ratios. One of
+            ``"none"``, ``"clr"``, ``"ilr"``, ``"alr"``, ``"radial"``.
+        n_jobs : int, optional
+            Number of joblib workers. ``-1`` uses all available CPUs.
+        return_results : bool, optional
+            If True, return the result dictionary.
+        print_progress : bool, optional
+            Whether to show a progress bar.
+
+        Returns
+        -------
+        results : dict or None
+            Result dictionary when ``return_results=True``; otherwise ``None``.
+            Keys: ``"statistic"`` (n_genes, n_factors), ``"pvalue"``
+            (n_genes, n_factors), ``"pvalue_adj"`` (n_genes, n_factors),
+            ``"method"`` (str), ``"factor_names"`` (list[str]).
 
         Raises
         ------
-        NotImplementedError
-            Always, because this method is intentionally deferred.
+        RuntimeError
+            If ``setup_data()`` has not been called before this method.
+        ValueError
+            If ``method`` is not one of the supported methods, if
+            ``ratio_transformation`` is not one of the supported values, or
+            if ``design_matrix`` shape does not match the number of observations.
         """
-        raise NotImplementedError(
-            "SplisosmFFT.test_differential_usage() is not implemented yet."
+        if self._adata is None:
+            raise RuntimeError("Data is not initialized. Call setup_data() first.")
+        if self.kernel is None or self._raster_layer is None:
+            raise RuntimeError(
+                "Kernel/raster data is not initialized. Call setup_data() first."
+            )
+
+        valid_methods = ["hsic", "hsic-gp", "t-fisher", "t-tippett"]
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
+
+        valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
+        if ratio_transformation not in valid_transformations:
+            raise ValueError(
+                f"Invalid ratio_transformation. Must be one of {valid_transformations}."
+            )
+
+        import pandas as _pd
+
+        if isinstance(design_matrix, _pd.DataFrame):
+            factor_names = list(design_matrix.columns)
+            design_np = design_matrix.values.astype(float)
+        else:
+            design_np = np.asarray(design_matrix, dtype=float)
+            factor_names = [f"factor_{i}" for i in range(design_np.shape[1])]
+
+        if design_np.ndim != 2:
+            raise ValueError("`design_matrix` must be 2-D (n_obs, n_factors).")
+        if design_np.shape[0] != self._adata.n_obs:
+            raise ValueError(
+                f"`design_matrix` has {design_np.shape[0]} rows but adata has "
+                f"{self._adata.n_obs} observations."
+            )
+
+        n_factors = design_np.shape[1]
+        ny, nx = self.kernel.ny, self.kernel.nx
+
+        adata = self._adata
+        rows_raw = np.asarray(adata.obs[self._row_key], dtype=int)
+        cols_raw = np.asarray(adata.obs[self._col_key], dtype=int)
+        row_offset = int(rows_raw.min())
+        col_offset = int(cols_raw.min())
+        rows = rows_raw - row_offset  # 0-based grid indices
+        cols = cols_raw - col_offset
+
+        if n_jobs == -1:
+            n_jobs = os.cpu_count() or 1
+
+        iterator = self._gene_iso_names
+        prog_desc = f"DU ({method})"
+
+        if method == "hsic-gp":
+            # Build GPR for isoforms (per-gene epsilon search via LML)
+            gpr_iso = FFTKernelGPR(self.kernel)
+
+            # Rasterize and residualize covariates once (per factor)
+            covariate_grid = np.zeros((ny, nx, n_factors), dtype=float)
+            for _f in range(n_factors):
+                covariate_grid[rows, cols, _f] = design_np[:, _f]
+
+            gpr_cov = FFTKernelGPR(self.kernel)
+            z_res_list: list[np.ndarray] = []
+            for _f in range(n_factors):
+                z_cube = covariate_grid[:, :, _f]  # (ny, nx)
+                z_res_cube, _ = gpr_cov.fit_residuals_cube(z_cube)  # (ny, nx)
+                # Normalise for numerical stability
+                z_res_cube = z_res_cube - z_res_cube.mean()
+                std = z_res_cube.std()
+                if std > 0:
+                    z_res_cube = z_res_cube / std
+                z_res_list.append(z_res_cube)
+
+            if print_progress:
+                iterator = tqdm(iterator, desc=prog_desc)
+
+            results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_du_worker_fft)(
+                    self._raster_layer,
+                    iso_names,
+                    gpr_iso,
+                    z_res_list,
+                    ratio_transformation,
+                )
+                for iso_names in iterator
+            )
+
+        else:  # 'hsic', 't-fisher', 't-tippett' - spot-level methods
+            z_list = [design_np[:, _f] for _f in range(n_factors)]
+
+            if print_progress:
+                iterator = tqdm(iterator, desc=prog_desc)
+
+            results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_du_worker_spot)(
+                    self._raster_layer,
+                    iso_names,
+                    rows,
+                    cols,
+                    z_list,
+                    ratio_transformation,
+                    method,
+                )
+                for iso_names in iterator
+            )
+
+        stats = np.array([r[0] for r in results], dtype=float)  # (n_genes, n_factors)
+        pvals = np.array([r[1] for r in results], dtype=float)  # (n_genes, n_factors)
+
+        # Adjust p-values per factor (column-wise BH correction)
+        pvals_adj = np.column_stack(
+            [false_discovery_control(pvals[:, _f]) for _f in range(n_factors)]
         )
+
+        self.du_test_results = {
+            "statistic": stats,
+            "pvalue": pvals,
+            "pvalue_adj": pvals_adj,
+            "method": method,
+            "factor_names": factor_names,
+        }
+
+        if return_results:
+            return self.du_test_results
+        return None
 
     def get_formatted_test_results(
         self, test_type: Literal["sv", "du"]
@@ -773,7 +1475,22 @@ class SplisosmFFT:
             raise ValueError(
                 "No differential usage results found. Run test_differential_usage() first."
             )
-        return pd.DataFrame(self.du_test_results)
+
+        du = self.du_test_results
+        factor_names = du.get("factor_names", [])
+        rows = []
+        for _g, gene in enumerate(self.gene_names):
+            for _f, factor in enumerate(factor_names):
+                rows.append(
+                    {
+                        "gene": gene,
+                        "factor": factor,
+                        "statistic": du["statistic"][_g, _f],
+                        "pvalue": du["pvalue"][_g, _f],
+                        "pvalue_adj": du["pvalue_adj"][_g, _f],
+                    }
+                )
+        return pd.DataFrame(rows)
 
     def _compute_feature_summaries(self, print_progress: bool = True) -> None:
         """Compute and cache both gene-level and isoform-level summaries."""

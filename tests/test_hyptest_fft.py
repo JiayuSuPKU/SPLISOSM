@@ -383,7 +383,7 @@ class TestSplisosmFFT(unittest.TestCase):
         with self.assertRaises(ValueError):
             model.extract_feature_summary(level="bad-level")
 
-    def test_differential_usage_placeholder(self):
+    def _setup_model(self):
         model = SplisosmFFT(rho=0.9, neighbor_degree=1)
         model.setup_data(
             self.sdata,
@@ -392,9 +392,131 @@ class TestSplisosmFFT(unittest.TestCase):
             col_key="array_col",
             row_key="array_row",
         )
+        return model
 
-        with self.assertRaises(NotImplementedError):
-            model.test_differential_usage()
+    def test_differential_usage(self):
+        """hsic-gp (default): FFT GPR residualization + HSIC."""
+        model = self._setup_model()
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(42)
+        design = rng.standard_normal((adata.n_obs, 2))
+
+        results = model.test_differential_usage(
+            design_matrix=design,
+            method="hsic-gp",
+            n_jobs=1,
+            return_results=True,
+        )
+
+        self.assertIn("statistic", results)
+        self.assertIn("pvalue", results)
+        self.assertIn("pvalue_adj", results)
+        self.assertEqual(results["statistic"].shape, (model.n_genes, 2))
+        self.assertEqual(results["pvalue"].shape, (model.n_genes, 2))
+        self.assertTrue(np.all(results["pvalue"] >= 0))
+        self.assertTrue(np.all(results["pvalue"] <= 1))
+
+        # get_formatted_test_results should return a long-format DataFrame
+        df = model.get_formatted_test_results("du")
+        self.assertEqual(len(df), model.n_genes * 2)
+        self.assertIn("gene", df.columns)
+        self.assertIn("factor", df.columns)
+        self.assertIn("pvalue", df.columns)
+
+    def test_differential_usage_unconditional_hsic(self):
+        """hsic (unconditional): no spatial residualization, spot-level."""
+        model = self._setup_model()
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(1)
+        design = rng.standard_normal((adata.n_obs, 2))
+
+        results = model.test_differential_usage(
+            design_matrix=design,
+            method="hsic",
+            n_jobs=1,
+            return_results=True,
+        )
+        self.assertEqual(results["statistic"].shape, (model.n_genes, 2))
+        self.assertTrue(np.all(results["pvalue"] >= 0))
+        self.assertTrue(np.all(results["pvalue"] <= 1))
+        self.assertEqual(results["method"], "hsic")
+
+    def test_differential_usage_t_fisher(self):
+        """t-fisher: per-isoform t-test with Fisher combination."""
+        model = self._setup_model()
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(2)
+        # Binary factor (0/1)
+        binary = (rng.random(adata.n_obs) > 0.5).astype(float)[:, None]
+
+        results = model.test_differential_usage(
+            design_matrix=binary,
+            method="t-fisher",
+            n_jobs=1,
+            return_results=True,
+        )
+        self.assertEqual(results["statistic"].shape, (model.n_genes, 1))
+        self.assertTrue(np.all(results["pvalue"] >= 0))
+        self.assertTrue(np.all(results["pvalue"] <= 1))
+        self.assertEqual(results["method"], "t-fisher")
+
+    def test_differential_usage_t_tippett(self):
+        """t-tippett: per-isoform t-test with Tippett combination."""
+        model = self._setup_model()
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(3)
+        binary = (rng.random(adata.n_obs) > 0.5).astype(float)[:, None]
+
+        results = model.test_differential_usage(
+            design_matrix=binary,
+            method="t-tippett",
+            n_jobs=1,
+            return_results=True,
+        )
+        self.assertEqual(results["statistic"].shape, (model.n_genes, 1))
+        self.assertTrue(np.all(results["pvalue"] >= 0))
+        self.assertTrue(np.all(results["pvalue"] <= 1))
+
+    def test_differential_usage_dataframe_input(self):
+        """Design matrix as pandas DataFrame preserves column names as factor names."""
+        import pandas as pd
+
+        model = self._setup_model()
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(7)
+        design = pd.DataFrame(
+            rng.standard_normal((adata.n_obs, 1)), columns=["condition"]
+        )
+
+        results = model.test_differential_usage(
+            design_matrix=design, method="hsic", n_jobs=1, return_results=True
+        )
+        self.assertEqual(results["factor_names"], ["condition"])
+
+    def test_differential_usage_invalid_inputs(self):
+        model = self._setup_model()
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(0)
+
+        # invalid method
+        with self.assertRaises(ValueError):
+            model.test_differential_usage(
+                design_matrix=rng.standard_normal((adata.n_obs, 1)),
+                method="invalid_method",
+            )
+
+        # wrong number of rows
+        with self.assertRaises(ValueError):
+            model.test_differential_usage(
+                design_matrix=rng.standard_normal((adata.n_obs + 1, 1)),
+            )
+
+        # bad ratio transformation
+        with self.assertRaises(ValueError):
+            model.test_differential_usage(
+                design_matrix=rng.standard_normal((adata.n_obs, 1)),
+                ratio_transformation="bad_transform",
+            )
 
 
 if __name__ == "__main__":
