@@ -621,6 +621,88 @@ class TestSplisosmNP(unittest.TestCase):
             all(name.startswith("batch_") for name in model.covariate_names[1:])
         )
 
+    def test_differential_usage_residualize_both(self):
+        """residualize='both' should run without error and return valid p-values."""
+        model = SplisosmNP()
+        model.setup_data(
+            data=self.counts[:5],
+            coordinates=self.coords,
+            design_mtx=self.design_mtx,
+            covariate_names=["C1", "C2"],
+        )
+        model.test_differential_usage(
+            method="hsic-gp",
+            gpr_backend="sklearn",
+            residualize="both",
+            print_progress=False,
+        )
+        df = model.get_formatted_test_results("du")
+        self.assertEqual(df.shape[0], 5 * 2)  # 5 genes × 2 covariates
+        pv = df["pvalue"].values
+        self.assertTrue(np.all(np.isfinite(pv)))
+        self.assertTrue(np.all((pv >= 0) & (pv <= 1)))
+
+    @unittest.skipUnless(
+        __import__("importlib").util.find_spec("gpytorch") is not None,
+        "gpytorch not installed",
+    )
+    def test_differential_usage_gpytorch_backend(self):
+        """gpr_backend='gpytorch' should return valid p-values."""
+        model = SplisosmNP()
+        model.setup_data(
+            data=self.counts[:5],
+            coordinates=self.coords,
+            design_mtx=self.design_mtx,
+            covariate_names=["C1", "C2"],
+        )
+        model.test_differential_usage(
+            method="hsic-gp",
+            gpr_backend="gpytorch",
+            residualize="cov_only",
+            print_progress=False,
+        )
+        df = model.get_formatted_test_results("du")
+        self.assertEqual(df.shape[0], 5 * 2)
+        pv = df["pvalue"].values
+        self.assertTrue(np.all(np.isfinite(pv)))
+        self.assertTrue(np.all((pv >= 0) & (pv <= 1)))
+
+    @unittest.skipUnless(
+        __import__("importlib").util.find_spec("gpytorch") is not None,
+        "gpytorch not installed",
+    )
+    def test_gpytorch_agrees_with_sklearn(self):
+        """GPyTorch and sklearn backends should produce broadly consistent p-value ranks."""
+        from scipy.stats import spearmanr
+
+        model = SplisosmNP()
+        model.setup_data(
+            data=self.counts[:10],
+            coordinates=self.coords,
+            design_mtx=self.design_mtx,
+            covariate_names=["C1", "C2"],
+        )
+        model.test_differential_usage(
+            method="hsic-gp",
+            gpr_backend="sklearn",
+            residualize="cov_only",
+            print_progress=False,
+        )
+        pv_sk = model.get_formatted_test_results("du")["pvalue"].values
+
+        model.test_differential_usage(
+            method="hsic-gp",
+            gpr_backend="gpytorch",
+            residualize="cov_only",
+            print_progress=False,
+        )
+        pv_pt = model.get_formatted_test_results("du")["pvalue"].values
+
+        rho, _ = spearmanr(
+            -np.log10(np.clip(pv_sk, 1e-300, 1)), -np.log10(np.clip(pv_pt, 1e-300, 1))
+        )
+        self.assertGreater(rho, 0.9, f"Spearman rank correlation={rho:.3f} too low")
+
 
 if __name__ == "__main__":
     unittest.main()

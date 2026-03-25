@@ -348,11 +348,11 @@ class TestGPyTorchKernelGPRImportGuard(unittest.TestCase):
         res = gpr.fit_residuals(coords, Y)
         self.assertLess(res.std().item(), Y.std().item())
 
-    def test_n_inducing_raises(self):
-        """n_inducing > 0 raises NotImplementedError."""
+    def test_n_inducing_accepted(self):
+        """n_inducing > 0 is now accepted (FITC sparse GP path)."""
         try:
-            with self.assertRaises(NotImplementedError):
-                GPyTorchKernelGPR(n_inducing=50)
+            gpr = GPyTorchKernelGPR(n_inducing=50)
+            self.assertIsNotNone(gpr)
         except ImportError:
             self.skipTest("gpytorch not installed.")
 
@@ -573,6 +573,116 @@ class TestFFTKernelGPR(unittest.TestCase):
             ks_sk, 0.01, f"sklearn p-values not uniform: KS p={ks_sk:.4f}"
         )
         self.assertGreater(ks_fft, 0.01, f"FFT p-values not uniform: KS p={ks_fft:.4f}")
+
+
+try:
+    import gpytorch as _gpytorch_check # noqa: F401
+
+    _GPYTORCH_AVAILABLE = True
+except ImportError:
+    _GPYTORCH_AVAILABLE = False
+
+
+class TestSklearnKernelGPRLargeN(unittest.TestCase):
+    """Tests for the large-n approximate path (subset GP + chunked prediction)."""
+
+    def setUp(self):
+        torch.manual_seed(7)
+        np.random.seed(7)
+        self.coords = _make_coords(300)  # 300 points
+        signal = torch.sin(self.coords[:, 0] * 2.0)
+        self.Y = signal.unsqueeze(1) + 0.1 * torch.randn(300, 1)
+
+    def test_large_n_output_shape(self):
+        """Approximate path should return same shape as input."""
+        gpr = SklearnKernelGPR(
+            constant_value_bounds=(1e-3, 1e3),
+            length_scale_bounds="fixed",
+            max_n_fit=50,
+        )
+        res = gpr.fit_residuals(self.coords, self.Y)
+        self.assertEqual(res.shape, self.Y.shape)
+
+    def test_large_n_reduces_signal(self):
+        """Approximate path should substantially reduce spatial signal variance."""
+        gpr = SklearnKernelGPR(
+            constant_value_bounds=(1e-3, 1e3),
+            length_scale_bounds="fixed",
+            max_n_fit=50,
+        )
+        res = gpr.fit_residuals(self.coords, self.Y)
+        self.assertLess(float(res.var()), float(self.Y.var()) * 0.8)
+
+    def test_large_n_fixed_bounds(self):
+        """Fixed-bounds large-n path should also reduce signal."""
+        gpr = SklearnKernelGPR(
+            constant_value=1.0,
+            constant_value_bounds="fixed",
+            length_scale_bounds="fixed",
+            max_n_fit=50,
+        )
+        res = gpr.fit_residuals(self.coords, self.Y)
+        self.assertEqual(res.shape, self.Y.shape)
+
+    def test_precompute_shared_kernel_warns_for_large_n(self):
+        """precompute_shared_kernel should warn when n > max_n_fit."""
+        gpr = SklearnKernelGPR(
+            constant_value_bounds="fixed",
+            length_scale_bounds="fixed",
+            max_n_fit=50,
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            gpr.precompute_shared_kernel(self.coords)  # n=300 > max_n_fit=50
+        large_n_warns = [x for x in w if "max_n_fit" in str(x.message)]
+        self.assertTrue(len(large_n_warns) > 0, "Expected warning about max_n_fit")
+
+
+@unittest.skipUnless(_GPYTORCH_AVAILABLE, "gpytorch not installed")
+class TestGPyTorchKernelGPRSparse(unittest.TestCase):
+    """Tests for the SGPR (InducingPointKernel) path in GPyTorchKernelGPR."""
+
+    def setUp(self):
+        torch.manual_seed(7)
+        np.random.seed(7)
+        self.coords = _make_coords(200)
+        signal = torch.sin(self.coords[:, 0] * 2.0)
+        self.Y = signal.unsqueeze(1) + 0.1 * torch.randn(200, 1)
+
+    def test_sgpr_output_shape(self):
+        gpr = GPyTorchKernelGPR(
+            constant_value_bounds=(1e-3, 1e3),
+            length_scale_bounds="fixed",
+            n_inducing=50,
+            n_iter=30,
+        )
+        res = gpr.fit_residuals(self.coords, self.Y)
+        self.assertEqual(res.shape, self.Y.shape)
+
+    def test_sgpr_reduces_signal(self):
+        gpr = GPyTorchKernelGPR(
+            constant_value_bounds=(1e-3, 1e3),
+            length_scale_bounds="fixed",
+            n_inducing=50,
+            n_iter=50,
+        )
+        res = gpr.fit_residuals(self.coords, self.Y)
+        self.assertLess(float(res.var()), float(self.Y.var()) * 0.8)
+
+    def test_sgpr_nan_preserved(self):
+        Y_nan = self.Y.clone()
+        Y_nan[10] = float("nan")
+        gpr = GPyTorchKernelGPR(
+            constant_value=1.0,
+            constant_value_bounds=(1e-2, 1e2),
+            length_scale=1.0,
+            length_scale_bounds="fixed",
+            n_inducing=50,
+            n_iter=20,
+        )
+        res = gpr.fit_residuals(self.coords, Y_nan)
+        self.assertTrue(torch.isnan(res[10]).all())
+        self.assertFalse(torch.isnan(res[0]).any())
 
 
 if __name__ == "__main__":

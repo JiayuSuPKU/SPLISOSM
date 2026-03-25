@@ -479,6 +479,31 @@ def _build_rbf_kernel(
     return torch.from_numpy(kernel(X.numpy())).float()
 
 
+def _build_rbf_cross_kernel(
+    X1: torch.Tensor,
+    X2: torch.Tensor,
+    constant_value: float,
+    length_scale: float,
+) -> torch.Tensor:
+    """Cross-covariance matrix K(X1, X2).
+
+    Parameters
+    ----------
+    X1 : torch.Tensor, shape (n1, d)
+    X2 : torch.Tensor, shape (n2, d)
+    constant_value : float
+        Signal variance.
+    length_scale : float
+        RBF length scale.
+
+    Returns
+    -------
+    torch.Tensor, shape (n1, n2)
+    """
+    kernel = C(constant_value, "fixed") * RBF(length_scale, "fixed")
+    return torch.from_numpy(kernel(X1.numpy(), X2.numpy())).float()
+
+
 def _kernel_residuals_from_eigdecomp(
     eigvecs: torch.Tensor,
     eigvals: torch.Tensor,
@@ -671,6 +696,10 @@ class SklearnKernelGPR(KernelGPR):
         Initial RBF length scale.
     length_scale_bounds : tuple or ``"fixed"``
         Search bounds for the length scale.
+    max_n_fit : int
+        Maximum n for which to allow full GP fitting. If more sample
+        points are passed to ``fit_residuals``, will use the inducing-point 
+        kernel approximation.
 
     Notes
     -----
@@ -684,11 +713,13 @@ class SklearnKernelGPR(KernelGPR):
         constant_value_bounds: Union[tuple, str] = (1e-3, 1e3),
         length_scale: float = 1.0,
         length_scale_bounds: Union[tuple, str] = "fixed",
+        max_n_fit: int = 5_000,
     ) -> None:
         self._constant_value = constant_value
         self._constant_value_bounds = constant_value_bounds
         self._length_scale = length_scale
         self._length_scale_bounds = length_scale_bounds
+        self._max_n_fit = max_n_fit
 
         # Cached eigendecomposition of the shared kernel (when bounds fixed)
         self._shared_eigvecs: Optional[torch.Tensor] = None
@@ -714,6 +745,7 @@ class SklearnKernelGPR(KernelGPR):
             constant_value_bounds=config.get("constant_value_bounds", (1e-3, 1e3)),
             length_scale=config.get("length_scale", 1.0),
             length_scale_bounds=config.get("length_scale_bounds", "fixed"),
+            max_n_fit=config.get("max_n_fit", 5_000),
         )
 
     @property
@@ -744,6 +776,13 @@ class SklearnKernelGPR(KernelGPR):
         -------
         None
         """
+        if coords.shape[0] > self._max_n_fit:
+            warnings.warn(
+                f"n={coords.shape[0]} > max_n_fit={self._max_n_fit}; "
+                "large-n approximate path will be used; precompute_shared_kernel skipped.",
+                stacklevel=2,
+            )
+            return
         if not self.signal_bounds_fixed:
             warnings.warn(
                 "precompute_shared_kernel() has no effect when signal bounds "
@@ -786,7 +825,8 @@ class SklearnKernelGPR(KernelGPR):
 
         Chooses the fast spectral path when :attr:`signal_bounds_fixed` and
         the shared eigendecomposition has been precomputed; otherwise falls
-        back to a full sklearn GP fit.
+        back to a full sklearn GP fit when n_obs <= max_n_fit, or an
+        inducing-point approximation when n_obs > max_n_fit.
 
         NaN rows in ``Y`` are excluded from fitting and reinserted as NaN
         in the output.
@@ -814,8 +854,61 @@ class SklearnKernelGPR(KernelGPR):
 
         return self._fit_no_nan(coords, Y)
 
+    def _fit_large_n(self, coords: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+        """Approximate residualization for n > max_n_fit via subset GP + chunked prediction.
+
+        Fits sklearn GP on a randomly sub-sampled ``max_n_fit`` reference set,
+        extracts hyperparameters, then computes GP posterior-mean predictions at
+        every point in ``coords`` using O(chunk x m) peak memory per chunk.
+
+        Returns
+        -------
+        torch.Tensor, shape (n, m)
+            Residuals ``Y - K(X, X_m) @ (K_mm + eps·I)^{-1} @ Y_m``.
+        """
+        n = coords.shape[0]
+        m = self._max_n_fit
+        rng = np.random.default_rng(0)
+        idx = rng.choice(n, m, replace=False)
+        idx_t = torch.from_numpy(idx)
+        X_m = coords[idx_t]  # (m, d)
+        Y2d = Y if Y.dim() == 2 else Y.unsqueeze(1)
+        Y_m = Y2d[idx_t].float()  # (m, targets)
+
+        # Fit sklearn GP on subset to get hyperparameters
+        y_m_mean = Y_m.mean(dim=1).numpy()  # (m,) — column mean for multi-output
+        kernel = C(self._constant_value, self._constant_value_bounds) * RBF(
+            self._length_scale, self._length_scale_bounds
+        ) + WhiteKernel(0.1, (1e-5, 1e1))
+        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=0)
+        gp.fit(X_m.numpy(), y_m_mean)
+
+        # Extract fitted hyperparameters
+        fitted_k = gp.kernel_
+        sigma2 = float(fitted_k.k1.k1.constant_value)
+        ls = float(fitted_k.k1.k2.length_scale)
+        eps = float(np.exp(fitted_k.k2.theta[0]))
+
+        # Build (m, m) kernel and solve alpha = (K_mm + eps·I)^{-1} @ Y_m
+        K_mm = _build_rbf_kernel(X_m, sigma2, ls)  # (m, m)
+        A = K_mm + eps * torch.eye(m)
+        L = torch.linalg.cholesky(A)
+        alpha = torch.cholesky_solve(Y_m, L)  # (m, targets)
+
+        # Predict in chunks: res = Y - K(X, X_m) @ alpha
+        _CHUNK = 10_000
+        res = Y2d.float().clone()
+        for start in range(0, n, _CHUNK):
+            end = min(start + _CHUNK, n)
+            K_chunk = _build_rbf_cross_kernel(coords[start:end], X_m, sigma2, ls)
+            res[start:end] -= K_chunk @ alpha
+
+        return res.squeeze(1) if Y.dim() == 1 else res
+
     def _fit_no_nan(self, coords: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         """Inner residualization without NaN handling."""
+        if coords.shape[0] > self._max_n_fit:
+            return self._fit_large_n(coords, Y)
         if (
             self.signal_bounds_fixed
             and self._shared_eigvals is not None
@@ -948,6 +1041,66 @@ class _GPyTorchExactGPModel:
 
         return _Model()
 
+    @staticmethod
+    def build_sparse(
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        likelihood: Any,
+        inducing_points: torch.Tensor,
+        constant_value: float,
+        constant_value_bounds: Union[tuple, str],
+        length_scale: float,
+        length_scale_bounds: Union[tuple, str],
+    ) -> Any:
+        """Build a GPyTorch SGPR model (FITC) using InducingPointKernel."""
+        import gpytorch
+
+        class _SparseModel(gpytorch.models.ExactGP):
+            def __init__(self) -> None:
+                super().__init__(train_x, train_y, likelihood)
+                self.mean_module = gpytorch.means.ZeroMean()
+                base = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+                # Set initial values
+                base.outputscale = constant_value
+                base.base_kernel.lengthscale = length_scale
+                # Apply bounds / fix parameters — mirror build() exactly
+                if constant_value_bounds == "fixed":
+                    base.raw_outputscale.requires_grad_(False)
+                else:
+                    lo, hi = constant_value_bounds
+                    base.register_constraint(
+                        "raw_outputscale",
+                        gpytorch.constraints.Interval(lo, hi),
+                    )
+                    base.outputscale = constant_value  # re-apply after constraint
+                if length_scale_bounds == "fixed":
+                    base.base_kernel.raw_lengthscale.requires_grad_(False)
+                else:
+                    lo, hi = length_scale_bounds
+                    base.base_kernel.register_constraint(
+                        "raw_lengthscale",
+                        gpytorch.constraints.Interval(lo, hi),
+                    )
+                    base.base_kernel.lengthscale = length_scale
+                self.covar_module = gpytorch.kernels.InducingPointKernel(
+                    base,
+                    inducing_points=inducing_points,
+                    likelihood=likelihood,
+                )
+
+            def forward(self, x: torch.Tensor) -> Any:
+                mean = self.mean_module(x)
+                covar = self.covar_module(x)
+                return gpytorch.distributions.MultivariateNormal(mean, covar)
+
+        return _SparseModel()
+
+
+def _subsample_inducing(X: torch.Tensor, m: int, seed: int = 0) -> torch.Tensor:
+    """Uniformly sub-sample m rows from X as inducing points."""
+    idx = np.random.default_rng(seed).choice(len(X), m, replace=False)
+    return X[torch.from_numpy(idx)]
+
 
 class GPyTorchKernelGPR(KernelGPR):
     """GPyTorch-based GP residualizer.
@@ -958,7 +1111,8 @@ class GPyTorchKernelGPR(KernelGPR):
     marginal log-likelihood.
 
     For most datasets (n <= ~10,000) the exact-GP path is used.  Passing
-    ``n_inducing > 0`` is reserved for a future sparse-SVGP implementation.
+    ``n_inducing > 0`` enables the FITC sparse GP approximation via
+    InducingPointKernel.
 
     Parameters
     ----------
@@ -972,7 +1126,9 @@ class GPyTorchKernelGPR(KernelGPR):
     length_scale_bounds : tuple or "fixed"
         Search bounds for the length scale.
     n_inducing : int or None
-        Reserved for future sparse-SVGP support.  Must be ``None``.
+        Number of inducing points for FITC sparse GP approximation. When set,
+        memory scales as O(n x n_inducing) rather than O(n²). Set to None to
+        use exact GP.
     n_iter : int
         Adam optimizer iterations for hyperparameter learning.
     lr : float
@@ -1014,11 +1170,6 @@ class GPyTorchKernelGPR(KernelGPR):
                 "GPyTorchKernelGPR requires gpytorch. "
                 "Install it with:  pip install gpytorch"
             ) from exc
-        if n_inducing is not None:
-            raise NotImplementedError(
-                "Sparse SVGP (n_inducing > 0) is not yet implemented. "
-                "Use n_inducing=None for exact GP."
-            )
         self._constant_value = constant_value
         self._constant_value_bounds = constant_value_bounds
         self._length_scale = length_scale
@@ -1085,15 +1236,28 @@ class GPyTorchKernelGPR(KernelGPR):
         train_y = Y2d.float().mean(dim=1).to(dev)  # (n,)
 
         likelihood = gpytorch.likelihoods.GaussianLikelihood().to(dev)
-        model = _GPyTorchExactGPModel.build(
-            train_x,
-            train_y,
-            likelihood,
-            self._constant_value,
-            self._constant_value_bounds,
-            self._length_scale,
-            self._length_scale_bounds,
-        ).to(dev)
+        if self.n_inducing is not None:
+            inducing_pts = _subsample_inducing(train_x, self.n_inducing)
+            model = _GPyTorchExactGPModel.build_sparse(
+                train_x,
+                train_y,
+                likelihood,
+                inducing_pts,
+                self._constant_value,
+                self._constant_value_bounds,
+                self._length_scale,
+                self._length_scale_bounds,
+            ).to(dev)
+        else:
+            model = _GPyTorchExactGPModel.build(
+                train_x,
+                train_y,
+                likelihood,
+                self._constant_value,
+                self._constant_value_bounds,
+                self._length_scale,
+                self._length_scale_bounds,
+            ).to(dev)
 
         model.train()
         likelihood.train()
@@ -1254,7 +1418,7 @@ class FFTKernelGPR(KernelGPR):
         if ny * nx != len(xy):
             raise ValueError(
                 f"FFTKernelGPR requires a regular grid but got {len(xy)} "
-                f"points for a {ny}×{nx} grid."
+                f"points for a {ny}x{nx} grid."
             )
 
         dy = float(np.diff(uy).mean()) if ny > 1 else 1.0
