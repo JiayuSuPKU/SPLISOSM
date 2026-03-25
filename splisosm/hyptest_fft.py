@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import Any, Callable, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 # Suppress deprecations from SpatialData stack before importing it.
 warnings.filterwarnings(
@@ -30,12 +30,9 @@ from anndata import AnnData
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
-from scipy.optimize import minimize_scalar
 from scipy.stats import ttest_ind, combine_pvalues
 
 from splisosm.kernel_gpr import (
-    SpatialKernelOp,
-    KernelGPR,
     FFTKernelOp,
     FFTKernelGPR,
     _DEFAULT_GPR_CONFIGS,
@@ -301,8 +298,8 @@ def _du_worker_fft(
 
     Returns
     -------
-    stats : np.ndarray, shape (n_factors,)
-    pvals : np.ndarray, shape (n_factors,)
+    stats : np.ndarray, shape (n_covariates,)
+    pvals : np.ndarray, shape (n_covariates,)
     """
     n_factors = len(z_res_list)
     stats = np.zeros(n_factors)
@@ -312,7 +309,9 @@ def _du_worker_fft(
     data = raster_layer.sel(c=iso_names).values
     counts_cube = np.moveaxis(np.asarray(data, dtype=float), 0, -1)
 
-    counts_flat = counts_cube.reshape(counts_cube.shape[0] * counts_cube.shape[1], counts_cube.shape[2])
+    counts_flat = counts_cube.reshape(
+        counts_cube.shape[0] * counts_cube.shape[1], counts_cube.shape[2]
+    )
     ratios = counts_to_ratios(
         torch.from_numpy(counts_flat).float(),
         transformation=ratio_transformation,
@@ -321,7 +320,9 @@ def _du_worker_fft(
     y_cube = ratios.numpy().reshape(counts_cube.shape[0], counts_cube.shape[1], -1)
 
     # Spatially residualize isoform ratios via FFT + per-gene epsilon search
-    y_res_cube, _ = gpr_iso.fit_residuals_cube(y_cube, spacing=spacing)  # (ny, nx, n_isos)
+    y_res_cube, _ = gpr_iso.fit_residuals_cube(
+        y_cube, spacing=spacing
+    )  # (ny, nx, n_isos)
     n_grid = gpr_iso.n
     y_res = y_res_cube.reshape(n_grid, -1)  # (n_grid, n_isos)
 
@@ -389,8 +390,8 @@ def _du_worker_spot(
 
     Returns
     -------
-    stats : np.ndarray, shape (n_factors,)
-    pvals : np.ndarray, shape (n_factors,)
+    stats : np.ndarray, shape (n_covariates,)
+    pvals : np.ndarray, shape (n_covariates,)
     """
     n_factors = len(z_list)
     stats = np.zeros(n_factors)
@@ -562,9 +563,9 @@ class SplisosmFFT:
     It contains the following keys:
     
     - ``'method'``: str, the method used for the test.
-    - ``'statistic'``: numpy.ndarray of shape (n_genes, n_factors), the test statistic for each gene and covariate.
-    - ``'pvalue'``: numpy.ndarray of shape (n_genes, n_factors), the p-value for each gene and covariate.
-    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes, n_factors), the BH adjusted p-value for each gene and covariate. Each column/covariate is adjusted separately.
+    - ``'statistic'``: numpy.ndarray of shape (n_genes, n_covariates), the test statistic for each gene and covariate.
+    - ``'pvalue'``: numpy.ndarray of shape (n_genes, n_covariates), the p-value for each gene and covariate.
+    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes, n_covariates), the BH adjusted p-value for each gene and covariate. Each column/covariate is adjusted separately.
     """
 
     def __init__(
@@ -976,8 +977,8 @@ class SplisosmFFT:
 
         Parameters
         ----------
-        design_matrix : np.ndarray or pd.DataFrame, shape (n_obs, n_factors)
-            Covariates of shape ``(n_obs, n_factors)``. Must be aligned with
+        design_matrix : np.ndarray or pd.DataFrame, shape (n_obs, n_covariates)
+            Covariates of shape ``(n_obs, n_covariates)``. Must be aligned with
             ``adata.obs`` (same row order). Accepts a numpy array or a pandas
             DataFrame whose columns name the factors.
         method : str, optional
@@ -997,8 +998,8 @@ class SplisosmFFT:
         -------
         results : dict or None
             Result dictionary when ``return_results=True``; otherwise ``None``.
-            Keys: ``"statistic"`` (n_genes, n_factors), ``"pvalue"``
-            (n_genes, n_factors), ``"pvalue_adj"`` (n_genes, n_factors),
+            Keys: ``"statistic"`` (n_genes, n_covariates), ``"pvalue"``
+            (n_genes, n_covariates), ``"pvalue_adj"`` (n_genes, n_covariates),
             ``"method"`` (str), ``"factor_names"`` (list[str]).
 
         Raises
@@ -1088,7 +1089,9 @@ class SplisosmFFT:
             z_res_list: list[np.ndarray] = []
             for _f in range(n_factors):
                 z_cube = covariate_grid[:, :, _f]  # (ny, nx)
-                z_res_cube, _ = gpr_cov.fit_residuals_cube(z_cube, spacing=spacing)  # (ny, nx)
+                z_res_cube, _ = gpr_cov.fit_residuals_cube(
+                    z_cube, spacing=spacing
+                )  # (ny, nx)
                 # Normalise for numerical stability
                 z_res_cube = z_res_cube - z_res_cube.mean()
                 std = z_res_cube.std()
