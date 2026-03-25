@@ -36,6 +36,9 @@ from scipy.stats import ttest_ind, combine_pvalues
 from splisosm.kernel_gpr import (
     SpatialKernelOp,
     KernelGPR,
+    FFTKernelOp,
+    FFTKernelGPR,
+    _DEFAULT_GPR_CONFIGS,
     linear_hsic_test,
 )
 from splisosm.likelihood import liu_sf
@@ -264,322 +267,13 @@ class FFTKernel:
         return float(np.sum(self.spectrum**2))
 
 
-# ---------------------------------------------------------------------------
-# FFT-based SpatialKernelOp and KernelGPR
-# ---------------------------------------------------------------------------
-
-
-class FFTKernelOp(SpatialKernelOp):
-    """Implicit kernel linear operator backed by :class:`FFTKernel`.
-
-    All operations are O(N log N) via FFT convolution.  The n x n kernel
-    matrix is never formed.
-
-    Parameters
-    ----------
-    kernel : FFTKernel
-        Spatial kernel instance defining the grid and spectrum.
-
-    Attributes
-    ----------
-    n : int
-        Total number of grid cells.
-
-    Methods
-    -------
-    matvec(v)
-        Compute K @ v in O(N log N).
-    solve(v, epsilon)
-        Solve (K + epsilon * I) u = v in O(N log N).
-    residuals(v, epsilon)
-        Apply the residual operator epsilon * (K + epsilon * I)**(-1).
-    eigenvalues(k)
-        Return kernel eigenvalues in descending order.
-    lml_1d(v_cube)
-        Build a 1-D log-marginal-likelihood function for epsilon search.
-    """
-
-    def __init__(self, kernel: FFTKernel) -> None:
-        self._kernel = kernel
-
-    @property
-    def n(self) -> int:
-        return self._kernel.n_grid
-
-    def _to_cube(self, v: np.ndarray) -> np.ndarray:
-        """Reshape flat (n,) or (n, m) to (ny, nx) or (ny, nx, m)."""
-        ny, nx = self._kernel.ny, self._kernel.nx
-        if v.ndim == 1:
-            return v.reshape(ny, nx)
-        return v.reshape(ny, nx, v.shape[1])
-
-    def _from_cube(self, cube: np.ndarray, scalar: bool) -> np.ndarray:
-        if scalar:
-            return cube.ravel()
-        return cube.reshape(self._kernel.n_grid, -1)
-
-    def matvec(self, v: np.ndarray) -> np.ndarray:
-        """Compute ``K @ v`` in O(N log N).
-
-        Parameters
-        ----------
-        v : np.ndarray, shape (n,) or (n, m)
-            Input vector or matrix.
-
-        Returns
-        -------
-        np.ndarray, shape (n,) or (n, m)
-            Result of K @ v.
-        """
-        scalar = v.ndim == 1
-        cube = self._to_cube(v)
-        if cube.ndim == 2:
-            cube = cube[..., None]
-        x_hat = scipy.fft.fft2(cube, axes=(0, 1), workers=self._kernel.workers)
-        kv_hat = x_hat * self._kernel._spectrum_2d[:, :, None]
-        kv_cube = np.real(
-            scipy.fft.ifft2(kv_hat, axes=(0, 1), workers=self._kernel.workers)
-        )
-        kv_cube /= self._kernel.n_grid
-        return self._from_cube(kv_cube[..., 0] if scalar else kv_cube, scalar)
-
-    def solve(self, v: np.ndarray, epsilon: float) -> np.ndarray:
-        """Solve ``(K + epsilon * I) u = v`` in O(N log N) via spectral division.
-
-        Parameters
-        ----------
-        v : np.ndarray, shape (n,) or (n, m)
-            Right-hand side vector or matrix.
-        epsilon : float
-            Regularization level (> 0).
-
-        Returns
-        -------
-        np.ndarray, shape (n,) or (n, m)
-            Solution u.
-        """
-        scalar = v.ndim == 1
-        cube = self._to_cube(v)
-        if cube.ndim == 2:
-            cube = cube[..., None]
-        v_hat = scipy.fft.fft2(cube, axes=(0, 1), workers=self._kernel.workers)
-        scale = 1.0 / (
-            self._kernel._spectrum_2d[:, :, None] / self._kernel.n_grid + epsilon
-        )
-        u_hat = scale * v_hat
-        u_cube = np.real(
-            scipy.fft.ifft2(u_hat, axes=(0, 1), workers=self._kernel.workers)
-        )
-        return self._from_cube(u_cube[..., 0] if scalar else u_cube, scalar)
-
-    def residuals(self, v: np.ndarray, epsilon: float) -> np.ndarray:
-        """Apply ``epsilon * (K + epsilon * I)**(-1)`` in O(N log N).
-
-        Parameters
-        ----------
-        v : np.ndarray, shape (n,) or (n, m)
-            Input vector or matrix.
-        epsilon : float
-            Regularization level (> 0).
-
-        Returns
-        -------
-        np.ndarray, shape (n,) or (n, m)
-            Residual vector or matrix.
-        """
-        return epsilon * self.solve(v, epsilon)
-
-    def eigenvalues(self, k: Optional[int] = None) -> np.ndarray:
-        """Return kernel eigenvalues in descending order (from FFT spectrum).
-
-        Parameters
-        ----------
-        k : int or None
-            Number of leading eigenvalues to return. None returns all.
-
-        Returns
-        -------
-        np.ndarray, shape (k,) or (n,)
-            Eigenvalues in descending order.
-        """
-        evals = np.sort(self._kernel.spectrum / self._kernel.n_grid)[::-1]
-        if k is not None:
-            return evals[:k]
-        return evals
-
-    def lml_1d(self, v_cube: np.ndarray) -> "Callable[[float], float]":
-        """Build a 1-D log-marginal-likelihood function for epsilon search.
-
-        Parameters
-        ----------
-        v_cube : np.ndarray, shape (ny, nx) or (ny, nx, m)
-            Target data (already centred; NaN replaced with 0).
-
-        Returns
-        -------
-        callable
-            Negative log-marginal-likelihood function neg_lml(epsilon) -> float.
-        """
-        if v_cube.ndim == 2:
-            v_cube = v_cube[..., None]
-        v_hat = scipy.fft.fft2(v_cube, axes=(0, 1), workers=self._kernel.workers)
-        power = (np.abs(v_hat) ** 2).sum(axis=2)  # (ny, nx) - sum over channels
-        lam = self._kernel._spectrum_2d / self._kernel.n_grid  # (ny, nx)
-        n = self._kernel.n_grid
-        m = v_cube.shape[2]
-
-        def neg_lml(epsilon: float) -> float:
-            lam_eps = lam + epsilon
-            ll = m * np.sum(np.log(lam_eps)) + np.sum(power / lam_eps)
-            return 0.5 * ll / n
-
-        return neg_lml
-
-
-class FFTKernelGPR(KernelGPR):
-    """FFT-based GPR residualizer for regular ``(ny, nx)`` grids.
-
-    Hyperparameters are learned by 1-D log-marginal-likelihood maximisation
-    in the spectral domain - O(N log N) per evaluation.  The n x n kernel
-    matrix is never formed.
-
-    This is the default backend for :class:`SplisosmFFT`.
-
-    Parameters
-    ----------
-    kernel : FFTKernel
-        Spatial kernel instance (shared with the :class:`SplisosmFFT` model).
-    epsilon_bounds : tuple[float, float]
-        Search bounds for the white-noise / regularization level.
-
-    Attributes
-    ----------
-    epsilon_bounds : tuple[float, float]
-        Search bounds for the regularization level.
-
-    Methods
-    -------
-    get_kernel_op(coords)
-        Return the FFTKernelOp for this kernel.
-    find_epsilon(data_cube)
-        Find the optimal regularization epsilon via LML search.
-    fit_residuals_cube(data_cube, epsilon)
-        Residualize a raster cube in O(N log N).
-    """
-
-    def __init__(
-        self,
-        kernel: FFTKernel,
-        epsilon_bounds: tuple[float, float] = (1e-5, 1e1),
-    ) -> None:
-        self._kernel = kernel
-        self._epsilon_bounds = epsilon_bounds
-        self._op = FFTKernelOp(kernel)
-
-    def get_kernel_op(self, coords=None) -> FFTKernelOp:
-        """Return the FFTKernelOp for this kernel.
-
-        Returns
-        -------
-        FFTKernelOp
-            The kernel operator backed by this instance's FFTKernel.
-        """
-        return self._op
-
-    def fit_residuals(self, coords, Y) -> torch.Tensor:
-        """Fit GP residuals (not implemented for FFT backend).
-
-        This method raises TypeError because FFTKernelGPR operates on raster
-        cubes rather than coordinate arrays. Use fit_residuals_cube() instead.
-
-        Parameters
-        ----------
-        coords : torch.Tensor
-            Spatial coordinates (not used).
-        Y : torch.Tensor
-            Target values (not used).
-
-        Returns
-        -------
-        torch.Tensor
-            Not returned; raises TypeError.
-
-        Raises
-        ------
-        TypeError
-            Always raised; use fit_residuals_cube() for raster data.
-        """
-        raise TypeError(
-            "FFTKernelGPR operates on raster cubes, not coordinate arrays. "
-            "Use fit_residuals_cube() for raster data."
-        )
-
-    def find_epsilon(self, data_cube: np.ndarray) -> float:
-        """Find the optimal regularization epsilon for the given raster data.
-
-        Parameters
-        ----------
-        data_cube : np.ndarray, shape (ny, nx) or (ny, nx, m)
-            Centred, NaN-imputed raster data.
-
-        Returns
-        -------
-        float
-            Optimal regularization level.
-        """
-        neg_lml = self._op.lml_1d(data_cube)
-        lo, hi = self._epsilon_bounds
-        result = minimize_scalar(neg_lml, bounds=(lo, hi), method="bounded")
-        return float(result.x)
-
-    def fit_residuals_cube(
-        self,
-        data_cube: np.ndarray,
-        epsilon: Optional[float] = None,
-    ) -> tuple[np.ndarray, float]:
-        """Residualize a raster cube in O(N log N).
-
-        Centers the data, optionally searches for the optimal epsilon, then
-        applies ``R = epsilon * (K + epsilon * I)**(-1)``.
-
-        Parameters
-        ----------
-        data_cube : np.ndarray, shape (ny, nx) or (ny, nx, m)
-            Raster data to residualize.
-        epsilon : float or None
-            Regularization level. If None, found via LML search.
-
-        Returns
-        -------
-        residuals : np.ndarray, same shape as data_cube
-            Spatially residualized data.
-        epsilon : float
-            Regularization level used.
-        """
-        cube = np.asarray(data_cube, dtype=float)
-        scalar = cube.ndim == 2
-        if scalar:
-            cube = cube[..., None]
-
-        # Centre and NaN-impute
-        cube = cube - np.nanmean(cube, axis=(0, 1), keepdims=True)
-        cube = np.nan_to_num(cube, nan=0.0, posinf=0.0, neginf=0.0)
-
-        if epsilon is None:
-            epsilon = self.find_epsilon(cube)
-
-        # Use apply_residual_op directly - it natively handles (ny, nx, m) cubes
-        # and is O(N log N) via FFT without materialising the n x n kernel matrix.
-        res = self._kernel.apply_residual_op(cube, epsilon)  # (ny, nx, m)
-        return (res[..., 0] if scalar else res), epsilon
-
-
 def _du_worker_fft(
     raster_layer: Any,
     iso_names: list[str],
     gpr_iso: "FFTKernelGPR",
     z_res_list: list[np.ndarray],
     ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"],
+    spacing: tuple[float, float] = (1.0, 1.0),
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute DU HSIC statistics and p-values for one gene against all factors.
 
@@ -601,6 +295,9 @@ def _du_worker_fft(
         Pre-computed once before the per-gene loop.
     ratio_transformation : str
         Compositional transformation for isoform ratios.
+    spacing : tuple of float, optional
+        Physical spacing ``(dy, dx)`` between grid cells. Passed to
+        ``fit_residuals_cube`` to set the kernel length-scale units.
 
     Returns
     -------
@@ -614,19 +311,19 @@ def _du_worker_fft(
     # SpatialData raster channel order is (c, y, x), convert to (y, x, c)
     data = raster_layer.sel(c=iso_names).values
     counts_cube = np.moveaxis(np.asarray(data, dtype=float), 0, -1)
-    kernel = gpr_iso._kernel
 
-    counts_flat = counts_cube.reshape(kernel.n_grid, counts_cube.shape[2])
+    counts_flat = counts_cube.reshape(counts_cube.shape[0] * counts_cube.shape[1], counts_cube.shape[2])
     ratios = counts_to_ratios(
         torch.from_numpy(counts_flat).float(),
         transformation=ratio_transformation,
         nan_filling="none",
     )
-    y_cube = ratios.numpy().reshape(kernel.ny, kernel.nx, -1)
+    y_cube = ratios.numpy().reshape(counts_cube.shape[0], counts_cube.shape[1], -1)
 
     # Spatially residualize isoform ratios via FFT + per-gene epsilon search
-    y_res_cube, _ = gpr_iso.fit_residuals_cube(y_cube)  # (ny, nx, n_isos)
-    y_res = y_res_cube.reshape(kernel.n_grid, -1)  # (n_grid, n_isos)
+    y_res_cube, _ = gpr_iso.fit_residuals_cube(y_cube, spacing=spacing)  # (ny, nx, n_isos)
+    n_grid = gpr_iso.n
+    y_res = y_res_cube.reshape(n_grid, -1)  # (n_grid, n_isos)
 
     # Pre-compute gram matrix eigenvalues for y (shared across factors)
     gram_y = y_res.T @ y_res
@@ -644,7 +341,7 @@ def _du_worker_fft(
         # HSIC = ||y_res^T z_res||_F^2
         cross = y_res.T @ z_flat  # (n_isos, 1)
         hsic_scaled = float(np.sum(cross**2))
-        stats[_f] = hsic_scaled / (kernel.n_grid - 1) ** 2
+        stats[_f] = hsic_scaled / (n_grid - 1) ** 2
 
         lambda_z = np.linalg.eigvalsh(z_flat.T @ z_flat)
         lambda_z = lambda_z[lambda_z > 1e-8]
@@ -654,7 +351,7 @@ def _du_worker_fft(
             continue
 
         lambda_mix = (lambda_z[:, None] * lambda_y[None, :]).reshape(-1)
-        pvals[_f] = float(liu_sf(hsic_scaled * kernel.n_grid, lambda_mix))
+        pvals[_f] = float(liu_sf(hsic_scaled * n_grid, lambda_mix))
 
     return stats, pvals
 
@@ -1365,19 +1062,33 @@ class SplisosmFFT:
         prog_desc = f"DU ({method})"
 
         if method == "hsic-gp":
-            # Build GPR for isoforms (per-gene epsilon search via LML)
-            gpr_iso = FFTKernelGPR(self.kernel)
+            # Build GPR using same configs as SklearnKernelGPR (RBF kernel)
+            cov_cfg = {**_DEFAULT_GPR_CONFIGS["covariate"]}
+            iso_cfg = {**_DEFAULT_GPR_CONFIGS["isoform"]}
+            spacing = (self.kernel.dy, self.kernel.dx)
+
+            gpr_cov = FFTKernelGPR(
+                constant_value=cov_cfg["constant_value"],
+                constant_value_bounds=cov_cfg["constant_value_bounds"],
+                length_scale=cov_cfg["length_scale"],
+                length_scale_bounds=cov_cfg["length_scale_bounds"],
+            )
+            gpr_iso = FFTKernelGPR(
+                constant_value=iso_cfg["constant_value"],
+                constant_value_bounds=iso_cfg["constant_value_bounds"],
+                length_scale=iso_cfg["length_scale"],
+                length_scale_bounds=iso_cfg["length_scale_bounds"],
+            )
 
             # Rasterize and residualize covariates once (per factor)
             covariate_grid = np.zeros((ny, nx, n_factors), dtype=float)
             for _f in range(n_factors):
                 covariate_grid[rows, cols, _f] = design_np[:, _f]
 
-            gpr_cov = FFTKernelGPR(self.kernel)
             z_res_list: list[np.ndarray] = []
             for _f in range(n_factors):
                 z_cube = covariate_grid[:, :, _f]  # (ny, nx)
-                z_res_cube, _ = gpr_cov.fit_residuals_cube(z_cube)  # (ny, nx)
+                z_res_cube, _ = gpr_cov.fit_residuals_cube(z_cube, spacing=spacing)  # (ny, nx)
                 # Normalise for numerical stability
                 z_res_cube = z_res_cube - z_res_cube.mean()
                 std = z_res_cube.std()
@@ -1395,6 +1106,7 @@ class SplisosmFFT:
                     gpr_iso,
                     z_res_list,
                     ratio_transformation,
+                    spacing,
                 )
                 for iso_names in iterator
             )

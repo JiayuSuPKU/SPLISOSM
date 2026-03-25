@@ -729,6 +729,7 @@ class SplisosmNP:
         nan_filling: Literal["mean", "none"] = "mean",
         gpr_backend: Literal["sklearn", "gpytorch"] = "sklearn",
         gpr_configs: Optional[dict[str, Any]] = None,
+        residualize: Literal["cov_only", "iso_only", "both"] = "cov_only",
         print_progress: bool = True,
         return_results: bool = False,
     ) -> Optional[dict[str, Any]]:
@@ -793,6 +794,16 @@ class SplisosmNP:
                     },
                 }
 
+        residualize : {"cov_only", "iso_only", "both"}, optional
+            Controls which signals are spatially residualized when
+            ``method="hsic-gp"``:
+
+            * ``"cov_only"`` (default): residualize covariates only; test
+              HSIC(Z_res, Y_raw).  Fastest; calibration matches ``"both"``
+              when covariate GPR captures most spatial confounding.
+            * ``"iso_only"``: residualize isoform ratios only; test
+              HSIC(Z_raw, Y_res).
+            * ``"both"``: residualize both covariates and isoform ratios.
         print_progress : bool, optional
             Whether to show the progress bar. Default to True.
         return_results : bool, optional
@@ -817,6 +828,7 @@ class SplisosmNP:
         valid_methods = ["hsic", "hsic-gp", "t-fisher", "t-tippett"]
         valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
         valid_nan_filling = ["none", "mean"]
+        valid_residualize = ["cov_only", "iso_only", "both"]
         assert (
             method in valid_methods
         ), f"Invalid method. Must be one of {valid_methods}."
@@ -826,6 +838,9 @@ class SplisosmNP:
         assert (
             nan_filling in valid_nan_filling
         ), f"Invalid nan_filling. Must be one of {valid_nan_filling}."
+        assert (
+            residualize in valid_residualize
+        ), f"Invalid residualize. Must be one of {valid_residualize}."
 
         if method == "hsic":  # unconditional HSIC test (multivariate RV coefficient)
             # Precompute isoform ratios for all genes
@@ -872,28 +887,37 @@ class SplisosmNP:
                 if "isoform" in gpr_configs:
                     iso_config.update(gpr_configs["isoform"])
 
-            gpr_cov = make_kernel_gpr(gpr_backend, **cov_config)
-            gpr_iso = make_kernel_gpr(gpr_backend, **iso_config)
-
             # Normalize spatial coordinates
             x = self.coordinates.clone()  # (n_spots, 2)
             x = (x - x.mean(0)) / x.std(0)
             x[torch.isinf(x)] = 0  # guard against constant coordinate axes
 
-            # Residualize all factors
-            z_res_list = []
-            for _ind in tqdm(
-                range(n_factors), disable=(not print_progress), dynamic_ncols=True
-            ):
-                z = self.design_mtx[:, _ind].clone()  # (n_spots,)
-                assert (
-                    z.std() > 0
-                ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
-                z = (z - z.mean()) / z.std()
-                z = z.unsqueeze(1)  # (n_spots, 1)
-                z_res_list.append(gpr_cov.fit_residuals(x, z))
+            # --- Covariate residualization (skip when iso_only) ---
+            if residualize in ("cov_only", "both"):
+                gpr_cov = make_kernel_gpr(gpr_backend, **cov_config)
+                z_res_list = []
+                for _ind in tqdm(
+                    range(n_factors), disable=(not print_progress), dynamic_ncols=True
+                ):
+                    z = self.design_mtx[:, _ind].clone()
+                    assert (
+                        z.std() > 0
+                    ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
+                    z = (z - z.mean()) / z.std()
+                    z = z.unsqueeze(1)
+                    z_res_list.append(gpr_cov.fit_residuals(x, z))
+            else:
+                # iso_only: use normalized raw covariates
+                z_res_list = []
+                for _ind in range(n_factors):
+                    z = self.design_mtx[:, _ind].clone()
+                    assert (
+                        z.std() > 0
+                    ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
+                    z = (z - z.mean()) / z.std()
+                    z_res_list.append(z.unsqueeze(1))
 
-            # Compute isoform ratios for all genes
+            # --- Isoform ratio computation ---
             y_list = []
             for counts in tqdm(
                 self.data, disable=(not print_progress), dynamic_ncols=True
@@ -905,10 +929,15 @@ class SplisosmNP:
                 )
                 y_list.append(y)
 
-            # Residualize all genes (amortizes shared eigendecomp when bounds fixed)
-            y_res_list = gpr_iso.fit_residuals_batch(x, y_list)
+            # --- Isoform residualization (skip when cov_only) ---
+            if residualize in ("iso_only", "both"):
+                gpr_iso = make_kernel_gpr(gpr_backend, **iso_config)
+                y_res_list = gpr_iso.fit_residuals_batch(x, y_list)
+            else:
+                # cov_only: use raw isoform ratios
+                y_res_list = y_list
 
-            # Compute HSIC for all (gene, factor) pairs
+            # --- HSIC for all (gene, factor) pairs ---
             n_genes = len(y_res_list)
             hsic_all = torch.empty(n_genes, n_factors)
             pvals_all = torch.empty(n_genes, n_factors)

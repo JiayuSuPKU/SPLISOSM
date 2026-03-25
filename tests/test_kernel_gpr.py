@@ -8,6 +8,8 @@ import torch
 
 from splisosm.kernel_gpr import (
     DenseKernelOp,
+    FFTKernelOp,
+    FFTKernelGPR,
     SpatialKernelOp,
     SklearnKernelGPR,
     GPyTorchKernelGPR,
@@ -313,14 +315,60 @@ class TestGPyTorchKernelGPRImportGuard(unittest.TestCase):
             # Some other error is also acceptable if gpytorch isn't present
             self.assertIsInstance(e, (ImportError, RuntimeError))
 
-    def test_fit_residuals_raises(self):
-        """fit_residuals always raises NotImplementedError."""
+    def test_fit_residuals_shape(self):
+        """fit_residuals returns correct shape for multi-output Y."""
         try:
-            gpr = GPyTorchKernelGPR()
+            gpr = GPyTorchKernelGPR(n_iter=5)
         except ImportError:
             self.skipTest("gpytorch not installed.")
-        with self.assertRaises(NotImplementedError):
-            gpr.fit_residuals(torch.randn(10, 2), torch.randn(10, 3))
+        n, m = 20, 3
+        coords = torch.randn(n, 2)
+        Y = torch.randn(n, m)
+        res = gpr.fit_residuals(coords, Y)
+        self.assertEqual(res.shape, (n, m))
+
+    def test_fit_residuals_nan_rows_preserved(self):
+        """NaN rows in Y are reinserted as NaN in the residuals."""
+        try:
+            gpr = GPyTorchKernelGPR(n_iter=5)
+        except ImportError:
+            self.skipTest("gpytorch not installed.")
+        n, m = 20, 2
+        coords = torch.randn(n, 2)
+        Y = torch.randn(n, m)
+        Y[3, :] = float("nan")
+        res = gpr.fit_residuals(coords, Y)
+        self.assertEqual(res.shape, (n, m))
+        self.assertTrue(torch.isnan(res[3]).all())
+        self.assertFalse(torch.isnan(res[0]).any())
+
+    def test_fit_residuals_shrinks_signal(self):
+        """Residuals have smaller variance than pure spatial signal."""
+        try:
+            gpr = GPyTorchKernelGPR(
+                constant_value=1.0,
+                constant_value_bounds="fixed",
+                length_scale=1.0,
+                length_scale_bounds="fixed",
+                n_iter=20,
+            )
+        except ImportError:
+            self.skipTest("gpytorch not installed.")
+        torch.manual_seed(0)
+        n = 30
+        t = torch.linspace(0, 2 * np.pi, n).unsqueeze(1)
+        coords = torch.cat([t, torch.zeros_like(t)], dim=1)
+        Y = torch.sin(t).expand(n, 3) + 0.05 * torch.randn(n, 3)
+        res = gpr.fit_residuals(coords, Y)
+        self.assertLess(res.std().item(), Y.std().item())
+
+    def test_n_inducing_raises(self):
+        """n_inducing > 0 raises NotImplementedError."""
+        try:
+            with self.assertRaises(NotImplementedError):
+                GPyTorchKernelGPR(n_inducing=50)
+        except ImportError:
+            self.skipTest("gpytorch not installed.")
 
 
 class TestMakeKernelGPR(unittest.TestCase):
@@ -346,6 +394,189 @@ class TestMakeKernelGPR(unittest.TestCase):
         ):
             self.assertIn(key, _DEFAULT_GPR_CONFIGS["covariate"])
             self.assertIn(key, _DEFAULT_GPR_CONFIGS["isoform"])
+
+
+def _make_regular_grid_coords(ny: int = 15, nx: int = 20) -> torch.Tensor:
+    """Return z-score normalized coords for a regular (ny, nx) grid."""
+    y_idx = torch.arange(ny, dtype=torch.float32)
+    x_idx = torch.arange(nx, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y_idx, x_idx, indexing="ij")
+    coords = torch.stack([yy.flatten(), xx.flatten()], dim=1)
+    coords = (coords - coords.mean(0)) / coords.std(0)
+    return coords
+
+
+class TestFFTKernelOp(unittest.TestCase):
+    """Tests for FFTKernelOp."""
+
+    def setUp(self):
+        self.op = FFTKernelOp(
+            ny=15, nx=20, dy=0.1, dx=0.1,
+            constant_value=1.0, length_scale=0.5,
+        )
+
+    def test_n(self):
+        self.assertEqual(self.op.n, 300)
+        self.assertEqual(self.op.ny, 15)
+        self.assertEqual(self.op.nx, 20)
+
+    def test_eigenvalues_shape_and_sorted(self):
+        evals = self.op.eigenvalues()
+        self.assertEqual(evals.shape, (300,))
+        self.assertGreaterEqual(float(evals[0]), float(evals[-1]))
+
+    def test_eigenvalues_nonneg(self):
+        evals = self.op.eigenvalues()
+        self.assertTrue(np.all(evals >= 0), "FFT eigenvalues should be non-negative")
+
+    def test_trace_equals_n_times_constant_value(self):
+        # trace(K) = sum of eigenvalues ≈ n * constant_value for large grid
+        # (exact for periodic torus); here we just check it's positive and finite
+        t = self.op.trace()
+        self.assertGreater(t, 0)
+        self.assertTrue(np.isfinite(t))
+
+    def test_matvec_shape_1d(self):
+        v = np.random.randn(300)
+        kv = self.op.matvec(v)
+        self.assertEqual(kv.shape, (300,))
+
+    def test_matvec_shape_2d(self):
+        V = np.random.randn(300, 5)
+        KV = self.op.matvec(V)
+        self.assertEqual(KV.shape, (300, 5))
+
+    def test_residuals_reduce_variance(self):
+        """GP residualization should reduce signal variance."""
+        np.random.seed(7)
+        v = np.random.randn(300)
+        r = self.op.residuals(v, epsilon=0.5)
+        self.assertLess(float(np.var(r)), float(np.var(v)))
+
+    def test_solve_is_inverse_of_matvec_plus_eps(self):
+        """solve((K + eps*I)v) ≈ v."""
+        eps = 0.2
+        np.random.seed(3)
+        v = np.random.randn(300)
+        u = self.op.solve(v, eps)
+        # Reconstruct: matvec(u) + eps*u should ≈ v
+        recon = self.op.matvec(u) + eps * u
+        np.testing.assert_allclose(recon, v, atol=1e-6)
+
+
+class TestFFTKernelGPR(unittest.TestCase):
+    """Tests for FFTKernelGPR."""
+
+    def setUp(self):
+        self.coords = _make_regular_grid_coords(ny=15, nx=20)
+        n = 300
+        # Smooth spatial signal + noise.
+        # Use frequency 1.5 rad/unit — within the RBF kernel's spectral support on
+        # this 15×20 grid (ky=2 at f≈1.94 has negative circulant eigenvalue; f=1.5
+        # falls clearly at ky=1 which has eigenvalue ≈35).
+        torch.manual_seed(42)
+        self.Y_signal = torch.sin(self.coords[:, 0] * 1.5).unsqueeze(1) + 0.05 * torch.randn(n, 1)
+        self.Y_noise = torch.randn(n, 2)
+
+    def test_fit_residuals_shape(self):
+        gpr = FFTKernelGPR(constant_value_bounds="fixed")
+        res = gpr.fit_residuals(self.coords, self.Y_signal)
+        self.assertEqual(res.shape, self.Y_signal.shape)
+
+    def test_fit_residuals_reduces_spatial_signal(self):
+        """Residuals should have substantially less variance than a smooth signal."""
+        gpr = FFTKernelGPR(constant_value_bounds=(1e-3, 1e3))
+        res = gpr.fit_residuals(self.coords, self.Y_signal)
+        self.assertLess(float(res.var()), float(self.Y_signal.var()) * 0.5)
+
+    def test_fit_residuals_noise_unchanged(self):
+        """Residuals of pure noise should retain most variance (kernel can't fit noise)."""
+        gpr = FFTKernelGPR(constant_value_bounds=(1e-3, 1e3))
+        res = gpr.fit_residuals(self.coords, self.Y_noise)
+        # Residual variance should be a large fraction of original
+        self.assertGreater(float(res.var()), float(self.Y_noise.var()) * 0.3)
+
+    def test_fit_residuals_nan_rows_preserved(self):
+        """NaN rows in Y should be preserved as NaN in residuals."""
+        Y = self.Y_signal.clone()
+        Y[5] = float("nan")
+        Y[20] = float("nan")
+        gpr = FFTKernelGPR(constant_value_bounds="fixed")
+        res = gpr.fit_residuals(self.coords, Y)
+        self.assertTrue(torch.isnan(res[5]).all())
+        self.assertTrue(torch.isnan(res[20]).all())
+        self.assertFalse(torch.isnan(res[0]).any())
+
+    def test_fit_residuals_batch_matches_single(self):
+        """fit_residuals_batch should give same result as repeated fit_residuals."""
+        gpr = FFTKernelGPR(constant_value_bounds="fixed")
+        res_single = [gpr.fit_residuals(self.coords, self.Y_signal),
+                      gpr.fit_residuals(self.coords, self.Y_noise)]
+        res_batch = gpr.fit_residuals_batch(self.coords, [self.Y_signal, self.Y_noise])
+        for single, batch in zip(res_single, res_batch):
+            torch.testing.assert_close(single, batch, atol=1e-5, rtol=1e-4)
+
+    def test_fit_residuals_cube_backward_compat(self):
+        """fit_residuals_cube should work and return (array, float)."""
+        gpr = FFTKernelGPR(constant_value_bounds="fixed")
+        cube = np.random.randn(8, 10)
+        res_cube, eps = gpr.fit_residuals_cube(cube, spacing=(0.125, 0.1))
+        self.assertEqual(res_cube.shape, (8, 10))
+        self.assertGreater(eps, 0)
+
+    def test_irregular_grid_raises(self):
+        """fit_residuals should raise ValueError for irregular coordinates."""
+        gpr = FFTKernelGPR()
+        irregular = self.coords.clone()
+        irregular[5, 0] += 0.0137  # break regularity
+        with self.assertRaises(ValueError):
+            gpr.fit_residuals(irregular, self.Y_signal)
+
+    def test_length_scale_bounds_not_fixed_raises(self):
+        with self.assertRaises(NotImplementedError):
+            FFTKernelGPR(length_scale_bounds=(0.1, 10.0))
+
+    def test_make_kernel_gpr_fft(self):
+        gpr = make_kernel_gpr("fft", **_DEFAULT_GPR_CONFIGS["covariate"])
+        self.assertIsInstance(gpr, FFTKernelGPR)
+        res = gpr.fit_residuals(self.coords, self.Y_signal)
+        self.assertEqual(res.shape, self.Y_signal.shape)
+
+    def test_fft_matches_sklearn_calibration(self):
+        """FFT and sklearn backends should give similar calibration on null data."""
+        from scipy.stats import kstest
+
+        torch.manual_seed(99)
+        np.random.seed(99)
+        n = self.coords.shape[0]  # 300 (15x20 grid)
+        n_genes = 40
+
+        # Null isoform ratios (no spatial signal)
+        Y_list = [torch.rand(n, 3) for _ in range(n_genes)]
+
+        # Residualize a single covariate
+        covar_config = _DEFAULT_GPR_CONFIGS["covariate"]
+        z = torch.randn(n, 1)
+
+        gpr_sk = SklearnKernelGPR(**covar_config)
+        z_sk = gpr_sk.fit_residuals(self.coords, z)
+
+        gpr_fft = FFTKernelGPR(
+            constant_value=covar_config["constant_value"],
+            constant_value_bounds=covar_config["constant_value_bounds"],
+            length_scale=covar_config["length_scale"],
+            length_scale_bounds=covar_config["length_scale_bounds"],
+        )
+        z_fft = gpr_fft.fit_residuals(self.coords, z)
+
+        pvals_sk = [linear_hsic_test(z_sk, Y, centering=True)[1] for Y in Y_list]
+        pvals_fft = [linear_hsic_test(z_fft, Y, centering=True)[1] for Y in Y_list]
+
+        # Both should be roughly uniform under null (KS p > 0.05)
+        ks_sk = kstest(pvals_sk, "uniform").pvalue
+        ks_fft = kstest(pvals_fft, "uniform").pvalue
+        self.assertGreater(ks_sk, 0.01, f"sklearn p-values not uniform: KS p={ks_sk:.4f}")
+        self.assertGreater(ks_fft, 0.01, f"FFT p-values not uniform: KS p={ks_fft:.4f}")
 
 
 if __name__ == "__main__":

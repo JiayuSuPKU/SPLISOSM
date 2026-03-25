@@ -40,8 +40,9 @@ from abc import ABC, abstractmethod
 from typing import Any, Literal, Optional, Union
 
 import numpy as np
+import scipy.fft
 import torch
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize, minimize_scalar
 
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel as C
@@ -53,10 +54,12 @@ __all__ = [
     # Kernel linear operators
     "SpatialKernelOp",
     "DenseKernelOp",
+    "FFTKernelOp",
     # GPR residualizers
     "KernelGPR",
     "SklearnKernelGPR",
     "GPyTorchKernelGPR",
+    "FFTKernelGPR",
     "make_kernel_gpr",
     # HSIC utilities
     "linear_hsic_test",
@@ -264,6 +267,189 @@ class DenseKernelOp(SpatialKernelOp):
             Corresponding orthonormal eigenvectors.
         """
         return torch.linalg.eigh(self._K)
+
+
+# ---------------------------------------------------------------------------
+# FFT kernel operator (RBF, regular grid)
+# ---------------------------------------------------------------------------
+
+
+class FFTKernelOp(SpatialKernelOp):
+    """Implicit RBF kernel linear operator on a periodic 2-D grid via FFT.
+
+    Eigenvalues are computed as ``FFT2(K_row)`` where
+    ``K_row[i, j] = sigma^2 * exp(-(di^2 + dj^2) / (2 * l^2))`` with
+    periodic (torus) distances — no ``/n_grid`` normalization.  This
+    matches the convention used by :class:`DenseKernelOp` and
+    :class:`SklearnKernelGPR`.
+
+    All linear-algebra operations are O(N log N) via FFT; the n x n kernel
+    matrix is never formed.
+
+    Parameters
+    ----------
+    ny, nx : int
+        Grid shape.
+    dy, dx : float
+        Physical spacing between neighboring grid cells (used to compute
+        torus distances).
+    constant_value : float
+        RBF signal variance sigma^2.
+    length_scale : float
+        RBF length scale (in the same units as dy/dx).
+    workers : int or None
+        Number of ``scipy.fft`` workers.
+
+    Attributes
+    ----------
+    n : int
+        Total number of grid cells (ny * nx).
+    ny, nx : int
+        Grid dimensions.
+    eigenvalues_2d : np.ndarray, shape (ny, nx)
+        FFT2 of the kernel first row (lazy, computed on first access).
+    """
+
+    def __init__(
+        self,
+        ny: int,
+        nx: int,
+        dy: float,
+        dx: float,
+        constant_value: float,
+        length_scale: float,
+        workers: Optional[int] = None,
+    ) -> None:
+        self._ny = int(ny)
+        self._nx = int(nx)
+        self._dy = float(dy)
+        self._dx = float(dx)
+        self._constant_value = float(constant_value)
+        self._length_scale = float(length_scale)
+        self._workers = workers
+        self._eigenvalues_2d: Optional[np.ndarray] = None  # lazy
+
+    @property
+    def ny(self) -> int:
+        """Grid height."""
+        return self._ny
+
+    @property
+    def nx(self) -> int:
+        """Grid width."""
+        return self._nx
+
+    @property
+    def n(self) -> int:
+        """Total grid cells ny * nx."""
+        return self._ny * self._nx
+
+    @property
+    def eigenvalues_2d(self) -> np.ndarray:
+        """2-D eigenvalue array, shape (ny, nx). Computed lazily."""
+        if self._eigenvalues_2d is None:
+            y = np.arange(self._ny, dtype=float) * self._dy
+            x = np.arange(self._nx, dtype=float) * self._dx
+            # Periodic (torus) distances from origin
+            y = np.minimum(y, self._ny * self._dy - y)
+            x = np.minimum(x, self._nx * self._dx - x)
+            yy, xx = np.meshgrid(y, x, indexing="ij")
+            K_row = self._constant_value * np.exp(
+                -(yy**2 + xx**2) / (2.0 * self._length_scale**2)
+            )
+            lam = np.real(scipy.fft.fft2(K_row, workers=self._workers))
+            # Clip negligible numerical negatives (RBF kernel is PSD)
+            self._eigenvalues_2d = np.maximum(lam, 0.0)
+        return self._eigenvalues_2d
+
+    def _to_cube(self, v: np.ndarray) -> tuple[np.ndarray, bool]:
+        """Reshape flat/2-D input to (ny, nx, m) cube."""
+        was_1d = v.ndim == 1
+        if was_1d:
+            return v.reshape(self._ny, self._nx)[..., np.newaxis], True
+        return v.reshape(self._ny, self._nx, v.shape[1]), False
+
+    def _from_cube(self, cube: np.ndarray, was_1d: bool) -> np.ndarray:
+        if was_1d:
+            return cube[..., 0].ravel()
+        return cube.reshape(self.n, -1)
+
+    def matvec(self, v: np.ndarray) -> np.ndarray:
+        """Compute ``K @ v`` in O(N log N).
+
+        Parameters
+        ----------
+        v : np.ndarray, shape (n,) or (n, m)
+
+        Returns
+        -------
+        np.ndarray, same shape as v.
+        """
+        cube, was_1d = self._to_cube(np.asarray(v, dtype=float))
+        v_hat = scipy.fft.fft2(cube, axes=(0, 1), workers=self._workers)
+        kv_hat = v_hat * self.eigenvalues_2d[:, :, np.newaxis]
+        kv = np.real(scipy.fft.ifft2(kv_hat, axes=(0, 1), workers=self._workers))
+        return self._from_cube(kv, was_1d)
+
+    def solve(self, v: np.ndarray, epsilon: float) -> np.ndarray:
+        """Solve ``(K + epsilon * I) u = v`` in O(N log N).
+
+        Parameters
+        ----------
+        v : np.ndarray, shape (n,) or (n, m)
+        epsilon : float
+            Regularization level (> 0).
+
+        Returns
+        -------
+        np.ndarray, same shape as v.
+        """
+        cube, was_1d = self._to_cube(np.asarray(v, dtype=float))
+        v_hat = scipy.fft.fft2(cube, axes=(0, 1), workers=self._workers)
+        scale = 1.0 / (self.eigenvalues_2d[:, :, np.newaxis] + epsilon)
+        u = np.real(scipy.fft.ifft2(scale * v_hat, axes=(0, 1), workers=self._workers))
+        return self._from_cube(u, was_1d)
+
+    def residuals(self, v: np.ndarray, epsilon: float) -> np.ndarray:
+        """Apply ``epsilon * (K + epsilon * I)^{-1} @ v`` in O(N log N).
+
+        Parameters
+        ----------
+        v : np.ndarray, shape (n,) or (n, m)
+        epsilon : float
+
+        Returns
+        -------
+        np.ndarray, same shape as v.
+        """
+        cube, was_1d = self._to_cube(np.asarray(v, dtype=float))
+        v_hat = scipy.fft.fft2(cube, axes=(0, 1), workers=self._workers)
+        scale = epsilon / (self.eigenvalues_2d[:, :, np.newaxis] + epsilon)
+        r = np.real(scipy.fft.ifft2(scale * v_hat, axes=(0, 1), workers=self._workers))
+        return self._from_cube(r, was_1d)
+
+    def eigenvalues(self, k: Optional[int] = None) -> np.ndarray:
+        """Return eigenvalues in descending order.
+
+        Parameters
+        ----------
+        k : int or None
+            Number of leading eigenvalues. ``None`` returns all.
+
+        Returns
+        -------
+        np.ndarray, shape (k,) or (n,).
+        """
+        evals = np.sort(self.eigenvalues_2d.ravel())[::-1]
+        return evals[:k] if k is not None else evals
+
+    def trace(self) -> float:
+        """Return ``trace(K)``."""
+        return float(self.eigenvalues_2d.sum())
+
+    def square_trace(self) -> float:
+        """Return ``trace(K^2)``."""
+        return float((self.eigenvalues_2d**2).sum())
 
 
 # ---------------------------------------------------------------------------
@@ -525,15 +711,34 @@ class KernelGPR(ABC):
 # ---------------------------------------------------------------------------
 
 _DEFAULT_GPR_CONFIGS = {
+    # Covariate GPR: optimize signal amplitude; length scale fixed at 1.0
+    # (coordinates are z-score normalized before fitting).
     "covariate": {
         "constant_value": 1.0,
         "constant_value_bounds": (1e-3, 1e3),
         "length_scale": 1.0,
         "length_scale_bounds": "fixed",
     },
+    # Isoform GPR (default, fast): both signal bounds fixed -> shared
+    # eigendecomposition fast path (O(n^2) per gene).  The tiny
+    # constant_value means the kernel contributes negligibly; only the
+    # WhiteKernel noise level is optimized per gene.  Use this when
+    # the covariate residualization alone is expected to remove spatial
+    # confounding (n_spots <= ~5,000 and covariate GPR has wide bounds).
     "isoform": {
         "constant_value": 1e-3,
         "constant_value_bounds": "fixed",
+        "length_scale": 1.0,
+        "length_scale_bounds": "fixed",
+    },
+    # Isoform GPR (calibrated): signal amplitude is optimized per gene
+    # via full MLE (O(n^3) per gene, no shared eigendecomp fast path).
+    # Use when isoform ratios carry substantial spatial autocorrelation
+    # (e.g. iso_usage_variability='mvn') and the covariate fit alone
+    # may not remove all confounding -- at the cost of ~10x slower runtime.
+    "isoform_calibrated": {
+        "constant_value": 1.0,
+        "constant_value_bounds": (1e-3, 1e3),
         "length_scale": 1.0,
         "length_scale_bounds": "fixed",
     },
@@ -790,26 +995,97 @@ def _sklearn_gpr_residuals(
 # ---------------------------------------------------------------------------
 
 
+class _GPyTorchExactGPModel:
+    """Internal helper: wraps a gpytorch ExactGP with ScaleKernel(RBFKernel).
+
+    Constructed lazily to avoid importing gpytorch at module load time.
+    """
+
+    @staticmethod
+    def build(
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        likelihood: Any,
+        constant_value: float,
+        constant_value_bounds: Union[tuple, str],
+        length_scale: float,
+        length_scale_bounds: Union[tuple, str],
+    ) -> Any:
+        """Build and return a gpytorch ExactGP model."""
+        import gpytorch
+
+        class _Model(gpytorch.models.ExactGP):
+            def __init__(self) -> None:
+                super().__init__(train_x, train_y, likelihood)
+                self.mean_module = gpytorch.means.ZeroMean()
+                covar = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+                # Set initial values
+                covar.outputscale = constant_value
+                covar.base_kernel.lengthscale = length_scale
+                # Apply bounds / fix parameters
+                if constant_value_bounds == "fixed":
+                    covar.raw_outputscale.requires_grad_(False)
+                else:
+                    lo, hi = constant_value_bounds
+                    covar.register_constraint(
+                        "raw_outputscale",
+                        gpytorch.constraints.Interval(lo, hi),
+                    )
+                    covar.outputscale = constant_value  # re-apply after constraint
+                if length_scale_bounds == "fixed":
+                    covar.base_kernel.raw_lengthscale.requires_grad_(False)
+                else:
+                    lo, hi = length_scale_bounds
+                    covar.base_kernel.register_constraint(
+                        "raw_lengthscale",
+                        gpytorch.constraints.Interval(lo, hi),
+                    )
+                    covar.base_kernel.lengthscale = length_scale
+                self.covar_module = covar
+
+            def forward(self, x: torch.Tensor) -> Any:
+                mean = self.mean_module(x)
+                covar = self.covar_module(x)
+                return gpytorch.distributions.MultivariateNormal(mean, covar)
+
+        return _Model()
+
+
 class GPyTorchKernelGPR(KernelGPR):
     """GPyTorch-based GP residualizer.
 
-    Uses GPyTorch's lazy-tensor infrastructure so that the n x n kernel
-    matrix is never explicitly materialised; all computations operate via
-    kernel-vector products.
+    Uses GPyTorch's lazy-tensor infrastructure so that all linear-system
+    solves during training use Lanczos-based conjugate gradients rather
+    than dense Cholesky.  Hyperparameters are optimized with Adam on the
+    marginal log-likelihood.
 
-    For n > ~5,000, pass ``n_inducing > 0`` to use sparse variational GP
-    (SVGP), reducing complexity from O(n^3) to O(m^2 n) where m = n_inducing.
+    For most datasets (n <= ~10,000) the exact-GP path is used.  Passing
+    ``n_inducing > 0`` is reserved for a future sparse-SVGP implementation.
 
     Parameters
     ----------
+    constant_value : float
+        Initial signal amplitude (outputscale).
+    constant_value_bounds : tuple or "fixed"
+        Search bounds for the signal amplitude.  ``"fixed"`` disables
+        optimization of this parameter.
+    length_scale : float
+        Initial RBF length scale.
+    length_scale_bounds : tuple or "fixed"
+        Search bounds for the length scale.
     n_inducing : int or None
-        Number of inducing points for SVGP.  ``None`` (default) uses exact GP.
+        Reserved for future sparse-SVGP support.  Must be ``None``.
     n_iter : int
-        Optimiser iterations for hyperparameter learning.
+        Adam optimizer iterations for hyperparameter learning.
     lr : float
         Adam learning rate.
     device : str
-        PyTorch device (``"cpu"`` or ``"cuda"``).
+        PyTorch device string, e.g. ``"cpu"`` or ``"cuda"``.
+
+    Attributes
+    ----------
+    signal_bounds_fixed : bool
+        True when both constant_value and length_scale bounds are ``"fixed"``.
 
     Notes
     -----
@@ -817,14 +1093,22 @@ class GPyTorchKernelGPR(KernelGPR):
 
         pip install gpytorch
 
-    The exact-GP path is already more memory-efficient than the sklearn
-    backend because GPyTorch uses Lanczos-based CG rather than dense Cholesky.
-    The sparse-SVGP path (``n_inducing > 0``) will be implemented in a future
-    release.  The n x n matrix is never formed.
+    Hyperparameter search uses the mean of all target columns as the
+    training signal, then applies the fitted kernel to every column.
+    This matches the sklearn backend behavior and amortizes O(n^3) GP
+    fitting across outputs.
+
+    The noise (epsilon) search is handled by GPyTorch's
+    ``GaussianLikelihood``, which is always optimized regardless of the
+    signal bounds setting.
     """
 
     def __init__(
         self,
+        constant_value: float = 1.0,
+        constant_value_bounds: Union[tuple, str] = (1e-3, 1e3),
+        length_scale: float = 1.0,
+        length_scale_bounds: Union[tuple, str] = "fixed",
         n_inducing: Optional[int] = None,
         n_iter: int = 100,
         lr: float = 0.01,
@@ -837,17 +1121,40 @@ class GPyTorchKernelGPR(KernelGPR):
                 "GPyTorchKernelGPR requires gpytorch. "
                 "Install it with:  pip install gpytorch"
             ) from exc
+        if n_inducing is not None:
+            raise NotImplementedError(
+                "Sparse SVGP (n_inducing > 0) is not yet implemented. "
+                "Use n_inducing=None for exact GP."
+            )
+        self._constant_value = constant_value
+        self._constant_value_bounds = constant_value_bounds
+        self._length_scale = length_scale
+        self._length_scale_bounds = length_scale_bounds
         self.n_inducing = n_inducing
         self.n_iter = n_iter
         self.lr = lr
         self.device = device
+
+    @property
+    def signal_bounds_fixed(self) -> bool:
+        """True when both constant_value and length_scale bounds are ``"fixed"``."""
+        return (
+            self._constant_value_bounds == "fixed"
+            and self._length_scale_bounds == "fixed"
+        )
 
     def fit_residuals(
         self,
         coords: torch.Tensor,
         Y: torch.Tensor,
     ) -> torch.Tensor:
-        """Fit GP residuals using GPyTorch.
+        """Fit GP residuals using GPyTorch's exact-GP backend.
+
+        Hyperparameters are optimized on the mean of all target columns.
+        The fitted kernel and noise level are then applied to every column
+        of ``Y`` to compute residuals.
+
+        NaN rows are excluded from fitting and reinserted as NaN in output.
 
         Parameters
         ----------
@@ -859,18 +1166,513 @@ class GPyTorchKernelGPR(KernelGPR):
         Returns
         -------
         torch.Tensor, shape (n, m)
-            Spatial residuals.
-
-        Notes
-        -----
-        The full (exact-GP) implementation is planned for the next
-        release.  The sparse-SVGP path (``n_inducing > 0``) will follow.
+            Spatial residuals ``epsilon * (K + epsilon * I)**(-1) @ Y``.
+            NaN rows from Y are preserved as NaN.
         """
-        raise NotImplementedError(
-            "GPyTorchKernelGPR.fit_residuals() is not yet implemented.  "
-            "Use SklearnKernelGPR for now, or contribute the GPyTorch "
-            "backend via a pull request."
+        is_nan = torch.isnan(Y).any(1)
+        if is_nan.any():
+            coords_c = coords[~is_nan]
+            Y_c = Y[~is_nan]
+            res_clean = self._fit_no_nan(coords_c, Y_c)
+            out = torch.full_like(Y, float("nan"))
+            out[~is_nan] = res_clean
+            return out
+        return self._fit_no_nan(coords, Y)
+
+    def _fit_no_nan(self, coords: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+        """Inner residualization assuming no NaN rows."""
+        import gpytorch
+
+        Y2d = Y if Y.dim() == 2 else Y.unsqueeze(1)  # (n, m)
+        n = Y2d.shape[0]
+        dev = torch.device(self.device)
+
+        train_x = coords.float().to(dev)
+        # Optimize hyperparameters on the column mean
+        train_y = Y2d.float().mean(dim=1).to(dev)  # (n,)
+
+        likelihood = gpytorch.likelihoods.GaussianLikelihood().to(dev)
+        model = _GPyTorchExactGPModel.build(
+            train_x,
+            train_y,
+            likelihood,
+            self._constant_value,
+            self._constant_value_bounds,
+            self._length_scale,
+            self._length_scale_bounds,
+        ).to(dev)
+
+        model.train()
+        likelihood.train()
+        # model.parameters() already includes likelihood params via ExactGP
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        if trainable and self.n_iter > 0:
+            optimizer = torch.optim.Adam(trainable, lr=self.lr)
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+            for _ in range(self.n_iter):
+                optimizer.zero_grad()
+                loss = -mll(model(train_x), train_y)
+                loss.backward()
+                optimizer.step()
+
+        model.eval()
+        likelihood.eval()
+        with torch.no_grad():
+            eps = likelihood.noise.item()
+            K_lazy = model.covar_module(train_x)  # lazy (n, n)
+            Y_dev = Y2d.float().to(dev)  # (n, m)
+            # Solve (K + eps*I) @ alpha = Y via CG (no explicit n x n matrix)
+            K_noisy = K_lazy.add_diagonal(torch.full((n,), eps, device=dev))
+            alpha = K_noisy.solve(Y_dev)  # (n, m)
+            res = eps * alpha  # epsilon * (K + eps*I)^{-1} @ Y
+
+        return res.cpu()
+
+
+# ---------------------------------------------------------------------------
+# FFT GPR backend (regular grid, RBF kernel)
+# ---------------------------------------------------------------------------
+
+
+class FFTKernelGPR(KernelGPR):
+    """FFT-based GPR residualizer for regular (ny, nx) grids using an RBF kernel.
+
+    Accepts the same hyperparameter interface as :class:`SklearnKernelGPR`.
+    Kernel eigenvalues are computed via :class:`FFTKernelOp`; all linear-algebra
+    is O(N log N) with no n x n matrix formed.
+
+    Hyperparameter optimization strategy
+    -------------------------------------
+    The spectral log-marginal-likelihood (LML) for Y (n observations, m channels)
+    is::
+
+        -2 LML = m * sum_k log(lam_k + eps)
+                 + (1/n) * sum_k ||Y_hat_k||^2 / (lam_k + eps)
+
+    where ``lam_k = sigma^2 * s_k`` are the kernel eigenvalues,
+    ``s_k`` the unit-spectrum eigenvalues (``sigma^2 = 1``), and
+    ``Y_hat = FFT2(Y_cube)`` (unnormalized 2-D DFT).
+
+    * ``constant_value_bounds == "fixed"`` → 1-D bounded scalar search over
+      ``log(eps)`` (fast; shared unit spectrum across targets in batch).
+    * Otherwise → 2-D joint L-BFGS-B over ``(log_sigma2, log_eps)``.
+
+    Parameters
+    ----------
+    constant_value : float
+        Initial signal variance sigma^2.
+    constant_value_bounds : tuple or "fixed"
+        Bounds for sigma^2. "fixed" pins sigma^2 and uses only 1-D eps search.
+    length_scale : float
+        RBF length scale.  Must be fixed (``length_scale_bounds="fixed"``).
+    length_scale_bounds : str
+        Must be ``"fixed"``; length-scale optimization not yet supported.
+    epsilon_bounds : tuple[float, float]
+        Search bounds for the white-noise / regularization level.
+    workers : int or None
+        Number of ``scipy.fft`` workers.
+
+    Attributes
+    ----------
+    signal_bounds_fixed : bool
+        True when ``constant_value_bounds == "fixed"``.
+    ny, nx : int or None
+        Grid dimensions populated on first :meth:`fit_residuals` call.
+    n : int or None
+        Total grid cells.
+    """
+
+    def __init__(
+        self,
+        constant_value: float = 1.0,
+        constant_value_bounds: Union[tuple, str] = (1e-3, 1e3),
+        length_scale: float = 1.0,
+        length_scale_bounds: Union[tuple, str] = "fixed",
+        epsilon_bounds: tuple = (1e-5, 1e1),
+        workers: Optional[int] = None,
+    ) -> None:
+        if length_scale_bounds != "fixed":
+            raise NotImplementedError(
+                "FFTKernelGPR does not support length_scale optimization. "
+                "Set length_scale_bounds='fixed'."
+            )
+        self._constant_value = float(constant_value)
+        self._constant_value_bounds = constant_value_bounds
+        self._length_scale = float(length_scale)
+        self._length_scale_bounds = length_scale_bounds
+        self._epsilon_bounds = tuple(epsilon_bounds)
+        self._workers = workers
+
+        # Grid state — populated on first use
+        self._ny: Optional[int] = None
+        self._nx: Optional[int] = None
+        self._dy: float = 1.0
+        self._dx: float = 1.0
+
+        # Cached unit-spectrum op (sigma^2 = 1, reused for 1-D eps search)
+        self._unit_op: Optional[FFTKernelOp] = None
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def signal_bounds_fixed(self) -> bool:
+        """True when ``constant_value_bounds == "fixed"``."""
+        return self._constant_value_bounds == "fixed"
+
+    @property
+    def ny(self) -> Optional[int]:
+        """Grid height (set after first residualization)."""
+        return self._ny
+
+    @property
+    def nx(self) -> Optional[int]:
+        """Grid width (set after first residualization)."""
+        return self._nx
+
+    @property
+    def n(self) -> Optional[int]:
+        """Total grid cells (ny * nx)."""
+        if self._ny is None or self._nx is None:
+            return None
+        return self._ny * self._nx
+
+    # ------------------------------------------------------------------
+    # Grid helpers
+    # ------------------------------------------------------------------
+
+    def _detect_grid(
+        self, coords: torch.Tensor
+    ) -> tuple[int, int, float, float, np.ndarray, np.ndarray]:
+        """Auto-detect regular grid from 2-D coordinates.
+
+        Parameters
+        ----------
+        coords : torch.Tensor, shape (n, 2)
+
+        Returns
+        -------
+        ny, nx : int
+        dy, dx : float
+        rows, cols : np.ndarray[int]
+
+        Raises
+        ------
+        ValueError
+            If coordinates do not form a regular grid.
+        """
+        xy = coords.numpy()
+        uy = np.unique(xy[:, 0])
+        ux = np.unique(xy[:, 1])
+        ny, nx = len(uy), len(ux)
+
+        if ny * nx != len(xy):
+            raise ValueError(
+                f"FFTKernelGPR requires a regular grid but got {len(xy)} "
+                f"points for a {ny}×{nx} grid."
+            )
+
+        dy = float(np.diff(uy).mean()) if ny > 1 else 1.0
+        dx = float(np.diff(ux).mean()) if nx > 1 else 1.0
+
+        if ny > 1 and not np.allclose(np.diff(uy), dy, rtol=1e-4):
+            raise ValueError("y-coordinates are not evenly spaced.")
+        if nx > 1 and not np.allclose(np.diff(ux), dx, rtol=1e-4):
+            raise ValueError("x-coordinates are not evenly spaced.")
+
+        y_to_row = {v: i for i, v in enumerate(uy)}
+        x_to_col = {v: i for i, v in enumerate(ux)}
+        rows = np.array([y_to_row[float(v)] for v in xy[:, 0]], dtype=int)
+        cols = np.array([x_to_col[float(v)] for v in xy[:, 1]], dtype=int)
+        return ny, nx, dy, dx, rows, cols
+
+    def _get_unit_op(self, ny: int, nx: int, dy: float, dx: float) -> FFTKernelOp:
+        """Build/cache a unit-spectrum FFTKernelOp (sigma^2 = 1)."""
+        if (
+            self._unit_op is None
+            or self._ny != ny
+            or self._nx != nx
+        ):
+            self._unit_op = FFTKernelOp(
+                ny=ny, nx=nx, dy=dy, dx=dx,
+                constant_value=1.0,
+                length_scale=self._length_scale,
+                workers=self._workers,
+            )
+        self._ny, self._nx, self._dy, self._dx = ny, nx, dy, dx
+        return self._unit_op
+
+    # ------------------------------------------------------------------
+    # Spectral LML helpers
+    # ------------------------------------------------------------------
+
+    def _yhat_power(self, cube: np.ndarray) -> tuple[np.ndarray, int, int]:
+        """Compute FFT2-power summed over channels.
+
+        Parameters
+        ----------
+        cube : np.ndarray, shape (ny, nx, m)
+            Centred, NaN-imputed cube.
+
+        Returns
+        -------
+        power : np.ndarray, shape (ny, nx)
+            ``sum_c |FFT2(cube_c)[k]|^2`` for each frequency k.
+        n : int
+        m : int
+        """
+        y_hat = scipy.fft.fft2(cube, axes=(0, 1), workers=self._workers)
+        power = (np.abs(y_hat) ** 2).sum(axis=2)
+        return power, cube.shape[0] * cube.shape[1], cube.shape[2]
+
+    def _optimize(
+        self,
+        unit_op: FFTKernelOp,
+        power: np.ndarray,
+        n: int,
+        m: int,
+    ) -> tuple[float, float]:
+        """Optimize (sigma^2, eps) via spectral LML.
+
+        Returns
+        -------
+        sigma2 : float
+        eps : float
+        """
+        lam0 = unit_op.eigenvalues_2d.ravel()
+        power_flat = power.ravel()
+
+        if self.signal_bounds_fixed:
+            # 1-D search over log(eps) with sigma^2 fixed
+            lam_fixed = self._constant_value * lam0
+
+            def neg_lml_1d(log_eps: float) -> float:
+                eps = float(np.exp(log_eps))
+                le = lam_fixed + eps
+                return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+
+            lo, hi = self._epsilon_bounds
+            res = minimize_scalar(
+                neg_lml_1d, bounds=(np.log(lo), np.log(hi)), method="bounded"
+            )
+            return self._constant_value, float(np.exp(res.x))
+
+        else:
+            # 2-D joint L-BFGS-B over (log_sigma2, log_eps)
+            def neg_lml_2d(params: np.ndarray) -> float:
+                sigma2 = float(np.exp(params[0]))
+                eps = float(np.exp(params[1]))
+                le = sigma2 * lam0 + eps
+                return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+
+            lo_eps, hi_eps = self._epsilon_bounds
+            lo_s, hi_s = self._constant_value_bounds
+            x0 = np.array([np.log(self._constant_value), np.log(np.sqrt(lo_eps * hi_eps))])
+            bounds_lb = [(np.log(float(lo_s)), np.log(float(hi_s))),
+                         (np.log(lo_eps), np.log(hi_eps))]
+            res = minimize(neg_lml_2d, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
+            return float(np.exp(res.x[0])), float(np.exp(res.x[1]))
+
+    def _residualize_cube(
+        self,
+        raw_cube: np.ndarray,
+        ny: int,
+        nx: int,
+        dy: float,
+        dx: float,
+    ) -> tuple[np.ndarray, float, float]:
+        """Core per-cube residualization.
+
+        Parameters
+        ----------
+        raw_cube : np.ndarray, shape (ny, nx, m)
+            Raw raster data (may contain NaN).
+
+        Returns
+        -------
+        res_cube : np.ndarray, shape (ny, nx, m)
+        sigma2 : float
+        eps : float
+        """
+        cube = raw_cube - np.nanmean(raw_cube, axis=(0, 1), keepdims=True)
+        cube = np.nan_to_num(cube, nan=0.0, posinf=0.0, neginf=0.0)
+
+        unit_op = self._get_unit_op(ny, nx, dy, dx)
+        power, n, m = self._yhat_power(cube)
+        sigma2, eps = self._optimize(unit_op, power, n, m)
+
+        # Apply residual op with optimized sigma^2
+        signal_op = FFTKernelOp(
+            ny=ny, nx=nx, dy=dy, dx=dx,
+            constant_value=sigma2,
+            length_scale=self._length_scale,
+            workers=self._workers,
         )
+        res = signal_op.residuals(cube.reshape(n, m), eps)
+        return res.reshape(ny, nx, m), sigma2, eps
+
+    # ------------------------------------------------------------------
+    # KernelGPR public interface
+    # ------------------------------------------------------------------
+
+    def fit_residuals(
+        self,
+        coords: torch.Tensor,
+        Y: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fit GP and return spatial residuals.
+
+        Auto-detects the regular grid from ``coords``, rasterizes ``Y``,
+        optimizes hyperparameters via spectral LML, then de-rasterizes.
+
+        Parameters
+        ----------
+        coords : torch.Tensor, shape (n, 2)
+            Spatial coordinates forming a regular grid.
+        Y : torch.Tensor, shape (n, m)
+            Target values (may contain NaN rows).
+
+        Returns
+        -------
+        torch.Tensor, shape (n, m)
+            Spatial residuals. NaN rows are preserved.
+        """
+        Y2d = Y if Y.dim() == 2 else Y.unsqueeze(1)
+        n_obs, m = Y2d.shape[0], Y2d.shape[1]
+
+        ny, nx, dy, dx, rows, cols = self._detect_grid(coords)
+
+        # Rasterize (NaN-fill gaps)
+        cube = np.full((ny, nx, m), np.nan, dtype=float)
+        cube[rows, cols, :] = Y2d.numpy()
+
+        res_cube, _, _ = self._residualize_cube(cube, ny, nx, dy, dx)
+
+        # De-rasterize and restore NaN rows
+        out = torch.from_numpy(res_cube[rows, cols, :]).float()
+        is_nan = torch.isnan(Y2d).any(1)
+        if is_nan.any():
+            out[is_nan] = float("nan")
+
+        return out.squeeze(1) if Y.dim() == 1 else out
+
+    def fit_residuals_batch(
+        self,
+        coords: torch.Tensor,
+        Y_list: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Residualize a list of targets, amortizing grid detection and unit spectrum.
+
+        When :attr:`signal_bounds_fixed` is True the unit-spectrum
+        eigenvalues are shared; only eps is re-optimised per target (1-D
+        search).  Otherwise each target gets full 2-D optimisation.
+
+        Parameters
+        ----------
+        coords : torch.Tensor, shape (n, 2)
+        Y_list : list of torch.Tensor, each (n, m_i)
+
+        Returns
+        -------
+        list of torch.Tensor, each (n, m_i)
+        """
+        ny, nx, dy, dx, rows, cols = self._detect_grid(coords)
+        unit_op = self._get_unit_op(ny, nx, dy, dx)
+
+        results = []
+        for Y in Y_list:
+            Y2d = Y if Y.dim() == 2 else Y.unsqueeze(1)
+            n_obs, m = Y2d.shape[0], Y2d.shape[1]
+
+            cube = np.full((ny, nx, m), np.nan, dtype=float)
+            cube[rows, cols, :] = Y2d.numpy()
+            cube_c = cube - np.nanmean(cube, axis=(0, 1), keepdims=True)
+            cube_c = np.nan_to_num(cube_c, nan=0.0, posinf=0.0, neginf=0.0)
+
+            power, n_cells, m_ch = self._yhat_power(cube_c)
+            sigma2, eps = self._optimize(unit_op, power, n_cells, m_ch)
+
+            signal_op = FFTKernelOp(
+                ny=ny, nx=nx, dy=dy, dx=dx,
+                constant_value=sigma2,
+                length_scale=self._length_scale,
+                workers=self._workers,
+            )
+            res = signal_op.residuals(cube_c.reshape(n_cells, m), eps)
+            res_cube = res.reshape(ny, nx, m)
+
+            out = torch.from_numpy(res_cube[rows, cols, :]).float()
+            is_nan = torch.isnan(Y2d).any(1)
+            if is_nan.any():
+                out[is_nan] = float("nan")
+            results.append(out.squeeze(1) if Y.dim() == 1 else out)
+
+        return results
+
+    def fit_residuals_cube(
+        self,
+        data_cube: np.ndarray,
+        spacing: tuple = (1.0, 1.0),
+        epsilon: Optional[float] = None,
+    ) -> tuple[np.ndarray, float]:
+        """Residualize a raster cube in O(N log N).
+
+        Kept for backward compatibility with :class:`SplisosmFFT`.
+
+        Parameters
+        ----------
+        data_cube : np.ndarray, shape (ny, nx) or (ny, nx, m)
+        spacing : (dy, dx)
+            Physical grid spacing.
+        epsilon : float or None
+            If given, skip optimization and use this value directly.
+
+        Returns
+        -------
+        residuals : np.ndarray, same shape as data_cube
+        epsilon : float
+            Regularization level used.
+        """
+        cube = np.asarray(data_cube, dtype=float)
+        scalar = cube.ndim == 2
+        if scalar:
+            cube = cube[..., np.newaxis]
+
+        ny, nx, m = cube.shape
+        dy, dx = float(spacing[0]), float(spacing[1])
+
+        if epsilon is not None:
+            # Skip optimization — use provided epsilon with current sigma^2
+            cube_c = cube - np.nanmean(cube, axis=(0, 1), keepdims=True)
+            cube_c = np.nan_to_num(cube_c, nan=0.0, posinf=0.0, neginf=0.0)
+            op = FFTKernelOp(
+                ny=ny, nx=nx, dy=dy, dx=dx,
+                constant_value=self._constant_value,
+                length_scale=self._length_scale,
+                workers=self._workers,
+            )
+            res = op.residuals(cube_c.reshape(ny * nx, m), epsilon)
+            res_cube = res.reshape(ny, nx, m)
+            self._ny, self._nx, self._dy, self._dx = ny, nx, dy, dx
+        else:
+            res_cube, _, epsilon = self._residualize_cube(cube, ny, nx, dy, dx)
+
+        return (res_cube[..., 0] if scalar else res_cube), float(epsilon)
+
+    def get_kernel_op(self, coords: Optional[torch.Tensor] = None) -> "FFTKernelOp":
+        """Return the cached unit-spectrum FFTKernelOp.
+
+        Raises
+        ------
+        RuntimeError
+            If called before any residualization.
+        """
+        if self._unit_op is None:
+            raise RuntimeError(
+                "No FFTKernelOp available. Call fit_residuals or fit_residuals_cube first."
+            )
+        return self._unit_op
 
 
 # ---------------------------------------------------------------------------
@@ -887,8 +1689,9 @@ def make_kernel_gpr(
     Parameters
     ----------
     backend : {"sklearn", "gpytorch", "fft"}
-        Backend to use.  ``"fft"`` requires passing a ``kernel`` keyword
-        argument of type :class:`~splisosm.hyptest_fft.FFTKernel`.
+        Backend to use.  ``"fft"`` accepts the same kwargs as ``"sklearn"``
+        (``constant_value``, ``constant_value_bounds``, ``length_scale``,
+        ``length_scale_bounds``) plus ``epsilon_bounds`` and ``workers``.
     **kwargs
         Passed to the backend constructor.
 
@@ -907,8 +1710,6 @@ def make_kernel_gpr(
     if backend == "gpytorch":
         return GPyTorchKernelGPR(**kwargs)
     if backend == "fft":
-        from splisosm.hyptest_fft import FFTKernelGPR  # lazy to avoid circular import
-
         return FFTKernelGPR(**kwargs)
     raise ValueError(
         f"Unknown backend '{backend}'. Choose from 'sklearn', 'gpytorch', 'fft'."
