@@ -12,7 +12,6 @@ import torch
 from tqdm import tqdm
 from anndata import AnnData
 
-from smoother.weights import coordinate_to_weights_knn_sparse
 from splisosm.utils import (
     counts_to_ratios,
     false_discovery_control,
@@ -77,51 +76,6 @@ def _calc_ttest_differential_usage(
         stats, pval = combine_pvalues(pval, method=combine_method)  # each of len 1
 
     return stats, pval
-
-
-def get_knn_regression_residual_op(X: torch.Tensor, k: int = 6) -> torch.Tensor:
-    """Calculate the residuals of KNN regression.
-
-    .. deprecated::
-        ``method='hsic-knn'`` has been retired.  This function is kept for
-        backward compatibility and will be removed in a future release.
-
-    Parameters
-    ----------
-    X : torch.Tensor
-        Shape (n_samples, d). Input data.
-    k : int, optional
-        Number of neighbors.
-
-    Returns
-    -------
-    torch.Tensor
-        Shape (n_samples, n_samples), residual operator. Residuals(Y) := Y - Y_pred(X) = Rx @ Y.
-    """
-    n_samples = X.shape[0]
-
-    # build the KNN graph and convert to a row-normalized weights matrix
-    # w.shape == (n_samples, n_samples)
-    # w.sum(1) == [1] * n_samples
-    w = coordinate_to_weights_knn_sparse(
-        X, k=k, symmetric=True, row_scale=True
-    )  # sparse matrix
-
-    # remove diagonals in the weights matrix if any to free unconnected samples
-    w_i = w.indices()
-    w_v = w.values()
-    ndiag_mask = w_i[0] != w_i[1]  # non-diagonal indices
-
-    # calculate the residual operator (I - W)
-    w_i_new = torch.concatenate(
-        [w_i[:, ndiag_mask], torch.arange(n_samples).repeat(2, 1)], axis=1
-    )
-    w_v_new = torch.concatenate([w_v[ndiag_mask] * (-1), torch.ones(n_samples)])
-    Rx = torch.sparse_coo_tensor(
-        w_i_new, w_v_new, w.shape, dtype=torch.float32
-    ).coalesce()
-
-    return Rx
 
 
 class SplisosmNP:
@@ -273,6 +227,10 @@ class SplisosmNP:
             - Legacy mode: tensor/array/dataframe of shape ``(n_spots, n_factors)``.
             - AnnData mode: tensor/array/dataframe, or one obs-column name
               (str), or a list of obs-column names.
+
+            When ``design_mtx`` contains categorical obs columns in AnnData mode,
+            they are automatically one-hot encoded. Covariate names are inferred
+            when not explicitly provided (see ``covariate_names`` below).
         gene_names
             Gene names.
 
@@ -280,7 +238,16 @@ class SplisosmNP:
             - AnnData mode: optional column name in ``adata.var`` used as
               display names for grouped genes; if None, use grouped gene IDs.
         covariate_names
-            List of covariate names.
+            List of covariate names. If not provided, names are inferred as follows:
+
+            - In **AnnData mode with column name(s)**: column names are used, with
+              categorical columns expanded to one-hot encoded names (e.g., ``col_cat0``,
+              ``col_cat1`` for ``col`` if it has categorical values).
+            - In **legacy mode with DataFrame**: DataFrame column names are used.
+            - **Otherwise**: default names like ``factor_1``, ``factor_2``, etc. are generated.
+
+            When explicitly provided, must match the number of factors in the
+            design matrix (after any categorical encoding/one-hot expansion).
         adata
             AnnData object used in the new input mode.
         spatial_key
@@ -422,40 +389,74 @@ class SplisosmNP:
         # self.corr_sp = get_cov_sp(coordinates, k = 4, rho=0.99)
         self.corr_sp = K_sp
 
-        # check the design matrix
+        # check and process the design matrix
         if design_mtx is not None:
+            # Infer covariate names from DataFrame columns if available
+            inferred_cov_names = None
             if isinstance(design_mtx, pd.DataFrame):
-                design_mtx = torch.from_numpy(design_mtx.values)
-            elif isinstance(design_mtx, np.ndarray):
-                design_mtx = torch.from_numpy(design_mtx)
+                inferred_cov_names = list(design_mtx.columns)
+                design_mtx = design_mtx.values
 
+            # Convert sparse matrices to dense
+            if hasattr(design_mtx, "toarray"):  # scipy sparse matrix
+                design_mtx = design_mtx.toarray()
+
+            # Convert numpy to torch
+            if isinstance(design_mtx, np.ndarray):
+                design_mtx = torch.from_numpy(design_mtx.astype(np.float32))
+            elif isinstance(design_mtx, torch.Tensor):
+                design_mtx = design_mtx.float()
+            else:
+                raise TypeError(
+                    f"Unsupported design_mtx type: {type(design_mtx)}. "
+                    "Expected numpy array, torch tensor, pandas DataFrame, or sparse matrix."
+                )
+
+            # Validate shape
             if design_mtx.shape[0] != self.n_spots:
                 raise ValueError(
-                    "The design matrix must have the same number of rows as spots."
+                    f"Design matrix row count ({design_mtx.shape[0]}) must match "
+                    f"number of spots ({self.n_spots})."
                 )
 
-            if design_mtx.dim() == 1:  # in case of a single covariate
+            # Handle 1D design matrix (single covariate)
+            if design_mtx.dim() == 1:
                 design_mtx = design_mtx.unsqueeze(1)
 
-            # convert to float tensor
+            # Ensure float dtype
             design_mtx = design_mtx.float()
 
-            if covariate_names is not None:  # set default names
-                if len(covariate_names) != design_mtx.shape[1]:
+            # Determine covariate names with priority: explicit > inferred > generated
+            n_factors = design_mtx.shape[1]
+            if covariate_names is not None:
+                # Explicit covariate_names provided by user
+                if len(covariate_names) != n_factors:
                     raise ValueError(
-                        "Covariate names must match the number of factors."
+                        f"Number of covariate_names ({len(covariate_names)}) must match "
+                        f"design matrix columns ({n_factors})."
                     )
+            elif inferred_cov_names is not None:
+                # Inferred from DataFrame columns
+                if len(inferred_cov_names) != n_factors:
+                    raise ValueError(
+                        f"DataFrame column count ({len(inferred_cov_names)}) does not match "
+                        f"design matrix columns ({n_factors})."
+                    )
+                covariate_names = inferred_cov_names
             else:
-                covariate_names = [
-                    f"factor_{i + 1}" for i in range(design_mtx.shape[1])
-                ]
+                # Generate default covariate names
+                covariate_names = [f"factor_{i+1}" for i in range(n_factors)]
 
-            # check for constant covariates
-            _ind = torch.where(design_mtx.std(0) < 1e-5)[0]
-            for _i in _ind:
-                warnings.warn(
-                    f"{covariate_names[_i]} has zero variance. Please remove it."
-                )
+            # Check for constant/zero-variance covariates
+            with warnings.catch_warnings():
+                warnings.simplefilter("always")
+                cov_stds = design_mtx.std(dim=0)
+                zero_var_indices = torch.where(cov_stds < 1e-5)[0]
+                for idx in zero_var_indices:
+                    warnings.warn(
+                        f"Covariate '{covariate_names[idx]}' has near-zero variance "
+                        "(std < 1e-5). Consider removing it."
+                    )
 
         self.design_mtx = design_mtx
         self.n_factors = design_mtx.shape[1] if design_mtx is not None else 0

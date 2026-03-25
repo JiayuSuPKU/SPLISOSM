@@ -964,38 +964,74 @@ class SplisosmGLMM:
         self.coordinates = coordinates
         self.corr_sp = get_cov_sp(coordinates, k=4, rho=0.99)
 
-        # check and store the design matrix
+        # check and process the design matrix
         if design_mtx is not None:
+            # Infer covariate names from DataFrame columns if available
+            inferred_cov_names = None
             if isinstance(design_mtx, pd.DataFrame):
-                design_mtx = torch.from_numpy(design_mtx.values)
-            elif isinstance(design_mtx, np.ndarray):
-                design_mtx = torch.from_numpy(design_mtx)
+                inferred_cov_names = list(design_mtx.columns)
+                design_mtx = design_mtx.values
 
-            if design_mtx.shape[0] != self.n_spots:
-                raise ValueError(
-                    "The design matrix must have the same number of rows as spots."
+            # Convert sparse matrices to dense
+            if hasattr(design_mtx, "toarray"):  # scipy sparse matrix
+                design_mtx = design_mtx.toarray()
+
+            # Convert numpy to torch
+            if isinstance(design_mtx, np.ndarray):
+                design_mtx = torch.from_numpy(design_mtx.astype(np.float32))
+            elif isinstance(design_mtx, torch.Tensor):
+                design_mtx = design_mtx.float()
+            else:
+                raise TypeError(
+                    f"Unsupported design_mtx type: {type(design_mtx)}. "
+                    "Expected numpy array, torch tensor, pandas DataFrame, or sparse matrix."
                 )
 
+            # Validate shape
+            if design_mtx.shape[0] != self.n_spots:
+                raise ValueError(
+                    f"Design matrix row count ({design_mtx.shape[0]}) must match "
+                    f"number of spots ({self.n_spots})."
+                )
+
+            # Handle 1D design matrix (single covariate)
             if design_mtx.dim() == 1:
                 design_mtx = design_mtx.unsqueeze(1)
 
+            # Ensure float dtype
             design_mtx = design_mtx.float()
 
+            # Determine covariate names with priority: explicit > inferred > generated
+            n_factors = design_mtx.shape[1]
             if covariate_names is not None:
-                if len(covariate_names) != design_mtx.shape[1]:
+                # Explicit covariate_names provided by user
+                if len(covariate_names) != n_factors:
                     raise ValueError(
-                        "Covariate names must match the number of factors."
+                        f"Number of covariate_names ({len(covariate_names)}) must match "
+                        f"design matrix columns ({n_factors})."
                     )
+            elif inferred_cov_names is not None:
+                # Inferred from DataFrame columns
+                if len(inferred_cov_names) != n_factors:
+                    raise ValueError(
+                        f"DataFrame column count ({len(inferred_cov_names)}) does not match "
+                        f"design matrix columns ({n_factors})."
+                    )
+                covariate_names = inferred_cov_names
             else:
-                covariate_names = [
-                    f"factor_{str(i + 1).zfill(4)}" for i in range(design_mtx.shape[1])
-                ]
+                # Generate default covariate names
+                covariate_names = [f"factor_{i+1}" for i in range(n_factors)]
 
-            _ind = torch.where(design_mtx.std(0) < 1e-5)[0]
-            for _i in _ind:
-                warnings.warn(
-                    f"{covariate_names[_i]} has zero variance. Please remove it."
-                )
+            # Check for constant/zero-variance covariates
+            with warnings.catch_warnings():
+                warnings.simplefilter("always")
+                cov_stds = design_mtx.std(dim=0)
+                zero_var_indices = torch.where(cov_stds < 1e-5)[0]
+                for idx in zero_var_indices:
+                    warnings.warn(
+                        f"Covariate '{covariate_names[idx]}' has near-zero variance "
+                        "(std < 1e-5). Consider removing it."
+                    )
 
         self.n_factors = design_mtx.shape[1] if design_mtx is not None else 0
         self.design_mtx = design_mtx

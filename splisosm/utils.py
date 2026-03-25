@@ -353,6 +353,171 @@ def load_visium_sp_meta(
     return adata
 
 
+def _process_design_mtx(
+    adata: AnnData,
+    design_mtx: Optional[Any],
+    covariate_names: Optional[list[str]],
+) -> tuple[Optional[np.ndarray], Optional[list[str]]]:
+    """Process and resolve design matrix from AnnData.obs columns.
+
+    Handles extraction, categorical encoding, sparse array conversion, and
+    dimension validation for design matrices extracted from AnnData object.
+    Automatically infers covariate names when not explicitly provided.
+
+    Supports three input modes:
+
+    1. Single column name (str): extracts one ``adata.obs`` column
+    2. Multiple column names (list[str]): extracts and concatenates columns
+    3. Pre-computed matrix (array/dataframe/tensor): used as-is
+
+    For columns containing categorical data (dtype 'category' or object),
+    one-hot encoding is applied. Numerical columns are converted as-is.
+
+    Parameters
+    ----------
+    adata
+        Annotated data matrix.
+    design_mtx
+        Design matrix specification or pre-computed matrix.
+
+        - str: single column name in ``adata.obs``
+        - list[str]: list of column names in ``adata.obs``
+        - ndarray/tensor/sparse/DataFrame: pre-computed design matrix
+
+    covariate_names
+        Explicit covariate names. If provided, dimensions must match
+        the resulting design matrix. If None, names are inferred as follows:
+
+        - **From obs columns (str/list[str])**: column names are used, with
+          categorical columns expanded to one-hot encoded names.
+        - **From DataFrame**: column names are extracted.
+        - **Otherwise**: default names ``factor_1``, ``factor_2``, etc.
+
+    Returns
+    -------
+    resolved_design : np.ndarray | None
+        Design matrix of shape ``(n_spots, n_factors)``, dtype float32.
+        Returns ``None`` if ``design_mtx`` is ``None``.
+    resolved_covariates : list[str] | None
+        Inferred or explicit covariate names matching design matrix columns.
+        Resolves as:
+
+        1. User-provided ``covariate_names`` (if valid dimensions)
+        2. Extracted from obs columns or DataFrame
+        3. Auto-generated ``factor_1``, ``factor_2``, etc.
+
+        Returns ``None`` if ``design_mtx`` is ``None``.
+
+    Raises
+    ------
+    ValueError
+        If columns are missing, covariate_names dimensions don't match,
+        or other validation failures occur.
+    """
+    if design_mtx is None:
+        return None, None
+
+    # Extract columns from adata.obs
+    if isinstance(design_mtx, str):
+        # Single column
+        col_names = [design_mtx]
+        columns_to_extract = col_names
+    elif (
+        isinstance(design_mtx, list)
+        and len(design_mtx) > 0
+        and all(isinstance(x, str) for x in design_mtx)
+    ):
+        # Multiple columns
+        col_names = list(design_mtx)
+        columns_to_extract = col_names
+    else:
+        # Pre-computed matrix: validate and return
+        columns_to_extract = None
+        col_names = None
+
+    if columns_to_extract is not None:
+        # Validate columns exist
+        missing = [col for col in columns_to_extract if col not in adata.obs.columns]
+        if missing:
+            raise ValueError(
+                f"Columns {missing} were not found in `adata.obs` for design_mtx."
+            )
+
+        # Extract and process columns
+        design_list = []
+        resolved_cov_names = []
+
+        for col in columns_to_extract:
+            col_data = adata.obs[col]
+            col_dtype = col_data.dtype
+
+            # Check if categorical (either pandas Categorical or object/string type)
+            is_categorical = (
+                isinstance(col_dtype, pd.CategoricalDtype)
+                or col_dtype == "object"
+                or col_dtype.kind == "O"  # Object array
+            )
+
+            if is_categorical:
+                # One-hot encode categorical column
+                # Use pd.get_dummies to create binary indicators
+                dummies = pd.get_dummies(col_data, prefix=col, drop_first=False)
+                design_list.append(dummies.values.astype(np.float32))
+                resolved_cov_names.extend(dummies.columns.tolist())
+            else:
+                # Numerical column: convert to float
+                col_array = col_data.values.astype(np.float32).reshape(-1, 1)
+                design_list.append(col_array)
+                resolved_cov_names.append(col)
+
+        # Concatenate all columns
+        resolved_design = np.concatenate(design_list, axis=1)
+
+    else:
+        # Pre-computed matrix: convert to appropriate format
+        if isinstance(design_mtx, pd.DataFrame):
+            resolved_design = design_mtx.values.astype(np.float32)
+            resolved_cov_names = list(design_mtx.columns)
+        elif isinstance(design_mtx, torch.Tensor):
+            resolved_design = design_mtx.cpu().numpy().astype(np.float32)
+            resolved_cov_names = None
+        elif scipy.sparse.issparse(design_mtx):
+            # Convert sparse matrix to dense
+            resolved_design = design_mtx.toarray().astype(np.float32)
+            resolved_cov_names = None
+        elif isinstance(design_mtx, np.ndarray):
+            resolved_design = design_mtx.astype(np.float32)
+            resolved_cov_names = None
+        else:
+            raise TypeError(
+                f"Unsupported design_mtx type: {type(design_mtx)}. "
+                "Expected array-like, DataFrame, tensor, or sparse matrix."
+            )
+
+    # Validate shapes
+    n_spots = adata.n_obs
+    if resolved_design.shape[0] != n_spots:
+        raise ValueError(
+            f"Design matrix row count ({resolved_design.shape[0]}) "
+            f"must match number of spots ({n_spots})."
+        )
+
+    # Validate and set covariate names
+    n_factors = resolved_design.shape[1]
+    if covariate_names is not None:
+        if len(covariate_names) != n_factors:
+            raise ValueError(
+                f"covariate_names length ({len(covariate_names)}) must match "
+                f"design matrix columns ({n_factors})."
+            )
+        resolved_cov_names = covariate_names
+    elif resolved_cov_names is None:
+        # Generate default names
+        resolved_cov_names = [f"factor_{i+1}" for i in range(n_factors)]
+
+    return resolved_design, resolved_cov_names
+
+
 def prepare_inputs_from_anndata(
     adata: AnnData,
     layer: str,
@@ -520,29 +685,10 @@ def prepare_inputs_from_anndata(
     if coordinates.dim() != 2:
         raise ValueError("Coordinates in `adata.obsm[spatial_key]` must be a 2D array.")
 
-    resolved_design = design_mtx
-    resolved_covariates = covariate_names
-    if isinstance(design_mtx, str):
-        if design_mtx not in adata.obs.columns:
-            raise ValueError(
-                f"`{design_mtx}` was not found in `adata.obs` for design_mtx."
-            )
-        resolved_design = adata.obs[[design_mtx]].to_numpy()
-        if resolved_covariates is None:
-            resolved_covariates = [design_mtx]
-    elif (
-        isinstance(design_mtx, list)
-        and len(design_mtx) > 0
-        and all(isinstance(_x, str) for _x in design_mtx)
-    ):
-        missing = [col for col in design_mtx if col not in adata.obs.columns]
-        if len(missing) > 0:
-            raise ValueError(
-                f"Columns {missing} were not found in `adata.obs` for design_mtx."
-            )
-        resolved_design = adata.obs[design_mtx].to_numpy()
-        if resolved_covariates is None:
-            resolved_covariates = list(design_mtx)
+    # Process design matrix (handles column extraction, categorical encoding, etc.)
+    resolved_design, resolved_covariates = _process_design_mtx(
+        adata, design_mtx, covariate_names
+    )
 
     return (
         counts_list,
