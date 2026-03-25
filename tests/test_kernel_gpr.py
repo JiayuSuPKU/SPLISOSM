@@ -15,8 +15,7 @@ from splisosm.kernel_gpr import (
     GPyTorchKernelGPR,
     make_kernel_gpr,
     linear_hsic_test,
-    build_rbf_kernel,
-    get_kernel_regression_residual_op,
+    _build_rbf_kernel,
     _DEFAULT_GPR_CONFIGS,
     _kernel_residuals_from_eigdecomp,
 )
@@ -32,7 +31,7 @@ def _make_rbf_kernel(
     n: int = 50, constant_value: float = 1.0, length_scale: float = 1.0
 ):
     coords = _make_coords(n)
-    return build_rbf_kernel(coords, constant_value, length_scale)
+    return _build_rbf_kernel(coords, constant_value, length_scale)
 
 
 class TestBuildRbfKernel(unittest.TestCase):
@@ -49,24 +48,6 @@ class TestBuildRbfKernel(unittest.TestCase):
     def test_diagonal_equals_constant_value(self):
         K = _make_rbf_kernel(n=20, constant_value=2.5)
         self.assertTrue(torch.allclose(K.diag(), torch.full((20,), 2.5), atol=1e-5))
-
-
-class TestGetKernelRegressionResidualOp(unittest.TestCase):
-    def test_shape_and_idempotency(self):
-        K = _make_rbf_kernel(n=30)
-        epsilon = 0.1
-        Rx = get_kernel_regression_residual_op(K, epsilon)
-        self.assertEqual(Rx.shape, (30, 30))
-
-    def test_residual_shrinks_signal(self):
-        n = 40
-        K = _make_rbf_kernel(n=n)
-        Rx = get_kernel_regression_residual_op(K, epsilon=1e-3)
-        torch.manual_seed(1)
-        y = torch.randn(n, 3)
-        y_res = Rx @ y
-        # Residuals should be smaller than the original (spatial signal removed)
-        self.assertLess(float(y_res.norm()), float(y.norm()))
 
 
 class TestDenseKernelOp(unittest.TestCase):
@@ -232,8 +213,13 @@ class TestSklearnKernelGPR(unittest.TestCase):
         )
 
     def test_from_config_default(self):
-        gpr = SklearnKernelGPR.from_config(_DEFAULT_GPR_CONFIGS["isoform"])
-        self.assertTrue(gpr.signal_bounds_fixed)
+        # Both covariate and isoform configs now use free (calibrated) bounds.
+        for key in ("covariate", "isoform"):
+            gpr = SklearnKernelGPR.from_config(_DEFAULT_GPR_CONFIGS[key])
+            self.assertFalse(
+                gpr.signal_bounds_fixed,
+                f"_DEFAULT_GPR_CONFIGS['{key}'] should have free constant_value_bounds",
+            )
 
     def test_signal_bounds_fixed(self):
         gpr_f = self._make_gpr_fixed()
@@ -411,8 +397,12 @@ class TestFFTKernelOp(unittest.TestCase):
 
     def setUp(self):
         self.op = FFTKernelOp(
-            ny=15, nx=20, dy=0.1, dx=0.1,
-            constant_value=1.0, length_scale=0.5,
+            ny=15,
+            nx=20,
+            dy=0.1,
+            dx=0.1,
+            constant_value=1.0,
+            length_scale=0.5,
         )
 
     def test_n(self):
@@ -475,7 +465,9 @@ class TestFFTKernelGPR(unittest.TestCase):
         # this 15×20 grid (ky=2 at f≈1.94 has negative circulant eigenvalue; f=1.5
         # falls clearly at ky=1 which has eigenvalue ≈35).
         torch.manual_seed(42)
-        self.Y_signal = torch.sin(self.coords[:, 0] * 1.5).unsqueeze(1) + 0.05 * torch.randn(n, 1)
+        self.Y_signal = torch.sin(self.coords[:, 0] * 1.5).unsqueeze(
+            1
+        ) + 0.05 * torch.randn(n, 1)
         self.Y_noise = torch.randn(n, 2)
 
     def test_fit_residuals_shape(self):
@@ -510,8 +502,10 @@ class TestFFTKernelGPR(unittest.TestCase):
     def test_fit_residuals_batch_matches_single(self):
         """fit_residuals_batch should give same result as repeated fit_residuals."""
         gpr = FFTKernelGPR(constant_value_bounds="fixed")
-        res_single = [gpr.fit_residuals(self.coords, self.Y_signal),
-                      gpr.fit_residuals(self.coords, self.Y_noise)]
+        res_single = [
+            gpr.fit_residuals(self.coords, self.Y_signal),
+            gpr.fit_residuals(self.coords, self.Y_noise),
+        ]
         res_batch = gpr.fit_residuals_batch(self.coords, [self.Y_signal, self.Y_noise])
         for single, batch in zip(res_single, res_batch):
             torch.testing.assert_close(single, batch, atol=1e-5, rtol=1e-4)
@@ -575,7 +569,9 @@ class TestFFTKernelGPR(unittest.TestCase):
         # Both should be roughly uniform under null (KS p > 0.05)
         ks_sk = kstest(pvals_sk, "uniform").pvalue
         ks_fft = kstest(pvals_fft, "uniform").pvalue
-        self.assertGreater(ks_sk, 0.01, f"sklearn p-values not uniform: KS p={ks_sk:.4f}")
+        self.assertGreater(
+            ks_sk, 0.01, f"sklearn p-values not uniform: KS p={ks_sk:.4f}"
+        )
         self.assertGreater(ks_fft, 0.01, f"FFT p-values not uniform: KS p={ks_fft:.4f}")
 
 

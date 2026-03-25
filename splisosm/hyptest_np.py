@@ -729,7 +729,7 @@ class SplisosmNP:
         nan_filling: Literal["mean", "none"] = "mean",
         gpr_backend: Literal["sklearn", "gpytorch"] = "sklearn",
         gpr_configs: Optional[dict[str, Any]] = None,
-        residualize: Literal["cov_only", "iso_only", "both"] = "cov_only",
+        residualize: Literal["cov_only", "both"] = "cov_only",
         print_progress: bool = True,
         return_results: bool = False,
     ) -> Optional[dict[str, Any]]:
@@ -773,6 +773,8 @@ class SplisosmNP:
         gpr_backend : str, optional
             GPR backend to use for ``method='hsic-gp'``.
             One of ``'sklearn'`` (default) or ``'gpytorch'``.
+            For FFT-accelerated spatial GP on regular grids use
+            :class:`~splisosm.hyptest_fft.SplisosmFFT` instead.
         gpr_configs : dict, optional
             Nested configuration dict for the GPR objects, with optional keys
             ``'covariate'`` and/or ``'isoform'``.  Each sub-dict is forwarded to
@@ -787,22 +789,20 @@ class SplisosmNP:
                         "length_scale_bounds": "fixed",
                     },
                     "isoform": {
-                        "constant_value": 1e-3,
-                        "constant_value_bounds": "fixed",
+                        "constant_value": 1.0,
+                        "constant_value_bounds": (1e-3, 1e3),
                         "length_scale": 1.0,
                         "length_scale_bounds": "fixed",
                     },
                 }
 
-        residualize : {"cov_only", "iso_only", "both"}, optional
+        residualize : {"cov_only", "both"}, optional
             Controls which signals are spatially residualized when
             ``method="hsic-gp"``:
 
             * ``"cov_only"`` (default): residualize covariates only; test
               HSIC(Z_res, Y_raw).  Fastest; calibration matches ``"both"``
               when covariate GPR captures most spatial confounding.
-            * ``"iso_only"``: residualize isoform ratios only; test
-              HSIC(Z_raw, Y_res).
             * ``"both"``: residualize both covariates and isoform ratios.
         print_progress : bool, optional
             Whether to show the progress bar. Default to True.
@@ -828,7 +828,7 @@ class SplisosmNP:
         valid_methods = ["hsic", "hsic-gp", "t-fisher", "t-tippett"]
         valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
         valid_nan_filling = ["none", "mean"]
-        valid_residualize = ["cov_only", "iso_only", "both"]
+        valid_residualize = ["cov_only", "both"]
         assert (
             method in valid_methods
         ), f"Invalid method. Must be one of {valid_methods}."
@@ -842,34 +842,34 @@ class SplisosmNP:
             residualize in valid_residualize
         ), f"Invalid residualize. Must be one of {valid_residualize}."
 
+        n_genes = self.n_genes
+
         if method == "hsic":  # unconditional HSIC test (multivariate RV coefficient)
-            # Precompute isoform ratios for all genes
-            y_list = []
-            for counts in self.data:
+            # Pre-compute normalized covariates (n_factors small tensors, never sparse)
+            z_list = []
+            for _ind in range(n_factors):
+                z = self.design_mtx[:, _ind].clone().unsqueeze(1)  # (n_spots, 1)
+                assert (
+                    z.std() > 0
+                ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
+                z_list.append(z)
+
+            hsic_all = torch.empty(n_genes, n_factors)
+            pvals_all = torch.empty(n_genes, n_factors)
+
+            # Outer loop: one gene at a time to avoid materialising all dense counts
+            for _g, counts in enumerate(
+                tqdm(self.data, disable=(not print_progress), dynamic_ncols=True)
+            ):
                 if counts.is_sparse:
                     counts = counts.to_dense()
                 y = counts_to_ratios(
                     counts, transformation=ratio_transformation, nan_filling=nan_filling
                 )
-                y_list.append(y)
-
-            n_genes = len(y_list)
-            hsic_all = torch.empty(n_genes, n_factors)
-            pvals_all = torch.empty(n_genes, n_factors)
-
-            for _ind in tqdm(
-                range(n_factors), disable=(not print_progress), dynamic_ncols=True
-            ):
-                z = self.design_mtx[:, _ind].clone().unsqueeze(1)  # (n_spots, 1)
-                assert (
-                    z.std() > 0
-                ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
-
-                for _g, y in enumerate(y_list):
-                    # linear_hsic_test handles NaN rows internally
-                    _hsic, _pval = linear_hsic_test(z, y, centering=True)
-                    hsic_all[_g, _ind] = _hsic
-                    pvals_all[_g, _ind] = _pval
+                for _f, z in enumerate(z_list):
+                    hsic_all[_g, _f], pvals_all[_g, _f] = linear_hsic_test(
+                        z, y, centering=True
+                    )
 
             self.du_test_results = {
                 "statistic": hsic_all.numpy(),
@@ -878,7 +878,7 @@ class SplisosmNP:
             }
 
         elif method == "hsic-gp":  # conditional HSIC via GP regression residuals
-            # Build GPR configs
+            # Build GPR configs (merge user overrides over defaults)
             cov_config = {**_DEFAULT_GPR_CONFIGS["covariate"]}
             iso_config = {**_DEFAULT_GPR_CONFIGS["isoform"]}
             if gpr_configs is not None:
@@ -887,65 +887,56 @@ class SplisosmNP:
                 if "isoform" in gpr_configs:
                     iso_config.update(gpr_configs["isoform"])
 
-            # Normalize spatial coordinates
+            # Normalize spatial coordinates once
             x = self.coordinates.clone()  # (n_spots, 2)
             x = (x - x.mean(0)) / x.std(0)
             x[torch.isinf(x)] = 0  # guard against constant coordinate axes
 
-            # --- Covariate residualization (skip when iso_only) ---
-            if residualize in ("cov_only", "both"):
-                gpr_cov = make_kernel_gpr(gpr_backend, **cov_config)
-                z_res_list = []
-                for _ind in tqdm(
-                    range(n_factors), disable=(not print_progress), dynamic_ncols=True
-                ):
-                    z = self.design_mtx[:, _ind].clone()
-                    assert (
-                        z.std() > 0
-                    ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
-                    z = (z - z.mean()) / z.std()
-                    z = z.unsqueeze(1)
-                    z_res_list.append(gpr_cov.fit_residuals(x, z))
-            else:
-                # iso_only: use normalized raw covariates
-                z_res_list = []
-                for _ind in range(n_factors):
-                    z = self.design_mtx[:, _ind].clone()
-                    assert (
-                        z.std() > 0
-                    ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
-                    z = (z - z.mean()) / z.std()
-                    z_res_list.append(z.unsqueeze(1))
+            # Fit GPR for covariates and get residuals (n_factors small tensors, never sparse)
+            gpr_cov = make_kernel_gpr(gpr_backend, **cov_config)
+            z_res_list = []
+            for _ind in tqdm(
+                range(n_factors), disable=(not print_progress), dynamic_ncols=True
+            ):
+                z = self.design_mtx[:, _ind].clone()
+                assert (
+                    z.std() > 0
+                ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
+                z = (z - z.mean()) / z.std()
+                z_res_list.append(gpr_cov.fit_residuals(x, z.unsqueeze(1)))
 
-            # --- Isoform ratio computation ---
-            y_list = []
-            for counts in tqdm(
-                self.data, disable=(not print_progress), dynamic_ncols=True
+            # Optionally fit GPR for isoform ratios to residualize spatial effects in the response as well.
+            if residualize == "both":
+                gpr_iso = make_kernel_gpr(gpr_backend, **iso_config)
+                # Warm up the shared eigendecomposition for backends that support it
+                # (e.g. sklearn with fixed signal bounds) so the first gene does not
+                # pay the cost of a redundant full GP fit.
+                if (
+                    hasattr(gpr_iso, "precompute_shared_kernel")
+                    and gpr_iso.signal_bounds_fixed
+                ):
+                    gpr_iso.precompute_shared_kernel(x)
+
+            # --- Main loop: densify and process one gene at a time ---
+            hsic_all = torch.empty(n_genes, n_factors)
+            pvals_all = torch.empty(n_genes, n_factors)
+
+            for _g, counts in enumerate(
+                tqdm(self.data, disable=(not print_progress), dynamic_ncols=True)
             ):
                 if counts.is_sparse:
                     counts = counts.to_dense()
                 y = counts_to_ratios(
                     counts, transformation=ratio_transformation, nan_filling=nan_filling
                 )
-                y_list.append(y)
 
-            # --- Isoform residualization (skip when cov_only) ---
-            if residualize in ("iso_only", "both"):
-                gpr_iso = make_kernel_gpr(gpr_backend, **iso_config)
-                y_res_list = gpr_iso.fit_residuals_batch(x, y_list)
-            else:
-                # cov_only: use raw isoform ratios
-                y_res_list = y_list
+                if residualize == "both":
+                    y = gpr_iso.fit_residuals(x, y)
 
-            # --- HSIC for all (gene, factor) pairs ---
-            n_genes = len(y_res_list)
-            hsic_all = torch.empty(n_genes, n_factors)
-            pvals_all = torch.empty(n_genes, n_factors)
-            for _f, _z in enumerate(z_res_list):
-                for _g, _y in enumerate(y_res_list):
-                    _hsic, _pval = linear_hsic_test(_z, _y, centering=True)
-                    hsic_all[_g, _f] = _hsic
-                    pvals_all[_g, _f] = _pval
+                for _f, z_res in enumerate(z_res_list):
+                    hsic_all[_g, _f], pvals_all[_g, _f] = linear_hsic_test(
+                        z_res, y, centering=True
+                    )
 
             self.du_test_results = {
                 "statistic": hsic_all.numpy(),
@@ -957,47 +948,33 @@ class SplisosmNP:
             # method to combine p-values across isoforms, either 'fisher' or 'tippett'
             combine_method = re.findall(r"^t-(.+)", method)[0]
 
-            _du_ttest_stats_all, _du_ttest_pvals_all = [], []
+            stats_all = np.empty((n_genes, n_factors))
+            pvals_all = np.empty((n_genes, n_factors))
 
-            # iterate over factors
-            for _ind in range(n_factors):
-                # iterate over genes and calculate the t-test statistic
-                _du_ttest_stats, _du_ttest_pvals = [], []
-                for counts in self.data:
-                    if counts.is_sparse:
-                        counts = counts.to_dense()
-
-                    # calculate isoform usage ratio (n_spots, n_isos)
-                    ratios = counts_to_ratios(
-                        counts,
-                        transformation=ratio_transformation,
-                        nan_filling=nan_filling,
-                    )
-
-                    # run t-test and combine p-values
+            # Outer loop: one gene at a time so each sparse tensor is densified once
+            for _g, counts in enumerate(
+                tqdm(self.data, disable=(not print_progress), dynamic_ncols=True)
+            ):
+                if counts.is_sparse:
+                    counts = counts.to_dense()
+                ratios = counts_to_ratios(
+                    counts,
+                    transformation=ratio_transformation,
+                    nan_filling=nan_filling,
+                )
+                for _ind in range(n_factors):
                     _stats, _pvals = _calc_ttest_differential_usage(
                         ratios,
                         self.design_mtx[:, _ind],
                         combine_pval=True,
                         combine_method=combine_method,
                     )
-                    _du_ttest_stats.append(_stats)
-                    _du_ttest_pvals.append(_pvals)
+                    stats_all[_g, _ind] = _stats
+                    pvals_all[_g, _ind] = _pvals
 
-                _du_ttest_stats = np.stack(_du_ttest_stats, axis=0)
-                _du_ttest_pvals = np.stack(_du_ttest_pvals, axis=0)
-
-                _du_ttest_stats_all.append(_du_ttest_stats)
-                _du_ttest_pvals_all.append(_du_ttest_pvals)
-
-            # combine results
-            _du_ttest_stats_all = np.stack(_du_ttest_stats_all, axis=1)
-            _du_ttest_pvals_all = np.stack(_du_ttest_pvals_all, axis=1)
-
-            # store the results
             self.du_test_results = {
-                "statistic": _du_ttest_stats_all,  # (n_genes, n_factors)
-                "pvalue": _du_ttest_pvals_all,  # (n_genes, n_factors)
+                "statistic": stats_all,  # (n_genes, n_factors)
+                "pvalue": pvals_all,  # (n_genes, n_factors)
                 "method": method,
             }
 

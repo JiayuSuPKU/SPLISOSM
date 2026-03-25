@@ -1,36 +1,23 @@
 """Kernel Gaussian Process Regression backends for SPLISOSM spatial residualization.
 
 This module provides an abstract interface and concrete implementations for
-kernel-based spatial residualization used by the SPLISOSM differential-usage
-tests.  The design deliberately decouples what the kernel computes from how
-the n x n matrix is (or is not) materialized, so that large-dataset backends can
-be swapped in without changing the public calling interface.
+kernel-based conditional independence testing (via spatial residualization)
+used by the SPLISOSM differential-usage tests.
 
 Kernel-operator hierarchy
 --------------------------
-``SpatialKernelOp`` (abstract)
-    ``DenseKernelOp``     - stores K explicitly; Cholesky solve; O(n^2) memory.
-    ``FFTKernelOp``       - defined in ``hyptest_fft``; O(N log N); no matrix.
-    (planned) ``LanczosKernelOp`` - CG/Lanczos for large sparse kernels.
+``SpatialKernelOp`` (abstract):
+
+    - ``DenseKernelOp``     - stores K explicitly; Cholesky solve; O(n^2) memory.
+    - ``FFTKernelOp``       - operates in the spectral domain; O(N log N); no matrix.
 
 GPR-residualizer hierarchy
 ---------------------------
-``KernelGPR`` (abstract)
-    ``SklearnKernelGPR``  - sklearn backend; dense; suitable for n <= ~10,000.
-    ``GPyTorchKernelGPR`` - GPyTorch backend (optional dep); lazy tensors.
+``KernelGPR`` (abstract):
 
-``SplisosmNP`` currently constructs ``DenseKernelOp`` / ``SklearnKernelGPR``.
-Future large-dataset support is unlocked by substituting an implicit
-``SpatialKernelOp`` subclass without changing the public API.
-
-Public API
-----------
-``SpatialKernelOp``, ``DenseKernelOp``
-``KernelGPR``, ``SklearnKernelGPR``, ``GPyTorchKernelGPR``
-``make_kernel_gpr``
-``linear_hsic_test``
-``get_kernel_regression_residual_op``
-``fit_kernel_gpr``     (backward-compat wrapper)
+    - ``SklearnKernelGPR``  - sklearn backend; dense; suitable for n <= ~10,000.
+    - ``GPyTorchKernelGPR`` - GPyTorch backend (optional dep); lazy tensors.
+    - ``FFTKernelGPR``      - FFT-based kernel; suitable for regular grids.
 """
 
 from __future__ import annotations
@@ -63,9 +50,6 @@ __all__ = [
     "make_kernel_gpr",
     # HSIC utilities
     "linear_hsic_test",
-    # Lower-level helpers (also exported for tests / advanced use)
-    "get_kernel_regression_residual_op",
-    "build_rbf_kernel",
     # Backward-compat wrapper
     "fit_kernel_gpr",
 ]
@@ -89,9 +73,6 @@ class SpatialKernelOp(ABC):
     ``FFTKernelOp`` (``splisosm.hyptest_fft``)
         Operates entirely in the spectral domain; O(N log N) per operation;
         no n x n matrix formed at any point.
-    (planned) ``LanczosKernelOp``
-        Conjugate-gradient / Lanczos for large or sparse kernels where only
-        matrix-vector products are available.
 
     Extending ``SplisosmNP`` to large datasets
     ------------------------------------------
@@ -100,26 +81,6 @@ class SpatialKernelOp(ABC):
     an implicit subclass (e.g. ``LanczosKernelOp``) and pair it with an
     iterative ``KernelGPR`` that only calls ``matvec``; the rest of the
     pipeline is unchanged.
-
-    Attributes
-    ----------
-    n : int
-        Number of data points.
-
-    Methods
-    -------
-    matvec(v)
-        Compute K @ v.
-    solve(v, epsilon)
-        Solve (K + epsilon * I) u = v.
-    residuals(v, epsilon)
-        Apply the kernel regression residual operator.
-    eigenvalues(k)
-        Return eigenvalues of K in descending order.
-    trace()
-        Return trace(K).
-    square_trace()
-        Return trace(K**2).
     """
 
     @property
@@ -133,12 +94,12 @@ class SpatialKernelOp(ABC):
 
         Parameters
         ----------
-        v : torch.Tensor, shape (n,) or (n, m)
+        v : torch.Tensor, shape (n_obs,) or (n_obs, m)
             Input vector or matrix.
 
         Returns
         -------
-        torch.Tensor, shape (n,) or (n, m)
+        torch.Tensor, shape (n_obs,) or (n_obs, m)
             Result of K @ v.
         """
 
@@ -148,14 +109,14 @@ class SpatialKernelOp(ABC):
 
         Parameters
         ----------
-        v : torch.Tensor, shape (n, m)
+        v : torch.Tensor, shape (n_obs, m)
             Right-hand side vector or matrix.
         epsilon : float
             Regularization / noise level (> 0).
 
         Returns
         -------
-        torch.Tensor, shape (n, m)
+        torch.Tensor, shape (n_obs, m)
             Solution u.
         """
 
@@ -167,14 +128,14 @@ class SpatialKernelOp(ABC):
 
         Parameters
         ----------
-        v : torch.Tensor, shape (n, m)
+        v : torch.Tensor, shape (n_obs, m)
             Input vector or matrix.
         epsilon : float
             Regularization / noise level (> 0).
 
         Returns
         -------
-        torch.Tensor, shape (n, m)
+        torch.Tensor, shape (n_obs, m)
             Residual vector or matrix.
         """
         return epsilon * self.solve(v, epsilon)
@@ -190,7 +151,7 @@ class SpatialKernelOp(ABC):
 
         Returns
         -------
-        torch.Tensor, shape (k,) or (n,)
+        torch.Tensor, shape (k,) or (n_obs,)
             Eigenvalues in descending order.
         """
 
@@ -212,13 +173,8 @@ class DenseKernelOp(SpatialKernelOp):
 
     Parameters
     ----------
-    K : torch.Tensor, shape (n, n)
+    K : torch.Tensor, shape (n_obs, n_obs)
         Symmetric positive semi-definite kernel matrix.
-
-    Attributes
-    ----------
-    n : int
-        Number of data points (inferred from K).
     """
 
     def __init__(self, K: torch.Tensor) -> None:
@@ -261,9 +217,9 @@ class DenseKernelOp(SpatialKernelOp):
 
         Returns
         -------
-        eigenvalues : torch.Tensor, shape (n,)
+        eigenvalues : torch.Tensor, shape (n_obs,)
             Eigenvalues in ascending order.
-        eigenvectors : torch.Tensor, shape (n, n)
+        eigenvectors : torch.Tensor, shape (n_obs, n_obs)
             Corresponding orthonormal eigenvectors.
         """
         return torch.linalg.eigh(self._K)
@@ -299,15 +255,6 @@ class FFTKernelOp(SpatialKernelOp):
         RBF length scale (in the same units as dy/dx).
     workers : int or None
         Number of ``scipy.fft`` workers.
-
-    Attributes
-    ----------
-    n : int
-        Total number of grid cells (ny * nx).
-    ny, nx : int
-        Grid dimensions.
-    eigenvalues_2d : np.ndarray, shape (ny, nx)
-        FFT2 of the kernel first row (lazy, computed on first access).
     """
 
     def __init__(
@@ -379,7 +326,7 @@ class FFTKernelOp(SpatialKernelOp):
 
         Parameters
         ----------
-        v : np.ndarray, shape (n,) or (n, m)
+        v : np.ndarray, shape (n_obs,) or (n_obs, m)
 
         Returns
         -------
@@ -396,7 +343,7 @@ class FFTKernelOp(SpatialKernelOp):
 
         Parameters
         ----------
-        v : np.ndarray, shape (n,) or (n, m)
+        v : np.ndarray, shape (n_obs,) or (n_obs, m)
         epsilon : float
             Regularization level (> 0).
 
@@ -415,7 +362,7 @@ class FFTKernelOp(SpatialKernelOp):
 
         Parameters
         ----------
-        v : np.ndarray, shape (n,) or (n, m)
+        v : np.ndarray, shape (n_obs,) or (n_obs, m)
         epsilon : float
 
         Returns
@@ -438,7 +385,7 @@ class FFTKernelOp(SpatialKernelOp):
 
         Returns
         -------
-        np.ndarray, shape (k,) or (n,).
+        np.ndarray, shape (k,) or (n_obs,).
         """
         evals = np.sort(self.eigenvalues_2d.ravel())[::-1]
         return evals[:k] if k is not None else evals
@@ -507,7 +454,7 @@ def linear_hsic_test(
 # ---------------------------------------------------------------------------
 
 
-def build_rbf_kernel(
+def _build_rbf_kernel(
     X: torch.Tensor,
     constant_value: float,
     length_scale: float,
@@ -516,7 +463,7 @@ def build_rbf_kernel(
 
     Parameters
     ----------
-    X : torch.Tensor, shape (n, d)
+    X : torch.Tensor, shape (n_obs, d)
         Normalized input coordinates.
     constant_value : float
         Signal variance.
@@ -525,32 +472,11 @@ def build_rbf_kernel(
 
     Returns
     -------
-    torch.Tensor, shape (n, n)
+    torch.Tensor, shape (n_obs, n_obs)
         Symmetric positive semi-definite kernel matrix.
     """
     kernel = C(constant_value, "fixed") * RBF(length_scale, "fixed")
     return torch.from_numpy(kernel(X.numpy())).float()
-
-
-def get_kernel_regression_residual_op(Kx: torch.Tensor, epsilon: float) -> torch.Tensor:
-    """Compute the regularized kernel regression residual operator.
-
-    Returns ``R = epsilon * (K + epsilon * I)**(-1)`` as a dense matrix.
-
-    Parameters
-    ----------
-    Kx : torch.Tensor, shape (n, n)
-        Symmetric positive semi-definite kernel matrix.
-    epsilon : float
-        Regularization / noise level (> 0).
-
-    Returns
-    -------
-    Rx : torch.Tensor, shape (n, n)
-        Residual operator ``R`` such that ``R @ Y`` gives spatial residuals of ``Y``.
-    """
-    Kx = 0.5 * (Kx + Kx.T)
-    return epsilon * torch.linalg.inv(Kx + epsilon * torch.eye(Kx.shape[0]))
 
 
 def _kernel_residuals_from_eigdecomp(
@@ -570,18 +496,18 @@ def _kernel_residuals_from_eigdecomp(
 
     Parameters
     ----------
-    eigvecs : torch.Tensor, shape (n, n)
+    eigvecs : torch.Tensor, shape (n_obs, n_obs)
         Eigenvectors of the base kernel, ascending eigenvalue order.
-    eigvals : torch.Tensor, shape (n,)
+    eigvals : torch.Tensor, shape (n_obs,)
         Eigenvalues, ascending order.
-    Y : torch.Tensor, shape (n, m)
+    Y : torch.Tensor, shape (n_obs, m)
         Target data (no NaN values).
     epsilon_bounds : tuple[float, float]
         Log-space search bounds for the noise level.
 
     Returns
     -------
-    torch.Tensor, shape (n, m)
+    torch.Tensor, shape (n_obs, m)
         Spatial residuals of Y.
     """
     eigvals_np = eigvals.numpy()
@@ -618,15 +544,6 @@ class KernelGPR(ABC):
 
     All subclasses expose the same ``fit_residuals`` interface so that the
     DU-test pipeline in ``SplisosmNP`` and ``SplisosmFFT`` is backend-agnostic.
-
-    Methods
-    -------
-    fit_residuals(coords, Y)
-        Fit GP and return spatial residuals for a single target matrix.
-    fit_residuals_batch(coords, Y_list)
-        Fit residuals for multiple targets sharing the same coordinates.
-    get_kernel_op(coords)
-        Build the kernel operator for given coordinates.
     """
 
     @abstractmethod
@@ -639,14 +556,14 @@ class KernelGPR(ABC):
 
         Parameters
         ----------
-        coords : torch.Tensor, shape (n, d)
+        coords : torch.Tensor, shape (n_obs, d)
             Spatial coordinates (should be pre-normalized by the caller).
-        Y : torch.Tensor, shape (n, m)
+        Y : torch.Tensor, shape (n_obs, m)
             Target values (may contain NaN rows, which are handled internally).
 
         Returns
         -------
-        residuals : torch.Tensor, shape (n, m)
+        residuals : torch.Tensor, shape (n_obs, m)
             Residuals Y - GP_smooth(Y | coords). NaN rows in Y are preserved as NaN.
         """
 
@@ -664,15 +581,15 @@ class KernelGPR(ABC):
 
         Parameters
         ----------
-        coords : torch.Tensor, shape (n, d)
+        coords : torch.Tensor, shape (n_obs, d)
             Spatial coordinates.
         Y_list : list of torch.Tensor
-            List of target matrices, each shape (n, m_i).
+            List of target matrices, each shape (n_obs, m_i).
 
         Returns
         -------
         list of torch.Tensor
-            List of residual matrices, each shape (n, m_i).
+            List of residual matrices, each shape (n_obs, m_i).
         """
         return [self.fit_residuals(coords, Y) for Y in Y_list]
 
@@ -688,7 +605,7 @@ class KernelGPR(ABC):
 
         Parameters
         ----------
-        coords : torch.Tensor, shape (n, d)
+        coords : torch.Tensor, shape (n_obs, d)
             Spatial coordinates.
 
         Returns
@@ -711,32 +628,18 @@ class KernelGPR(ABC):
 # ---------------------------------------------------------------------------
 
 _DEFAULT_GPR_CONFIGS = {
-    # Covariate GPR: optimize signal amplitude; length scale fixed at 1.0
-    # (coordinates are z-score normalized before fitting).
+    # Covariate GPR: optimize signal amplitude via MLE; length scale fixed
+    # at 1.0 (coordinates are z-score normalized before fitting).
     "covariate": {
         "constant_value": 1.0,
         "constant_value_bounds": (1e-3, 1e3),
         "length_scale": 1.0,
         "length_scale_bounds": "fixed",
     },
-    # Isoform GPR (default, fast): both signal bounds fixed -> shared
-    # eigendecomposition fast path (O(n^2) per gene).  The tiny
-    # constant_value means the kernel contributes negligibly; only the
-    # WhiteKernel noise level is optimized per gene.  Use this when
-    # the covariate residualization alone is expected to remove spatial
-    # confounding (n_spots <= ~5,000 and covariate GPR has wide bounds).
+    # Isoform GPR: same calibrated config as covariate — signal amplitude
+    # is optimized per gene via MLE.  Only used when residualize='both';
+    # the default behavior residualize='cov_only' skips this entirely.
     "isoform": {
-        "constant_value": 1e-3,
-        "constant_value_bounds": "fixed",
-        "length_scale": 1.0,
-        "length_scale_bounds": "fixed",
-    },
-    # Isoform GPR (calibrated): signal amplitude is optimized per gene
-    # via full MLE (O(n^3) per gene, no shared eigendecomp fast path).
-    # Use when isoform ratios carry substantial spatial autocorrelation
-    # (e.g. iso_usage_variability='mvn') and the covariate fit alone
-    # may not remove all confounding -- at the cost of ~10x slower runtime.
-    "isoform_calibrated": {
         "constant_value": 1.0,
         "constant_value_bounds": (1e-3, 1e3),
         "length_scale": 1.0,
@@ -768,11 +671,6 @@ class SklearnKernelGPR(KernelGPR):
         Initial RBF length scale.
     length_scale_bounds : tuple or ``"fixed"``
         Search bounds for the length scale.
-
-    Attributes
-    ----------
-    signal_bounds_fixed : bool
-        True when both constant_value and length_scale bounds are fixed.
 
     Notes
     -----
@@ -839,8 +737,8 @@ class SklearnKernelGPR(KernelGPR):
 
         Parameters
         ----------
-        coords : torch.Tensor, shape (n, d)
-            Normalized spatial coordinates, shape (n, d).
+        coords : torch.Tensor, shape (n_obs, d)
+            Normalized spatial coordinates, shape (n_obs, d).
 
         Returns
         -------
@@ -853,7 +751,7 @@ class SklearnKernelGPR(KernelGPR):
                 stacklevel=2,
             )
             return
-        K = build_rbf_kernel(coords, self._constant_value, self._length_scale)
+        K = _build_rbf_kernel(coords, self._constant_value, self._length_scale)
         K = 0.5 * (K + K.T)
         eigvals, eigvecs = torch.linalg.eigh(K)  # ascending
         self._shared_eigvals = eigvals
@@ -864,7 +762,7 @@ class SklearnKernelGPR(KernelGPR):
 
         Parameters
         ----------
-        coords : torch.Tensor, shape (n, d)
+        coords : torch.Tensor, shape (n_obs, d)
             Normalized spatial coordinates.
 
         Returns
@@ -872,7 +770,7 @@ class SklearnKernelGPR(KernelGPR):
         DenseKernelOp
             Kernel operator for the given coordinates.
         """
-        K = build_rbf_kernel(coords, self._constant_value, self._length_scale)
+        K = _build_rbf_kernel(coords, self._constant_value, self._length_scale)
         return DenseKernelOp(K)
 
     # ------------------------------------------------------------------
@@ -895,14 +793,14 @@ class SklearnKernelGPR(KernelGPR):
 
         Parameters
         ----------
-        coords : torch.Tensor, shape (n, d)
+        coords : torch.Tensor, shape (n_obs, d)
             Normalized spatial coordinates.
-        Y : torch.Tensor, shape (n, m)
+        Y : torch.Tensor, shape (n_obs, m)
             Target values; may contain NaN rows.
 
         Returns
         -------
-        torch.Tensor, shape (n, m)
+        torch.Tensor, shape (n_obs, m)
             Spatial residuals. NaN rows from Y are preserved as NaN.
         """
         is_nan = torch.isnan(Y).any(1)
@@ -951,15 +849,15 @@ class SklearnKernelGPR(KernelGPR):
 
         Parameters
         ----------
-        coords : torch.Tensor, shape (n, d)
+        coords : torch.Tensor, shape (n_obs, d)
             Normalized spatial coordinates.
         Y_list : list of torch.Tensor
-            List of target matrices, each shape (n, m_i).
+            List of target matrices, each shape (n_obs, m_i).
 
         Returns
         -------
         list of torch.Tensor
-            List of residual matrices, each shape (n, m_i).
+            List of residual matrices, each shape (n_obs, m_i).
         """
         if self.signal_bounds_fixed and self._shared_eigvals is None:
             self.precompute_shared_kernel(coords)
@@ -1082,11 +980,6 @@ class GPyTorchKernelGPR(KernelGPR):
     device : str
         PyTorch device string, e.g. ``"cpu"`` or ``"cuda"``.
 
-    Attributes
-    ----------
-    signal_bounds_fixed : bool
-        True when both constant_value and length_scale bounds are ``"fixed"``.
-
     Notes
     -----
     Requires ``gpytorch`` (optional dependency)::
@@ -1158,14 +1051,14 @@ class GPyTorchKernelGPR(KernelGPR):
 
         Parameters
         ----------
-        coords : torch.Tensor, shape (n, d)
+        coords : torch.Tensor, shape (n_obs, d)
             Normalized spatial coordinates.
-        Y : torch.Tensor, shape (n, m)
+        Y : torch.Tensor, shape (n_obs, m)
             Target values; may contain NaN rows.
 
         Returns
         -------
-        torch.Tensor, shape (n, m)
+        torch.Tensor, shape (n_obs, m)
             Spatial residuals ``epsilon * (K + epsilon * I)**(-1) @ Y``.
             NaN rows from Y are preserved as NaN.
         """
@@ -1271,15 +1164,6 @@ class FFTKernelGPR(KernelGPR):
         Search bounds for the white-noise / regularization level.
     workers : int or None
         Number of ``scipy.fft`` workers.
-
-    Attributes
-    ----------
-    signal_bounds_fixed : bool
-        True when ``constant_value_bounds == "fixed"``.
-    ny, nx : int or None
-        Grid dimensions populated on first :meth:`fit_residuals` call.
-    n : int or None
-        Total grid cells.
     """
 
     def __init__(
@@ -1349,7 +1233,7 @@ class FFTKernelGPR(KernelGPR):
 
         Parameters
         ----------
-        coords : torch.Tensor, shape (n, 2)
+        coords : torch.Tensor, shape (n_obs, 2)
 
         Returns
         -------
@@ -1389,13 +1273,12 @@ class FFTKernelGPR(KernelGPR):
 
     def _get_unit_op(self, ny: int, nx: int, dy: float, dx: float) -> FFTKernelOp:
         """Build/cache a unit-spectrum FFTKernelOp (sigma^2 = 1)."""
-        if (
-            self._unit_op is None
-            or self._ny != ny
-            or self._nx != nx
-        ):
+        if self._unit_op is None or self._ny != ny or self._nx != nx:
             self._unit_op = FFTKernelOp(
-                ny=ny, nx=nx, dy=dy, dx=dx,
+                ny=ny,
+                nx=nx,
+                dy=dy,
+                dx=dx,
                 constant_value=1.0,
                 length_scale=self._length_scale,
                 workers=self._workers,
@@ -1468,9 +1351,13 @@ class FFTKernelGPR(KernelGPR):
 
             lo_eps, hi_eps = self._epsilon_bounds
             lo_s, hi_s = self._constant_value_bounds
-            x0 = np.array([np.log(self._constant_value), np.log(np.sqrt(lo_eps * hi_eps))])
-            bounds_lb = [(np.log(float(lo_s)), np.log(float(hi_s))),
-                         (np.log(lo_eps), np.log(hi_eps))]
+            x0 = np.array(
+                [np.log(self._constant_value), np.log(np.sqrt(lo_eps * hi_eps))]
+            )
+            bounds_lb = [
+                (np.log(float(lo_s)), np.log(float(hi_s))),
+                (np.log(lo_eps), np.log(hi_eps)),
+            ]
             res = minimize(neg_lml_2d, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
             return float(np.exp(res.x[0])), float(np.exp(res.x[1]))
 
@@ -1504,7 +1391,10 @@ class FFTKernelGPR(KernelGPR):
 
         # Apply residual op with optimized sigma^2
         signal_op = FFTKernelOp(
-            ny=ny, nx=nx, dy=dy, dx=dx,
+            ny=ny,
+            nx=nx,
+            dy=dy,
+            dx=dx,
             constant_value=sigma2,
             length_scale=self._length_scale,
             workers=self._workers,
@@ -1528,18 +1418,18 @@ class FFTKernelGPR(KernelGPR):
 
         Parameters
         ----------
-        coords : torch.Tensor, shape (n, 2)
+        coords : torch.Tensor, shape (n_obs, 2)
             Spatial coordinates forming a regular grid.
-        Y : torch.Tensor, shape (n, m)
+        Y : torch.Tensor, shape (n_obs, m)
             Target values (may contain NaN rows).
 
         Returns
         -------
-        torch.Tensor, shape (n, m)
+        torch.Tensor, shape (n_obs, m)
             Spatial residuals. NaN rows are preserved.
         """
         Y2d = Y if Y.dim() == 2 else Y.unsqueeze(1)
-        n_obs, m = Y2d.shape[0], Y2d.shape[1]
+        _, m = Y2d.shape[0], Y2d.shape[1]
 
         ny, nx, dy, dx, rows, cols = self._detect_grid(coords)
 
@@ -1570,12 +1460,12 @@ class FFTKernelGPR(KernelGPR):
 
         Parameters
         ----------
-        coords : torch.Tensor, shape (n, 2)
-        Y_list : list of torch.Tensor, each (n, m_i)
+        coords : torch.Tensor, shape (n_obs, 2)
+        Y_list : list of torch.Tensor, each (n_obs, m_i)
 
         Returns
         -------
-        list of torch.Tensor, each (n, m_i)
+        list of torch.Tensor, each (n_obs, m_i)
         """
         ny, nx, dy, dx, rows, cols = self._detect_grid(coords)
         unit_op = self._get_unit_op(ny, nx, dy, dx)
@@ -1583,7 +1473,7 @@ class FFTKernelGPR(KernelGPR):
         results = []
         for Y in Y_list:
             Y2d = Y if Y.dim() == 2 else Y.unsqueeze(1)
-            n_obs, m = Y2d.shape[0], Y2d.shape[1]
+            _, m = Y2d.shape[0], Y2d.shape[1]
 
             cube = np.full((ny, nx, m), np.nan, dtype=float)
             cube[rows, cols, :] = Y2d.numpy()
@@ -1594,7 +1484,10 @@ class FFTKernelGPR(KernelGPR):
             sigma2, eps = self._optimize(unit_op, power, n_cells, m_ch)
 
             signal_op = FFTKernelOp(
-                ny=ny, nx=nx, dy=dy, dx=dx,
+                ny=ny,
+                nx=nx,
+                dy=dy,
+                dx=dx,
                 constant_value=sigma2,
                 length_scale=self._length_scale,
                 workers=self._workers,
@@ -1647,7 +1540,10 @@ class FFTKernelGPR(KernelGPR):
             cube_c = cube - np.nanmean(cube, axis=(0, 1), keepdims=True)
             cube_c = np.nan_to_num(cube_c, nan=0.0, posinf=0.0, neginf=0.0)
             op = FFTKernelOp(
-                ny=ny, nx=nx, dy=dy, dx=dx,
+                ny=ny,
+                nx=nx,
+                dy=dy,
+                dx=dx,
                 constant_value=self._constant_value,
                 length_scale=self._length_scale,
                 workers=self._workers,
@@ -1740,9 +1636,9 @@ def fit_kernel_gpr(
 
     Parameters
     ----------
-    X : torch.Tensor, shape (n, d)
+    X : torch.Tensor, shape (n_obs, d)
         Input spatial coordinates.
-    Y : torch.Tensor, shape (n, m)
+    Y : torch.Tensor, shape (n_obs, m)
         Target values.
     normalize_x : bool
         Whether to z-score normalize X before fitting.
@@ -1764,7 +1660,7 @@ def fit_kernel_gpr(
     tuple[torch.Tensor, float] or torch.Tensor
         If ``return_residuals`` is False: ``(Kxy, epsilon)`` kernel matrix and
         noise level.  If ``return_residuals`` is True: residual tensor of shape
-        (n, m).
+        (n_obs, m).
     """
     n_orig = Y.shape[0]
     is_nan = torch.isnan(Y).any(1)
