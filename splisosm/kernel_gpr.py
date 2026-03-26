@@ -1306,24 +1306,32 @@ class FFTKernelGPR(KernelGPR):
         -2 LML = m * sum_k log(lam_k + eps)
                  + (1/n) * sum_k ||Y_hat_k||^2 / (lam_k + eps)
 
-    where ``lam_k = sigma^2 * s_k`` are the kernel eigenvalues,
-    ``s_k`` the unit-spectrum eigenvalues (``sigma^2 = 1``), and
+    where ``lam_k = sigma^2 * s_k(l)`` are the kernel eigenvalues,
+    ``s_k(l)`` the unit-spectrum eigenvalues at length scale ``l``, and
     ``Y_hat = FFT2(Y_cube)`` (unnormalized 2-D DFT).
 
-    * ``constant_value_bounds == "fixed"`` → 1-D bounded scalar search over
-      ``log(eps)`` (fast; shared unit spectrum across targets in batch).
-    * Otherwise → 2-D joint L-BFGS-B over ``(log_sigma2, log_eps)``.
+    Four optimization cases based on which bounds are ``"fixed"``:
+
+    1. **Both fixed** → 1-D bounded scalar search over ``log(eps)`` only.
+       Fastest; unit spectrum cached across repeated calls.
+    2. **cv free, ls fixed** → 2-D L-BFGS-B over ``(log_sigma2, log_eps)``.
+       Unit spectrum cached.
+    3. **cv fixed, ls free** → 2-D L-BFGS-B over ``(log_l, log_eps)``.
+       A fresh ``FFTKernelOp`` is built at each optimizer step.
+    4. **Both free** → 3-D L-BFGS-B over ``(log_sigma2, log_l, log_eps)``.
+       A fresh ``FFTKernelOp`` is built at each optimizer step.
 
     Parameters
     ----------
     constant_value : float
         Initial signal variance sigma^2.
     constant_value_bounds : tuple or "fixed"
-        Bounds for sigma^2. "fixed" pins sigma^2 and uses only 1-D eps search.
+        Bounds for sigma^2.  ``"fixed"`` pins sigma^2.
     length_scale : float
-        RBF length scale.  Must be fixed (``length_scale_bounds="fixed"``).
-    length_scale_bounds : str
-        Must be ``"fixed"``; length-scale optimization not yet supported.
+        Initial RBF length scale.
+    length_scale_bounds : tuple or "fixed"
+        Bounds for the RBF length scale.  ``"fixed"`` pins it; a 2-tuple
+        ``(lo, hi)`` of positive floats enables length-scale optimization.
     epsilon_bounds : tuple[float, float]
         Search bounds for the white-noise / regularization level.
     workers : int or None
@@ -1340,10 +1348,16 @@ class FFTKernelGPR(KernelGPR):
         workers: Optional[int] = None,
     ) -> None:
         if length_scale_bounds != "fixed":
-            raise NotImplementedError(
-                "FFTKernelGPR does not support length_scale optimization. "
-                "Set length_scale_bounds='fixed'."
-            )
+            if not (
+                isinstance(length_scale_bounds, (tuple, list))
+                and len(length_scale_bounds) == 2
+                and float(length_scale_bounds[0]) > 0
+                and float(length_scale_bounds[1]) > float(length_scale_bounds[0])
+            ):
+                raise ValueError(
+                    "length_scale_bounds must be 'fixed' or a 2-tuple of positive "
+                    f"floats (lo, hi) with lo < hi; got {length_scale_bounds!r}."
+                )
         self._constant_value = float(constant_value)
         self._constant_value_bounds = constant_value_bounds
         self._length_scale = float(length_scale)
@@ -1366,8 +1380,11 @@ class FFTKernelGPR(KernelGPR):
 
     @property
     def signal_bounds_fixed(self) -> bool:
-        """True when ``constant_value_bounds == "fixed"``."""
-        return self._constant_value_bounds == "fixed"
+        """True when BOTH ``constant_value_bounds`` and ``length_scale_bounds`` are ``"fixed"``."""
+        return (
+            self._constant_value_bounds == "fixed"
+            and self._length_scale_bounds == "fixed"
+        )
 
     @property
     def ny(self) -> Optional[int]:
@@ -1437,7 +1454,13 @@ class FFTKernelGPR(KernelGPR):
 
     def _get_unit_op(self, ny: int, nx: int, dy: float, dx: float) -> FFTKernelOp:
         """Build/cache a unit-spectrum FFTKernelOp (sigma^2 = 1)."""
-        if self._unit_op is None or self._ny != ny or self._nx != nx:
+        if (
+            self._unit_op is None
+            or self._ny != ny
+            or self._nx != nx
+            or self._dy != dy
+            or self._dx != dx
+        ):
             self._unit_op = FFTKernelOp(
                 ny=ny,
                 nx=nx,
@@ -1475,55 +1498,121 @@ class FFTKernelGPR(KernelGPR):
 
     def _optimize(
         self,
-        unit_op: FFTKernelOp,
         power: np.ndarray,
         n: int,
         m: int,
-    ) -> tuple[float, float]:
-        """Optimize (sigma^2, eps) via spectral LML.
+        ny: int,
+        nx: int,
+        dy: float,
+        dx: float,
+    ) -> tuple[float, float, float]:
+        """Optimize (sigma^2, length_scale, eps) via spectral LML.
+
+        Four cases depending on which bounds are ``"fixed"``:
+
+        1. Both fixed → 1-D scalar search over ``log(eps)``.
+        2. cv free, ls fixed → 2-D L-BFGS-B over ``(log_sigma2, log_eps)``.
+        3. cv fixed, ls free → 2-D L-BFGS-B over ``(log_l, log_eps)``.
+        4. Both free → 3-D L-BFGS-B over ``(log_sigma2, log_l, log_eps)``.
 
         Returns
         -------
         sigma2 : float
+        length_scale : float
         eps : float
         """
-        lam0 = unit_op.eigenvalues_2d.ravel()
         power_flat = power.ravel()
+        lo_e, hi_e = self._epsilon_bounds
+        ls_fixed = self._length_scale_bounds == "fixed"
+        cv_fixed = self._constant_value_bounds == "fixed"
 
-        if self.signal_bounds_fixed:
-            # 1-D search over log(eps) with sigma^2 fixed
-            lam_fixed = self._constant_value * lam0
+        if ls_fixed:
+            # Cases 1 & 2: unit spectrum can be cached
+            unit_op = self._get_unit_op(ny, nx, dy, dx)
+            lam0 = unit_op.eigenvalues_2d.ravel()
 
-            def neg_lml_1d(log_eps: float) -> float:
-                eps = float(np.exp(log_eps))
-                le = lam_fixed + eps
-                return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+            if cv_fixed:
+                # Case 1: 1-D search over log(eps)
+                lam_fixed = self._constant_value * lam0
 
-            lo, hi = self._epsilon_bounds
-            res = minimize_scalar(
-                neg_lml_1d, bounds=(np.log(lo), np.log(hi)), method="bounded"
-            )
-            return self._constant_value, float(np.exp(res.x))
+                def neg_lml_1d(log_eps: float) -> float:
+                    eps = float(np.exp(log_eps))
+                    le = lam_fixed + eps
+                    return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+
+                res = minimize_scalar(
+                    neg_lml_1d, bounds=(np.log(lo_e), np.log(hi_e)), method="bounded"
+                )
+                return self._constant_value, self._length_scale, float(np.exp(res.x))
+
+            else:
+                # Case 2: 2-D over (log_sigma2, log_eps)
+                lo_s, hi_s = self._constant_value_bounds
+
+                def neg_lml_2d(params: np.ndarray) -> float:
+                    sigma2 = float(np.exp(params[0]))
+                    eps = float(np.exp(params[1]))
+                    le = sigma2 * lam0 + eps
+                    return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+
+                x0 = np.array([np.log(self._constant_value), np.log(np.sqrt(lo_e * hi_e))])
+                bounds_lb = [
+                    (np.log(float(lo_s)), np.log(float(hi_s))),
+                    (np.log(lo_e), np.log(hi_e)),
+                ]
+                res = minimize(neg_lml_2d, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
+                return float(np.exp(res.x[0])), self._length_scale, float(np.exp(res.x[1]))
 
         else:
-            # 2-D joint L-BFGS-B over (log_sigma2, log_eps)
-            def neg_lml_2d(params: np.ndarray) -> float:
-                sigma2 = float(np.exp(params[0]))
-                eps = float(np.exp(params[1]))
-                le = sigma2 * lam0 + eps
-                return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+            # Cases 3 & 4: length scale is free; rebuild FFTKernelOp per step.
+            # eigenvalues are sigma^2-scaled inside the op (constant_value argument).
+            lo_l, hi_l = self._length_scale_bounds
 
-            lo_eps, hi_eps = self._epsilon_bounds
-            lo_s, hi_s = self._constant_value_bounds
-            x0 = np.array(
-                [np.log(self._constant_value), np.log(np.sqrt(lo_eps * hi_eps))]
-            )
-            bounds_lb = [
-                (np.log(float(lo_s)), np.log(float(hi_s))),
-                (np.log(lo_eps), np.log(hi_eps)),
-            ]
-            res = minimize(neg_lml_2d, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
-            return float(np.exp(res.x[0])), float(np.exp(res.x[1]))
+            if cv_fixed:
+                # Case 3: 2-D over (log_l, log_eps)
+                sigma2_fixed = self._constant_value
+
+                def neg_lml_3(params: np.ndarray) -> float:
+                    l = float(np.exp(params[0]))
+                    eps = float(np.exp(params[1]))
+                    tmp_op = FFTKernelOp(ny, nx, dy, dx, sigma2_fixed, l, self._workers)
+                    lam = tmp_op.eigenvalues_2d.ravel()
+                    le = lam + eps
+                    return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+
+                x0 = np.array([np.log(self._length_scale), np.log(np.sqrt(lo_e * hi_e))])
+                bounds_lb = [
+                    (np.log(float(lo_l)), np.log(float(hi_l))),
+                    (np.log(lo_e), np.log(hi_e)),
+                ]
+                res = minimize(neg_lml_3, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
+                return sigma2_fixed, float(np.exp(res.x[0])), float(np.exp(res.x[1]))
+
+            else:
+                # Case 4: 3-D over (log_sigma2, log_l, log_eps)
+                lo_s, hi_s = self._constant_value_bounds
+
+                def neg_lml_4(params: np.ndarray) -> float:
+                    sigma2 = float(np.exp(params[0]))
+                    l = float(np.exp(params[1]))
+                    eps = float(np.exp(params[2]))
+                    tmp_op = FFTKernelOp(ny, nx, dy, dx, sigma2, l, self._workers)
+                    lam = tmp_op.eigenvalues_2d.ravel()
+                    le = lam + eps
+                    return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+
+                x0 = np.array([
+                    np.log(self._constant_value),
+                    np.log(self._length_scale),
+                    np.log(np.sqrt(lo_e * hi_e)),
+                ])
+                bounds_lb = [
+                    (np.log(float(lo_s)), np.log(float(hi_s))),
+                    (np.log(float(lo_l)), np.log(float(hi_l))),
+                    (np.log(lo_e), np.log(hi_e)),
+                ]
+                res = minimize(neg_lml_4, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
+                return float(np.exp(res.x[0])), float(np.exp(res.x[1])), float(np.exp(res.x[2]))
 
     def _residualize_cube(
         self,
@@ -1532,7 +1621,7 @@ class FFTKernelGPR(KernelGPR):
         nx: int,
         dy: float,
         dx: float,
-    ) -> tuple[np.ndarray, float, float]:
+    ) -> tuple[np.ndarray, float, float, float]:
         """Core per-cube residualization.
 
         Parameters
@@ -1544,27 +1633,27 @@ class FFTKernelGPR(KernelGPR):
         -------
         res_cube : np.ndarray, shape (ny, nx, m)
         sigma2 : float
+        length_scale : float
         eps : float
         """
         cube = raw_cube - np.nanmean(raw_cube, axis=(0, 1), keepdims=True)
         cube = np.nan_to_num(cube, nan=0.0, posinf=0.0, neginf=0.0)
 
-        unit_op = self._get_unit_op(ny, nx, dy, dx)
         power, n, m = self._yhat_power(cube)
-        sigma2, eps = self._optimize(unit_op, power, n, m)
+        sigma2, length_scale, eps = self._optimize(power, n, m, ny, nx, dy, dx)
 
-        # Apply residual op with optimized sigma^2
+        # Apply residual op with optimized hyperparameters
         signal_op = FFTKernelOp(
             ny=ny,
             nx=nx,
             dy=dy,
             dx=dx,
             constant_value=sigma2,
-            length_scale=self._length_scale,
+            length_scale=length_scale,
             workers=self._workers,
         )
         res = signal_op.residuals(cube.reshape(n, m), eps)
-        return res.reshape(ny, nx, m), sigma2, eps
+        return res.reshape(ny, nx, m), sigma2, length_scale, eps
 
     # ------------------------------------------------------------------
     # KernelGPR public interface
@@ -1601,7 +1690,7 @@ class FFTKernelGPR(KernelGPR):
         cube = np.full((ny, nx, m), np.nan, dtype=float)
         cube[rows, cols, :] = Y2d.numpy()
 
-        res_cube, _, _ = self._residualize_cube(cube, ny, nx, dy, dx)
+        res_cube, _, _, _ = self._residualize_cube(cube, ny, nx, dy, dx)
 
         # De-rasterize and restore NaN rows
         out = torch.from_numpy(res_cube[rows, cols, :]).float()
@@ -1632,7 +1721,8 @@ class FFTKernelGPR(KernelGPR):
         list of torch.Tensor, each (n_obs, m_i)
         """
         ny, nx, dy, dx, rows, cols = self._detect_grid(coords)
-        unit_op = self._get_unit_op(ny, nx, dy, dx)
+        # No pre-computed unit_op: _optimize handles caching internally for
+        # fixed-ls cases; cases 3 & 4 rebuild per optimizer step anyway.
 
         results = []
         for Y in Y_list:
@@ -1645,7 +1735,7 @@ class FFTKernelGPR(KernelGPR):
             cube_c = np.nan_to_num(cube_c, nan=0.0, posinf=0.0, neginf=0.0)
 
             power, n_cells, m_ch = self._yhat_power(cube_c)
-            sigma2, eps = self._optimize(unit_op, power, n_cells, m_ch)
+            sigma2, length_scale, eps = self._optimize(power, n_cells, m_ch, ny, nx, dy, dx)
 
             signal_op = FFTKernelOp(
                 ny=ny,
@@ -1653,7 +1743,7 @@ class FFTKernelGPR(KernelGPR):
                 dy=dy,
                 dx=dx,
                 constant_value=sigma2,
-                length_scale=self._length_scale,
+                length_scale=length_scale,
                 workers=self._workers,
             )
             res = signal_op.residuals(cube_c.reshape(n_cells, m), eps)
@@ -1716,7 +1806,7 @@ class FFTKernelGPR(KernelGPR):
             res_cube = res.reshape(ny, nx, m)
             self._ny, self._nx, self._dy, self._dx = ny, nx, dy, dx
         else:
-            res_cube, _, epsilon = self._residualize_cube(cube, ny, nx, dy, dx)
+            res_cube, _, _, epsilon = self._residualize_cube(cube, ny, nx, dy, dx)
 
         return (res_cube[..., 0] if scalar else res_cube), float(epsilon)
 

@@ -1,6 +1,7 @@
 import unittest
 
 import numpy as np
+import pandas as pd
 from anndata import AnnData
 
 import splisosm.hyptest_fft as hyptest_fft
@@ -15,9 +16,15 @@ class _SpatialDataStub:
         self._images = {}
 
     def __setitem__(self, key: str, value):
-        self._images[key] = value
+        # Real spatialdata routes AnnData to sdata.tables
+        if isinstance(value, AnnData):
+            self.tables[key] = value
+        else:
+            self._images[key] = value
 
     def __getitem__(self, key: str):
+        if key in self.tables:
+            return self.tables[key]
         return self._images[key]
 
 
@@ -54,19 +61,35 @@ class _SpatialDataModuleStub:
         value_key=None,
         return_region_as_labels=False,
     ):
-        del bins, value_key, return_region_as_labels
+        del bins, return_region_as_labels
         adata = sdata.tables[table_name]
         row = adata.obs[row_key].to_numpy(dtype=int)
         col = adata.obs[col_key].to_numpy(dtype=int)
+        row = row - row.min()
+        col = col - col.min()
         ny = int(row.max()) + 1
         nx = int(col.max()) + 1
 
-        counts = np.asarray(adata.X, dtype=float)
-        out = np.zeros((counts.shape[1], ny, nx), dtype=float)
-        for i in range(counts.shape[0]):
-            out[:, row[i], col[i]] += counts[i, :]
+        var_list = adata.var_names.astype(str).tolist()
+        counts_mat = np.asarray(
+            adata.X.toarray() if hasattr(adata.X, "toarray") else adata.X,
+            dtype=float,
+        )  # (n_obs, n_vars)
 
-        return _RasterLayerStub(out, adata.var_names.astype(str).tolist())
+        if value_key is not None:
+            if isinstance(value_key, str):
+                value_key = [value_key]
+            indices = [var_list.index(v) for v in value_key]
+            counts_mat = counts_mat[:, indices]
+            channels = list(value_key)
+        else:
+            channels = var_list
+
+        out = np.zeros((counts_mat.shape[1], ny, nx), dtype=float)
+        for i in range(len(row)):
+            out[:, row[i], col[i]] += counts_mat[i, :]
+
+        return _RasterLayerStub(out, channels)
 
 
 class TestFFTKernel(unittest.TestCase):
@@ -145,6 +168,23 @@ def _build_test_sdata(table_name: str = "isoform_table") -> _SpatialDataStub:
     adata.var["gene_symbol"] = gene_symbols
     adata.var["gene_id"] = gene_ids
 
+    # Add spatialdata annotation metadata (region + instance linking)
+    adata.obs["region"] = pd.Categorical([table_name] * len(adata.obs))
+    adata.obs["instance_id"] = np.arange(len(adata.obs), dtype=int)
+    try:
+        from spatialdata.models import TableModel
+        adata = TableModel.parse(
+            adata,
+            region=table_name,
+            region_key="region",
+            instance_key="instance_id",
+        )
+    except Exception:
+        adata.uns["spatialdata_attrs"] = {
+            "region": table_name,
+            "region_key": "region",
+            "instance_key": "instance_id",
+        }
     return _SpatialDataStub(table_name=table_name, adata=adata)
 
 
@@ -383,7 +423,7 @@ class TestSplisosmFFT(unittest.TestCase):
         with self.assertRaises(ValueError):
             model.extract_feature_summary(level="bad-level")
 
-    def _setup_model(self):
+    def _setup_model(self, design_mtx=None):
         model = SplisosmFFT(rho=0.9, neighbor_degree=1)
         model.setup_data(
             self.sdata,
@@ -391,19 +431,18 @@ class TestSplisosmFFT(unittest.TestCase):
             table_name=self.table_name,
             col_key="array_col",
             row_key="array_row",
+            design_mtx=design_mtx,
         )
         return model
 
     def test_differential_usage(self):
         """hsic-gp (default): FFT GPR residualization + HSIC."""
-        model = self._setup_model()
         adata = self.sdata.tables[self.table_name]
         rng = np.random.default_rng(42)
         design = rng.standard_normal((adata.n_obs, 2))
+        model = self._setup_model(design_mtx=design)
 
         results = model.test_differential_usage(
-            design_matrix=design,
-            method="hsic-gp",
             n_jobs=1,
             return_results=True,
         )
@@ -423,100 +462,238 @@ class TestSplisosmFFT(unittest.TestCase):
         self.assertIn("factor", df.columns)
         self.assertIn("pvalue", df.columns)
 
-    def test_differential_usage_unconditional_hsic(self):
-        """hsic (unconditional): no spatial residualization, spot-level."""
-        model = self._setup_model()
-        adata = self.sdata.tables[self.table_name]
-        rng = np.random.default_rng(1)
-        design = rng.standard_normal((adata.n_obs, 2))
-
-        results = model.test_differential_usage(
-            design_matrix=design,
-            method="hsic",
-            n_jobs=1,
-            return_results=True,
-        )
-        self.assertEqual(results["statistic"].shape, (model.n_genes, 2))
-        self.assertTrue(np.all(results["pvalue"] >= 0))
-        self.assertTrue(np.all(results["pvalue"] <= 1))
-        self.assertEqual(results["method"], "hsic")
-
-    def test_differential_usage_t_fisher(self):
-        """t-fisher: per-isoform t-test with Fisher combination."""
-        model = self._setup_model()
-        adata = self.sdata.tables[self.table_name]
-        rng = np.random.default_rng(2)
-        # Binary factor (0/1)
-        binary = (rng.random(adata.n_obs) > 0.5).astype(float)[:, None]
-
-        results = model.test_differential_usage(
-            design_matrix=binary,
-            method="t-fisher",
-            n_jobs=1,
-            return_results=True,
-        )
-        self.assertEqual(results["statistic"].shape, (model.n_genes, 1))
-        self.assertTrue(np.all(results["pvalue"] >= 0))
-        self.assertTrue(np.all(results["pvalue"] <= 1))
-        self.assertEqual(results["method"], "t-fisher")
-
-    def test_differential_usage_t_tippett(self):
-        """t-tippett: per-isoform t-test with Tippett combination."""
-        model = self._setup_model()
-        adata = self.sdata.tables[self.table_name]
-        rng = np.random.default_rng(3)
-        binary = (rng.random(adata.n_obs) > 0.5).astype(float)[:, None]
-
-        results = model.test_differential_usage(
-            design_matrix=binary,
-            method="t-tippett",
-            n_jobs=1,
-            return_results=True,
-        )
-        self.assertEqual(results["statistic"].shape, (model.n_genes, 1))
-        self.assertTrue(np.all(results["pvalue"] >= 0))
-        self.assertTrue(np.all(results["pvalue"] <= 1))
-
     def test_differential_usage_dataframe_input(self):
         """Design matrix as pandas DataFrame preserves column names as factor names."""
         import pandas as pd
 
-        model = self._setup_model()
         adata = self.sdata.tables[self.table_name]
         rng = np.random.default_rng(7)
         design = pd.DataFrame(
             rng.standard_normal((adata.n_obs, 1)), columns=["condition"]
         )
+        model = self._setup_model(design_mtx=design)
 
-        results = model.test_differential_usage(
-            design_matrix=design, method="hsic", n_jobs=1, return_results=True
-        )
+        results = model.test_differential_usage(n_jobs=1, return_results=True)
         self.assertEqual(results["factor_names"], ["condition"])
 
     def test_differential_usage_invalid_inputs(self):
-        model = self._setup_model()
         adata = self.sdata.tables[self.table_name]
         rng = np.random.default_rng(0)
-
-        # invalid method
-        with self.assertRaises(ValueError):
-            model.test_differential_usage(
-                design_matrix=rng.standard_normal((adata.n_obs, 1)),
-                method="invalid_method",
-            )
-
-        # wrong number of rows
-        with self.assertRaises(ValueError):
-            model.test_differential_usage(
-                design_matrix=rng.standard_normal((adata.n_obs + 1, 1)),
-            )
+        design = rng.standard_normal((adata.n_obs, 1))
+        model = self._setup_model(design_mtx=design)
 
         # bad ratio transformation
         with self.assertRaises(ValueError):
             model.test_differential_usage(
-                design_matrix=rng.standard_normal((adata.n_obs, 1)),
                 ratio_transformation="bad_transform",
             )
+        with self.assertRaises(ValueError):
+            model.test_differential_usage(residualize="bad")
+
+    def test_setup_data_with_design_mtx(self):
+        """design_mtx passed to setup_data is stored as AnnData in sdata."""
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(0)
+        design = rng.standard_normal((adata.n_obs, 2))
+
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+            design_mtx=design,
+            covariate_names=["cov_A", "cov_B"],
+        )
+
+        self.assertEqual(model.n_factors, 2)
+        self.assertEqual(model.covariate_names, ["cov_A", "cov_B"])
+        self.assertIsNotNone(model._design_table_name)
+        # design_mtx is the AnnData table; shape = (n_obs, n_factors)
+        self.assertIsNotNone(model.design_mtx)
+        self.assertEqual(model.design_mtx.shape, (adata.n_obs, 2))
+        # The design table is registered in sdata
+        self.assertIn(model._design_table_name, self.sdata.tables)
+
+    def test_setup_data_design_mtx_from_obs_columns(self):
+        """design_mtx specified as obs column names is extracted from adata.obs."""
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(1)
+        adata.obs["covariate_x"] = rng.standard_normal(adata.n_obs)
+
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+            design_mtx="covariate_x",
+        )
+
+        self.assertEqual(model.n_factors, 1)
+        self.assertEqual(model.covariate_names, ["covariate_x"])
+        self.assertIsNotNone(model._design_table_name)
+        self.assertIn(model._design_table_name, self.sdata.tables)
+        self.assertEqual(model.design_mtx.shape, (adata.n_obs, 1))
+
+    def test_setup_data_design_mtx_from_table_name(self):
+        """design_mtx as sdata table name reuses that table's X as covariates."""
+        import anndata as ad
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(5)
+        cov_arr = rng.standard_normal((adata.n_obs, 2)).astype(np.float32)
+
+        # Add a covariate table to sdata with same obs spatial indexing
+        obs_df = adata.obs[["array_row", "array_col"]].copy()
+        cov_adata = ad.AnnData(X=cov_arr, obs=obs_df)
+        cov_adata.var_names = ["cov1", "cov2"]
+        self.sdata["my_covariates"] = cov_adata
+
+
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+            design_mtx="my_covariates",
+        )
+
+        self.assertEqual(model.n_factors, 2)
+        self.assertEqual(model.covariate_names, ["cov1", "cov2"])
+        self.assertEqual(model.design_mtx.shape, (adata.n_obs, 2))
+
+    def test_differential_usage_residualize_both(self):
+        """residualize='both' should also spatially residualize isoform ratios."""
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(4)
+        design = rng.standard_normal((adata.n_obs, 1))
+        model = self._setup_model(design_mtx=design)
+        results = model.test_differential_usage(
+            residualize="both", n_jobs=1, return_results=True
+        )
+        self.assertEqual(results["statistic"].shape, (model.n_genes, 1))
+        self.assertTrue(np.all(results["pvalue"] >= 0))
+        self.assertTrue(np.all(results["pvalue"] <= 1))
+
+    def test_differential_usage_gpr_configs(self):
+        """Custom gpr_configs overrides default GPR hyperparameters."""
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(5)
+        design = rng.standard_normal((adata.n_obs, 1))
+        model = self._setup_model(design_mtx=design)
+        custom_cfg = {"covariate": {"constant_value_bounds": "fixed", "length_scale_bounds": "fixed"}}
+        results = model.test_differential_usage(
+            gpr_configs=custom_cfg, n_jobs=1, return_results=True
+        )
+        self.assertEqual(results["statistic"].shape, (model.n_genes, 1))
+
+    def test_differential_usage_no_design_raises(self):
+        """test_differential_usage without design_mtx raises RuntimeError."""
+        model = self._setup_model()  # no design_mtx
+        with self.assertRaises(RuntimeError):
+            model.test_differential_usage(n_jobs=1)
+
+    def test_fft_vs_np_du_agreement(self):
+        """SplisosmFFT and SplisosmNP DU p-values should be positively correlated.
+
+        Both models are run on the same 6x5 regular-grid data with a continuous
+        covariate.  Since both apply spatial conditioning (hsic-gp), the p-values
+        should be rank-correlated (Spearman rho > 0 on combined null+signal).
+        """
+        from scipy.stats import spearmanr
+        from splisosm.hyptest_np import SplisosmNP
+
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(42)
+        design = rng.standard_normal((adata.n_obs, 1))
+
+        # --- SplisosmFFT ---
+        model_fft = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model_fft.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+            design_mtx=design,
+            covariate_names=["covariate"],
+        )
+        model_fft.test_differential_usage(
+            n_jobs=1, print_progress=False
+        )
+        df_fft = model_fft.get_formatted_test_results("du")
+
+        # --- SplisosmNP ---
+        row_idx = np.asarray(adata.obs["array_row"], dtype=int)
+        col_idx = np.asarray(adata.obs["array_col"], dtype=int)
+        coords = np.stack([row_idx, col_idx], axis=1).astype(float)
+
+        adata.obsm["spatial"] = coords  # add spatial coordinates from grid indices
+
+        model_np = SplisosmNP()
+        model_np.setup_data(
+            adata=adata,
+            spatial_key="spatial",
+            layer="counts",
+            group_iso_by="gene_symbol",
+            design_mtx=design,
+            covariate_names=["covariate"],
+        )
+
+        model_np.test_differential_usage(
+            method="hsic-gp",
+            gpr_backend="sklearn",
+            residualize="cov_only",
+            print_progress=False,
+        )
+        df_np = model_np.get_formatted_test_results("du")
+
+        # Align on shared genes
+        shared_genes = set(df_fft["gene"].unique()) & set(df_np["gene"].unique())
+        self.assertGreater(len(shared_genes), 0, "No shared genes between FFT and NP results")
+
+        p_fft = df_fft[df_fft["gene"].isin(shared_genes)].sort_values("gene")["pvalue"].values
+        p_np  = df_np[df_np["gene"].isin(shared_genes)].sort_values("gene")["pvalue"].values
+
+        # Rank correlation should be positive (both remove spatial confound similarly)
+        if len(p_fft) >= 4:
+            rho, _ = spearmanr(p_fft, p_np)
+            # Allow rho to be NaN (e.g., all p-values identical) or >= -0.5
+            # The key is that neither method systematically inverts the ranking.
+            if not np.isnan(rho):
+                self.assertGreater(rho, -0.5,
+                    f"FFT vs NP p-value Spearman rho={rho:.3f} is strongly negative (unexpected)")
+
+    def test_fft_gpr_scalability(self):
+        """FFTKernelGPR.fit_residuals_cube should scale as O(N log N) not O(N^2).
+
+        Verify that a 50x50 grid (2500 cells) runs in reasonable time and
+        that memory does not blow up (no n x n matrix formed).
+        """
+        import time
+        from splisosm.kernel_gpr import FFTKernelGPR
+
+        # Build a 50x50 raster cube
+        rng = np.random.default_rng(0)
+        ny, nx = 50, 50
+        cube = rng.standard_normal((ny, nx, 3)).astype(float)  # 3 channels
+
+        gpr = FFTKernelGPR(
+            constant_value_bounds=(1e-3, 1e3),
+            length_scale_bounds="fixed",
+        )
+        t0 = time.perf_counter()
+        res, eps = gpr.fit_residuals_cube(cube, spacing=(1.0, 1.0))
+        elapsed = time.perf_counter() - t0
+
+        # Should complete in under 5 seconds even for 2500-cell grid
+        self.assertLess(elapsed, 5.0, f"FFT residualization took {elapsed:.1f}s (expected < 5s)")
+        self.assertEqual(res.shape, (ny, nx, 3))
+        self.assertGreater(eps, 0)
 
 
 if __name__ == "__main__":

@@ -526,9 +526,22 @@ class TestFFTKernelGPR(unittest.TestCase):
         with self.assertRaises(ValueError):
             gpr.fit_residuals(irregular, self.Y_signal)
 
-    def test_length_scale_bounds_not_fixed_raises(self):
-        with self.assertRaises(NotImplementedError):
-            FFTKernelGPR(length_scale_bounds=(0.1, 10.0))
+    def test_length_scale_bounds_invalid_raises(self):
+        """Invalid length_scale_bounds should raise ValueError."""
+        with self.assertRaises(ValueError):
+            FFTKernelGPR(length_scale_bounds="auto")
+        with self.assertRaises(ValueError):
+            FFTKernelGPR(length_scale_bounds=(10.0, 0.1))  # lo >= hi
+
+    def test_length_scale_optimization_free(self):
+        """Free length_scale_bounds: completes, correct shape, reduces variance."""
+        gpr = FFTKernelGPR(
+            constant_value_bounds="fixed",
+            length_scale_bounds=(0.1, 10.0),
+        )
+        res = gpr.fit_residuals(self.coords, self.Y_signal)
+        self.assertEqual(res.shape, self.Y_signal.shape)
+        self.assertLess(float(res.var()), float(self.Y_signal.var()))
 
     def test_make_kernel_gpr_fft(self):
         gpr = make_kernel_gpr("fft", **_DEFAULT_GPR_CONFIGS["covariate"])
@@ -573,6 +586,67 @@ class TestFFTKernelGPR(unittest.TestCase):
             ks_sk, 0.01, f"sklearn p-values not uniform: KS p={ks_sk:.4f}"
         )
         self.assertGreater(ks_fft, 0.01, f"FFT p-values not uniform: KS p={ks_fft:.4f}")
+
+    def test_fft_sklearn_du_agreement(self):
+        """FFT and sklearn give highly correlated residuals and p-values on realistic covariates.
+
+        Uses a mixed-frequency covariate (low-freq spatial + high-freq + noise) so that
+        neither backend can achieve eps→0 (degenerate interpolation), ensuring a fair
+        comparison.  The same calibrated config (case 2: free sigma2, fixed length_scale)
+        is used for both backends.
+        """
+        from scipy.stats import spearmanr
+
+        torch.manual_seed(0)
+        n = self.coords.shape[0]  # 300
+
+        # Mixed covariate: low-freq + high-freq + noise (matches realistic covariates)
+        z = (
+            torch.sin(self.coords[:, 0] * 1.5) * 0.5     # low-frequency spatial
+            + torch.sin(self.coords[:, 0] * 8.0) * 0.3   # high-frequency spatial
+            + torch.randn(n) * 0.4                        # independent noise
+        ).unsqueeze(1)
+        z = (z - z.mean()) / z.std()
+
+        # Same calibrated config for both backends (case 2: free sigma2, fixed length_scale)
+        cfg = dict(
+            constant_value=1.0,
+            constant_value_bounds=(1e-3, 1e3),
+            length_scale=1.0,
+            length_scale_bounds="fixed",
+        )
+        gpr_fft = FFTKernelGPR(**cfg)
+        z_fft = gpr_fft.fit_residuals(self.coords, z)
+
+        gpr_sk = SklearnKernelGPR(**cfg)
+        z_sk = gpr_sk.fit_residuals(self.coords, z)
+
+        # (1) Residuals should be highly correlated (same GP kernel, different approximation)
+        r = float(np.corrcoef(z_fft.squeeze().numpy(), z_sk.squeeze().numpy())[0, 1])
+        self.assertGreater(r, 0.8, f"Pearson r between FFT and sklearn residuals: {r:.3f}")
+
+        # (2) HSIC p-values for 40 null + 40 signal genes should agree in ranking
+        pv_fft, pv_sk = [], []
+        Y_signal = 0.7 * z + 0.3 * torch.randn(n, 2)  # correlated with z
+        for seed in range(40):
+            torch.manual_seed(seed + 100)
+            Y_null = torch.randn(n, 2)
+            _, p_null_fft = linear_hsic_test(z_fft, Y_null, centering=True)
+            _, p_null_sk  = linear_hsic_test(z_sk,  Y_null, centering=True)
+            pv_fft.append(p_null_fft); pv_sk.append(p_null_sk)
+        # Add signal genes (correlated with z — should get low p-values)
+        torch.manual_seed(77)
+        for _ in range(40):
+            Y_sig = 0.7 * z + 0.3 * torch.randn(n, 2)
+            _, p_sig_fft = linear_hsic_test(z_fft, Y_sig, centering=True)
+            _, p_sig_sk  = linear_hsic_test(z_sk,  Y_sig, centering=True)
+            pv_fft.append(p_sig_fft); pv_sk.append(p_sig_sk)
+
+        rho, _ = spearmanr(pv_fft, pv_sk)
+        self.assertGreater(
+            rho, 0.8,
+            f"Spearman rho between FFT and sklearn DU p-values: {rho:.3f} (expected > 0.8)",
+        )
 
 
 try:
