@@ -698,7 +698,7 @@ class SklearnKernelGPR(KernelGPR):
         Search bounds for the length scale.
     max_n_fit : int
         Maximum n for which to allow full GP fitting. If more sample
-        points are passed to ``fit_residuals``, will use the inducing-point 
+        points are passed to ``fit_residuals``, will use the inducing-point
         kernel approximation.
 
     Notes
@@ -1538,7 +1538,9 @@ class FFTKernelGPR(KernelGPR):
                 def neg_lml_1d(log_eps: float) -> float:
                     eps = float(np.exp(log_eps))
                     le = lam_fixed + eps
-                    return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+                    return 0.5 * float(
+                        m * np.sum(np.log(le)) + np.sum(power_flat / le) / n
+                    )
 
                 res = minimize_scalar(
                     neg_lml_1d, bounds=(np.log(lo_e), np.log(hi_e)), method="bounded"
@@ -1553,15 +1555,23 @@ class FFTKernelGPR(KernelGPR):
                     sigma2 = float(np.exp(params[0]))
                     eps = float(np.exp(params[1]))
                     le = sigma2 * lam0 + eps
-                    return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+                    return 0.5 * float(
+                        m * np.sum(np.log(le)) + np.sum(power_flat / le) / n
+                    )
 
-                x0 = np.array([np.log(self._constant_value), np.log(np.sqrt(lo_e * hi_e))])
+                x0 = np.array(
+                    [np.log(self._constant_value), np.log(np.sqrt(lo_e * hi_e))]
+                )
                 bounds_lb = [
                     (np.log(float(lo_s)), np.log(float(hi_s))),
                     (np.log(lo_e), np.log(hi_e)),
                 ]
                 res = minimize(neg_lml_2d, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
-                return float(np.exp(res.x[0])), self._length_scale, float(np.exp(res.x[1]))
+                return (
+                    float(np.exp(res.x[0])),
+                    self._length_scale,
+                    float(np.exp(res.x[1])),
+                )
 
         else:
             # Cases 3 & 4: length scale is free; rebuild FFTKernelOp per step.
@@ -1573,14 +1583,18 @@ class FFTKernelGPR(KernelGPR):
                 sigma2_fixed = self._constant_value
 
                 def neg_lml_3(params: np.ndarray) -> float:
-                    l = float(np.exp(params[0]))
+                    length_scale = float(np.exp(params[0]))
                     eps = float(np.exp(params[1]))
-                    tmp_op = FFTKernelOp(ny, nx, dy, dx, sigma2_fixed, l, self._workers)
+                    tmp_op = FFTKernelOp(ny, nx, dy, dx, sigma2_fixed, length_scale, self._workers)
                     lam = tmp_op.eigenvalues_2d.ravel()
                     le = lam + eps
-                    return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+                    return 0.5 * float(
+                        m * np.sum(np.log(le)) + np.sum(power_flat / le) / n
+                    )
 
-                x0 = np.array([np.log(self._length_scale), np.log(np.sqrt(lo_e * hi_e))])
+                x0 = np.array(
+                    [np.log(self._length_scale), np.log(np.sqrt(lo_e * hi_e))]
+                )
                 bounds_lb = [
                     (np.log(float(lo_l)), np.log(float(hi_l))),
                     (np.log(lo_e), np.log(hi_e)),
@@ -1594,25 +1608,33 @@ class FFTKernelGPR(KernelGPR):
 
                 def neg_lml_4(params: np.ndarray) -> float:
                     sigma2 = float(np.exp(params[0]))
-                    l = float(np.exp(params[1]))
+                    length_scale = float(np.exp(params[1]))
                     eps = float(np.exp(params[2]))
-                    tmp_op = FFTKernelOp(ny, nx, dy, dx, sigma2, l, self._workers)
+                    tmp_op = FFTKernelOp(ny, nx, dy, dx, sigma2, length_scale, self._workers)
                     lam = tmp_op.eigenvalues_2d.ravel()
                     le = lam + eps
-                    return 0.5 * float(m * np.sum(np.log(le)) + np.sum(power_flat / le) / n)
+                    return 0.5 * float(
+                        m * np.sum(np.log(le)) + np.sum(power_flat / le) / n
+                    )
 
-                x0 = np.array([
-                    np.log(self._constant_value),
-                    np.log(self._length_scale),
-                    np.log(np.sqrt(lo_e * hi_e)),
-                ])
+                x0 = np.array(
+                    [
+                        np.log(self._constant_value),
+                        np.log(self._length_scale),
+                        np.log(np.sqrt(lo_e * hi_e)),
+                    ]
+                )
                 bounds_lb = [
                     (np.log(float(lo_s)), np.log(float(hi_s))),
                     (np.log(float(lo_l)), np.log(float(hi_l))),
                     (np.log(lo_e), np.log(hi_e)),
                 ]
                 res = minimize(neg_lml_4, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
-                return float(np.exp(res.x[0])), float(np.exp(res.x[1])), float(np.exp(res.x[2]))
+                return (
+                    float(np.exp(res.x[0])),
+                    float(np.exp(res.x[1])),
+                    float(np.exp(res.x[2])),
+                )
 
     def _residualize_cube(
         self,
@@ -1735,7 +1757,9 @@ class FFTKernelGPR(KernelGPR):
             cube_c = np.nan_to_num(cube_c, nan=0.0, posinf=0.0, neginf=0.0)
 
             power, n_cells, m_ch = self._yhat_power(cube_c)
-            sigma2, length_scale, eps = self._optimize(power, n_cells, m_ch, ny, nx, dy, dx)
+            sigma2, length_scale, eps = self._optimize(
+                power, n_cells, m_ch, ny, nx, dy, dx
+            )
 
             signal_op = FFTKernelOp(
                 ny=ny,

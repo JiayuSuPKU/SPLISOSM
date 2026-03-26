@@ -602,9 +602,9 @@ class TestFFTKernelGPR(unittest.TestCase):
 
         # Mixed covariate: low-freq + high-freq + noise (matches realistic covariates)
         z = (
-            torch.sin(self.coords[:, 0] * 1.5) * 0.5     # low-frequency spatial
-            + torch.sin(self.coords[:, 0] * 8.0) * 0.3   # high-frequency spatial
-            + torch.randn(n) * 0.4                        # independent noise
+            torch.sin(self.coords[:, 0] * 1.5) * 0.5  # low-frequency spatial
+            + torch.sin(self.coords[:, 0] * 8.0) * 0.3  # high-frequency spatial
+            + torch.randn(n) * 0.4  # independent noise
         ).unsqueeze(1)
         z = (z - z.mean()) / z.std()
 
@@ -623,34 +623,38 @@ class TestFFTKernelGPR(unittest.TestCase):
 
         # (1) Residuals should be highly correlated (same GP kernel, different approximation)
         r = float(np.corrcoef(z_fft.squeeze().numpy(), z_sk.squeeze().numpy())[0, 1])
-        self.assertGreater(r, 0.8, f"Pearson r between FFT and sklearn residuals: {r:.3f}")
+        self.assertGreater(
+            r, 0.8, f"Pearson r between FFT and sklearn residuals: {r:.3f}"
+        )
 
         # (2) HSIC p-values for 40 null + 40 signal genes should agree in ranking
         pv_fft, pv_sk = [], []
-        Y_signal = 0.7 * z + 0.3 * torch.randn(n, 2)  # correlated with z
         for seed in range(40):
             torch.manual_seed(seed + 100)
             Y_null = torch.randn(n, 2)
             _, p_null_fft = linear_hsic_test(z_fft, Y_null, centering=True)
-            _, p_null_sk  = linear_hsic_test(z_sk,  Y_null, centering=True)
-            pv_fft.append(p_null_fft); pv_sk.append(p_null_sk)
+            _, p_null_sk = linear_hsic_test(z_sk, Y_null, centering=True)
+            pv_fft.append(p_null_fft)
+            pv_sk.append(p_null_sk)
         # Add signal genes (correlated with z — should get low p-values)
         torch.manual_seed(77)
         for _ in range(40):
             Y_sig = 0.7 * z + 0.3 * torch.randn(n, 2)
             _, p_sig_fft = linear_hsic_test(z_fft, Y_sig, centering=True)
-            _, p_sig_sk  = linear_hsic_test(z_sk,  Y_sig, centering=True)
-            pv_fft.append(p_sig_fft); pv_sk.append(p_sig_sk)
+            _, p_sig_sk = linear_hsic_test(z_sk, Y_sig, centering=True)
+            pv_fft.append(p_sig_fft)
+            pv_sk.append(p_sig_sk)
 
         rho, _ = spearmanr(pv_fft, pv_sk)
         self.assertGreater(
-            rho, 0.8,
+            rho,
+            0.8,
             f"Spearman rho between FFT and sklearn DU p-values: {rho:.3f} (expected > 0.8)",
         )
 
 
 try:
-    import gpytorch as _gpytorch_check # noqa: F401
+    import gpytorch as _gpytorch_check  # noqa: F401
 
     _GPYTORCH_AVAILABLE = True
 except ImportError:
