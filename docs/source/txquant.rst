@@ -70,7 +70,7 @@ Tested platforms:
 - 10x Visium + ONT (SiT :cite:`lebrigand2023spatial`)
 - 10x Visium HD + ONT (the EPI2ME dataset)
 
-`Visium HD ONT tutorial <tutorials/visiumhd_ont>`_ shows an example workflow of loading preprocessed ONT + Visium HD data and running SPLISOSM. 
+:doc:`Visium HD ONT tutorial <tutorials/visiumhd_ont>` shows an example workflow of loading preprocessed ONT + Visium HD data and running SPLISOSM. 
 The dataset is publicly accessible and can be downloaded from `EPI2ME <https://epi2me.nanoporetech.com/visium_hd_2025.06/>`_. 
 Transcript assignment and quantification were performed using ``minimap2``, ``Stringtie``, and ``FLAMES``. See the `EPI2ME workflow documentation <https://epi2me.nanoporetech.com/epi2me-docs/workflows/wf-single-cell/#transcript-assignment>`_ for details.
 The generated ``SpatialData`` object has the following structure (example):

@@ -68,7 +68,7 @@ contain sufficient isoform-level information for spatial pattern discovery. Thes
 
 .. note::
 
-  SPLISOSM does not perform isoform quantification itself. See the :doc:`Isoform Quantification page <txquant>` for guidance on preparing input data for different platforms.
+  SPLISOSM does not perform isoform quantification itself. See the :doc:`Feature Quantification page <txquant>` for guidance on preparing input data for different platforms.
 
 Unlike conventional gene-centric spatial analysis, SPLISOSM focuses on patterns of RNA processing (e.g., alternative splicing, alternative polyadenylation) manifested at the isoform level.
 Given isoform quantifications, SPLISOSM supports two types of statistical analyses:

@@ -34,7 +34,7 @@ Running SPLISOSM
 **2. Can I run SPLISOSM on single-cell spatial transcriptomics data?**
 
   Yes. SPLISOSM is applicable to both spot-based and single-cell resolution spatial transcriptomics data, as long as isoform-level quantifications are available. 
-  For single-cell data, the spatial coordinates correspond to cell centroids instead of spot centers. See the :doc:`Isoform Quantification page <txquant>` for guidance on preparing input data.
+  For single-cell data, the spatial coordinates correspond to cell centroids instead of spot centers. See the :doc:`Feature Quantification page <txquant>` for guidance on preparing input data.
 
 
 **3. Can I run SPLISOSM on a subset of cells/spots instead of the whole tissue?**

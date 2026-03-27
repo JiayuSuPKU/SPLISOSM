@@ -17,3 +17,11 @@ Spatial variability analysis for large-scale data
   visiumhd_3prime
   visiumhd_ont
   xenium_prime_5k
+
+Differential usage analysis for large-scale data
+-------------------------------------------------
+.. base-gallery::
+  :caption: Available notebooks
+  :tooltip:
+
+  visiumhd_ffpe_du
