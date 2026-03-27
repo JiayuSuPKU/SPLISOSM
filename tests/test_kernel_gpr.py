@@ -676,7 +676,7 @@ class TestSklearnKernelGPRLargeN(unittest.TestCase):
         gpr = SklearnKernelGPR(
             constant_value_bounds=(1e-3, 1e3),
             length_scale_bounds="fixed",
-            max_n_fit=50,
+            n_inducing=50,
         )
         res = gpr.fit_residuals(self.coords, self.Y)
         self.assertEqual(res.shape, self.Y.shape)
@@ -686,7 +686,7 @@ class TestSklearnKernelGPRLargeN(unittest.TestCase):
         gpr = SklearnKernelGPR(
             constant_value_bounds=(1e-3, 1e3),
             length_scale_bounds="fixed",
-            max_n_fit=50,
+            n_inducing=50,
         )
         res = gpr.fit_residuals(self.coords, self.Y)
         self.assertLess(float(res.var()), float(self.Y.var()) * 0.8)
@@ -697,23 +697,23 @@ class TestSklearnKernelGPRLargeN(unittest.TestCase):
             constant_value=1.0,
             constant_value_bounds="fixed",
             length_scale_bounds="fixed",
-            max_n_fit=50,
+            n_inducing=50,
         )
         res = gpr.fit_residuals(self.coords, self.Y)
         self.assertEqual(res.shape, self.Y.shape)
 
     def test_precompute_shared_kernel_warns_for_large_n(self):
-        """precompute_shared_kernel should warn when n > max_n_fit."""
+        """precompute_shared_kernel should warn when n > n_inducing."""
         gpr = SklearnKernelGPR(
             constant_value_bounds="fixed",
             length_scale_bounds="fixed",
-            max_n_fit=50,
+            n_inducing=50,
         )
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            gpr.precompute_shared_kernel(self.coords)  # n=300 > max_n_fit=50
-        large_n_warns = [x for x in w if "max_n_fit" in str(x.message)]
-        self.assertTrue(len(large_n_warns) > 0, "Expected warning about max_n_fit")
+            gpr.precompute_shared_kernel(self.coords)  # n=300 > n_inducing=50
+        large_n_warns = [x for x in w if "n_inducing" in str(x.message)]
+        self.assertTrue(len(large_n_warns) > 0, "Expected warning about n_inducing")
 
 
 @unittest.skipUnless(_GPYTORCH_AVAILABLE, "gpytorch not installed")

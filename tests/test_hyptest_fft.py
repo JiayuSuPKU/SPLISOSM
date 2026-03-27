@@ -173,6 +173,7 @@ def _build_test_sdata(table_name: str = "isoform_table") -> _SpatialDataStub:
     adata.obs["instance_id"] = np.arange(len(adata.obs), dtype=int)
     try:
         from spatialdata.models import TableModel
+
         adata = TableModel.parse(
             adata,
             region=table_name,
@@ -357,6 +358,39 @@ class TestSplisosmFFT(unittest.TestCase):
                 self.assertTrue(np.isfinite(res["pvalue"].to_numpy()).all())
                 self.assertTrue(np.isfinite(res["pvalue_adj"].to_numpy()).all())
 
+    def test_setup_data_filter_single_iso_genes_false(self):
+        """filter_single_iso_genes=False keeps genes with only one passing isoform."""
+        # The default fixture has 2 genes each with 3 probes.
+        # Raise min_counts so only ONE isoform per gene passes — those genes
+        # would normally be dropped but should survive with the flag disabled.
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+            min_counts=10,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        # With filter_single_iso_genes=False, all genes that have ≥1 passing
+        # isoform are retained.
+        self.assertGreaterEqual(model.n_genes, 1)
+
+        # Default (True) removes single-isoform genes — verify it still works
+        # by using normal thresholds where each gene has multiple passing probes.
+        model2 = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model2.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+            filter_single_iso_genes=True,
+        )
+        self.assertGreaterEqual(model2.n_genes, 1)
+
     def test_extract_feature_summary_gene(self):
         model = SplisosmFFT(rho=0.9, neighbor_degree=1)
         model.setup_data(
@@ -459,7 +493,7 @@ class TestSplisosmFFT(unittest.TestCase):
         df = model.get_formatted_test_results("du")
         self.assertEqual(len(df), model.n_genes * 2)
         self.assertIn("gene", df.columns)
-        self.assertIn("factor", df.columns)
+        self.assertIn("covariate", df.columns)
         self.assertIn("pvalue", df.columns)
 
     def test_differential_usage_dataframe_input(self):
@@ -472,9 +506,9 @@ class TestSplisosmFFT(unittest.TestCase):
             rng.standard_normal((adata.n_obs, 1)), columns=["condition"]
         )
         model = self._setup_model(design_mtx=design)
-
-        results = model.test_differential_usage(n_jobs=1, return_results=True)
-        self.assertEqual(results["factor_names"], ["condition"])
+        model.test_differential_usage(n_jobs=1, return_results=False)
+        results = model.get_formatted_test_results("du")
+        self.assertEqual(results["covariate"].unique(), ["condition"])
 
     def test_differential_usage_invalid_inputs(self):
         adata = self.sdata.tables[self.table_name]
@@ -482,13 +516,19 @@ class TestSplisosmFFT(unittest.TestCase):
         design = rng.standard_normal((adata.n_obs, 1))
         model = self._setup_model(design_mtx=design)
 
-        # bad ratio transformation
         with self.assertRaises(ValueError):
-            model.test_differential_usage(
-                ratio_transformation="bad_transform",
-            )
+            model.test_differential_usage(method="invalid_method")
+        with self.assertRaises(ValueError):
+            model.test_differential_usage(ratio_transformation="bad_transform")
         with self.assertRaises(ValueError):
             model.test_differential_usage(residualize="bad")
+
+        # t-fisher / t-tippett raise ValueError for non-binary covariates
+        model_cont = self._setup_model(design_mtx=design)  # continuous covariate
+        with self.assertRaises(ValueError):
+            model_cont.test_differential_usage(method="t-fisher", n_jobs=1)
+        with self.assertRaises(ValueError):
+            model_cont.test_differential_usage(method="t-tippett", n_jobs=1)
 
     def test_setup_data_with_design_mtx(self):
         """design_mtx passed to setup_data is stored as AnnData in sdata."""
@@ -541,6 +581,7 @@ class TestSplisosmFFT(unittest.TestCase):
     def test_setup_data_design_mtx_from_table_name(self):
         """design_mtx as sdata table name reuses that table's X as covariates."""
         import anndata as ad
+
         adata = self.sdata.tables[self.table_name]
         rng = np.random.default_rng(5)
         cov_arr = rng.standard_normal((adata.n_obs, 2)).astype(np.float32)
@@ -550,7 +591,6 @@ class TestSplisosmFFT(unittest.TestCase):
         cov_adata = ad.AnnData(X=cov_arr, obs=obs_df)
         cov_adata.var_names = ["cov1", "cov2"]
         self.sdata["my_covariates"] = cov_adata
-
 
         model = SplisosmFFT(rho=0.9, neighbor_degree=1)
         model.setup_data(
@@ -585,7 +625,12 @@ class TestSplisosmFFT(unittest.TestCase):
         rng = np.random.default_rng(5)
         design = rng.standard_normal((adata.n_obs, 1))
         model = self._setup_model(design_mtx=design)
-        custom_cfg = {"covariate": {"constant_value_bounds": "fixed", "length_scale_bounds": "fixed"}}
+        custom_cfg = {
+            "covariate": {
+                "constant_value_bounds": "fixed",
+                "length_scale_bounds": "fixed",
+            }
+        }
         results = model.test_differential_usage(
             gpr_configs=custom_cfg, n_jobs=1, return_results=True
         )
@@ -596,6 +641,68 @@ class TestSplisosmFFT(unittest.TestCase):
         model = self._setup_model()  # no design_mtx
         with self.assertRaises(RuntimeError):
             model.test_differential_usage(n_jobs=1)
+
+    def test_differential_usage_method_hsic(self):
+        """method='hsic' (unconditional) returns valid p-values without GPR."""
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(10)
+        design = rng.standard_normal((adata.n_obs, 1))
+        model = self._setup_model(design_mtx=design)
+        results = model.test_differential_usage(
+            method="hsic", n_jobs=1, return_results=True
+        )
+        self.assertEqual(results["method"], "hsic")
+        self.assertEqual(results["statistic"].shape, (model.n_genes, 1))
+        self.assertTrue(np.all(results["pvalue"] >= 0))
+        self.assertTrue(np.all(results["pvalue"] <= 1))
+        self.assertTrue(np.all(np.isfinite(results["pvalue"])))
+
+    def test_differential_usage_method_t_fisher(self):
+        """method='t-fisher' uses two-sample t-tests for binary covariates."""
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(11)
+        # t-fisher requires binary (0/1) covariates
+        design = rng.integers(0, 2, size=(adata.n_obs, 1)).astype(float)
+        model = self._setup_model(design_mtx=design)
+        results = model.test_differential_usage(
+            method="t-fisher", n_jobs=1, return_results=True
+        )
+        self.assertEqual(results["method"], "t-fisher")
+        self.assertEqual(results["statistic"].shape, (model.n_genes, 1))
+        self.assertTrue(np.all(results["pvalue"] >= 0))
+        self.assertTrue(np.all(results["pvalue"] <= 1))
+        # Fisher statistic is chi-squared (>=0)
+        self.assertTrue(np.all(results["statistic"] >= 0))
+
+    def test_differential_usage_method_t_tippett(self):
+        """method='t-tippett' uses two-sample t-tests for binary covariates."""
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(12)
+        # t-tippett requires binary (0/1) covariates
+        design = rng.integers(0, 2, size=(adata.n_obs, 1)).astype(float)
+        model = self._setup_model(design_mtx=design)
+        results = model.test_differential_usage(
+            method="t-tippett", n_jobs=1, return_results=True
+        )
+        self.assertEqual(results["method"], "t-tippett")
+        self.assertEqual(results["statistic"].shape, (model.n_genes, 1))
+        self.assertTrue(np.all(results["pvalue"] >= 0))
+        self.assertTrue(np.all(results["pvalue"] <= 1))
+
+    def test_differential_usage_multi_factor_chunking(self):
+        """Multiple covariates trigger chunked processing; results are valid."""
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(13)
+        n_cov = 3
+        design = rng.standard_normal((adata.n_obs, n_cov))
+        model = self._setup_model(design_mtx=design)
+        results = model.test_differential_usage(
+            method="hsic-gp", n_jobs=1, return_results=True, print_progress=False
+        )
+        self.assertEqual(results["statistic"].shape, (model.n_genes, n_cov))
+        self.assertTrue(np.all(results["pvalue"] >= 0))
+        self.assertTrue(np.all(results["pvalue"] <= 1))
+        self.assertEqual(len(model.covariate_names), n_cov)
 
     def test_fft_vs_np_du_agreement(self):
         """SplisosmFFT and SplisosmNP DU p-values should be positively correlated.
@@ -622,9 +729,7 @@ class TestSplisosmFFT(unittest.TestCase):
             design_mtx=design,
             covariate_names=["covariate"],
         )
-        model_fft.test_differential_usage(
-            n_jobs=1, print_progress=False
-        )
+        model_fft.test_differential_usage(n_jobs=1, print_progress=False)
         df_fft = model_fft.get_formatted_test_results("du")
 
         # --- SplisosmNP ---
@@ -644,20 +749,37 @@ class TestSplisosmFFT(unittest.TestCase):
             covariate_names=["covariate"],
         )
 
-        model_np.test_differential_usage(
-            method="hsic-gp",
-            gpr_backend="sklearn",
-            residualize="cov_only",
-            print_progress=False,
-        )
+        import warnings
+        from sklearn.exceptions import ConvergenceWarning
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=ConvergenceWarning,
+                message=".*is close to the specified.*",
+            )
+            model_np.test_differential_usage(
+                method="hsic-gp",
+                gpr_backend="sklearn",
+                residualize="cov_only",
+                print_progress=False,
+            )
         df_np = model_np.get_formatted_test_results("du")
 
         # Align on shared genes
         shared_genes = set(df_fft["gene"].unique()) & set(df_np["gene"].unique())
-        self.assertGreater(len(shared_genes), 0, "No shared genes between FFT and NP results")
+        self.assertGreater(
+            len(shared_genes), 0, "No shared genes between FFT and NP results"
+        )
 
-        p_fft = df_fft[df_fft["gene"].isin(shared_genes)].sort_values("gene")["pvalue"].values
-        p_np  = df_np[df_np["gene"].isin(shared_genes)].sort_values("gene")["pvalue"].values
+        p_fft = (
+            df_fft[df_fft["gene"].isin(shared_genes)]
+            .sort_values("gene")["pvalue"]
+            .values
+        )
+        p_np = (
+            df_np[df_np["gene"].isin(shared_genes)].sort_values("gene")["pvalue"].values
+        )
 
         # Rank correlation should be positive (both remove spatial confound similarly)
         if len(p_fft) >= 4:
@@ -665,8 +787,11 @@ class TestSplisosmFFT(unittest.TestCase):
             # Allow rho to be NaN (e.g., all p-values identical) or >= -0.5
             # The key is that neither method systematically inverts the ranking.
             if not np.isnan(rho):
-                self.assertGreater(rho, -0.5,
-                    f"FFT vs NP p-value Spearman rho={rho:.3f} is strongly negative (unexpected)")
+                self.assertGreater(
+                    rho,
+                    -0.5,
+                    f"FFT vs NP p-value Spearman rho={rho:.3f} is strongly negative (unexpected)",
+                )
 
     def test_fft_gpr_scalability(self):
         """FFTKernelGPR.fit_residuals_cube should scale as O(N log N) not O(N^2).
@@ -691,7 +816,9 @@ class TestSplisosmFFT(unittest.TestCase):
         elapsed = time.perf_counter() - t0
 
         # Should complete in under 5 seconds even for 2500-cell grid
-        self.assertLess(elapsed, 5.0, f"FFT residualization took {elapsed:.1f}s (expected < 5s)")
+        self.assertLess(
+            elapsed, 5.0, f"FFT residualization took {elapsed:.1f}s (expected < 5s)"
+        )
         self.assertEqual(res.shape, (ny, nx, 3))
         self.assertGreater(eps, 0)
 

@@ -340,7 +340,7 @@ class SplisosmNP:
         )
         if len(self.gene_names) != self.n_genes:
             raise ValueError("Gene names must match the number of genes.")
-        if min(self.n_isos) <= 1:
+        if filter_single_iso_genes and min(self.n_isos) <= 1:
             raise ValueError("At least two isoforms are required for each gene.")
 
         # convert numpy.array to torch.tensor float if not already
@@ -788,14 +788,25 @@ class SplisosmNP:
                         "constant_value_bounds": (1e-3, 1e3),
                         "length_scale": 1.0,
                         "length_scale_bounds": "fixed",
+                        "n_inducing": 5000,
                     },
                     "isoform": {
                         "constant_value": 1.0,
                         "constant_value_bounds": (1e-3, 1e3),
                         "length_scale": 1.0,
                         "length_scale_bounds": "fixed",
+                        "n_inducing": 5000,
                     },
                 }
+
+            ``"n_inducing"`` *(int)* is supported by both backends with the
+            same semantics:
+
+            * **sklearn** — full exact GP when ``n_obs ≤ n_inducing``; a
+              randomly sub-sampled subset of ``n_inducing`` points is used
+              as the inducing set otherwise (default: ``5000``).
+            * **gpytorch** — FITC sparse GP approximation with ``n_inducing``
+              points; set to ``None`` to use exact GP (default: ``5000``).
 
         residualize : {"cov_only", "both"}, optional
             Controls which signals are spatially residualized when

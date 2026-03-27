@@ -660,6 +660,10 @@ _DEFAULT_GPR_CONFIGS = {
         "constant_value_bounds": (1e-3, 1e3),
         "length_scale": 1.0,
         "length_scale_bounds": "fixed",
+        # n_inducing: number of inducing points.
+        # sklearn  — full GP when n ≤ n_inducing; subset-GP otherwise.
+        # gpytorch — FITC sparse GP; set to None for exact GP.
+        "n_inducing": 5_000,
     },
     # Isoform GPR: same calibrated config as covariate — signal amplitude
     # is optimized per gene via MLE.  Only used when residualize='both';
@@ -669,6 +673,7 @@ _DEFAULT_GPR_CONFIGS = {
         "constant_value_bounds": (1e-3, 1e3),
         "length_scale": 1.0,
         "length_scale_bounds": "fixed",
+        "n_inducing": 5_000,
     },
 }
 
@@ -696,15 +701,17 @@ class SklearnKernelGPR(KernelGPR):
         Initial RBF length scale.
     length_scale_bounds : tuple or ``"fixed"``
         Search bounds for the length scale.
-    max_n_fit : int
-        Maximum n for which to allow full GP fitting. If more sample
-        points are passed to ``fit_residuals``, will use the inducing-point
-        kernel approximation.
+    n_inducing : int
+        Number of inducing points.  When ``n_obs <= n_inducing`` the full
+        exact GP is used.  When ``n_obs > n_inducing``, a subset of
+        ``n_inducing`` randomly sampled points is used as the inducing set
+        for an approximate GP (subset-of-data / Nyström-style approximation).
 
     Notes
     -----
-    This backend always materialises a dense n x n kernel matrix.  For
-    n > ~10,000, consider ``GPyTorchKernelGPR`` with inducing points.
+    This backend always materialises a dense n x n kernel matrix up to
+    ``n_inducing`` points.  For very large n consider ``GPyTorchKernelGPR``
+    with inducing points.
     """
 
     def __init__(
@@ -713,13 +720,13 @@ class SklearnKernelGPR(KernelGPR):
         constant_value_bounds: Union[tuple, str] = (1e-3, 1e3),
         length_scale: float = 1.0,
         length_scale_bounds: Union[tuple, str] = "fixed",
-        max_n_fit: int = 5_000,
+        n_inducing: int = 5_000,
     ) -> None:
         self._constant_value = constant_value
         self._constant_value_bounds = constant_value_bounds
         self._length_scale = length_scale
         self._length_scale_bounds = length_scale_bounds
-        self._max_n_fit = max_n_fit
+        self.n_inducing = n_inducing
 
         # Cached eigendecomposition of the shared kernel (when bounds fixed)
         self._shared_eigvecs: Optional[torch.Tensor] = None
@@ -733,7 +740,8 @@ class SklearnKernelGPR(KernelGPR):
         ----------
         config : dict
             Configuration dict with optional keys: ``constant_value``,
-            ``constant_value_bounds``, ``length_scale``, ``length_scale_bounds``.
+            ``constant_value_bounds``, ``length_scale``, ``length_scale_bounds``,
+            ``n_inducing``.
 
         Returns
         -------
@@ -745,7 +753,7 @@ class SklearnKernelGPR(KernelGPR):
             constant_value_bounds=config.get("constant_value_bounds", (1e-3, 1e3)),
             length_scale=config.get("length_scale", 1.0),
             length_scale_bounds=config.get("length_scale_bounds", "fixed"),
-            max_n_fit=config.get("max_n_fit", 5_000),
+            n_inducing=config.get("n_inducing", 5_000),
         )
 
     @property
@@ -776,9 +784,9 @@ class SklearnKernelGPR(KernelGPR):
         -------
         None
         """
-        if coords.shape[0] > self._max_n_fit:
+        if coords.shape[0] > self.n_inducing:
             warnings.warn(
-                f"n={coords.shape[0]} > max_n_fit={self._max_n_fit}; "
+                f"n={coords.shape[0]} > n_inducing={self.n_inducing}; "
                 "large-n approximate path will be used; precompute_shared_kernel skipped.",
                 stacklevel=2,
             )
@@ -825,8 +833,8 @@ class SklearnKernelGPR(KernelGPR):
 
         Chooses the fast spectral path when :attr:`signal_bounds_fixed` and
         the shared eigendecomposition has been precomputed; otherwise falls
-        back to a full sklearn GP fit when n_obs <= max_n_fit, or an
-        inducing-point approximation when n_obs > max_n_fit.
+        back to a full sklearn GP fit when n_obs <= n_inducing, or an
+        inducing-point approximation when n_obs > n_inducing.
 
         NaN rows in ``Y`` are excluded from fitting and reinserted as NaN
         in the output.
@@ -855,9 +863,9 @@ class SklearnKernelGPR(KernelGPR):
         return self._fit_no_nan(coords, Y)
 
     def _fit_large_n(self, coords: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-        """Approximate residualization for n > max_n_fit via subset GP + chunked prediction.
+        """Approximate residualization for n > n_inducing via subset GP + chunked prediction.
 
-        Fits sklearn GP on a randomly sub-sampled ``max_n_fit`` reference set,
+        Fits sklearn GP on a randomly sub-sampled ``n_inducing`` reference set,
         extracts hyperparameters, then computes GP posterior-mean predictions at
         every point in ``coords`` using O(chunk x m) peak memory per chunk.
 
@@ -867,7 +875,7 @@ class SklearnKernelGPR(KernelGPR):
             Residuals ``Y - K(X, X_m) @ (K_mm + eps·I)^{-1} @ Y_m``.
         """
         n = coords.shape[0]
-        m = self._max_n_fit
+        m = self.n_inducing
         rng = np.random.default_rng(0)
         idx = rng.choice(n, m, replace=False)
         idx_t = torch.from_numpy(idx)
@@ -907,7 +915,7 @@ class SklearnKernelGPR(KernelGPR):
 
     def _fit_no_nan(self, coords: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         """Inner residualization without NaN handling."""
-        if coords.shape[0] > self._max_n_fit:
+        if coords.shape[0] > self.n_inducing:
             return self._fit_large_n(coords, Y)
         if (
             self.signal_bounds_fixed
@@ -1585,7 +1593,9 @@ class FFTKernelGPR(KernelGPR):
                 def neg_lml_3(params: np.ndarray) -> float:
                     length_scale = float(np.exp(params[0]))
                     eps = float(np.exp(params[1]))
-                    tmp_op = FFTKernelOp(ny, nx, dy, dx, sigma2_fixed, length_scale, self._workers)
+                    tmp_op = FFTKernelOp(
+                        ny, nx, dy, dx, sigma2_fixed, length_scale, self._workers
+                    )
                     lam = tmp_op.eigenvalues_2d.ravel()
                     le = lam + eps
                     return 0.5 * float(
@@ -1610,7 +1620,9 @@ class FFTKernelGPR(KernelGPR):
                     sigma2 = float(np.exp(params[0]))
                     length_scale = float(np.exp(params[1]))
                     eps = float(np.exp(params[2]))
-                    tmp_op = FFTKernelOp(ny, nx, dy, dx, sigma2, length_scale, self._workers)
+                    tmp_op = FFTKernelOp(
+                        ny, nx, dy, dx, sigma2, length_scale, self._workers
+                    )
                     lam = tmp_op.eigenvalues_2d.ravel()
                     le = lam + eps
                     return 0.5 * float(
@@ -1866,6 +1878,8 @@ def make_kernel_gpr(
         Backend to use.  ``"fft"`` accepts the same kwargs as ``"sklearn"``
         (``constant_value``, ``constant_value_bounds``, ``length_scale``,
         ``length_scale_bounds``) plus ``epsilon_bounds`` and ``workers``.
+        ``n_inducing`` is supported by both ``"sklearn"`` and ``"gpytorch"``
+        with the same name (see :data:`_DEFAULT_GPR_CONFIGS`).
     **kwargs
         Passed to the backend constructor.
 
@@ -1884,7 +1898,10 @@ def make_kernel_gpr(
     if backend == "gpytorch":
         return GPyTorchKernelGPR(**kwargs)
     if backend == "fft":
-        return FFTKernelGPR(**kwargs)
+        # FFTKernelGPR operates on the full spectral grid and has no
+        # inducing-point approximation — silently drop the shared key.
+        fft_kwargs = {k: v for k, v in kwargs.items() if k != "n_inducing"}
+        return FFTKernelGPR(**fft_kwargs)
     raise ValueError(
         f"Unknown backend '{backend}'. Choose from 'sklearn', 'gpytorch', 'fft'."
     )
