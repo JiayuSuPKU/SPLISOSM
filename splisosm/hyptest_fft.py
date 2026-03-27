@@ -470,6 +470,9 @@ class SplisosmFFT:
 
     Examples
     --------
+
+    Spatial variability test:
+
     >>> from splisosm import SplisosmFFT
     >>> model = SplisosmFFT(rho=0.9, neighbor_degree=1)
     >>> model.setup_data(
@@ -486,6 +489,25 @@ class SplisosmFFT:
     ... )
     >>> model.test_spatial_variability(method="hsic-ir")
     >>> sv_results = model.get_formatted_test_results(test_type="sv")
+
+    Differential usage test:
+
+    >>> model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+    >>> model.setup_data(
+    ...     sdata=sdata,
+    ...     bins="ID_square_016um",
+    ...     table_name="square_016um_svp",
+    ...     design_mtx="square_016um_rbp_sve",
+    ...     col_key="array_col",
+    ...     row_key="array_row",
+    ...     layer="counts",
+    ...     group_iso_by="gene_ids",
+    ...     gene_names="gene_name",
+    ...     min_counts=10,
+    ...     min_bin_pct=0.0,
+    ... )
+    >>> model.test_differential_usage(method="hsic-gp", residualize="cov_only")
+    >>> du_results = model.get_formatted_test_results("du")
     """
 
     n_genes: int
@@ -509,10 +531,22 @@ class SplisosmFFT:
     sdata: Any | None
     """SpatialData object containing the input data."""
 
+    n_factors: int
+    """Number of covariates to test for differential usage."""
+
+    covariate_names: list[str]
+    """List of covariate names corresponding to columns of the design matrix."""
+
+    design_mtx: Optional[Any]
+    """Rasterized design matrix stored as an :class:`anndata.AnnData` table
+    inside :attr:`sdata`; ``None`` if no covariates were provided to
+    :meth:`setup_data`.  Use :attr:`covariate_names` and :attr:`n_factors`
+    to inspect the covariate layout without accessing this object directly."""
+
     sv_test_results: dict
     """Dictionary to store the spatial variability test results after running test_spatial_variability().
     It contains the following keys:
-    
+
     - ``'method'``: str, the method used for the test.
     - ``'statistic'``: numpy.ndarray of shape (n_genes,), the test statistic for each gene.
     - ``'pvalue'``: numpy.ndarray of shape (n_genes,), the p-value for each gene.
@@ -520,13 +554,13 @@ class SplisosmFFT:
     """
 
     du_test_results: dict
-    """Dictionary to store the differential usage test results after running test_differential_usage(). 
+    """Dictionary to store the differential usage test results after running test_differential_usage().
     It contains the following keys:
-    
+
     - ``'method'``: str, the method used for the test.
-    - ``'statistic'``: numpy.ndarray of shape (n_genes, n_covariates), the test statistic for each gene and covariate.
-    - ``'pvalue'``: numpy.ndarray of shape (n_genes, n_covariates), the p-value for each gene and covariate.
-    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes, n_covariates), the BH adjusted p-value for each gene and covariate. Each column/covariate is adjusted separately.
+    - ``'statistic'``: numpy.ndarray of shape (n_genes, n_factors), the test statistic for each gene and covariate.
+    - ``'pvalue'``: numpy.ndarray of shape (n_genes, n_factors), the p-value for each gene and covariate.
+    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes, n_factors), the BH adjusted p-value for each gene and covariate. Each column/covariate is adjusted separately.
     """
 
     def __init__(
@@ -655,31 +689,31 @@ class SplisosmFFT:
 
         Parameters
         ----------
-        sdata
+        sdata : spatialdata.SpatialData
             SpatialData-like object with ``tables`` mapping.
-        bins
+        bins : str
             Name of the SpatialData bin geometry for rasterization.
-        table_name
+        table_name : str
             Key of the table in ``sdata.tables``.
-        col_key
+        col_key : str
             Column index key in ``adata.obs`` for rasterization.
-        row_key
+        row_key : str
             Row index key in ``adata.obs`` for rasterization.
-        layer
+        layer : str, optional
             AnnData layer that stores isoform count matrix.
-        group_iso_by
+        group_iso_by : str, optional
             Column in ``adata.var`` used to group isoforms by gene. The
             unique values of this column define the gene-level groups.
-        gene_names
+        gene_names : str or None, optional
             Optional column name in ``adata.var`` whose values are used as
             display gene names in results. If ``None``, the values of
             ``group_iso_by`` are used directly.
-        min_counts
+        min_counts : int, optional
             Minimum total count (summed across all spots) required for an
             isoform to be retained. Isoforms below this threshold are
             excluded before gene grouping. Genes with fewer than two
             remaining isoforms after filtering are also excluded.
-        min_bin_pct
+        min_bin_pct : float, optional
             Minimum percentage of bins in which an isoform must be expressed
             (count greater than zero) to be retained. Values in ``[0, 1]`` are
             interpreted as fractions of bins, and values in ``(1, 100]`` are
@@ -932,16 +966,16 @@ class SplisosmFFT:
 
         Parameters
         ----------
-        method
+        method : {"hsic-ir", "hsic-ic", "hsic-gc"}, optional
             One of ``"hsic-ir"`` (isoform ratios), ``"hsic-ic"`` (isoform counts),
             or ``"hsic-gc"`` (gene counts).
-        ratio_transformation
+        ratio_transformation : {"none", "clr", "ilr", "alr", "radial"}, optional
             Ratio transform used when ``method="hsic-ir"``.
-        n_jobs
+        n_jobs : int, optional
             Number of joblib workers. ``-1`` uses all available CPUs.
-        return_results
+        return_results : bool, optional
             If True, return result dictionary.
-        print_progress
+        print_progress : bool, optional
             Whether to show a progress bar.
 
         Returns
@@ -1269,7 +1303,7 @@ class SplisosmFFT:
 
         Parameters
         ----------
-        test_type
+        test_type : {"sv", "du"}
             Test type: ``"sv"`` for spatial variability or ``"du"`` for
             differential usage.
 

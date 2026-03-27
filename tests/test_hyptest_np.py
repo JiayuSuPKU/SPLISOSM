@@ -199,7 +199,7 @@ class TestSplisosmNP(unittest.TestCase):
             min_bin_pct=0.0,
         )
 
-        self.assertEqual(model.setup_input_mode, "anndata")
+        self.assertEqual(model._setup_input_mode, "anndata")
         self.assertIs(model.adata, self.adata)
         self.assertEqual(model.n_factors, 1)
         self.assertEqual(model.covariate_names, ["cov_1"])

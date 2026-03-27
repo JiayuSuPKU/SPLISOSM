@@ -98,7 +98,7 @@ class SplisosmNP:
 
     >>> model = SplisosmNP()
     >>> model.setup_data(data, coordinates)
-    >>> model.test_spatial_variability(method = 'hsic-ir')
+    >>> model.test_spatial_variability(method='hsic-ir')
     >>> sv_results = model.get_formatted_test_results('sv')
     >>> print(sv_results.head())
 
@@ -106,7 +106,7 @@ class SplisosmNP:
 
     >>> model = SplisosmNP()
     >>> model.setup_data(data, coordinates, design_mtx=design_mtx)
-    >>> model.test_differential_usage(method = 'hsic')
+    >>> model.test_differential_usage(method='hsic-gp', residualize='cov_only')
     >>> du_results = model.get_formatted_test_results('du')
     >>> print(du_results.head())
     """
@@ -123,10 +123,36 @@ class SplisosmNP:
     n_factors: int
     """Number of covariates to test for differential usage."""
 
+    gene_names: list[str]
+    """List of gene names corresponding to the genes in the model."""
+
+    covariate_names: list[str]
+    """List of covariate names corresponding to columns of the design matrix."""
+
+    adata: Optional[AnnData]
+    """Source :class:`anndata.AnnData` object when using AnnData input mode;
+    ``None`` in legacy (list-of-tensors) mode."""
+
+    data: list[torch.Tensor]
+    """List of isoform count tensors, one per gene, each of shape
+    ``(n_spots, n_isos)``.  Set by :meth:`setup_data`."""
+
+    coordinates: torch.Tensor
+    """Spatial coordinates of shape ``(n_spots, 2)``.
+    Set by :meth:`setup_data`."""
+
+    corr_sp: Any
+    """Spatial covariance kernel (:class:`~splisosm.kernel.SpatialCovKernel`)
+    constructed from :attr:`coordinates`.  Set by :meth:`setup_data`."""
+
+    design_mtx: Optional[torch.Tensor]
+    """Design matrix of shape ``(n_spots, n_factors)``; ``None`` if no
+    covariates were provided to :meth:`setup_data`."""
+
     sv_test_results: dict
     """Dictionary to store the spatial variability test results after running test_spatial_variability().
     It contains the following keys:
-    
+
     - ``'method'``: str, the method used for the test.
     - ``'statistic'``: numpy.ndarray of shape (n_genes,), the test statistic for each gene.
     - ``'pvalue'``: numpy.ndarray of shape (n_genes,), the p-value for each gene.
@@ -134,9 +160,9 @@ class SplisosmNP:
     """
 
     du_test_results: dict
-    """Dictionary to store the differential usage test results after running test_differential_usage(). 
+    """Dictionary to store the differential usage test results after running test_differential_usage().
     It contains the following keys:
-    
+
     - ``'method'``: str, the method used for the test.
     - ``'statistic'``: numpy.ndarray of shape (n_genes, n_factors), the test statistic for each gene and covariate.
     - ``'pvalue'``: numpy.ndarray of shape (n_genes, n_factors), the p-value for each gene and covariate.
@@ -150,7 +176,7 @@ class SplisosmNP:
         self.n_isos = None  # list of number of isoforms for each gene
         self.n_factors = None  # number of covariates to test for differential usage
         self.adata = None  # optional anndata source for the new setup path
-        self.setup_input_mode = None  # "legacy" or "anndata"
+        self._setup_input_mode = None  # "legacy" or "anndata"
 
         # to store the spatial variability test results after running test_spatial_variability()
         self.sv_test_results = {}
@@ -212,58 +238,58 @@ class SplisosmNP:
 
         Parameters
         ----------
-        data
-            Legacy mode only. List of tensors/arrays with shape
-            ``(n_spots, n_isos)`` containing isoform counts for each gene.
-        coordinates
-            Legacy mode only. Shape ``(n_spots, 2)``, spatial coordinates.
-        approx_rank
-            The rank of the low-rank approximation for the spatial covariance matrix.
-            If None, use the full-rank dense covariance matrix.
-            For larger datasets (n_spots > 5,000), the maximum rank is set to ``4 * sqrt(n_spots)``.
-        design_mtx
+        data : list of torch.Tensor or numpy.ndarray, optional
+            Legacy mode only. List of isoform count arrays, one per gene, each of
+            shape ``(n_spots, n_isos)``.
+        coordinates : torch.Tensor, numpy.ndarray, or pandas.DataFrame, optional
+            Legacy mode only. Spatial coordinates of shape ``(n_spots, 2)``.
+        approx_rank : int or None, optional
+            Rank of the low-rank approximation for the spatial covariance matrix.
+            If ``None``, the full-rank dense matrix is used.
+            For datasets with ``n_spots > 5000`` the maximum rank is capped at
+            ``4 * sqrt(n_spots)``.
+        design_mtx : torch.Tensor, numpy.ndarray, pandas.DataFrame, str, or list of str, optional
             Design matrix for differential usage tests.
 
-            - Legacy mode: tensor/array/dataframe of shape ``(n_spots, n_factors)``.
-            - AnnData mode: tensor/array/dataframe, or one obs-column name
-              (str), or a list of obs-column names.
+            - Legacy mode: array/tensor/DataFrame of shape ``(n_spots, n_factors)``.
+            - AnnData mode: array/tensor/DataFrame, one obs-column name (str),
+              or a list of obs-column names.
 
-            When ``design_mtx`` contains categorical obs columns in AnnData mode,
-            they are automatically one-hot encoded. Covariate names are inferred
-            when not explicitly provided (see ``covariate_names`` below).
-        gene_names
+            Categorical obs columns are one-hot encoded automatically. Covariate names
+            are inferred when not explicitly provided (see ``covariate_names``).
+        gene_names : list of str, str, or None, optional
             Gene names.
 
-            - Legacy mode: list of gene names.
-            - AnnData mode: optional column name in ``adata.var`` used as
-              display names for grouped genes; if None, use grouped gene IDs.
-        covariate_names
-            List of covariate names. If not provided, names are inferred as follows:
+            - Legacy mode: list of gene name strings.
+            - AnnData mode: column name in ``adata.var`` used as display names for
+              grouped genes; if ``None``, the values of ``group_iso_by`` are used.
+        covariate_names : list of str or None, optional
+            Covariate names for columns of the design matrix. If not provided,
+            names are inferred as follows:
 
-            - In **AnnData mode with column name(s)**: column names are used, with
-              categorical columns expanded to one-hot encoded names (e.g., ``col_cat0``,
-              ``col_cat1`` for ``col`` if it has categorical values).
-            - In **legacy mode with DataFrame**: DataFrame column names are used.
-            - **Otherwise**: default names like ``factor_1``, ``factor_2``, etc. are generated.
+            - **AnnData mode with column name(s)**: column names are used, with
+              categorical columns expanded to one-hot names (e.g., ``col_cat0``,
+              ``col_cat1`` for ``col``).
+            - **Legacy mode with DataFrame**: DataFrame column names are used.
+            - **Otherwise**: auto-generated as ``factor_1``, ``factor_2``, etc.
 
-            When explicitly provided, must match the number of factors in the
-            design matrix (after any categorical encoding/one-hot expansion).
-        adata
-            AnnData object used in the new input mode.
-        spatial_key
+            When explicitly provided, must match the number of factors in the design
+            matrix after any categorical encoding.
+        adata : anndata.AnnData or None, optional
+            AnnData object for AnnData input mode.
+        spatial_key : str, optional
             Key in ``adata.obsm`` for spatial coordinates.
-        layer
-            Counts layer in ``adata.layers``.
-        group_iso_by
+        layer : str, optional
+            Layer in ``adata.layers`` that stores isoform counts.
+        group_iso_by : str, optional
             Column in ``adata.var`` used to group isoforms by gene.
-        min_counts
+        min_counts : int, optional
             Minimum total isoform count across spots required to retain an isoform
             in AnnData mode.
-        min_bin_pct
-            Minimum percentage/fraction of spots where an isoform is expressed in
-            AnnData mode. Values in ``[0, 1]`` are treated as fractions; values in
-            ``(1, 100]`` are treated as percentages.
-        filter_single_iso_genes
+        min_bin_pct : float, optional
+            Minimum fraction/percentage of spots where an isoform must be expressed.
+            Values in ``[0, 1]`` are fractions; values in ``(1, 100]`` are percentages.
+        filter_single_iso_genes : bool, optional
             AnnData mode only. Whether to remove genes with fewer than two retained
             isoforms.
 
@@ -304,7 +330,7 @@ class SplisosmNP:
             covariate_names = extracted_covariate_names
 
             self.adata = adata
-            self.setup_input_mode = "anndata"
+            self._setup_input_mode = "anndata"
         else:
             if data is None or coordinates is None:
                 raise ValueError(
@@ -326,7 +352,7 @@ class SplisosmNP:
                 )
 
             self.adata = None
-            self.setup_input_mode = "legacy"
+            self._setup_input_mode = "legacy"
 
         self.n_genes = len(data)  # number of genes
         self.n_spots = len(data[0])  # number of spots
@@ -479,12 +505,13 @@ class SplisosmNP:
     def get_formatted_test_results(
         self, test_type: Literal["sv", "du"]
     ) -> pd.DataFrame:
-        """Get the formatted test results as data frame.
+        """Get formatted test results as a pandas DataFrame.
 
         Parameters
         ----------
-        test_type
-            Type of test results to retrieve. Can be one of ``'sv'`` (spatial variability) or ``'du'`` (differential usage).
+        test_type : {"sv", "du"}
+            Which results to retrieve: ``"sv"`` for spatial variability or
+            ``"du"`` for differential usage.
 
         Returns
         -------
@@ -549,25 +576,29 @@ class SplisosmNP:
 
         Parameters
         ----------
-        method
-            Must be one of ``"hsic-ir"``, ``"hsic-ic"``, ``"hsic-gc"``, or ``"spark-x"``.
-        ratio_transformation
-            If using isoform ratios, the compositional transformation to apply.
-            Can be one of ``'none'``, ``'clr'``, ``'ilr'``, ``'alr'``, or ``'radial'`` :cite:`park2022kernel`.
-            See :func:`splisosm.utils.counts_to_ratios` for more details.
-        nan_filling
-            How to fill the NaN values in the isoform ratios. Can be one of ``'mean'`` or ``'none'``.
-            See :func:`splisosm.utils.counts_to_ratios` for more details.
-        use_perm_null
-            Whether to generate the null distribution from permutation.
-            If False, use the asymptotic distribution of chi-square mixtures with Liu's method :cite:`liu2009new`.
-        n_perms_per_gene
-            Number of permutations per gene for permutation test.
-        return_results
-            Whether to return the test statistics and p-values.
-            Default to False, in which case the results are stored in ``self.sv_test_results``.
-        print_progress
-            Whether to show the progress bar. Default to True.
+        method : {"hsic-ir", "hsic-ic", "hsic-gc", "spark-x"}, optional
+            Test target: ``"hsic-ir"`` (isoform usage ratios), ``"hsic-ic"``
+            (isoform counts), ``"hsic-gc"`` (gene-level counts), or
+            ``"spark-x"`` (SPARK-X :cite:`zhu2021spark`).
+        ratio_transformation : {"none", "clr", "ilr", "alr", "radial"}, optional
+            Compositional transformation applied to isoform ratios when
+            ``method="hsic-ir"``.  See :func:`splisosm.utils.counts_to_ratios`
+            and :cite:`park2022kernel` for details.
+        nan_filling : {"mean", "none"}, optional
+            Strategy for NaN values in isoform ratios.
+            See :func:`splisosm.utils.counts_to_ratios` for details.
+        use_perm_null : bool, optional
+            If ``True``, estimate the null distribution by permutation.
+            If ``False`` (default), use the asymptotic chi-square mixture with
+            Liu's method :cite:`liu2009new`.
+        n_perms_per_gene : int or None, optional
+            Number of permutations per gene when ``use_perm_null=True``.
+            Defaults to 1000 when ``None``.
+        return_results : bool, optional
+            If ``True``, return the result dict.  Otherwise store results in
+            :attr:`sv_test_results` and return ``None``.
+        print_progress : bool, optional
+            Whether to show a progress bar.
 
         Returns
         -------
@@ -799,14 +830,18 @@ class SplisosmNP:
                     },
                 }
 
-            ``"n_inducing"`` *(int)* is supported by both backends with the
-            same semantics:
+            ``"n_inducing"`` *(int or None)* controls the scale of spatial GP
+            fitting for each backend:
 
-            * **sklearn** — full exact GP when ``n_obs ≤ n_inducing``; a
-              randomly sub-sampled subset of ``n_inducing`` points is used
-              as the inducing set otherwise (default: ``5000``).
-            * **gpytorch** — FITC sparse GP approximation with ``n_inducing``
-              points; set to ``None`` to use exact GP (default: ``5000``).
+            * **sklearn** — maximum number of observations used for
+              hyperparameter fitting.  Full exact GP when ``n_obs ≤ n_inducing``
+              (or ``None``); a randomly sub-sampled **subset-of-data** of
+              ``n_inducing`` points otherwise (**not** the same inducing-point
+              approximation as gpytorch).  Default: ``5000``.  Set to ``None``
+              to use all observations (warns when ``n_obs > 10_000``).
+            * **gpytorch** — FITC sparse-GP inducing-point approximation with
+              ``n_inducing`` points; set to ``None`` for exact GP.
+              Default: ``5000``.
 
         residualize : {"cov_only", "both"}, optional
             Controls which signals are spatially residualized when

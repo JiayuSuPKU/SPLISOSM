@@ -287,7 +287,7 @@ class TestSplisosmGLMM(unittest.TestCase):
             group_gene_by_n_iso=True,
         )
 
-        self.assertEqual(model.setup_input_mode, "anndata")
+        self.assertEqual(model._setup_input_mode, "anndata")
         self.assertIs(model.adata, self.adata)
         self.assertEqual(model.n_genes, len(self.gene_names))
         self.assertEqual(model.n_spots, self.n_spots)

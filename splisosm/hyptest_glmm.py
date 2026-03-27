@@ -639,15 +639,37 @@ class SplisosmGLMM:
     """Number of spots."""
 
     n_isos_per_gene: list[int]
-    """List of numbers of isoforms per gene."""
+    """List of numbers of isoforms per gene (equivalent to ``n_isos`` in :class:`SplisosmNP` and :class:`SplisosmFFT`)."""
 
     n_factors: int
     """Number of covariates to test for differential usage."""
 
+    gene_names: list[str]
+    """List of gene names corresponding to the genes in the model."""
+
+    covariate_names: list[str]
+    """List of covariate names corresponding to columns of the design matrix."""
+
+    adata: Optional[AnnData]
+    """Source :class:`anndata.AnnData` object when using AnnData input mode;
+    ``None`` in legacy (list-of-tensors) mode."""
+
+    coordinates: torch.Tensor
+    """Spatial coordinates of shape ``(n_spots, 2)``.
+    Set by :meth:`setup_data`."""
+
+    corr_sp: torch.Tensor
+    """Spatial covariance matrix of shape ``(n_spots, n_spots)``.
+    Constructed from :attr:`coordinates` by :meth:`setup_data`."""
+
+    design_mtx: Optional[torch.Tensor]
+    """Design matrix of shape ``(n_spots, n_factors)``; ``None`` if no
+    covariates were provided to :meth:`setup_data`."""
+
     sv_test_results: dict
     """Dictionary to store the spatial variability test results after running test_spatial_variability().
     It contains the following keys:
-    
+
     - ``'method'``: str, the method used for the test.
     - ``'statistic'``: numpy.ndarray of shape (n_genes,), the log likelihood ratio test statistic for each gene.
     - ``'df'``: int, the degrees of freedom for the test statistic.
@@ -657,9 +679,9 @@ class SplisosmGLMM:
     """
 
     du_test_results: dict
-    """Dictionary to store the differential usage test results after running test_differential_usage(). 
+    """Dictionary to store the differential usage test results after running test_differential_usage().
     It contains the following keys:
-    
+
     - ``'method'``: str, the method used for the test.
     - ``'statistic'``: numpy.ndarray of shape (n_genes, n_factors), the test statistic for each gene and covariate.
     - ``'pvalue'``: numpy.ndarray of shape (n_genes, n_factors), the p-value for each gene and covariate.
@@ -671,8 +693,8 @@ class SplisosmGLMM:
 
     model_configs: dict
     """Dictionary of model configurations, with keys
-    ``share_variance``, ``var_parameterization_sigma_theta``, 
-    ``var_fix_sigma``, ``var_prior_model``, ``var_prior_model_params``, 
+    ``share_variance``, ``var_parameterization_sigma_theta``,
+    ``var_fix_sigma``, ``var_prior_model``, ``var_prior_model_params``,
     ``init_ratio``, ``fitting_method``, and ``fitting_configs``."""
 
     fitting_results: dict
@@ -760,7 +782,7 @@ class SplisosmGLMM:
         self.n_isos_per_gene = None  # list of number of isoforms for each gene
         self.n_factors = None  # number of covariates to test for differential usage
         self.adata = None  # optional anndata source for the new setup path
-        self.setup_input_mode = None  # "legacy" or "anndata"
+        self._setup_input_mode = None  # "legacy" or "anndata"
 
         # to store the fitted models after running fit()
         self._is_trained = False
@@ -809,6 +831,15 @@ class SplisosmGLMM:
             + f"- Differential usage test: {_du_status}"
         )
 
+    @property
+    def n_isos(self) -> list[int]:
+        """List of numbers of isoforms per gene.
+
+        Alias for :attr:`n_isos_per_gene` for API consistency with
+        :class:`SplisosmNP` and :class:`SplisosmFFT`.
+        """
+        return self.n_isos_per_gene
+
     def setup_data(
         self,
         data: Optional[list[Union[torch.Tensor, np.ndarray]]] = None,
@@ -840,43 +871,49 @@ class SplisosmGLMM:
 
         Parameters
         ----------
-        data
-            Legacy mode only. List of tensors/arrays with shape
-            ``(n_spots, n_isos)`` containing isoform counts for each gene.
-        coordinates
-            Legacy mode only. Shape ``(n_spots, 2)``, the spatial coordinates.
-        design_mtx
+        data : list of torch.Tensor or numpy.ndarray, optional
+            Legacy mode only. List of isoform count arrays, one per gene, each of
+            shape ``(n_spots, n_isos)``.
+        coordinates : torch.Tensor, numpy.ndarray, or pandas.DataFrame, optional
+            Legacy mode only. Spatial coordinates of shape ``(n_spots, 2)``.
+        design_mtx : torch.Tensor, numpy.ndarray, pandas.DataFrame, str, or list of str, optional
             Design matrix for fixed effects.
 
-            - Legacy mode: tensor/array/dataframe of shape ``(n_spots, n_factors)``.
-            - AnnData mode: tensor/array/dataframe, or one obs-column name
-              (str), or a list of obs-column names.
-        gene_names
+            - Legacy mode: array/tensor/DataFrame of shape ``(n_spots, n_factors)``.
+            - AnnData mode: array/tensor/DataFrame, one obs-column name (str),
+              or a list of obs-column names.
+        gene_names : list of str, str, or None, optional
             Gene names.
 
-            - Legacy mode: list of gene names.
-            - AnnData mode: optional column name in ``adata.var`` used as
-              display names for grouped genes; if None, use grouped gene IDs.
-        group_gene_by_n_iso
-            Whether to group genes by the number of isoforms.
-        covariate_names
-            List of covariate names.
-        adata
-            AnnData object used in the new input mode.
-        spatial_key
+            - Legacy mode: list of gene name strings.
+            - AnnData mode: column name in ``adata.var`` used as display names for
+              grouped genes; if ``None``, the values of ``group_iso_by`` are used.
+        group_gene_by_n_iso : bool, optional
+            If ``True``, genes are sorted and grouped by their isoform count before
+            batching.  Required for ``batch_size > 1`` in :meth:`fit` because the
+            GLMM model expects a fixed isoform count per batch.
+        covariate_names : list of str or None, optional
+            Covariate names for columns of the design matrix.  If not provided,
+            names are inferred from DataFrame column names when available; otherwise
+            auto-generated as ``factor_1``, ``factor_2``, etc.
+
+            When explicitly provided, must match the number of factors in the design
+            matrix.
+        adata : anndata.AnnData or None, optional
+            AnnData object for AnnData input mode.
+        spatial_key : str, optional
             Key in ``adata.obsm`` for spatial coordinates.
-        layer
-            Counts layer in ``adata.layers``.
-        group_iso_by
+        layer : str, optional
+            Layer in ``adata.layers`` that stores isoform counts.
+        group_iso_by : str, optional
             Column in ``adata.var`` used to group isoforms by gene.
-        min_counts
+        min_counts : int, optional
             Minimum total isoform count across spots required to retain an
             isoform in AnnData mode.
-        min_bin_pct
-            Minimum percentage/fraction of spots where an isoform is expressed
-            in AnnData mode. Values in ``[0, 1]`` are treated as fractions;
-            values in ``(1, 100]`` are treated as percentages.
-        filter_single_iso_genes
+        min_bin_pct : float, optional
+            Minimum fraction/percentage of spots where an isoform must be expressed.
+            Values in ``[0, 1]`` are fractions; values in ``(1, 100]`` are percentages.
+        filter_single_iso_genes : bool, optional
             AnnData mode only. Whether to remove genes with fewer than two
             retained isoforms.
 
@@ -917,7 +954,7 @@ class SplisosmGLMM:
             covariate_names = extracted_covariate_names
 
             self.adata = adata
-            self.setup_input_mode = "anndata"
+            self._setup_input_mode = "anndata"
         else:
             if data is None or coordinates is None:
                 raise ValueError(
@@ -939,7 +976,7 @@ class SplisosmGLMM:
                 )
 
             self.adata = None
-            self.setup_input_mode = "legacy"
+            self._setup_input_mode = "legacy"
 
         # create the dataset and extract statistics
         _dataset = IsoDataset(data, gene_names, group_gene_by_n_iso)
@@ -949,8 +986,8 @@ class SplisosmGLMM:
             _dataset.n_isos_per_gene,
         )
         self.gene_names = _dataset.gene_names
-        self.dataset = _dataset
-        self.group_gene_by_n_iso = group_gene_by_n_iso
+        self._dataset = _dataset
+        self._group_gene_by_n_iso = group_gene_by_n_iso
 
         # create spatial covariance matrix from the coordinates
         if coordinates.shape[0] != self.n_spots:
@@ -1057,7 +1094,7 @@ class SplisosmGLMM:
 
         Parameters
         ----------
-        test_type
+        test_type : {"sv", "du"}
             Type of test results to retrieve. Can be one of ``'sv'`` (spatial variability) or ``'du'`` (differential usage).
 
         Returns
@@ -1116,22 +1153,22 @@ class SplisosmGLMM:
 
         Parameters
         ----------
-        n_jobs
+        n_jobs : int, optional
             The number of cores to use for parallel fitting. Default to 1.
-        batch_size
+        batch_size : int, optional
             The maximum number of genes per job to fit in parallel. Default to 1.
-        quiet
+        quiet : bool, optional
             Whether to suppress the fitting logs. Default to True.
-        print_progress
+        print_progress : bool, optional
             Whether to show the progress bar. Default to True.
-        with_design_mtx
+        with_design_mtx : bool, optional
             Whether to include the design matrix for the fixed effects. Default to False.
-        from_null
+        from_null : bool, optional
             Whether to initialize the full model from a null model
             with zero spatial variability (white-noise random effect).
-        refit_null
+        refit_null : bool, optional
             Whether to refit the null model after fitting the full model.
-        random_seed
+        random_seed : int or None, optional
             The random seed for reproducibility. Default to None.
 
         See also
@@ -1139,7 +1176,7 @@ class SplisosmGLMM:
         :func:`splisosm.model.MultinomGLMM.fit` for fitting a single model.
         """
 
-        if batch_size > 1 and not self.group_gene_by_n_iso:
+        if batch_size > 1 and not self._group_gene_by_n_iso:
             warnings.warn(
                 "Ignoring batch size argument since the dataset is not grouped. "
                 + "For batch fitting please set 'group_gene_by_n_iso = True' when setup_data()"
@@ -1240,7 +1277,7 @@ class SplisosmGLMM:
         list
             Fitted models ungrouped, list of length n_genes in the original order.
         """
-        data = self.dataset.get_dataloader(batch_size=batch_size)
+        data = self._dataset.get_dataloader(batch_size=batch_size)
 
         fitted_models_ungrouped = []
         gene_names_ungroupped = []
@@ -1350,8 +1387,8 @@ class SplisosmGLMM:
         t_start = timer()
 
         # extract the dataloader
-        n_batches = sum(1 for _ in self.dataset.get_dataloader(batch_size=batch_size))
-        data = self.dataset.get_dataloader(batch_size=batch_size)
+        n_batches = sum(1 for _ in self._dataset.get_dataloader(batch_size=batch_size))
+        data = self._dataset.get_dataloader(batch_size=batch_size)
 
         if n_jobs == 1:  # use single core
             if print_progress:
@@ -1422,7 +1459,7 @@ class SplisosmGLMM:
 
             # convert the fitted parameters to models
             for batch, pars in zip(
-                self.dataset.get_dataloader(batch_size=batch_size), fitted_pars
+                self._dataset.get_dataloader(batch_size=batch_size), fitted_pars
             ):
                 # unwrap the batch
                 b_counts = batch["x"]
@@ -1516,8 +1553,8 @@ class SplisosmGLMM:
         t_start = timer()
 
         # extract the dataloader
-        n_batches = sum(1 for _ in self.dataset.get_dataloader(batch_size=batch_size))
-        data = self.dataset.get_dataloader(batch_size=batch_size)
+        n_batches = sum(1 for _ in self._dataset.get_dataloader(batch_size=batch_size))
+        data = self._dataset.get_dataloader(batch_size=batch_size)
 
         if n_jobs == 1:  # use single core
             if print_progress:
@@ -1609,7 +1646,7 @@ class SplisosmGLMM:
 
             # convert the fitted parameters to models
             for batch, (n_par, f_par) in zip(
-                self.dataset.get_dataloader(batch_size=batch_size), fitted_pars
+                self._dataset.get_dataloader(batch_size=batch_size), fitted_pars
             ):
                 # unwrap the batch
                 b_counts = batch["x"]
@@ -1714,12 +1751,12 @@ class SplisosmGLMM:
                     if (self.design_mtx is not None and with_design_mtx)
                     else None
                 )
-                new_data = [_d[perm_idx, :] for _d in self.dataset.data]
+                new_data = [_d[perm_idx, :] for _d in self._dataset.data]
                 new_model.setup_data(
                     new_data,
                     self.coordinates,
                     new_design_mtx,
-                    group_gene_by_n_iso=self.group_gene_by_n_iso,
+                    group_gene_by_n_iso=self._group_gene_by_n_iso,
                 )
                 new_model._fit_null_full_sv(
                     refit_null=refit_null,
@@ -1761,9 +1798,9 @@ class SplisosmGLMM:
 
             # extract the dataloader
             n_batches = sum(
-                1 for _ in self.dataset.get_dataloader(batch_size=batch_size)
+                1 for _ in self._dataset.get_dataloader(batch_size=batch_size)
             )
-            data = self.dataset.get_dataloader(batch_size=batch_size)
+            data = self._dataset.get_dataloader(batch_size=batch_size)
 
             # Prepare tasks with delayed to ensure they're ready for parallel execution
             tasks_gen = (
@@ -1816,17 +1853,19 @@ class SplisosmGLMM:
 
         Parameters
         ----------
-        method
+        method : {"llr"}, optional
             The test method.
             Currently only support ``"llr"``, the likelihood ratio test (H_0: ``sigma_sp`` = 0).
-        use_perm_null
+        use_perm_null : bool, optional
             Whether to generate the null distribution from permutation.
             If False, use the chi-square with df = n_var_components as the null.
-        return_results
+        return_results : bool, optional
             Whether to return the test statistics and p-values.
             If False, the results will be stored in ``self.sv_test_results``.
-        print_progress
+        print_progress : bool, optional
             Whether to show the progress bar for permutation. Default to True.
+        n_perms_per_gene : int or None, optional
+            Number of permutations per gene when ``use_perm_null=True``. Default to 20.
         **kwargs : Any
             Additional arguments passed to `self._fit_sv_llr_perm()` if ``use_perm_null = True``.
 
@@ -1924,7 +1963,7 @@ class SplisosmGLMM:
 
         Parameters
         ----------
-        method
+        method : {"score", "wald"}, optional
             Depending on whether the design matrix is used for model fitting,
             different methods must be used for hypothesis testing:
 
@@ -1935,9 +1974,9 @@ class SplisosmGLMM:
                 The Wald statistic with GLM/GLMM is empirically anti-conserved (i.e., lots of false positives).
                 Always use ``method="score"`` when possible.
 
-        print_progress
+        print_progress : bool, optional
             Whether to show the progress bar. Default to True.
-        return_results
+        return_results : bool, optional
             Whether to return the test statistics and p-values.
             If False, the results are stored in ``self.du_test_results``.
 
