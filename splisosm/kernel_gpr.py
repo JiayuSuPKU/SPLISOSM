@@ -1244,7 +1244,10 @@ class GPyTorchKernelGPR(KernelGPR):
         train_y = Y2d.float().mean(dim=1).to(dev)  # (n,)
 
         likelihood = gpytorch.likelihoods.GaussianLikelihood().to(dev)
-        if self.n_inducing is not None:
+        # Use FITC only when there are strictly more observations than the
+        # requested inducing set (i.e. an actual sparse approximation).
+        use_sparse = self.n_inducing is not None and n > self.n_inducing
+        if use_sparse:
             inducing_pts = _subsample_inducing(train_x, self.n_inducing)
             model = _GPyTorchExactGPModel.build_sparse(
                 train_x,
