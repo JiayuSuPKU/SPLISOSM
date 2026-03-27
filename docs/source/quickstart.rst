@@ -16,7 +16,7 @@ Inputs and outputs
 ------------------
 
 :class:`~splisosm.SplisosmNP` and :class:`~splisosm.SplisosmGLMM` accept isoform-level quantification as either an ``AnnData`` object or as raw tensors.
-See :doc:`Isoform Quantification page <txquant>` for guidance on preparing input data for different platforms.
+See :doc:`Feature Quantification page <txquant>` for guidance on preparing input data for different platforms.
 
 .. code-block:: python
 

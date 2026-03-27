@@ -80,6 +80,9 @@ autodoc_default_options = {
     'undoc-members': False,
     'show-inheritance': True,
 }
+# Treat single-backtick interpreted text as literal to avoid accidental
+# ambiguous cross-references from docstring tokens like `n` or `n_factors`.
+default_role = 'literal'
 autodoc_typehints = "description"
 autodoc_typehints_format = "short"
 python_use_unqualified_type_names = True

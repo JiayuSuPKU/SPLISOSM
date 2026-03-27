@@ -338,11 +338,11 @@ class TestSplisosmNP(unittest.TestCase):
             design_mtx=self.design_mtx,
             gene_names=self.gene_names,
         )
-        for method in ["hsic", "hsic-knn", "hsic-gp"]:
+        for method in ["hsic", "hsic-gp"]:
             with self.subTest(method=method):
-                model.test_differential_usage(method=method, hsic_eps=1e-3)
+                model.test_differential_usage(method=method, print_progress=False)
                 du_results = model.get_formatted_test_results("du")
-                print(du_results.head())
+                self.assertGreater(len(du_results), 0)
                 self.assertIn(method, str(model))
 
     def test_spatial_variability_with_none_transformation(self):
@@ -430,7 +430,7 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertEqual(len(du_results), self.n_genes * 1)
 
     def test_differential_usage_unconditional_hsic(self):
-        """Test differential usage with unconditional HSIC (hsic_eps=None)."""
+        """Test unconditional HSIC (method='hsic', no spatial conditioning)."""
         model = SplisosmNP()
         model.setup_data(
             data=self.counts,
@@ -438,9 +438,7 @@ class TestSplisosmNP(unittest.TestCase):
             design_mtx=self.design_mtx,
             gene_names=self.gene_names,
         )
-        model.test_differential_usage(
-            method="hsic", hsic_eps=None, print_progress=False
-        )
+        model.test_differential_usage(method="hsic", print_progress=False)
         du_results = model.get_formatted_test_results("du")
         self.assertEqual(len(du_results), self.n_genes * self.design_mtx.shape[1])
 
@@ -474,6 +472,236 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertIsNotNone(results)
         self.assertIn("statistic", results)
         self.assertIn("pvalue", results)
+
+    def test_design_mtx_dataframe_name_inference(self):
+        """Test that DataFrame column names are inferred for covariate_names."""
+        model = SplisosmNP()
+        design_df = pd.DataFrame(
+            self.design_mtx.numpy(), columns=["treatment", "batch"]
+        )
+        model.setup_data(
+            data=self.counts,
+            coordinates=self.coords,
+            design_mtx=design_df,
+            # covariate_names=None (not provided, should be inferred)
+        )
+
+        # Verify covariate names were inferred from DataFrame columns
+        self.assertEqual(model.covariate_names, ["treatment", "batch"])
+        self.assertEqual(model.n_factors, 2)
+
+    def test_design_mtx_explicit_covariate_names_override(self):
+        """Test that explicit covariate_names override inferred names."""
+        model = SplisosmNP()
+        design_df = pd.DataFrame(
+            self.design_mtx.numpy(), columns=["default_1", "default_2"]
+        )
+        custom_names = ["my_treatment", "my_batch"]
+        model.setup_data(
+            data=self.counts,
+            coordinates=self.coords,
+            design_mtx=design_df,
+            covariate_names=custom_names,
+        )
+
+        # Verify explicit names take priority
+        self.assertEqual(model.covariate_names, custom_names)
+
+    def test_design_mtx_dimension_mismatch_error(self):
+        """Test that dimension mismatch between design_mtx and covariate_names raises error."""
+        model = SplisosmNP()
+        design_df = pd.DataFrame(
+            self.design_mtx.numpy(), columns=["treatment", "batch"]
+        )
+
+        # Number of covariate names doesn't match design matrix columns
+        with self.assertRaises(ValueError) as context:
+            model.setup_data(
+                data=self.counts,
+                coordinates=self.coords,
+                design_mtx=design_df,
+                covariate_names=["only_one"],
+            )
+
+        self.assertIn("must match", str(context.exception))
+
+    def test_design_mtx_sparse_array_conversion(self):
+        """Test that sparse matrices are properly converted to dense."""
+        import scipy.sparse as sp
+
+        model = SplisosmNP()
+        # Convert design matrix to sparse scipy format
+        design_sparse = sp.csr_matrix(self.design_mtx.numpy())
+
+        model.setup_data(
+            data=self.counts,
+            coordinates=self.coords,
+            design_mtx=design_sparse,
+        )
+
+        # Verify sparse matrix was converted to torch tensor
+        self.assertIsInstance(model.design_mtx, torch.Tensor)
+        self.assertEqual(model.design_mtx.shape, (self.n_spots, 2))
+
+    def test_design_mtx_numpy_array_conversion(self):
+        """Test numpy array conversion and covariate name generation."""
+        model = SplisosmNP()
+        design_np = self.design_mtx.numpy()
+
+        model.setup_data(
+            data=self.counts,
+            coordinates=self.coords,
+            design_mtx=design_np,
+        )
+
+        # Verify conversion and default name generation
+        self.assertIsInstance(model.design_mtx, torch.Tensor)
+        self.assertEqual(model.covariate_names, ["factor_1", "factor_2"])
+        self.assertEqual(model.n_factors, 2)
+
+    def test_design_mtx_anndata_categorical_encoding(self):
+        """Test that categorical columns in AnnData are one-hot encoded."""
+        # Create AnnData with a categorical column
+        adata = AnnData(X=self.adata.X, obs=self.adata.obs.copy(), var=self.adata.var)
+        adata.layers["counts"] = self.adata.layers["counts"].copy()
+        adata.obsm["spatial"] = self.adata.obsm["spatial"].copy()
+
+        # Add a categorical column with 3 categories
+        adata.obs["treatment"] = pd.Categorical(
+            ["A", "B", "C"] * (len(adata.obs) // 3) + ["A"] * (len(adata.obs) % 3)
+        )
+
+        model = SplisosmNP()
+        model.setup_data(
+            adata=adata,
+            spatial_key="spatial",
+            layer="counts",
+            group_iso_by="gene_symbol",
+            design_mtx=["treatment"],  # Categorical column should be one-hot encoded
+            min_counts=0,
+            min_bin_pct=0.0,
+        )
+
+        # Should have 3 columns (one-hot encoded) + no extra numerical columns
+        self.assertEqual(model.n_factors, 3)
+        # Covariate names should include one-hot expanded names
+        self.assertTrue(
+            all(name.startswith("treatment_") for name in model.covariate_names)
+        )
+
+    def test_design_mtx_anndata_mixed_columns(self):
+        """Test that numerical and categorical columns are handled correctly."""
+        # Create AnnData with both numerical and categorical columns
+        adata = AnnData(X=self.adata.X, obs=self.adata.obs.copy(), var=self.adata.var)
+        adata.layers["counts"] = self.adata.layers["counts"].copy()
+        adata.obsm["spatial"] = self.adata.obsm["spatial"].copy()
+
+        # Add numerical and categorical columns
+        adata.obs["age"] = np.linspace(20, 80, len(adata.obs))
+        adata.obs["batch"] = pd.Categorical(
+            ["batch1", "batch2"] * (len(adata.obs) // 2)
+        )
+
+        model = SplisosmNP()
+        model.setup_data(
+            adata=adata,
+            spatial_key="spatial",
+            layer="counts",
+            group_iso_by="gene_symbol",
+            design_mtx=["age", "batch"],
+            min_counts=0,
+            min_bin_pct=0.0,
+        )
+
+        # Should have 1 (age) + 2 (batch categorical) = 3 factors
+        self.assertEqual(model.n_factors, 3)
+        # First should be age, rest batch-related
+        self.assertEqual(model.covariate_names[0], "age")
+        self.assertTrue(
+            all(name.startswith("batch_") for name in model.covariate_names[1:])
+        )
+
+    def test_differential_usage_residualize_both(self):
+        """residualize='both' should run without error and return valid p-values."""
+        model = SplisosmNP()
+        model.setup_data(
+            data=self.counts[:5],
+            coordinates=self.coords,
+            design_mtx=self.design_mtx,
+            covariate_names=["C1", "C2"],
+        )
+        model.test_differential_usage(
+            method="hsic-gp",
+            gpr_backend="sklearn",
+            residualize="both",
+            print_progress=False,
+        )
+        df = model.get_formatted_test_results("du")
+        self.assertEqual(df.shape[0], 5 * 2)  # 5 genes × 2 covariates
+        pv = df["pvalue"].values
+        self.assertTrue(np.all(np.isfinite(pv)))
+        self.assertTrue(np.all((pv >= 0) & (pv <= 1)))
+
+    @unittest.skipUnless(
+        __import__("importlib").util.find_spec("gpytorch") is not None,
+        "gpytorch not installed",
+    )
+    def test_differential_usage_gpytorch_backend(self):
+        """gpr_backend='gpytorch' should return valid p-values."""
+        model = SplisosmNP()
+        model.setup_data(
+            data=self.counts[:5],
+            coordinates=self.coords,
+            design_mtx=self.design_mtx,
+            covariate_names=["C1", "C2"],
+        )
+        model.test_differential_usage(
+            method="hsic-gp",
+            gpr_backend="gpytorch",
+            residualize="cov_only",
+            print_progress=False,
+        )
+        df = model.get_formatted_test_results("du")
+        self.assertEqual(df.shape[0], 5 * 2)
+        pv = df["pvalue"].values
+        self.assertTrue(np.all(np.isfinite(pv)))
+        self.assertTrue(np.all((pv >= 0) & (pv <= 1)))
+
+    @unittest.skipUnless(
+        __import__("importlib").util.find_spec("gpytorch") is not None,
+        "gpytorch not installed",
+    )
+    def test_gpytorch_agrees_with_sklearn(self):
+        """GPyTorch and sklearn backends should produce broadly consistent p-value ranks."""
+        from scipy.stats import spearmanr
+
+        model = SplisosmNP()
+        model.setup_data(
+            data=self.counts[:10],
+            coordinates=self.coords,
+            design_mtx=self.design_mtx,
+            covariate_names=["C1", "C2"],
+        )
+        model.test_differential_usage(
+            method="hsic-gp",
+            gpr_backend="sklearn",
+            residualize="cov_only",
+            print_progress=False,
+        )
+        pv_sk = model.get_formatted_test_results("du")["pvalue"].values
+
+        model.test_differential_usage(
+            method="hsic-gp",
+            gpr_backend="gpytorch",
+            residualize="cov_only",
+            print_progress=False,
+        )
+        pv_pt = model.get_formatted_test_results("du")["pvalue"].values
+
+        rho, _ = spearmanr(
+            -np.log10(np.clip(pv_sk, 1e-300, 1)), -np.log10(np.clip(pv_pt, 1e-300, 1))
+        )
+        self.assertGreater(rho, 0.9, f"Spearman rank correlation={rho:.3f} too low")
 
 
 if __name__ == "__main__":

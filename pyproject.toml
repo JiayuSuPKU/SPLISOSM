@@ -40,6 +40,10 @@ sdata = [
     "spatialdata-io",
     "spatialdata-plot"
 ]
+gp = [
+    "gpytorch",
+    "linear-operator"
+]
 
 [project.urls]
 repository = "https://github.com/JiayuSuPKU/SPLISOSM"
