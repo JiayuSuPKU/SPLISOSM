@@ -394,6 +394,80 @@ class TestSplisosmNP(unittest.TestCase):
         sv_results = model.get_formatted_test_results("sv")
         self.assertEqual(len(sv_results), self.n_genes)
 
+    def test_sv_null_methods(self):
+        """All three null methods should run and return valid p-values."""
+        model = SplisosmNP()
+        model.setup_data(
+            data=self.counts,
+            coordinates=self.coords,
+            design_mtx=self.design_mtx,
+            gene_names=self.gene_names,
+        )
+        for null_method in ["eig", "trace", "perm"]:
+            with self.subTest(null_method=null_method):
+                configs = (
+                    {"n_perms_per_gene": 50, "perm_batch_size": 10}
+                    if null_method == "perm"
+                    else {}
+                )
+                model.test_spatial_variability(
+                    method="hsic-ir",
+                    null_method=null_method,
+                    null_configs=configs,
+                    print_progress=False,
+                )
+                res = model.sv_test_results
+                self.assertEqual(res["null_method"], null_method)
+                self.assertEqual(len(res["pvalue"]), self.n_genes)
+                self.assertTrue(np.all(res["pvalue"] >= 0))
+                self.assertTrue(np.all(res["pvalue"] <= 1))
+
+    def test_sv_perm_nan_filling_none(self):
+        """Perm null with nan_filling='none' should use the dense per-gene submatrix path."""
+        model = SplisosmNP()
+        model.setup_data(
+            data=self.counts,
+            coordinates=self.coords,
+            design_mtx=self.design_mtx,
+            gene_names=self.gene_names,
+        )
+        model.test_spatial_variability(
+            method="hsic-ir",
+            nan_filling="none",
+            null_method="perm",
+            null_configs={"n_perms_per_gene": 30, "perm_batch_size": 10},
+            print_progress=False,
+        )
+        res = model.sv_test_results
+        self.assertEqual(len(res["pvalue"]), self.n_genes)
+        self.assertTrue(np.all(res["pvalue"] >= 0))
+        self.assertTrue(np.all(res["pvalue"] <= 1))
+
+    def test_sv_perm_batch_size_config(self):
+        """perm_batch_size in null_configs should be respected."""
+        model = SplisosmNP()
+        model.setup_data(
+            data=self.counts,
+            coordinates=self.coords,
+            design_mtx=self.design_mtx,
+            gene_names=self.gene_names,
+        )
+        for batch_size in [1, 50]:
+            with self.subTest(perm_batch_size=batch_size):
+                model.test_spatial_variability(
+                    method="hsic-gc",
+                    null_method="perm",
+                    null_configs={
+                        "n_perms_per_gene": 50,
+                        "perm_batch_size": batch_size,
+                    },
+                    print_progress=False,
+                )
+                res = model.sv_test_results
+                self.assertEqual(len(res["pvalue"]), self.n_genes)
+                self.assertTrue(np.all(res["pvalue"] >= 0))
+                self.assertTrue(np.all(res["pvalue"] <= 1))
+
     def test_differential_usage_t_fisher(self):
         """Test differential usage with t-fisher method using binary factor."""
         model = SplisosmNP()

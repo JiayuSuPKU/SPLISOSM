@@ -5,6 +5,7 @@ from __future__ import annotations
 import warnings
 import json
 from typing import Any, Optional, Literal
+from scipy.stats import norm as _norm_dist
 
 from pathlib import Path
 import numpy as np
@@ -15,7 +16,6 @@ import pandas as pd
 import torch
 from matplotlib.image import imread
 from anndata import AnnData
-from smoother import SpatialWeightMatrix, SpatialLoss
 from splisosm.likelihood import liu_sf
 
 __all__ = [
@@ -34,19 +34,18 @@ __all__ = [
 def get_cov_sp(
     coords: np.ndarray | torch.Tensor, k: int = 4, rho: float = 0.99
 ) -> torch.Tensor:
-    """Wrapper function to get the spatial covariance matrix from spatial coordinates.
+    """Return the dense standardised CAR spatial covariance matrix.
 
-    It will first construct a mutual-k-nearest neighbor graph from the euclidean spatial coordinates,
-    then convert the adjacency matrix to a standardized spatial covariance matrix using the
-    intrinsic conditional autoregressive (ICAR) model with spatial autocorrelation coefficient rho.
-    See :cite:`su2023smoother` for details.
+    Constructs a k-mutual-nearest-neighbour graph from *coords*, builds the
+    CAR precision matrix M = I - rho * D^{-1/2} W_sym D^{-1/2}, and
+    returns K = M⁻¹ with unit marginal variance.
 
     Parameters
     ----------
     coords
         Shape (n_spots, n_dims). Euclidean spatial coordinates of spots.
     k
-        Number of nearest neighbors.
+        Number of mutual nearest neighbors.
     rho
         Spatial autocorrelation coefficient.
 
@@ -55,22 +54,11 @@ def get_cov_sp(
     cov_sp : torch.Tensor
         Shape (n_spots, n_spots). Spatial covariance matrix with standardized variance (== 1).
     """
-    # first calculate the spatial weights matrix (swm)
-    # here swm is the binary adjacency matrix of the knn graph
-    weights = SpatialWeightMatrix()
-    weights.calc_weights_knn(coords, k=k, verbose=False)
+    from splisosm.kernel import SpatialCovKernel
 
-    # # convert the swm to spatial covariance matrix with standardized variance (== 1)
-    # spatial_loss = SpatialLoss("icar", weights, rho=rho, standardize_cov=True)
-    # cov_sp = torch.cholesky_inverse(torch.linalg.cholesky(spatial_loss.inv_cov[0].to_dense())) # n_spots x n_spots
-    spatial_loss = SpatialLoss("icar", weights, rho=rho, standardize_cov=False)
-    cov_sp = torch.cholesky_inverse(
-        torch.linalg.cholesky(spatial_loss.inv_cov[0].to_dense())
-    )  # n_spots x n_spots
-    inv_sds = torch.diagflat(torch.diagonal(cov_sp) ** (-0.5))
-    cov_sp = inv_sds @ cov_sp @ inv_sds
-
-    return cov_sp
+    return SpatialCovKernel.from_coordinates(
+        coords, k_neighbors=k, rho=rho, standardize_cov=True, centering=False
+    ).realization()
 
 
 def counts_to_ratios(
@@ -983,60 +971,59 @@ def run_sparkx(
 def run_hsic_gc(
     counts_gene: np.ndarray | torch.Tensor,
     coordinates: np.ndarray | torch.Tensor,
-    approx_rank: Optional[int] = None,
+    null_method: Literal["eig", "trace"] = "eig",
+    null_configs: Optional[dict[str, Any]] = None,
     **spatial_kernel_kwargs: Any,
 ) -> dict[str, Any]:
-    """Function to compute HSIC-GC statistic for gene-level counts.
+    """Compute the HSIC-GC statistic for gene-level counts.
 
     This function is designed to be a plugin replacement for SPARK-X.
 
     Parameters
     ----------
     counts_gene
-        Shape (n_spots, n_genes). Gene counts.
+        Shape ``(n_spots, n_genes)``. Gene counts.
     coordinates
-        Shape (n_spots, 2). Spatial coordinates of spots.
-    approx_rank
-        Approximate rank of the spatial kernel matrix.
+        Shape ``(n_spots, n_dim)``. Spatial coordinates of spots.
+    null_method : {"eig", "trace"}, optional
+        Method for computing the null distribution of the test statistic:
+
+        * ``"eig"`` (default): asymptotic chi-square mixture using kernel
+          eigenvalues; Liu's method.  Supports optional
+          ``null_configs["approx_rank"]`` (int) to restrict to the top-k
+          eigenvalues.
+        * ``"trace"``: moment-matching normal approximation using
+          tr(K') and tr(K'²) of the centred spatial kernel and the scalar
+          per-gene variance.
+    null_configs : dict or None, optional
+        Extra keyword arguments for the chosen ``null_method``.
     **spatial_kernel_kwargs
-        Additional arguments for SpatialCovKernel.
+        Additional arguments forwarded to :class:`~splisosm.kernel.SpatialCovKernel`.
 
     Returns
     -------
     dict
-        Results of the HSIC-GC spatial variability test with keys:
+        Results with keys:
 
-        - ``'statistic'``: np.ndarray of shape (n_genes,). HSIC-GC statistics.
-        - ``'pvalue'``: np.ndarray of shape (n_genes,). P-values.
-        - ``'pvalue_adj'``: np.ndarray of shape (n_genes,). Adjusted p-values.
-        - ``'method'``: str. Method name "hsic-gc".
+        - ``'statistic'``: np.ndarray of shape (n_genes,).
+        - ``'pvalue'``: np.ndarray of shape (n_genes,).
+        - ``'pvalue_adj'``: np.ndarray of shape (n_genes,).
+        - ``'method'``: ``"hsic-gc"``.
+        - ``'null_method'``: the value of *null_method*.
     """
 
     from splisosm.kernel import SpatialCovKernel
 
     n_spots = counts_gene.shape[0]
     n_genes = counts_gene.shape[1]
-
-    # determine the maximum rank for spatial kernel computation
-    if n_spots > 5000:
-        # 10x Visium has 4992 spots per slide. For larger datasets (i.e. Slideseq-V2),
-        # it is recommended to use low-rank approximation
-        max_rank = np.ceil(np.sqrt(n_spots) * 4).astype(int)
-        approx_rank = (
-            min(approx_rank, max_rank) if approx_rank is not None else max_rank
-        )
-    else:
-        if approx_rank is not None:
-            approx_rank = approx_rank if approx_rank < n_spots else None
+    configs = null_configs or {}
 
     # set default spatial kernel kwargs
     default_spatial_kernel_kwargs = {
         "k_neighbors": 4,
-        "model": "icar",
         "rho": 0.99,
         "standardize_cov": True,
         "centering": True,
-        "approx_rank": approx_rank,
     }
     if spatial_kernel_kwargs is not None:
         if "centering" in spatial_kernel_kwargs:
@@ -1047,15 +1034,29 @@ def run_hsic_gc(
         default_spatial_kernel_kwargs.update(spatial_kernel_kwargs)
 
     # compute the spatial kernel
-    # Ensure coordinates is numpy for SpatialCovKernel/smoother
     if isinstance(coordinates, torch.Tensor):
         coordinates = coordinates.detach().cpu().numpy()
 
     K_sp = SpatialCovKernel(coordinates, **default_spatial_kernel_kwargs)
 
-    # get the eigenvalues
-    lambda_sp = K_sp.eigenvalues()  # (rank,)
-    lambda_sp = lambda_sp[lambda_sp > 1e-5]  # filter small eigenvalues
+    # pre-compute null distribution inputs (once, before the gene loop)
+    if null_method == "eig":
+        approx_rank = configs.get("approx_rank", None)
+        # auto-cap rank for large datasets to keep eigendecomposition tractable
+        if n_spots > 5000:
+            max_rank = int(np.ceil(np.sqrt(n_spots) * 4))
+            approx_rank = (
+                min(approx_rank, max_rank) if approx_rank is not None else max_rank
+            )
+        elif approx_rank is not None:
+            approx_rank = approx_rank if approx_rank < n_spots else None
+        lambda_sp = K_sp.eigenvalues(k=approx_rank)
+        lambda_sp = lambda_sp[lambda_sp > 1e-5]
+    elif null_method == "trace":
+        trK = K_sp.trace()
+        trK2 = K_sp.square_trace()
+    else:
+        raise ValueError(f"null_method must be 'eig' or 'trace', got {null_method!r}")
 
     # compute the HSIC-GC statistic per-gene
     is_scipy_sparse = scipy.sparse.issparse(counts_gene)
@@ -1104,10 +1105,22 @@ def run_hsic_gc(
         else:
             counts = y_dense[:, i : i + 1]  # (n_spots, 1)
 
-        lambda_y = counts.T @ counts  # (1, 1)
-        lambda_spy = lambda_sp * lambda_y  # (rank, 1)
         hsic_scaled = torch.trace(K_sp.xtKx(counts))  # scalar
-        pval = liu_sf((hsic_scaled * n_spots).numpy(), lambda_spy.numpy())
+
+        if null_method == "eig":
+            lambda_y = counts.T @ counts  # (1, 1)
+            lambda_spy = lambda_sp * lambda_y  # (rank, 1)
+            pval = liu_sf((hsic_scaled * n_spots).numpy(), lambda_spy.numpy())
+        else:  # "trace"
+            # For a (1,1) gene-count scatter S = counts.T @ counts:
+            # tr(S) = S[0,0];  tr(S²) = S[0,0]² = tr(S)²
+            trS = (counts.T @ counts).item()
+            trS2 = trS**2
+            n1 = n_spots - 1
+            mean_null = trK.item() * trS / n1
+            var_null = 2.0 * trK2.item() * trS2 / (n1**2)
+            z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
+            pval = float(_norm_dist.sf(z))
 
         hsic_list.append(hsic_scaled / (n_spots - 1) ** 2)  # HSIC statistic
         pvals_list.append(pval)
@@ -1116,6 +1129,7 @@ def run_hsic_gc(
         "statistic": torch.tensor(hsic_list).numpy(),
         "pvalue": torch.tensor(pvals_list).numpy(),
         "method": "hsic-gc",
+        "null_method": null_method,
     }
 
     # calculate adjusted p-values

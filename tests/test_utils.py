@@ -177,6 +177,27 @@ class TestUtils(unittest.TestCase):
             res_np["pvalue"], res_torch_sparse["pvalue"], rtol=1e-5
         )
 
+    def test_run_hsic_gc_null_methods(self):
+        """Both null_method='eig' and 'trace' should return valid p-values."""
+        n_spots, n_genes = 50, 4
+        counts_np = np.random.randint(0, 5, size=(n_spots, n_genes)).astype(np.float32)
+        coords_np = np.random.rand(n_spots, 2).astype(np.float32)
+
+        res_eig = run_hsic_gc(counts_np, coords_np, null_method="eig")
+        res_trace = run_hsic_gc(counts_np, coords_np, null_method="trace")
+
+        for res, nm in [(res_eig, "eig"), (res_trace, "trace")]:
+            self.assertEqual(res["null_method"], nm)
+            self.assertEqual(len(res["pvalue"]), n_genes)
+            self.assertTrue(np.all(res["pvalue"] >= 0))
+            self.assertTrue(np.all(res["pvalue"] <= 1))
+            self.assertIn("pvalue_adj", res)
+
+        # statistics should be identical (same kernel, same counts)
+        np.testing.assert_allclose(
+            res_eig["statistic"], res_trace["statistic"], rtol=1e-5
+        )
+
     def test_counts_to_ratios_importerror_fallback(self):
         counts = np.array([[1.0, 2.0], [0.0, 0.0]], dtype=np.float32)
         orig_import = __import__
@@ -340,7 +361,7 @@ class TestUtils(unittest.TestCase):
             def __init__(self, coordinates, **kwargs):
                 self.kwargs = kwargs
 
-            def eigenvalues(self):
+            def eigenvalues(self, k=None):
                 return torch.tensor([1.0], dtype=torch.float32)
 
             def xtKx(self, counts):
@@ -355,7 +376,7 @@ class TestUtils(unittest.TestCase):
                 res_large = run_hsic_gc(
                     counts_large,
                     coords_large,
-                    approx_rank=100000,
+                    null_configs={"approx_rank": 100000},
                     centering=False,
                 )
             self.assertIn("statistic", res_large)
@@ -364,7 +385,9 @@ class TestUtils(unittest.TestCase):
             # approx_rank >= n_spots should be reset to None
             counts_small = np.ones((10, 1), dtype=np.float32)
             coords_small = np.random.rand(10, 2).astype(np.float32)
-            res_small = run_hsic_gc(counts_small, coords_small, approx_rank=100)
+            res_small = run_hsic_gc(
+                counts_small, coords_small, null_configs={"approx_rank": 100}
+            )
             self.assertIn("pvalue", res_small)
 
             # scipy sparse branch with conversion to csc/csr

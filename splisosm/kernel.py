@@ -1,11 +1,13 @@
 """Spatial kernel abstractions."""
 
-import scipy
+import warnings
 import numpy as np
+import scipy.sparse
+import scipy.sparse.linalg
 import torch
-from typing import Literal
 from abc import ABC, abstractmethod
-from smoother.weights import coordinate_to_weights_knn_sparse, sparse_weights_to_inv_cov
+from scipy.sparse.linalg import splu
+from sklearn.neighbors import NearestNeighbors
 
 __all__ = ["SpatialCovKernel"]
 
@@ -62,184 +64,428 @@ class Kernel(ABC):
             Eigenvalues sorted in descending order.
         """
 
+    @abstractmethod
+    def trace(self) -> torch.Tensor:
+        """Return the trace of the kernel matrix tr(K).
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar trace value.
+        """
+
+    @abstractmethod
+    def square_trace(self) -> torch.Tensor:
+        """Return tr(K²).
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar value.
+        """
+
+
+def _build_adj_from_coords(
+    coords: np.ndarray,
+    k_neighbors: int,
+    mutual_neighbors: bool = True,
+) -> scipy.sparse.csc_matrix:
+    """Build a symmetric k-NN adjacency matrix from spot coordinates.
+
+    Parameters
+    ----------
+    coords : np.ndarray
+        Spot coordinates of shape ``(n_spots, n_dim)``.
+    k_neighbors : int
+        Number of nearest neighbours (excluding self).
+    mutual_neighbors : bool
+        If ``True``, retain only edges where both spots list each other as a
+        neighbour.  If ``False``, symmetrise by averaging.
+
+    Returns
+    -------
+    scipy.sparse.csc_matrix
+        Binary symmetric adjacency matrix of shape ``(n_spots, n_spots)``.
+    """
+    nbrs = NearestNeighbors(
+        n_neighbors=k_neighbors + 1, algorithm="auto", metric="euclidean"
+    ).fit(coords)
+    W = nbrs.kneighbors_graph(coords, mode="connectivity").astype(float)
+
+    if mutual_neighbors:
+        W_sym = W + W.T
+        W_sym.data = (W_sym.data > 1).astype(float)
+    else:
+        W_sym = 0.5 * (W + W.T)
+
+    # Remove self-connections; if any rows become empty, add self-loop to avoid isolated nodes
+    W_sym.setdiag(0)
+    row_sums = np.asarray(W_sym.sum(axis=1)).ravel()
+    isolated = row_sums == 0
+    if isolated.any():
+        W_sym.setdiag(isolated.astype(float))
+    W_sym.eliminate_zeros()
+    return W_sym.tocsc()
+
+
+def _build_car_precision_from_adj(
+    adj: scipy.sparse.spmatrix,
+    rho: float,
+) -> scipy.sparse.csc_matrix:
+    """Build a sparse CAR precision matrix from an adjacency/weight matrix.
+
+    Computes M = I - rho * D^{-1/2} W D^{-1/2}.
+
+    Parameters
+    ----------
+    adj : scipy.sparse.spmatrix
+        Symmetric adjacency or weight matrix of shape ``(n_spots, n_spots)``.
+    rho : float
+        Spatial autocorrelation coefficient (0 < rho < 1).
+
+    Returns
+    -------
+    scipy.sparse.csc_matrix
+        Sparse precision matrix of shape ``(n_spots, n_spots)``.
+    """
+    n = adj.shape[0]
+    row_sums = np.asarray(adj.sum(axis=1)).ravel().clip(1e-12)
+    inv_D_sqrt = scipy.sparse.diags(1.0 / np.sqrt(row_sums))
+    W_norm = inv_D_sqrt @ adj @ inv_D_sqrt
+    return (scipy.sparse.eye(n, format="csc") - rho * W_norm).tocsc()
+
 
 class SpatialCovKernel(Kernel):
-    """Graph-based spatial covariance kernel built from spot coordinates."""
+    """Graph-based spatial covariance kernel.
 
-    inv_cov: torch.Tensor
-    """Sparse precision matrix (aka inverse spatial kernel) of shape (n_spots, n_spots)."""
+    Construct from spot coordinates (:meth:`from_coordinates` or the
+    ``coords`` positional argument) or from a pre-built k-NN adjacency /
+    weight matrix (:meth:`from_adjacency` or the ``adj_matrix`` keyword
+    argument).  Exactly one of the two must be provided.
+
+    The kernel is stored in one of two modes depending on dataset size:
+
+    - **Dense mode** (``n ≤ DENSE_THRESHOLD``): the ``(n, n)`` covariance
+      matrix ``K_sp`` is materialised, with optional variance standardisation
+      and double-centring applied at construction time.
+    - **Implicit mode** (``n > DENSE_THRESHOLD``): only the sparse precision
+      ``inv_cov = K⁻¹`` is retained; ``K x`` is computed via a cached sparse
+      LU factorisation.
+
+    Eigenvalue decomposition and the low-rank Q factor are computed
+    **lazily** on the first call to :meth:`eigenvalues`.
+    """
+
+    DENSE_THRESHOLD: int = 5000
+    """Switch to implicit sparse mode above this number of spots."""
+
+    inv_cov: scipy.sparse.csc_matrix
+    """Sparse precision matrix M = K⁻¹ of shape (n_spots, n_spots)."""
 
     K_sp: torch.Tensor | None
-    """
-    Dense kernel matrix of shape (n_spots, n_spots) when full-rank storage is used.
-    ``None`` when low-rank storage is used.
-    """
+    """Dense centred/standardised kernel (n_spots, n_spots). ``None`` in
+    implicit mode."""
 
     Q: torch.Tensor | None
-    """
-    Low-rank factor of shape (n_spots, rank) such that ``K_sp ~= Q @ Q.T``.
-    ``None`` when full-rank storage is used.
-    """
+    """Low-rank factor (n_spots, rank) such that K ≈ Q @ Q.T.
+    Populated lazily after the first :meth:`eigenvalues` call."""
+
+    K_eigvals: torch.Tensor | None
+    """Cached eigenvalues in descending order. Populated lazily."""
+
+    K_eigvecs: torch.Tensor | None
+    """Cached eigenvectors (dense mode only). Populated lazily."""
 
     def __init__(
         self,
-        coords: np.ndarray | torch.Tensor,
+        coords: np.ndarray | torch.Tensor | None = None,
+        *,
+        adj_matrix: "scipy.sparse.spmatrix | np.ndarray | None" = None,
         k_neighbors: int = 4,
-        model: Literal["icar", "car", "isar", "sar"] = "icar",
         rho: float = 0.99,
         standardize_cov: bool = True,
         centering: bool = False,
-        approx_rank: int | None = None,
     ) -> None:
+        """Construct from spot coordinates or a pre-built adjacency matrix.
+
+        Exactly one of ``coords`` or ``adj_matrix`` must be supplied.
+        Prefer the factory methods :meth:`from_coordinates` and
+        :meth:`from_adjacency` for more descriptive call sites.
+
+        Parameters
+        ----------
+        coords : array-like of shape (n_spots, n_dim), optional
+            Spot coordinates.  A k-NN graph is built from these and used to
+            construct the CAR precision matrix.
+        adj_matrix : sparse or dense matrix of shape (n_spots, n_spots), optional
+            Pre-built symmetric k-NN adjacency / weight matrix.  The CAR
+            precision is built directly from this matrix.
+        k_neighbors : int
+            Number of nearest neighbours when building the graph from
+            ``coords``.  Ignored when ``adj_matrix`` is provided.
+        rho : float
+            CAR spatial autocorrelation coefficient (0 < rho < 1).
+        standardize_cov : bool
+            Scale the covariance to unit marginal variance.
+        centering : bool
+            Apply double-centring H K H.
         """
+        if (coords is None) == (adj_matrix is None):
+            raise ValueError(
+                "Provide exactly one of 'coords' or 'adj_matrix', not both or neither."
+            )
+
+        if coords is not None:
+            if isinstance(coords, torch.Tensor):
+                coords = coords.numpy()
+            coords_np = np.asarray(coords, dtype=np.float64)
+            adj = _build_adj_from_coords(coords_np, k_neighbors, mutual_neighbors=True)
+        else:
+            adj = (
+                adj_matrix
+                if scipy.sparse.issparse(adj_matrix)
+                else scipy.sparse.csc_matrix(adj_matrix)
+            )
+            # Symmetrise if not already symmetric
+            if not (adj != adj.T).nnz == 0:
+                adj = (adj + adj.T) / 2
+                warnings.warn(
+                    "Provided adjacency matrix is not symmetric; symmetrising by averaging with its transpose.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            # Through a warning if not sparse enough
+            if adj.nnz > 0.1 * adj.shape[0] ** 2:
+                warnings.warn(
+                    f"Provided adjacency matrix has {adj.nnz} nonzeros, which may be inefficient for large n. "
+                    "Consider using a sparse format or reducing k_neighbors.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        inv_cov = _build_car_precision_from_adj(adj, rho)
+        self._init_from_precision(
+            inv_cov, standardize_cov=standardize_cov, centering=centering
+        )
+
+    def _init_from_precision(
+        self,
+        inv_cov: scipy.sparse.csc_matrix,
+        *,
+        standardize_cov: bool,
+        centering: bool,
+    ) -> None:
+        """Core initialisation from a sparse precision matrix."""
+        n = inv_cov.shape[0]
+        self._n = n
+        self._standardize_cov = standardize_cov
+        self._centering = centering
+        self.inv_cov = inv_cov.tocsc()
+
+        # Lazy state — not computed at construction
+        self.Q = None
+        self.K_eigvals = None
+        self.K_eigvecs = None
+        self._lu = None
+
+        if n <= self.DENSE_THRESHOLD:
+            # Dense path: invert M → K, apply standardise + centering
+            M_dense = inv_cov.toarray().astype(np.float64)
+            M_t = torch.from_numpy(M_dense)
+            K = torch.cholesky_inverse(torch.linalg.cholesky(M_t)).numpy()
+
+            if standardize_cov:
+                d = K.diagonal().copy().clip(1e-12)
+                s = 1.0 / np.sqrt(d)
+                K = s[:, None] * K * s[None, :]
+
+            if centering:
+                K -= K.mean(axis=0, keepdims=True)
+                K -= K.mean(axis=1, keepdims=True)
+
+            self.K_sp = torch.from_numpy((0.5 * (K + K.T)).astype(np.float32))
+            self._rank = n
+        else:
+            # Implicit path: keep sparse M; standardise if requested
+            if standardize_cov:
+                inv_cov = self._standardize_precision(inv_cov)
+                self.inv_cov = inv_cov
+            self.K_sp = None
+            self._rank = n
+
+    # ------------------------------------------------------------------
+    # Factory class methods
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_coordinates(
+        cls,
+        coords: np.ndarray | torch.Tensor,
+        k_neighbors: int = 4,
+        rho: float = 0.99,
+        standardize_cov: bool = True,
+        centering: bool = False,
+    ) -> "SpatialCovKernel":
+        """Build a CAR spatial kernel from spot coordinates.
+
         Parameters
         ----------
         coords
-            Spot coordinates of shape (n_spots, 2).
+            Spot coordinates of shape ``(n_spots, n_dim)``.
         k_neighbors
-            Number of nearest neighbors used to build the graph.
-        model
-            Spatial process model for inverse covariance construction. Supported
-            values are ``'icar'``, ``'car'``, ``'isar'``, and ``'sar'``.
+            Number of nearest neighbours for the spatial graph.
         rho
-            Spatial autocorrelation coefficient.
+            CAR spatial autocorrelation coefficient (0 < rho < 1).
         standardize_cov
-            If True, scales covariance to unit marginal variance.
+            Scale covariance to unit marginal variance.
         centering
-            If True, applies centering so row/column sums are approximately
-            zero.
-        approx_rank
-            If provided, computes and stores a rank-`approx_rank` factorization.
+            Apply double-centring H K H.
+
+        Returns
+        -------
+        SpatialCovKernel
         """
-        # store the configurations
-        self._configs = {
-            "k_neighbors": k_neighbors,
-            "model": model,
-            "rho": rho,
-            "standardize_cov": standardize_cov,
-            "centering": centering,
-            "approx_rank": approx_rank,
-        }
+        if isinstance(coords, torch.Tensor):
+            coords = coords.numpy()
+        coords_np = np.asarray(coords, dtype=np.float64)
+        adj = _build_adj_from_coords(coords_np, k_neighbors, mutual_neighbors=True)
+        inv_cov = _build_car_precision_from_adj(adj, rho)
 
-        # calculate the sparse inverse spatial covariance matrix from KNN graph
-        swm = coordinate_to_weights_knn_sparse(
-            coords, k=k_neighbors, symmetric=True, row_scale=False
+        obj = cls.__new__(cls)
+        obj._init_from_precision(
+            inv_cov, standardize_cov=standardize_cov, centering=centering
         )
-        inv_cov = sparse_weights_to_inv_cov(
-            swm, model=model, rho=rho, standardize=False, return_sparse=True
-        ).coalesce()  # (n_spots, n_spots), sparse
-        self.inv_cov = inv_cov
+        return obj
 
-        if approx_rank is None:
-            # compute the (N, N) dense spatial covariance matrix
-            # torch.cholesky() is faster than scipy.sparse.linalg.inv()
-            cov_sp = torch.cholesky_inverse(torch.linalg.cholesky(inv_cov.to_dense()))
+    @classmethod
+    def from_adjacency(
+        cls,
+        adj_matrix: "scipy.sparse.spmatrix | np.ndarray",
+        rho: float = 0.99,
+        standardize_cov: bool = True,
+        centering: bool = False,
+    ) -> "SpatialCovKernel":
+        """Build a CAR kernel from a pre-built k-NN adjacency / weight matrix.
 
-            if (
-                standardize_cov
-            ):  # standardize the variance of the covariance matrix to one
-                inv_sds = torch.diagflat(torch.diagonal(cov_sp) ** (-0.5))
-                cov_sp = inv_sds @ cov_sp @ inv_sds
+        Use this when the spatial graph has already been constructed (e.g.
+        from external tools) and you want to skip the coordinate-based k-NN
+        step.
 
-            if centering:  # center the kernel matrix
-                cov_sp = cov_sp - cov_sp.mean(dim=0, keepdim=True)
-                cov_sp = cov_sp - cov_sp.mean(dim=1, keepdim=True)
+        Parameters
+        ----------
+        adj_matrix
+            Symmetric adjacency or weight matrix of shape
+            ``(n_spots, n_spots)``.  Can be a dense ``np.ndarray`` or any
+            ``scipy.sparse`` matrix.
+        rho
+            CAR spatial autocorrelation coefficient (0 < rho < 1).
+        standardize_cov
+            Scale covariance to unit marginal variance.
+        centering
+            Apply double-centring H K H.
 
-            # store the dense spatial kernel matrix
-            self.K_sp = cov_sp  # (n_spots, n_spots)
-            self._rank = cov_sp.shape[0]  # full rank
+        Returns
+        -------
+        SpatialCovKernel
+        """
+        adj = (
+            adj_matrix
+            if scipy.sparse.issparse(adj_matrix)
+            else scipy.sparse.csc_matrix(adj_matrix)
+        )
+        inv_cov = _build_car_precision_from_adj(adj, rho)
 
-            # compute eigenvalues and eigenvectors in later stages
-            self.K_eigvals = None  # eigenvalues of the kernel matrix
-            self.K_eigvecs = None  # eigenvectors of the kernel matrix
-            self.Q = None  # low-rank approximation of the kernel matrix K_sp = Q @ Q^T
+        obj = cls.__new__(cls)
+        obj._init_from_precision(
+            inv_cov, standardize_cov=standardize_cov, centering=centering
+        )
+        return obj
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _standardize_precision(
+        self, M: scipy.sparse.csc_matrix
+    ) -> scipy.sparse.csc_matrix:
+        """Return D_s M D_s where D_s = diag(1/sqrt(diag(K))).
+
+        Computes diag(K) = diag(M⁻¹) via batched column solves.
+        """
+        lu = splu(M)
+        n = M.shape[0]
+        diag_K = np.zeros(n)
+        batch = 128
+        for i in range(0, n, batch):
+            end = min(i + batch, n)
+            b = np.zeros((n, end - i))
+            b[i:end] = np.eye(end - i)
+            x = lu.solve(b)
+            diag_K[i:end] = x[i:end].diagonal()
+        diag_K = diag_K.clip(1e-12)
+        s = 1.0 / np.sqrt(diag_K)
+        S_inv = scipy.sparse.diags(1.0 / s, format="csc")
+        return (S_inv @ M @ S_inv).tocsc()
+
+    def _get_lu(self):
+        """Return (and cache) the LU factorisation of ``inv_cov``."""
+        if self._lu is None:
+            self._lu = splu(self.inv_cov)
+        return self._lu
+
+    def _hutchinson_trace(self, squared: bool, n_vectors: int = 30) -> float:
+        """Hutchinson stochastic estimator for tr(HKH) or tr((HKH)²).
+
+        Centred ±1 probing vectors target the double-centred kernel K' = HKH.
+
+        Parameters
+        ----------
+        squared
+            If ``True`` estimate tr((HKH)²), else tr(HKH).
+        n_vectors
+            Number of probing vectors.
+        """
+        lu = self._get_lu()
+        n, m = self._n, n_vectors
+        rng = np.random.default_rng()
+        rvs = rng.choice([-1.0, 1.0], size=(n, m))
+        rvs_c = rvs - rvs.mean(axis=0)  # H @ rvs
+        Kv = lu.solve(rvs_c)  # K (H rvs)
+        Kv_c = Kv - Kv.mean(axis=0)  # H K H rvs
+        if squared:
+            # tr((HKH)²) ≈ (1/m) Σ ||HKH v_i||²
+            return float((Kv_c**2).sum() / m)
         else:
-            # compute and store the low-rank approximation of the kernel matrix
-            if approx_rank > inv_cov.shape[0]:
-                raise ValueError("`approx_rank` must not exceed the number of spots.")
+            # tr(HKH) ≈ (1/m) Σ v_i^T HKH v_i
+            return float((rvs_c * Kv_c).sum() / m)
 
-            # normalize the inverse covariance matrix by degree such that the diagonal entries are 1
-            # inv_cov = D^(-1/2) @ inv_cov @ D^(-1/2)
-            # this will update self.inv_cov
-            degrees = swm.sum(dim=1).to_dense()  # (n_spots,)
-            inv_cov.values()[:] = inv_cov.values() / degrees[inv_cov.indices()[0]].pow(
-                0.5
-            )  # (n_spots, n_spots)
-            inv_cov.values()[:] = inv_cov.values() / degrees[inv_cov.indices()[1]].pow(
-                0.5
-            )  # (n_spots, n_spots)
-
-            # first convert torch sparse tensor to scipy coo matrix
-            indices = inv_cov.indices().numpy()
-            values = inv_cov.values().numpy()
-            shape = inv_cov.shape
-            coo_mtx = scipy.sparse.coo_matrix(
-                (values, (indices[0], indices[1])), shape=shape
-            )
-
-            # then compute the smallest k eigenvalues of the inverse covariance matrix
-            eigvals, eigvecs = scipy.sparse.linalg.eigsh(
-                coo_mtx, k=approx_rank, which="SM"
-            )
-
-            # which is equivalent to the largest k eigenvalues of the covariance matrix
-            eigvals = torch.from_numpy(eigvals + 1e-6).pow(
-                -1
-            )  # sorted in descending order
-            eigvecs = torch.from_numpy(eigvecs)
-
-            # store the eigenvalues and eigenvectors
-            self.cov_eigvals = eigvals
-            self.cov_eigvecs = eigvecs
-
-            # the low-rank approximation of the kernel matrix is K_sp = Q @ Q^T
-            Q = eigvecs @ torch.diag(eigvals.pow(0.5))  # (n_spots, rank)
-
-            # scale K_sp to have unit variance (diagonal entries)
-            if standardize_cov:
-                # after scaling, cov_sp and Q @ Q.T would have different eigenvalues
-                # due to the low-rank approximation
-                _sd = (Q.pow(2).sum(dim=1) + 1e-6).pow(0.5)  # (n_spots,)
-                Q = Q / _sd[:, None]
-
-            # center K_sp to have zero row and column sums
-            if centering:
-                Q = Q - Q.mean(dim=0, keepdim=True)
-
-            # compute kernel eigenvalues from Q
-            K_eigvals = torch.linalg.eigvalsh(Q.T @ Q)  # (rank,), ascending order
-
-            # sort the eigenvalues in descending order
-            idx = K_eigvals.argsort(descending=True)
-            self.K_eigvals = K_eigvals[idx]
-
-            # store the low-rank approximation of the kernel matrix
-            self.Q = Q
-            self.K_sp = None  # K_sp = Q @ Q^T
-            self._rank = self.Q.shape[1]
+    # ------------------------------------------------------------------
+    # Kernel interface
+    # ------------------------------------------------------------------
 
     def shape(self) -> tuple[int, int]:
-        """Return kernel shape.
+        """Return kernel shape ``(n_spots, n_spots)``.
 
         Returns
         -------
         tuple of int
-            Pair (n_spots, n_spots).
         """
-        return self.inv_cov.shape
+        return (self._n, self._n)
 
     def rank(self) -> int:
-        """Return effective rank of the kernel representation.
+        """Return effective rank of the stored representation.
 
         Returns
         -------
         int
-            Kernel rank.
         """
         return self._rank
 
     def realization(self) -> torch.Tensor:
-        """Return the realized dense kernel matrix.
+        """Return the realised dense kernel matrix.
+
+        For implicit kernels this forces dense inversion — prefer calling
+        :meth:`eigenvalues` first to populate ``Q``, then use ``Q @ Q.T``.
 
         Returns
         -------
@@ -247,12 +493,27 @@ class SpatialCovKernel(Kernel):
             Dense matrix of shape (n_spots, n_spots).
         """
         if self.K_sp is not None:
-            return self.K_sp
-        else:
+            return self.K_sp  # already standardised + centred
+
+        if self.Q is not None:
             return self.Q @ self.Q.t()
 
+        # Fallback: dense inversion (expensive for large n)
+        warnings.warn(
+            "realization() on an implicit kernel forces dense inversion — "
+            "call eigenvalues(k) first to populate Q, or avoid for large n.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        lu = self._get_lu()
+        K = lu.solve(np.eye(self._n, dtype=np.float64)).astype(np.float32)
+        if self._centering:
+            K -= K.mean(axis=0, keepdims=True)
+            K -= K.mean(axis=1, keepdims=True)
+        return torch.from_numpy(0.5 * (K + K.T))
+
     def xtKx(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute the kernel quadratic form for multivariate inputs.
+        """Compute the quadratic form ``x^T K x``.
 
         Parameters
         ----------
@@ -262,56 +523,135 @@ class SpatialCovKernel(Kernel):
         Returns
         -------
         torch.Tensor
-            Quadratic form of shape (d, d).
+            Matrix of shape (d, d).
         """
-        if self.K_sp is not None:  # use the full rank kernel matrix
+        if self.K_sp is not None:
+            if self.Q is not None:
+                # Low-rank path (populated after eigendecomposition)
+                xtQ = x.t() @ self.Q
+                return xtQ @ xtQ.t()
             return x.t() @ self.K_sp @ x
-        else:  # use the low-rank approximation
-            xtQ = x.t() @ self.Q  # (d, rank)
-            return xtQ @ xtQ.t()  # (d, d)
+
+        # Implicit: solve M u = x, return x^T u = x^T K x
+        lu = self._get_lu()
+        x_np = x.numpy().astype(np.float64)
+        u = lu.solve(x_np)  # shape (n, d)
+        return torch.from_numpy((x_np.T @ u).astype(np.float32))
 
     def eigenvalues(self, k: int | None = None) -> torch.Tensor:
-        """Return leading eigenvalues of the kernel matrix.
+        """Return leading eigenvalues in descending order.
+
+        For dense kernels a full eigendecomposition is triggered once and
+        cached.  For implicit kernels a partial eigsh via a
+        ``LinearOperator`` is used; the low-rank factor ``Q`` is cached
+        for subsequent :meth:`xtKx` calls.
 
         Parameters
         ----------
         k
-            Number of leading eigenvalues to return. If None, all
-            available eigenvalues are returned.
+            Number of leading eigenvalues.  ``None`` returns all cached values.
 
         Returns
         -------
         torch.Tensor
-            Eigenvalues sorted in descending order.
+            Eigenvalues in descending order.
         """
-        if self.K_eigvals is None:
-            # compute and store the eigendecomposition of self.K_sp
-            self.eigendecomposition()
+        if self.K_eigvals is not None:
+            return self.K_eigvals if k is None else self.K_eigvals[:k]
 
-        # return the top k largest eigenvalues
-        if k is None:
-            return self.K_eigvals
+        if self.K_sp is not None:
+            # Dense: full eigendecomposition (also populates Q)
+            self.eigendecomposition()
+            return self.K_eigvals if k is None else self.K_eigvals[:k]
+
+        # Implicit: partial eigsh
+        k_req = k if k is not None else self._n - 2
+        lu = self._get_lu()
+
+        if self._centering:
+
+            def _matvec(v: np.ndarray) -> np.ndarray:
+                v_c = v - v.mean()
+                u = lu.solve(v_c)
+                return u - u.mean()
+
         else:
-            return self.K_eigvals[:k]
+
+            def _matvec(v: np.ndarray) -> np.ndarray:
+                return lu.solve(v)
+
+        op = scipy.sparse.linalg.LinearOperator(
+            (self._n, self._n), matvec=_matvec, dtype=np.float64
+        )
+        eigvals, eigvecs = scipy.sparse.linalg.eigsh(op, k=k_req, which="LM")
+
+        # Sort descending
+        idx = eigvals.argsort()[::-1]
+        eigvals = eigvals[idx].astype(np.float32)
+        eigvecs = eigvecs[:, idx].astype(np.float32)
+
+        # Cache low-rank factor Q = V @ diag(sqrt(λ)) for xtKx reuse
+        sqrt_eigvals = np.sqrt(eigvals.clip(0))
+        self.Q = torch.from_numpy(eigvecs * sqrt_eigvals[None, :])
+        self._rank = k_req
+
+        # Always cache eigenvalues (even for partial k)
+        self.K_eigvals = torch.from_numpy(eigvals.copy())
+        return self.K_eigvals if k is None else self.K_eigvals[:k]
 
     def eigendecomposition(self) -> None:
-        """Compute and store eigendecomposition of the dense kernel.
+        """Compute and cache the full eigendecomposition of the dense kernel.
+
+        Populates :attr:`K_eigvals`, :attr:`K_eigvecs`, and :attr:`Q`.
 
         Raises
         ------
         ValueError
-            If only low-rank kernel factors are stored.
+            If called on an implicit kernel (no ``K_sp``).
         """
         if self.K_sp is None:
             raise ValueError(
-                "Dense kernel storage is required for eigendecomposition()."
+                "eigendecomposition() requires dense K_sp. "
+                "Use eigenvalues(k) for implicit (large-n) kernels."
             )
 
         eigvals, eigvecs = np.linalg.eigh(self.K_sp.numpy())
 
-        # sort the eigenvalues and eigenvectors in descending order
+        # Sort descending
         idx = eigvals.argsort()[::-1]
-        self.K_eigvals = torch.from_numpy(eigvals[idx])
-        self.K_eigvecs = torch.from_numpy(eigvecs[:, idx])
-        # Q = eigvecs @ np.diag(eigvals ** 0.5) # (n_spots, n_spots)
-        # self.Q = torch.from_numpy(Q)[:, idx]
+        self.K_eigvals = torch.from_numpy(eigvals[idx].astype(np.float32))
+        self.K_eigvecs = torch.from_numpy(eigvecs[:, idx].astype(np.float32))
+
+        # Build low-rank factor from positive eigenvalues
+        pos = self.K_eigvals > 0
+        self.Q = self.K_eigvecs[:, pos] * self.K_eigvals[pos].sqrt()[None, :]
+
+    def trace(self) -> torch.Tensor:
+        """Return tr(K) [or tr(HKH) when ``centering=True``].
+
+        Uses exact arithmetic for the dense case (``K_sp`` is already centred).
+        Falls back to a Hutchinson stochastic estimator for implicit kernels.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar trace value.
+        """
+        if self.K_sp is not None:
+            return torch.trace(self.K_sp)
+        return torch.tensor(self._hutchinson_trace(squared=False), dtype=torch.float32)
+
+    def square_trace(self) -> torch.Tensor:
+        """Return tr(K²) [or tr((HKH)²) when ``centering=True``].
+
+        Uses ``||K||_F²`` for the dense case. Falls back to a Hutchinson
+        stochastic estimator for implicit kernels.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar squared-trace value.
+        """
+        if self.K_sp is not None:
+            return self.K_sp.pow(2).sum()
+        return torch.tensor(self._hutchinson_trace(squared=True), dtype=torch.float32)

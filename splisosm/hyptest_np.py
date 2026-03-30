@@ -5,7 +5,7 @@ from __future__ import annotations
 import warnings
 import re
 from typing import Any, Optional, Union, Literal
-from scipy.stats import ttest_ind, combine_pvalues
+from scipy.stats import ttest_ind, combine_pvalues, norm as _norm_dist
 import numpy as np
 import pandas as pd
 import torch
@@ -138,7 +138,7 @@ class SplisosmNP:
     ``(n_spots, n_isos)``.  Set by :meth:`setup_data`."""
 
     coordinates: torch.Tensor
-    """Spatial coordinates of shape ``(n_spots, 2)``.
+    """Spatial coordinates of shape ``(n_spots, n_dims)``.
     Set by :meth:`setup_data`."""
 
     corr_sp: Any
@@ -211,7 +211,6 @@ class SplisosmNP:
         self,
         data: Optional[list[Union[torch.Tensor, np.ndarray]]] = None,
         coordinates: Optional[Union[torch.Tensor, np.ndarray, pd.DataFrame]] = None,
-        approx_rank: Optional[int] = None,
         design_mtx: Optional[
             Union[torch.Tensor, np.ndarray, pd.DataFrame, str, list[str]]
         ] = None,
@@ -242,12 +241,7 @@ class SplisosmNP:
             Legacy mode only. List of isoform count arrays, one per gene, each of
             shape ``(n_spots, n_isos)``.
         coordinates : torch.Tensor, numpy.ndarray, or pandas.DataFrame, optional
-            Legacy mode only. Spatial coordinates of shape ``(n_spots, 2)``.
-        approx_rank : int or None, optional
-            Rank of the low-rank approximation for the spatial covariance matrix.
-            If ``None``, the full-rank dense matrix is used.
-            For datasets with ``n_spots > 5000`` the maximum rank is capped at
-            ``4 * sqrt(n_spots)``.
+            Legacy mode only. Spatial coordinates of shape ``(n_spots, n_dims)``.
         design_mtx : torch.Tensor, numpy.ndarray, pandas.DataFrame, str, or list of str, optional
             Design matrix for differential usage tests.
 
@@ -390,30 +384,14 @@ class SplisosmNP:
 
         self.coordinates = coordinates
 
-        # determine the maximum rank for spatial kernel computation
-        if self.n_spots > 5000:
-            # 10x Visium has 4992 spots per slide. For larger datasets (i.e. Slideseq-V2),
-            # it is recommended to use low-rank approximation
-            max_rank = np.ceil(np.sqrt(self.n_spots) * 4).astype(int)
-            approx_rank = (
-                min(approx_rank, max_rank) if approx_rank is not None else max_rank
-            )
-        else:
-            if approx_rank is not None:
-                approx_rank = approx_rank if approx_rank < self.n_spots else None
-
-        # compute the spatial kernel
-        K_sp = SpatialCovKernel(
+        # compute the spatial kernel (dense for n ≤ 5000; implicit LU-solve above)
+        self.corr_sp = SpatialCovKernel(
             coordinates,
             k_neighbors=4,
             rho=0.99,
             centering=True,
             standardize_cov=True,
-            approx_rank=approx_rank,
         )
-
-        # self.corr_sp = get_cov_sp(coordinates, k = 4, rho=0.99)
-        self.corr_sp = K_sp
 
         # check and process the design matrix
         if design_mtx is not None:
@@ -488,20 +466,6 @@ class SplisosmNP:
         self.n_factors = design_mtx.shape[1] if design_mtx is not None else 0
         self.covariate_names = covariate_names
 
-        # store the eigendecomposition of the spatial covariance matrix
-        # try:
-        #     corr_sp_eigvals, corr_sp_eigvecs = torch.linalg.eigh(self.corr_sp)
-        # except RuntimeError:
-        #     # fall back to eig if eigh fails
-        #     # related to a pytorch bug on M1 macs, see https://github.com/pytorch/pytorch/issues/83818
-        #     corr_sp_eigvals, corr_sp_eigvecs = torch.linalg.eig(self.corr_sp)
-        #     corr_sp_eigvals = torch.real(corr_sp_eigvals)
-        #     corr_sp_eigvecs = torch.real(corr_sp_eigvecs)
-
-        # self._corr_sp_eigvals = corr_sp_eigvals
-        # self._corr_sp_eigvecs = corr_sp_eigvecs
-        self._corr_sp_eigvals = self.corr_sp.eigenvalues()
-
     def get_formatted_test_results(
         self, test_type: Literal["sv", "du"]
     ) -> pd.DataFrame:
@@ -559,8 +523,8 @@ class SplisosmNP:
         method: Literal["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"] = "hsic-ir",
         ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
         nan_filling: Literal["mean", "none"] = "mean",
-        use_perm_null: bool = False,
-        n_perms_per_gene: Optional[int] = None,
+        null_method: Literal["eig", "trace", "perm"] = "eig",
+        null_configs: Optional[dict[str, Any]] = None,
         return_results: bool = False,
         print_progress: bool = True,
     ) -> Optional[dict[str, Any]]:
@@ -587,13 +551,23 @@ class SplisosmNP:
         nan_filling : {"mean", "none"}, optional
             Strategy for NaN values in isoform ratios.
             See :func:`splisosm.utils.counts_to_ratios` for details.
-        use_perm_null : bool, optional
-            If ``True``, estimate the null distribution by permutation.
-            If ``False`` (default), use the asymptotic chi-square mixture with
-            Liu's method :cite:`liu2009new`.
-        n_perms_per_gene : int or None, optional
-            Number of permutations per gene when ``use_perm_null=True``.
-            Defaults to 1000 when ``None``.
+        null_method : {"eig", "trace", "perm"}, optional
+            Method for computing the null distribution of the test statistic:
+
+            * ``"eig"`` (default): asymptotic chi-square mixture using kernel
+              eigenvalues; Liu's method :cite:`liu2009new`.  Supports optional
+              ``null_configs["approx_rank"]`` (int) to use only the top-k
+              eigenvalues. By default, approx_rank = np.ceil(np.sqrt(n_spots) * 4)
+              for large datasets (n_spots > 5000). Set it to None to use
+              all eigenvalues, which can be slow for large n_spots.
+            * ``"trace"``: moment-matching normal approximation using
+              tr(K') and tr(K'²) of the (centred) spatial kernel.
+            * ``"perm"``: permutation-based null distribution.  Supports
+              optional ``null_configs["n_perms_per_gene"]`` (default 1000),
+              and ``null_configs["perm_batch_size"]`` (default 50, larger values
+              lead to more memory usage) for batch-wise null statistic computation.
+        null_configs : dict or None, optional
+            Extra keyword arguments for the chosen ``null_method``.
         return_results : bool, optional
             If ``True``, return the result dict.  Otherwise store results in
             :attr:`sv_test_results` and return ``None``.
@@ -612,11 +586,15 @@ class SplisosmNP:
         """
 
         valid_methods = ["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"]
+        valid_null_methods = ["eig", "trace", "perm"]
         valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
         valid_nan_filling = ["mean", "none"]
         assert (
             method in valid_methods
         ), f"Invalid method. Must be one of {valid_methods}."
+        assert (
+            null_method in valid_null_methods
+        ), f"Invalid null method. Must be one of {valid_null_methods}."
         assert (
             ratio_transformation in valid_transformations
         ), f"Invalid ratio transformation. Must be one of {valid_transformations}."
@@ -635,19 +613,32 @@ class SplisosmNP:
         else:
             # use a global spatial kernel unless nan_filling is 'none'
             n_spots = self.n_spots
-            # H = torch.eye(n_spots) - 1/n_spots
-            # K_sp = H @ self.corr_sp @ H # centered spatial kernel
             K_sp = self.corr_sp  # the Kernel class object was already centered
 
-            # calculate the eigenvalues of the spatial kernel
-            if not use_perm_null:
-                # lambda_sp = torch.linalg.eigvalsh(K_sp) # eigenvalues of length n_spots
-                lambda_sp = self._corr_sp_eigvals  # use precomputed eigenvalues
-                lambda_sp = lambda_sp[lambda_sp > 1e-5]  # remove small eigenvalues
-
-            # prepare inputs for generating the null distribution
-            if use_perm_null:
-                n_nulls = n_perms_per_gene if n_perms_per_gene is not None else 1000
+            # pre-compute null distribution inputs (once, before per-gene loop)
+            configs = null_configs or {}
+            if null_method == "eig":
+                _rank = (
+                    np.ceil(np.sqrt(self.n_spots) * 4).astype(int)
+                    if self.n_spots > 5000
+                    else self.n_spots
+                )
+                approx_rank = configs.get("approx_rank", _rank)
+                if approx_rank is None and self.n_spots > 5000:
+                    warnings.warn(
+                        "Computing all eigenvalues for null distribution can be slow for large n_spots. "
+                        "Consider setting a small value for null_configs['approx_rank'] to use low-rank approximation.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                lambda_sp = self.corr_sp.eigenvalues(k=approx_rank)
+                lambda_sp = lambda_sp[lambda_sp > 1e-5]
+            elif null_method == "trace":
+                trK = self.corr_sp.trace()
+                trK2 = self.corr_sp.square_trace()
+            elif null_method == "perm":
+                n_nulls = int(configs.get("n_perms_per_gene", 1000))
+                _perm_batch_size = int(configs.get("perm_batch_size", 50))
 
             # iterate over genes and calculate the HSIC statistic
             hsic_list, pvals_list = [], []
@@ -676,7 +667,7 @@ class SplisosmNP:
                     K_sp = K_sp - K_sp.mean(dim=1, keepdim=True)
 
                     # calculate the eigenvalues of the new per-gene spatial kernel
-                    if not use_perm_null:
+                    if null_method == "eig":
                         lambda_sp = torch.linalg.eigvalsh(
                             K_sp
                         )  # eigenvalues of length n_spots
@@ -711,29 +702,58 @@ class SplisosmNP:
 
                 hsic_list.append(hsic_scaled / (n_spots - 1) ** 2)
 
-                if use_perm_null:  # permutation-based null distribution
-                    # randomly shuffle the spatial locations
-                    perm_idx = torch.stack(
-                        [torch.randperm(n_spots) for _ in range(n_nulls)]
-                    )
-                    yy = y[perm_idx, :]  # (n_nulls, n_spots, n_isos)
+                if null_method == "eig":  # asymptotic chi-square mixture (Liu's method)
+                    try:
+                        lambda_y = torch.linalg.eigvalsh(y.T @ y)  # length of n_isos
+                    except torch._C._LinAlgError:
+                        # Add a small jitter to the diagonal and retry
+                        lambda_y = torch.linalg.eigvalsh(
+                            y.T @ y + 1e-6 * torch.eye(y.shape[1])
+                        )
 
-                    # calculate the null HSIC statistics
-                    null_m = torch.einsum(
-                        "bii->b", (yy.transpose(1, 2) @ K_sp.unsqueeze(0) @ yy)
-                    )
-
-                    # calculate the p-value
-                    pval = (null_m > hsic_scaled).sum() / n_nulls
-
-                else:  # asymptotic null distribution
-                    lambda_y = torch.linalg.eigvalsh(y.T @ y)  # length of n_isos
+                    lambda_y = lambda_y[lambda_y > 1e-5]  # remove small eigenvalues
                     lambda_spy = (
                         lambda_sp.unsqueeze(0) * lambda_y.unsqueeze(1)
                     ).reshape(
                         -1
                     )  # n_spots * (n_isos or 1)
                     pval = liu_sf((hsic_scaled * n_spots).numpy(), lambda_spy.numpy())
+
+                elif null_method == "trace":  # moment-matching normal approximation
+                    S = y.T @ y  # (n_isos, n_isos)
+                    trS = torch.trace(S).item()
+                    trS2 = torch.trace(S @ S).item()
+                    # Under the permutation null (centered K, centered y):
+                    # E[tr(y.T K y)] = tr(K) * tr(y.T y) / (n-1)
+                    # Var[tr(y.T K y)] ≈ 2 * tr(K^2) * tr((y.T y)^2) / (n-1)^2
+                    n1 = n_spots - 1
+                    mean_null = trK.item() * trS / n1
+                    var_null = 2.0 * trK2.item() * trS2 / (n1**2)
+                    z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
+                    pval = float(_norm_dist.sf(z))
+
+                elif null_method == "perm":  # permutation-based null distribution
+                    p_isos = y.shape[1]
+                    null_stats = []
+                    for chunk_start in range(0, n_nulls, _perm_batch_size):
+                        B = min(_perm_batch_size, n_nulls - chunk_start)
+                        # Concatenate B permuted copies of y along the feature axis → (n, B·p)
+                        y_batch = torch.cat(
+                            [y[torch.randperm(n_spots)] for _ in range(B)], dim=1
+                        )
+                        if isinstance(K_sp, torch.Tensor):
+                            # NaN path: K_sp is a dense per-gene submatrix tensor
+                            R = y_batch.T @ K_sp @ y_batch  # (B·p, B·p)
+                        else:
+                            # Global path: one LU solve for B·p right-hand sides
+                            R = K_sp.xtKx(y_batch)  # (B·p, B·p)
+                        # Recover per-permutation traces from diagonal blocks:
+                        # tr(y_i.T K y_i) = diagonal(R)[i·p:(i+1)·p].sum()
+                        null_stats.append(
+                            torch.diagonal(R).reshape(B, p_isos).sum(dim=1)
+                        )
+                    null_m = torch.cat(null_stats)  # (n_nulls,)
+                    pval = float((null_m > hsic_scaled).sum() / n_nulls)
 
                 pvals_list.append(pval)
 
@@ -742,7 +762,7 @@ class SplisosmNP:
                     "statistic": torch.tensor(hsic_list).numpy(),
                     "pvalue": torch.tensor(pvals_list).numpy(),
                     "method": method,
-                    "use_perm_null": use_perm_null,
+                    "null_method": null_method,
                 }
 
             # calculate adjusted p-values
@@ -935,7 +955,7 @@ class SplisosmNP:
                     iso_config.update(gpr_configs["isoform"])
 
             # Normalize spatial coordinates once
-            x = self.coordinates.clone()  # (n_spots, 2)
+            x = self.coordinates.clone()  # (n_spots, n_dims)
             x = (x - x.mean(0)) / x.std(0)
             x[torch.isinf(x)] = 0  # guard against constant coordinate axes
 
