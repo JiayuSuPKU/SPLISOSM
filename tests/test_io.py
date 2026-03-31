@@ -220,15 +220,6 @@ class TestIO(unittest.TestCase):
                 "spatialdata.models": spatialdata_models_mod,
             },
         ):
-            with self.assertRaisesRegex(
-                ValueError, "`spatial_resolutions` cannot be empty"
-            ):
-                load_xenium_codeword(
-                    Path("."),
-                    spatial_resolutions=[],
-                    create_square_shapes=False,
-                )
-
             with self.assertRaisesRegex(ValueError, "`chunk_batch_size` must be > 0"):
                 load_xenium_codeword(
                     Path("."),
@@ -251,6 +242,27 @@ class TestIO(unittest.TestCase):
                     spatial_resolutions=[0.0],
                     create_square_shapes=False,
                 )
+
+            # None and [] are now valid — they should NOT raise the old
+            # "spatial_resolutions cannot be empty" error.
+            # (Other ValueErrors such as path-not-found are acceptable here.)
+            for empty in (None, []):
+                try:
+                    load_xenium_codeword(
+                        Path("."),
+                        spatial_resolutions=empty,
+                        build_cell_codeword_table=False,
+                        create_square_shapes=False,
+                    )
+                except ValueError as exc:
+                    msg = str(exc)
+                    if "spatial_resolutions" in msg and "empty" in msg:
+                        self.fail(
+                            f"spatial_resolutions={empty!r} raised the old "
+                            f"'cannot be empty' ValueError: {exc}"
+                        )
+                except Exception:
+                    pass  # ImportError / FileNotFoundError etc. are fine
 
     def test_load_xenium_codeword_missing_density_codeword_group(self):
         with tempfile.TemporaryDirectory() as tmpdir:

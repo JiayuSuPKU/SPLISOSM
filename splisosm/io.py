@@ -552,6 +552,12 @@ def _add_xenium_cell_codeword_table_from_parquet(
         sdata.tables["table_codeword"].obs = sdata.tables["table_codeword"].obs.join(
             cell_meta, how="left", rsuffix="_from_table"
         )
+        # Copy spatial embeddings (e.g. cell centroids) from sdata.tables['table'].obsm
+        for key, val in sdata.tables["table"].obsm.items():
+            if key not in sdata.tables["table_codeword"].obsm:
+                sdata.tables["table_codeword"].obsm[key] = (
+                    val.copy() if hasattr(val, "copy") else val
+                )
 
 
 def _compute_xenium_bins_from_meta(
@@ -850,7 +856,7 @@ def _build_xenium_codeword_table_for_resolution(
 
 def load_xenium_codeword(
     path: str | Path,
-    spatial_resolutions: Sequence[float] = (8.0, 16.0),
+    spatial_resolutions: Sequence[float] | None = (8.0, 16.0),
     quality_threshold: float = 20.0,
     n_jobs: int = -1,
     chunk_batch_size: int = 64,
@@ -893,7 +899,8 @@ def load_xenium_codeword(
         Path to Xenium Ranger output directory, or its parent containing
         ``outs/``.
     spatial_resolutions
-        Spatial bin sizes in microns.
+        Spatial bin sizes in microns.  Pass ``None`` or an empty sequence to
+        skip bin table creation entirely (cell-segmentation-only mode).
     quality_threshold
         Minimum transcript quality score to retain.
     n_jobs
@@ -970,7 +977,17 @@ def load_xenium_codeword(
             "Install it via `pip install spatialdata`."
         ) from e
 
-    if create_square_shapes:
+    resolutions: list[float] = (
+        [] if spatial_resolutions is None else [float(x) for x in spatial_resolutions]
+    )
+    if any(r <= 0 for r in resolutions):
+        raise ValueError("All `spatial_resolutions` values must be > 0.")
+    if chunk_batch_size <= 0:
+        raise ValueError("`chunk_batch_size` must be > 0.")
+    if quality_threshold < 0:
+        raise ValueError("`quality_threshold` must be >= 0.")
+
+    if resolutions and create_square_shapes:
         try:
             import geopandas as gpd
             from shapely.geometry import box
@@ -981,17 +998,6 @@ def load_xenium_codeword(
                 "create_square_shapes=True requires geopandas, shapely, and spatialdata. "
                 "Install via `pip install geopandas shapely spatialdata`."
             ) from e
-
-    if len(spatial_resolutions) == 0:
-        raise ValueError("`spatial_resolutions` cannot be empty.")
-    if chunk_batch_size <= 0:
-        raise ValueError("`chunk_batch_size` must be > 0.")
-    if quality_threshold < 0:
-        raise ValueError("`quality_threshold` must be >= 0.")
-
-    resolutions = [float(x) for x in spatial_resolutions]
-    if any(r <= 0 for r in resolutions):
-        raise ValueError("All `spatial_resolutions` values must be > 0.")
 
     # Call spatialdata-io reader to load Xenium Ranger outputs into a SpatialData object
     outs_path = _xenium_locate_outs_path(path)
@@ -1010,126 +1016,132 @@ def load_xenium_codeword(
         gex_only=gex_only,
     )
 
-    # Binning transcripts into square bins at requested resolutions using transcript-level chunk data
-    zarr_path = outs_path / "transcripts.zarr.zip"
-    store = ZipStore(zarr_path, mode="r")
-    root = zarr.open(store, mode="r")
+    # Open transcripts.zarr.zip only when codeword data is actually needed.
+    if resolutions or build_cell_codeword_table:
+        zarr_path = outs_path / "transcripts.zarr.zip"
+        store = ZipStore(zarr_path, mode="r")
+        root = zarr.open(store, mode="r")
 
-    try:
         try:
-            codeword_names_raw = root["density"]["codeword"].attrs.get(
-                "codeword_names", []
-            )
-        except KeyError:
-            raise ValueError(
-                "Could not find `density/codeword` group in transcripts.zarr.zip. "
-                "Consider re-running the Xenium Ranger (>=v3.1.0) relabel pipeline. "
-                "https://www.10xgenomics.com/support/software/xenium-ranger/latest/analysis/running-pipelines/XR-relabel"
-            )
-        codeword_id_to_gene = [
-            x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x)
-            for x in codeword_names_raw
-        ]
-        if len(codeword_id_to_gene) == 0:
-            raise ValueError("No codeword names found in transcripts.zarr.zip.")
-
-        target_codewords = [
-            i
-            for i, name in enumerate(codeword_id_to_gene)
-            if not str(name).startswith("UnassignedCodeword")
-        ]
-        if len(target_codewords) == 0:
-            raise ValueError("No assigned codewords found in transcripts.zarr.zip.")
-
-        # If transcripts.parquet is available,
-        # build a cell-by-codeword table directly from the parquet file.
-        if build_cell_codeword_table:
-            _add_xenium_cell_codeword_table_from_parquet(
-                sdata=sdata,
-                outs_path=outs_path,
-                codeword_id_to_gene=codeword_id_to_gene,
-                target_codewords=target_codewords,
-                quality_threshold=quality_threshold,
-                counts_layer_name=counts_layer_name,
-            )
-
-        level0_keys: list[str] = []
-        try:
-            grid_keys_attr = root["grids"].attrs.get("grid_keys", None)
-        except Exception:
-            grid_keys_attr = None
-
-        if grid_keys_attr is not None and len(grid_keys_attr) > 0:
-            level0_keys = [
-                k.decode("utf-8") if isinstance(k, (bytes, bytearray)) else str(k)
-                for k in list(grid_keys_attr[0])
+            try:
+                codeword_names_raw = root["density"]["codeword"].attrs.get(
+                    "codeword_names", []
+                )
+            except KeyError:
+                raise ValueError(
+                    "Could not find `density/codeword` group in transcripts.zarr.zip. "
+                    "Consider re-running the Xenium Ranger (>=v3.1.0) relabel pipeline. "
+                    "https://www.10xgenomics.com/support/software/xenium-ranger/latest/analysis/running-pipelines/XR-relabel"
+                )
+            codeword_id_to_gene = [
+                x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x)
+                for x in codeword_names_raw
             ]
-        if len(level0_keys) == 0:
-            raise ValueError(
-                "Could not find transcript chunk keys under `grids/0` in transcripts.zarr.zip. "
-                "This function requires transcript chunks for quantification."
-            )
+            if len(codeword_id_to_gene) == 0:
+                raise ValueError("No codeword names found in transcripts.zarr.zip.")
 
-        for spatial_resolution in resolutions:
-            adata, x_bins, y_bins, nrows, ncols = (
-                _build_xenium_codeword_table_for_resolution(
-                    root=root,
-                    level0_keys=level0_keys,
+            target_codewords = [
+                i
+                for i, name in enumerate(codeword_id_to_gene)
+                if not str(name).startswith("UnassignedCodeword")
+            ]
+            if len(target_codewords) == 0:
+                raise ValueError("No assigned codewords found in transcripts.zarr.zip.")
+
+            # If transcripts.parquet is available,
+            # build a cell-by-codeword table directly from the parquet file.
+            if build_cell_codeword_table:
+                _add_xenium_cell_codeword_table_from_parquet(
+                    sdata=sdata,
+                    outs_path=outs_path,
                     codeword_id_to_gene=codeword_id_to_gene,
                     target_codewords=target_codewords,
-                    spatial_resolution=spatial_resolution,
                     quality_threshold=quality_threshold,
-                    n_jobs=n_jobs,
-                    chunk_batch_size=chunk_batch_size,
-                    show_progress=show_progress,
+                    counts_layer_name=counts_layer_name,
                 )
-            )
 
-            table_key = _format_resolution_bin_name(spatial_resolution)
-            shape_key = _format_resolution_shape_name(spatial_resolution)
+            if resolutions:
+                level0_keys: list[str] = []
+                try:
+                    grid_keys_attr = root["grids"].attrs.get("grid_keys", None)
+                except Exception:
+                    grid_keys_attr = None
 
-            adata.layers[counts_layer_name] = (
-                adata.X.copy() if hasattr(adata.X, "copy") else adata.X
-            )
-            adata.uns["spatial_bins"] = {
-                "resolution_um": float(spatial_resolution),
-                "shape_key": shape_key,
-                "grid_origin_um": {
-                    "x": float(x_bins[0]),
-                    "y": float(y_bins[0]),
-                },
-                "grid_dims": {
-                    "rows": int(nrows),
-                    "cols": int(ncols),
-                },
-            }
+                if grid_keys_attr is not None and len(grid_keys_attr) > 0:
+                    level0_keys = [
+                        (
+                            k.decode("utf-8")
+                            if isinstance(k, (bytes, bytearray))
+                            else str(k)
+                        )
+                        for k in list(grid_keys_attr[0])
+                    ]
+                if len(level0_keys) == 0:
+                    raise ValueError(
+                        "Could not find transcript chunk keys under `grids/0` in transcripts.zarr.zip. "
+                        "This function requires transcript chunks for quantification."
+                    )
 
-            adata.obs["region"] = pd.Categorical([shape_key] * adata.n_obs)
-            adata.obs["instance_id"] = adata.obs_names.astype(str)
-            table = TableModel.parse(
-                adata,
-                region=shape_key,
-                region_key="region",
-                instance_key="instance_id",
-            )
-            sdata.tables[table_key] = table
+                for spatial_resolution in resolutions:
+                    adata, x_bins, y_bins, nrows, ncols = (
+                        _build_xenium_codeword_table_for_resolution(
+                            root=root,
+                            level0_keys=level0_keys,
+                            codeword_id_to_gene=codeword_id_to_gene,
+                            target_codewords=target_codewords,
+                            spatial_resolution=spatial_resolution,
+                            quality_threshold=quality_threshold,
+                            n_jobs=n_jobs,
+                            chunk_batch_size=chunk_batch_size,
+                            show_progress=show_progress,
+                        )
+                    )
 
-            if create_square_shapes:
-                rows = adata.obs["array_row"].to_numpy(dtype=np.int64)
-                cols = adata.obs["array_col"].to_numpy(dtype=np.int64)
-                polygons = [
-                    box(x_bins[c], y_bins[r], x_bins[c + 1], y_bins[r + 1])
-                    for r, c in zip(rows, cols, strict=False)
-                ]
-                geo_df = gpd.GeoDataFrame(
-                    {"geometry": polygons},
-                    index=adata.obs_names.astype(str),
-                )
-                sdata.shapes[shape_key] = ShapesModel.parse(
-                    geo_df,
-                    transformations={"global": Identity()},
-                )
-    finally:
-        store.close()
+                    table_key = _format_resolution_bin_name(spatial_resolution)
+                    shape_key = _format_resolution_shape_name(spatial_resolution)
+
+                    adata.layers[counts_layer_name] = (
+                        adata.X.copy() if hasattr(adata.X, "copy") else adata.X
+                    )
+                    adata.uns["spatial_bins"] = {
+                        "resolution_um": float(spatial_resolution),
+                        "shape_key": shape_key,
+                        "grid_origin_um": {
+                            "x": float(x_bins[0]),
+                            "y": float(y_bins[0]),
+                        },
+                        "grid_dims": {
+                            "rows": int(nrows),
+                            "cols": int(ncols),
+                        },
+                    }
+
+                    adata.obs["region"] = pd.Categorical([shape_key] * adata.n_obs)
+                    adata.obs["instance_id"] = adata.obs_names.astype(str)
+                    table = TableModel.parse(
+                        adata,
+                        region=shape_key,
+                        region_key="region",
+                        instance_key="instance_id",
+                    )
+                    sdata.tables[table_key] = table
+
+                    if create_square_shapes:
+                        rows = adata.obs["array_row"].to_numpy(dtype=np.int64)
+                        cols = adata.obs["array_col"].to_numpy(dtype=np.int64)
+                        polygons = [
+                            box(x_bins[c], y_bins[r], x_bins[c + 1], y_bins[r + 1])
+                            for r, c in zip(rows, cols, strict=False)
+                        ]
+                        geo_df = gpd.GeoDataFrame(
+                            {"geometry": polygons},
+                            index=adata.obs_names.astype(str),
+                        )
+                        sdata.shapes[shape_key] = ShapesModel.parse(
+                            geo_df,
+                            transformations={"global": Identity()},
+                        )
+        finally:
+            store.close()
 
     return sdata
