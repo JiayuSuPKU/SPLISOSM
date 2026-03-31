@@ -1,5 +1,7 @@
 """Spatial kernel abstractions."""
 
+from __future__ import annotations
+
 import warnings
 import numpy as np
 import scipy.sparse
@@ -180,14 +182,14 @@ class SpatialCovKernel(Kernel):
     """Switch to implicit sparse mode above this number of spots."""
 
     inv_cov: scipy.sparse.csc_matrix
-    """Sparse precision matrix M = K⁻¹ of shape (n_spots, n_spots)."""
+    """Sparse precision matrix M = K⁻¹ of shape ``(n_spots, n_spots)``."""
 
     K_sp: torch.Tensor | None
-    """Dense centred/standardised kernel (n_spots, n_spots). ``None`` in
+    """Dense centred/standardised kernel ``(n_spots, n_spots)``. ``None`` in
     implicit mode."""
 
     Q: torch.Tensor | None
-    """Low-rank factor (n_spots, rank) such that K ≈ Q @ Q.T.
+    """Low-rank factor ``(n_spots, rank)`` such that K ≈ Q @ Q.T.
     Populated lazily after the first :meth:`eigenvalues` call."""
 
     K_eigvals: torch.Tensor | None
@@ -214,10 +216,10 @@ class SpatialCovKernel(Kernel):
 
         Parameters
         ----------
-        coords : array-like of shape (n_spots, n_dim), optional
+        coords : array-like of shape ``(n_spots, n_dim)``, optional
             Spot coordinates.  A k-NN graph is built from these and used to
             construct the CAR precision matrix.
-        adj_matrix : sparse or dense matrix of shape (n_spots, n_spots), optional
+        adj_matrix : sparse or dense matrix of shape ``(n_spots, n_spots)``, optional
             Pre-built symmetric k-NN adjacency / weight matrix.  The CAR
             precision is built directly from this matrix.
         k_neighbors : int
@@ -490,7 +492,7 @@ class SpatialCovKernel(Kernel):
         Returns
         -------
         torch.Tensor
-            Dense matrix of shape (n_spots, n_spots).
+            Dense matrix of shape ``(n_spots, n_spots)``.
         """
         if self.K_sp is not None:
             return self.K_sp  # already standardised + centred
@@ -513,26 +515,74 @@ class SpatialCovKernel(Kernel):
         return torch.from_numpy(0.5 * (K + K.T))
 
     def xtKx(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute the quadratic form ``x^T K x``.
+        """Compute ``x^T K x`` using the cached low-rank factor when available.
+
+        When :attr:`Q` has been populated (by a prior :meth:`eigenvalues` call)
+        the result is ``x^T Q Q^T x``, i.e. consistent with the approximation
+        ``K ≈ Q Q^T``:
+
+        * **Dense mode**: :meth:`eigendecomposition` produces a full-rank Q so
+          ``Q Q^T = K`` exactly.
+        * **Implicit mode**: :meth:`eigenvalues` produces a rank-k Q; the result
+          is therefore a rank-k approximation of ``x^T K x``.
+
+        Before :meth:`eigenvalues` is called (``Q`` is ``None``) this falls back
+        to :meth:`xtKx_exact`.  Use :meth:`xtKx_exact` directly to always obtain
+        the exact quadratic form regardless of whether Q has been computed.
 
         Parameters
         ----------
         x : torch.Tensor
-            Input matrix of shape (n_spots, d).
+            Input matrix of shape ``(n_spots, d)``.
 
         Returns
         -------
         torch.Tensor
-            Matrix of shape (d, d).
+            Matrix of shape ``(d, d)``.
+
+        See Also
+        --------
+        xtKx_exact : Always uses the exact path (dense multiply or LU solve).
         """
+        if self.Q is not None:
+            xtQ = x.t() @ self.Q
+            return xtQ @ xtQ.t()
+        return self.xtKx_exact(x)
+
+    def xtKx_exact(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute ``x^T K x`` exactly, bypassing any cached low-rank factor.
+
+        Always uses the full kernel:
+
+        * **Dense mode** (``K_sp`` is not ``None``): direct matrix multiply
+          ``x^T K_{sp} x``.
+        * **Implicit mode** (``K_sp`` is ``None``): sparse LU solve
+          ``M u = x`` where ``M = K^{-1}``, then returns ``x^T u = x^T K x``.
+
+        Unlike :meth:`xtKx`, this method **ignores** :attr:`Q` and always
+        returns the exact quadratic form under the full kernel K.  This is
+        useful when you need the exact HSIC statistic for reporting while using
+        a low-rank Q for the p-value null distribution.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input matrix of shape ``(n_spots, d)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Matrix of shape ``(d, d)``.
+
+        See Also
+        --------
+        xtKx : Uses cached Q (low-rank approximation) when available.
+        """
+        # Dense: direct multiply (always exact regardless of Q).
         if self.K_sp is not None:
-            if self.Q is not None:
-                # Low-rank path (populated after eigendecomposition)
-                xtQ = x.t() @ self.Q
-                return xtQ @ xtQ.t()
             return x.t() @ self.K_sp @ x
 
-        # Implicit: solve M u = x, return x^T u = x^T K x
+        # Implicit: sparse LU solve — M u = x  →  u = K x  →  x^T u = x^T K x.
         lu = self._get_lu()
         x_np = x.numpy().astype(np.float64)
         u = lu.solve(x_np)  # shape (n, d)
@@ -557,7 +607,14 @@ class SpatialCovKernel(Kernel):
             Eigenvalues in descending order.
         """
         if self.K_eigvals is not None:
-            return self.K_eigvals if k is None else self.K_eigvals[:k]
+            cached_k = len(self.K_eigvals)
+            # Dense mode always stores a full-rank decomposition — cache is always
+            # sufficient (K_eigvals[:k] simply clips at n).
+            # Implicit mode stores only the top-k_req eigenvalues from eigsh; if
+            # a larger k is requested we must rerun eigsh with the new k.
+            if self.K_sp is not None or k is None or k <= cached_k:
+                return self.K_eigvals if k is None else self.K_eigvals[:k]
+            # Fall through: implicit mode, k > cached_k — recompute below.
 
         if self.K_sp is not None:
             # Dense: full eigendecomposition (also populates Q)
