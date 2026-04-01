@@ -461,31 +461,46 @@ class MultinomGLM(BaseModel, nn.Module):
         return _melt_tensor_along_first_dim(multinom_hessian)
 
     def _get_log_lik_hessian_beta_bias(self):
-        """Get the Hessian matrix of the log joint probability wrt the fixed effects."""
-        # combine beta and the intercept bias_eta
-        X_expand = torch.cat(
-            [
-                self.X_spot,
-                torch.ones(1, self.n_spots, 1, device=self.device),
-            ],
+        """Get the Hessian matrix of the log joint probability wrt the fixed effects.
+
+        Computes ``X^T H_eta X`` directly from the per-spot Hessian blocks using
+        einsum, avoiding the large ``n_spots*(n_isos-1) × n_spots*(n_isos-1)``
+        intermediate matrix produced by ``_get_log_lik_hessian_eta``.
+
+        Note: uses ``self.X_spot.shape[-1]`` for the factor dimension rather than
+        ``self.n_factors``, because some callers (e.g. score test) extend ``X_spot``
+        without updating ``n_factors``.
+        """
+        n_isos = self.n_isos
+        props = self._alpha()  # (n_genes, n_spots, n_isos)
+
+        # Per-spot log-lik Hessian blocks w.r.t. eta:
+        # H_block[b, s, r, k] = -counts[b,s] * (diag(p) - p*p^T)[r,k]
+        # Shape (n_genes, n_spots, n_isos-1, n_isos-1)
+        H_block = -self.counts.sum(-1).view(self.n_genes, -1, 1, 1) * (
+            props[..., :-1].unsqueeze(-1).expand(-1, -1, -1, n_isos - 1)
+            * torch.eye(n_isos - 1, device=self.device)
+            - torch.einsum("bsi,bsj->bsij", props[..., :-1], props[..., :-1])
+        )
+
+        # X_s: (n_spots, n_factors_actual+1) — design matrix augmented with intercept column.
+        # Use X_spot.shape[-1] (not self.n_factors) to handle cases where X_spot is
+        # temporarily extended by callers (e.g., score test).
+        X_s = torch.cat(
+            [self.X_spot.squeeze(0), torch.ones(self.n_spots, 1, device=self.device)],
             dim=-1,
-        )  # (1, n_spots, n_factors + 1)
-        # (n_genes, n_spots * (n_isos - 1), (n_factors + 1) * (n_isos - 1))
-        X_expand_full = torch.stack(
-            [torch.block_diag(*[x] * (self.n_isos - 1)) for x in X_expand], dim=0
-        )
+        )  # (n_spots, n_factors_actual+1)
+        nF1 = X_s.shape[-1]  # n_factors_actual + 1
 
-        # calculate the hessian of the log likelihood wrt [beta, bias]
-        # W is the hessian of the log multinomial likelihood wrt eta := X@beta + nu
-        # W[s] = - sum(counts[s,:]) * {diag(p) - p@p.T}
-        # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
-        W = self._get_log_lik_hessian_eta()
-        # hessian_beta = X.T @ W @ X, ((n_factors + 1)(n_isos - 1), (n_factors + 1)(n_isos - 1))
-        # (n_genes, (n_factors + 1) * (n_isos - 1), (n_factors + 1) * (n_isos - 1))
-        hessian_beta_expand = (
-            X_expand_full.transpose(1, 2).matmul(W).matmul(X_expand_full)
+        # X^T H X directly via einsum (no large W matrix needed):
+        # XtHX[b, r*nF1+f, k*nF1+g] = Σ_s X_s[s,f] * H_block[b,s,r,k] * X_s[s,g]
+        XtHX_5d = torch.einsum("sf, bsrk, sg -> brfkg", X_s, H_block, X_s)
+        # (n_genes, n_isos-1, nF1, n_isos-1, nF1)
+        hessian_beta_expand = XtHX_5d.reshape(
+            self.n_genes,
+            (n_isos - 1) * nF1,
+            (n_isos - 1) * nF1,
         )
-
         return hessian_beta_expand
 
     """Functions for model fitting.
@@ -572,7 +587,12 @@ class MultinomGLM(BaseModel, nn.Module):
         )
 
     def _update_iwls(self):
-        """Update the model parameters using the iteratively reweighted least squares (IWLS)."""
+        """Update the model parameters using the iteratively reweighted least squares (IWLS).
+
+        Avoids materialising the large ``n_spots*(n_isos-1) × n_spots*(n_isos-1)``
+        block-diagonal weight matrix by computing ``X^T W X`` and ``X^T W y``
+        directly via einsum on the per-spot weight blocks.
+        """
         n_genes, n_spots, n_isos, n_factors = (
             self.n_genes,
             self.n_spots,
@@ -581,65 +601,54 @@ class MultinomGLM(BaseModel, nn.Module):
         )
         props = self._alpha()  # (n_genes, n_spots, n_isos)
 
-        # define the working variable (pseudo data)
-        # working_y = eta + [d_eta/d_mu][counts - mu]
-        # [d_eta/d_mu] = [d_mu/d_eta]^-1 = W^-1
-        # W = N_i * (diag(alpha[i,:-1]) - alpha[i,:-1].T @ alpha[i,:-1]) at given location i
-
-        # W = sum(counts[s,:]) * {diag(p) - p@p.T}
-        # (n_genes, n_spots, n_isos - 1, n_isos - 1)
+        # Per-spot IWLS weight blocks:
+        # W[b, s, r, k] = counts[b,s] * (diag(p) - p*p^T)[r, k]
+        # Shape (n_genes, n_spots, n_isos-1, n_isos-1)
         W = self.counts.sum(-1).view(n_genes, n_spots, 1, 1) * (
             props[..., :-1].unsqueeze(-1).expand(-1, -1, -1, n_isos - 1)
             * torch.eye(n_isos - 1, device=self.device)
-            - torch.einsum("bsi,bsj->bsij", (props[..., :-1], props[..., :-1]))
+            - torch.einsum("bsi,bsj->bsij", props[..., :-1], props[..., :-1])
         )
-        # for stability
+        # Invert per-spot weight (small (n_isos-1)×(n_isos-1) blocks, not n×n)
         W_inv = torch.linalg.inv(W + 1e-5 * torch.eye(n_isos - 1, device=self.device))
+
+        # Pseudo-response: y_tilde = eta + W^{-1}(counts - mu)
         residuals = self.counts - props * self.counts.sum(-1, keepdim=True)
-        working_y = residuals[..., :-1].unsqueeze(
-            -1
-        )  # (n_genes, n_spots, n_isos - 1, 1)
-        working_y = (W_inv.matmul(working_y)).squeeze(
-            -1
-        )  # (n_genes, n_spots, n_isos - 1)
-        working_y += self._eta()  # (n_genes, n_spots, n_isos - 1)
+        working_y = W_inv.matmul(residuals[..., :-1].unsqueeze(-1)).squeeze(-1)
+        working_y += self._eta()  # (n_genes, n_spots, n_isos-1)
 
-        # calculate the IWLS update for beta and bias_eta
-        # beta_new = (X.T @ W @ X)^-1 @ X.T @ W @ y
-        # reshape W
-        # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
-        W = _melt_tensor_along_first_dim(W)
-        # reshape X to include the intercept term
-        # (1, n_spots, n_factors + 1)
-        X_expand = torch.cat(
-            [self.X_spot, torch.ones(1, n_spots, 1, device=self.device)], dim=-1
-        )
-        # (1, n_spots * (n_isos - 1), (n_factors + 1) * (n_isos - 1))
-        X_expand_full = torch.stack(
-            [torch.block_diag(*[x] * (n_isos - 1)) for x in X_expand], dim=0
-        )
-        # calculate the analytical solution
-        # (n_genes, (n_factors + 1) * (n_isos - 1), n_spots * (n_isos - 1))
-        Xt_W = X_expand_full.transpose(1, 2).matmul(W)
-        # (n_genes, (n_factors + 1) * (n_isos - 1), (n_factors + 1) * (n_isos - 1))
-        Xt_W_X = Xt_W.matmul(X_expand_full)
-        # add a small value to the diagonal for stability
-        Xt_W_X += 1e-5 * torch.eye((n_factors + 1) * (n_isos - 1))
+        # X_s: (n_spots, n_factors+1) — design with intercept column (no n_spots² allocation)
+        X_s = torch.cat(
+            [self.X_spot.squeeze(0), torch.ones(n_spots, 1, device=self.device)], dim=-1
+        )  # (n_spots, n_factors+1)
 
-        # (n_genes, (n_factors + 1) x (n_isos - 1))
-        Xt_W_y = torch.einsum("bij,bj->bi", Xt_W, working_y.transpose(1, 2).flatten(1))
+        # Efficient X^T W X via einsum (avoids the n_spots*(n_isos-1) × n_spots*(n_isos-1) W):
+        # XtWX[b, r*(F+1)+f, k*(F+1)+g] = Σ_s X_s[s,f] * W[b,s,r,k] * X_s[s,g]
+        XtWX_5d = torch.einsum("sf, bsrk, sg -> brfkg", X_s, W, X_s)
+        # (n_genes, n_isos-1, n_factors+1, n_isos-1, n_factors+1)
+        Xt_W_X = XtWX_5d.reshape(
+            n_genes, (n_isos - 1) * (n_factors + 1), (n_isos - 1) * (n_factors + 1)
+        )
+        Xt_W_X += 1e-5 * torch.eye((n_isos - 1) * (n_factors + 1), device=self.device)
+
+        # Efficient X^T W y via einsum:
+        # XtWy[b, r*(F+1)+f] = Σ_s X_s[s,f] * Σ_k W[b,s,r,k] * y[b,s,k]
+        Wy = torch.einsum(
+            "bsrk, bsk -> bsr", W, working_y
+        )  # (n_genes, n_spots, n_isos-1)
+        XtWy = torch.einsum(
+            "sf, bsr -> brf", X_s, Wy
+        )  # (n_genes, n_isos-1, n_factors+1)
+        Xt_W_y = XtWy.reshape(n_genes, -1)  # (n_genes, (n_isos-1)*(n_factors+1))
+
         res = torch.linalg.solve(Xt_W_X, Xt_W_y).reshape(
             n_genes, n_isos - 1, n_factors + 1
         )
 
         # extract beta and bias_eta
-        beta_new = res[..., :-1].transpose(1, 2)  # (n_genes, n_factors, n_isos - 1)
-        bias_eta_new = res[..., -1]  # (n_genes, n_isos - 1)
+        beta_new = res[..., :-1].transpose(1, 2)  # (n_genes, n_factors, n_isos-1)
+        bias_eta_new = res[..., -1]  # (n_genes, n_isos-1)
 
-        # update the parameters and clear the gradients
-        # with torch.no_grad():
-        #     self.beta[~self.convergence].copy_(beta_new[~self.convergence])
-        #     self.bias_eta[~self.convergence].copy_(bias_eta_new[~self.convergence])
         self.beta.data.copy_(update_at_idx(self.beta, beta_new, self.convergence))
         self.bias_eta.data.copy_(
             update_at_idx(self.bias_eta, bias_eta_new, self.convergence)
@@ -1164,19 +1173,33 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
             self.register_buffer("corr_sp_eigvals", corr_sp_eigvals)
             self.register_buffer("corr_sp_eigvecs", corr_sp_eigvecs)
+            # Full eigendecomposition — always full-rank
+            self._rank = self.n_spots
+            self._is_low_rank = False
 
         else:
-            assert corr_sp_eigvals.shape == (self.n_spots,)
-            assert corr_sp_eigvecs.shape == (self.n_spots, self.n_spots)
-
-            corr_sp = corr_sp_eigvecs.matmul(torch.diag(corr_sp_eigvals)).matmul(
-                corr_sp_eigvecs.t()
+            rank = corr_sp_eigvals.shape[0]
+            assert corr_sp_eigvecs.shape[0] == self.n_spots, (
+                f"corr_sp_eigvecs must have {self.n_spots} rows, "
+                f"got {corr_sp_eigvecs.shape[0]}"
             )
-            # (n_spots, n_spots), the spatial covariance matrix
-            self.register_buffer("corr_sp", corr_sp)
-            # (n_spots,), the eigenvalues of the spatial covariance matrix
+            assert corr_sp_eigvecs.shape[1] == rank, (
+                "corr_sp_eigvecs columns must match corr_sp_eigvals length "
+                f"({rank}), got {corr_sp_eigvecs.shape[1]}"
+            )
+
+            # Store the rank as a plain Python int (not a buffer, not a param).
+            # This is used by _cov/_inv_cov and the log-prob methods.
+            self._rank = rank
+            self._is_low_rank = rank < self.n_spots
+
+            # Never reconstruct the n×n corr_sp from eigenpairs — it is not used
+            # in any computation (only the eigenpairs are needed).
+            self.register_buffer("corr_sp", None)
+
+            # (rank,), leading eigenvalues of the spatial correlation matrix
             self.register_buffer("corr_sp_eigvals", corr_sp_eigvals)
-            # (n_spots, n_spots), the eigenvectors of the spatial covariance matrix
+            # (n_spots, rank), corresponding orthonormal eigenvectors
             self.register_buffer("corr_sp_eigvecs", corr_sp_eigvecs)
 
         self.register_buffer("convergence", torch.zeros(self.n_genes, dtype=bool))
@@ -1297,46 +1320,106 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             return self.sigma_sp**2 / self.var_total()
 
     def _corr_eigvals(self):
-        """Output the eigenvalues of the correlation matrix."""
+        """Output the leading eigenvalues of the correlation matrix.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_components, rank)`` where ``rank`` is the
+            number of stored eigenpairs (``n_spots`` for full-rank, ``k`` for
+            low-rank approximations).
+        """
         var_sp_prop = self.var_sp_prop().unsqueeze(-1)  # (n_genes, n_var_components, 1)
-        # return: (n_genes, n_var_components, n_spots)
         return var_sp_prop * self.corr_sp_eigvals.unsqueeze(0) + (1 - var_sp_prop)
-        # return torch.stack(
-        #     [(p * self.corr_sp_eigvals + (1 - p)) for p in self.var_sp_prop()], dim=0
-        # )
 
     def _cov_eigvals(self):
-        """Output the eigenvalues of the covariance matrix."""
-        # (n_genes, n_var_components, n_spots) * (n_genes, n_var_components, 1)
-        # return: (n_genes, n_var_components, n_spots)
+        """Output the leading eigenvalues of the covariance matrix.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_components, rank)``.
+        """
         return self._corr_eigvals() * self.var_total().unsqueeze(-1)
 
+    def _residual_cov_eigval(self):
+        """Residual (noise-only) covariance eigenvalue for uncaptured modes.
+
+        In the low-rank approximation the ``n_spots - rank`` uncaptured spatial
+        modes are treated as pure white noise with eigenvalue
+        ``σ²(1 − θ)`` (equivalently ``σ_nsp²``).
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_components, 1)``.  Each entry equals the
+            residual covariance eigenvalue ``d`` for the corresponding gene and
+            variance component.
+        """
+        # (1 - θ) * σ² — valid for both parameterisations because:
+        #   sigma/theta:   var_total = σ², var_sp_prop = θ   → d = σ²(1-θ)
+        #   sigma_sp/nsp:  var_total = sqrt(σ_sp²+σ_nsp²),
+        #                  var_sp_prop = σ_sp²/var_total²     → d = σ_nsp²  ✓
+        var_sp_prop = self.var_sp_prop().unsqueeze(-1)  # (n_genes, n_var_comp, 1)
+        return (1.0 - var_sp_prop) * self.var_total().unsqueeze(-1)
+
     def _cov(self):
-        """Reconstruct the covariance of the random effect."""
-        # return (
-        #     self.corr_sp_eigvecs.unsqueeze(0)
-        #     @ torch.diag_embed(self._cov_eigvals())
-        #     @ self.corr_sp_eigvecs.T.unsqueeze(0)
-        # )  # (n_isos - 1) or 1 x n_spots x n_spots
-        # return: (n_genes, n_var_components, n_spots, n_spots)
-        return self.corr_sp_eigvecs[None, None, ...].matmul(
-            torch.diag_embed(self._cov_eigvals()).matmul(
-                self.corr_sp_eigvecs.transpose(0, 1)[None, None, ...]
-            )
-        )
+        """Reconstruct the covariance matrix of the random effect.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_components, n_spots, n_spots)``.
+
+        Notes
+        -----
+        **Full-rank**: ``C = V diag(c) V^T``
+
+        **Low-rank** (when ``_is_low_rank`` is True):
+        ``C = d I + V_k diag(c_k − d) V_k^T``
+        where ``d = _residual_cov_eigval()`` and ``c_k = _cov_eigvals()``.
+        """
+        V = self.corr_sp_eigvecs[None, None, ...]  # (1, 1, n_spots, rank)
+        c = self._cov_eigvals()  # (n_genes, n_var_comp, rank)
+        if not self._is_low_rank:
+            return V.matmul(torch.diag_embed(c).matmul(V.transpose(-1, -2)))
+
+        # Low-rank: C = d*I + V_k diag(c_k - d) V_k^T
+        d = self._residual_cov_eigval().unsqueeze(-1)  # (n_genes, n_var_comp, 1, 1)
+        delta = c - d.squeeze(-1)  # (n_genes, n_var_comp, rank)
+        eye = torch.eye(
+            self.n_spots, device=V.device, dtype=V.dtype
+        )  # (n_spots, n_spots)
+        return d * eye + V.matmul(torch.diag_embed(delta).matmul(V.transpose(-1, -2)))
 
     def _inv_cov(self):
-        """Reconstruct the inverse covariance of the random effect."""
-        # return (
-        #     self.corr_sp_eigvecs.unsqueeze(0)
-        #     @ torch.diag_embed(1 / self._cov_eigvals())
-        #     @ self.corr_sp_eigvecs.T.unsqueeze(0)
-        # )  # (n_isos - 1) or 1 x n_spots x n_spots
-        # return: (n_genes, n_var_components, n_spots, n_spots)
-        return self.corr_sp_eigvecs[None, None, ...].matmul(
-            torch.diag_embed(1 / self._cov_eigvals()).matmul(
-                self.corr_sp_eigvecs.transpose(0, 1)[None, None, ...]
-            )
+        """Reconstruct the inverse covariance of the random effect.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_components, n_spots, n_spots)``.
+
+        Notes
+        -----
+        **Full-rank**: ``C^{-1} = V diag(1/c) V^T``
+
+        **Low-rank** (Woodbury identity):
+        ``C^{-1} = (1/d) I + V_k diag(1/c_k − 1/d) V_k^T``
+        """
+        V = self.corr_sp_eigvecs[None, None, ...]  # (1, 1, n_spots, rank)
+        c = self._cov_eigvals()  # (n_genes, n_var_comp, rank)
+        if not self._is_low_rank:
+            return V.matmul(torch.diag_embed(1.0 / c).matmul(V.transpose(-1, -2)))
+
+        # Low-rank Woodbury: C^{-1} = (1/d)I + V_k diag(1/c_k - 1/d) V_k^T
+        d = self._residual_cov_eigval().unsqueeze(-1)  # (n_genes, n_var_comp, 1, 1)
+        inv_correction = 1.0 / c - 1.0 / d.squeeze(-1)  # (n_genes, n_var_comp, rank)
+        eye = torch.eye(
+            self.n_spots, device=V.device, dtype=V.dtype
+        )  # (n_spots, n_spots)
+        return (1.0 / d) * eye + V.matmul(
+            torch.diag_embed(inv_correction).matmul(V.transpose(-1, -2))
         )
 
     def _eta(self):
@@ -1363,18 +1446,27 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         # add mvn prob of nu ~ MVN(0, S)
         data = self.nu.transpose(1, 2)  # (n_genes, n_isos - 1, n_spots)
-        # use the same variance components for all genes if cov_eigvals.shape[1] == 1
+        # expand shared-variance dimension (1 → n_isos-1) if needed; keep rank dim
         cov_eigvals = self._cov_eigvals().expand(
-            self.n_genes, data.shape[1], self.n_spots
-        )
+            self.n_genes, data.shape[1], -1
+        )  # (n_genes, n_isos-1, rank)
         cov_eigvecs = self.corr_sp_eigvecs.expand(
-            1, data.shape[1], self.n_spots, self.n_spots
-        )
+            1, data.shape[1], self.n_spots, self._rank
+        )  # (1, n_isos-1, n_spots, rank)
+
+        residual_eigval = None
+        if self._is_low_rank:
+            # (n_genes, n_isos-1, 1) — broadcast across spots in fastmvn
+            residual_eigval = self._residual_cov_eigval().expand(
+                self.n_genes, data.shape[1], 1
+            )
+
         log_prob += log_prob_fastmvn_batched(
             locs=torch.zeros_like(data),
             cov_eigvals=cov_eigvals,
             cov_eigvecs=cov_eigvecs,
             data=data,
+            residual_eigval=residual_eigval,
         )
 
         # add Multinomial likelihood of the counts
@@ -1460,31 +1552,35 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             sigma, theta_logit = sigma_expand[..., 0], sigma_expand[..., 1]
             var_sp_prop = torch.sigmoid(theta_logit).unsqueeze(
                 -1
-            )  # (n_genes, n_iso - 1, -1)
+            )  # (n_genes, n_iso - 1, 1)
             sigma_total = sigma  # (n_genes, n_iso - 1)
-            # (n_genes, n_iso - 1, n_spots) * (n_genes, n_iso - 1, 1) -> (n_genes, n_iso - 1, n_spots)
+            # (n_genes, n_iso - 1, rank)
             cov_eigvals = (
                 var_sp_prop * self.corr_sp_eigvals.unsqueeze(0) + (1 - var_sp_prop)
             ) * sigma_total.unsqueeze(-1)
+            # residual = σ²(1-θ), shape (n_genes, n_iso-1, 1)
+            residual_eigval = (1.0 - var_sp_prop) * sigma_total.unsqueeze(-1)
         else:
             sigma_sp, sigma_nsp = sigma_expand[..., 0], sigma_expand[..., 1]
-            sigma_total = torch.sqrt(sigma_sp**2 + sigma_nsp**2)  # (n_genes, n_iso - 1)
-            # (n_genes, n_iso - 1, 1) * (1, n_spots) -> (n_genes, n_iso - 1, n_spots)
+            sigma_total = torch.sqrt(sigma_sp**2 + sigma_nsp**2)  # (n_genes, n_iso-1)
+            # (n_genes, n_iso-1, rank)
             cov_eigvals = sigma_sp.unsqueeze(-1).pow(
                 2
             ) * self.corr_sp_eigvals.unsqueeze(0) + sigma_nsp.unsqueeze(-1).pow(2)
+            # residual = σ_nsp², shape (n_genes, n_iso-1, 1)
+            residual_eigval = sigma_nsp.unsqueeze(-1).pow(2)
 
         # MVN prior likelihood as a function of the input eta
         data = self.nu.transpose(1, 2)  # (n_genes, n_isos - 1, n_spots)
-        # use the same variance components for all genes if cov_eigvals.shape[1] == 1
         cov_eigvecs = self.corr_sp_eigvecs.expand(
-            1, data.shape[1], self.n_spots, self.n_spots
+            1, data.shape[1], self.n_spots, self._rank
         )
         log_prob = log_prob_fastmvn_batched(
             locs=torch.zeros_like(data),
             cov_eigvals=cov_eigvals,
             cov_eigvecs=cov_eigvecs,
             data=data,
+            residual_eigval=residual_eigval if self._is_low_rank else None,
         )
 
         # add prior prob of sigma_total

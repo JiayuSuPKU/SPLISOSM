@@ -347,25 +347,49 @@ def log_prob_fastmvn_batched(
     cov_eigvecs: torch.Tensor,
     data: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
+    residual_eigval: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute batched multivariate normal log-likelihood with eigendecomposition.
 
     Classes along the second axis are treated as independent,
     and the log-likelihood is computed as the sum of log-likelihoods for each class.
 
+    Supports both full-rank and low-rank covariance approximations.  In the
+    **full-rank** case (``residual_eigval=None``) the covariance is
+    ``C = V diag(c) V^T`` and both ``cov_eigvals`` and ``cov_eigvecs`` have
+    ``n_spots`` entries in their last dimension.
+
+    In the **low-rank** case (``residual_eigval`` provided) the covariance is
+    approximated as
+
+    .. math::
+
+        C \\approx V_k \\operatorname{diag}(c_k) V_k^T
+                  + d\\,(I - V_k V_k^T)
+
+    where ``V_k`` (n_spots × k) contains the top-k eigenvectors, ``c_k`` (k)
+    the corresponding eigenvalues, and ``d`` is the scalar residual eigenvalue
+    (the noise-only contribution for the uncaptured modes).  The log-likelihood
+    is then computed via the Woodbury identity.
+
     Parameters
     ----------
     locs
         Batched mean tensor of shape (batch_size, n_classes, n_spots).
     cov_eigvals
-        Batched eigenvalue tensor of shape (batch_size, n_classes, n_spots).
+        Full-rank: shape (batch_size, n_classes, n_spots).
+        Low-rank:  shape (batch_size, n_classes, k) with k ≤ n_spots.
     cov_eigvecs
-        Batched eigenvector tensor of shape (batch_size, n_classes, n_spots, n_spots).
+        Full-rank: shape (batch_size, n_classes, n_spots, n_spots).
+        Low-rank:  shape (batch_size, n_classes, n_spots, k).
     data
         Batched observation of shape (batch_size, n_classes, n_spots).
     mask : torch.Tensor, optional
         Batched mask tensor of shape (batch_size, n_spots). Entries with value ``1``
         are treated as masked and are ignored when computing likelihood.
+    residual_eigval : torch.Tensor, optional
+        Low-rank residual eigenvalue ``d`` of shape (batch_size, n_classes, 1).
+        When ``None`` (default), full-rank computation is used.
 
     Returns
     -------
@@ -387,19 +411,51 @@ def log_prob_fastmvn_batched(
             batch_size, 1, num_spots, device=data.device, dtype=data.dtype
         )
 
-    if cov_eigvals.shape[1:] != (num_classes, num_spots):
-        raise ValueError(f"Invalid shape of cov_eigvals: {cov_eigvals.shape}")
-    if cov_eigvecs.shape[1:] != (num_classes, num_spots, num_spots):
-        raise ValueError(f"Invalid shape of cov_eigvecs: {cov_eigvecs.shape}")
+    rank = cov_eigvals.shape[-1]  # k (may equal num_spots for full-rank)
 
-    # calculate (x - mu).T @ (VLV.T)^-1 @ (x - mu)
-    # batch_size x n_classes x n_spots
-    # res = ((data - locs).mul(mask).unsqueeze(2) @ cov_eigvecs).squeeze(2)
-    res = torch.einsum("bis,bist->bit", (data - locs).mul(mask), cov_eigvecs)
-    quad_gamma = (res**2 / cov_eigvals).sum(dim=[1, 2])
+    if residual_eigval is None:
+        # Full-rank path — original behaviour
+        if cov_eigvals.shape[1:] != (num_classes, num_spots):
+            raise ValueError(f"Invalid shape of cov_eigvals: {cov_eigvals.shape}")
+        if cov_eigvecs.shape[1:] != (num_classes, num_spots, num_spots):
+            raise ValueError(f"Invalid shape of cov_eigvecs: {cov_eigvecs.shape}")
 
-    # calculate log_det
-    log_det_cov = cov_eigvals.log().sum(dim=[1, 2])
+        # x^T C^{-1} x = (V^T x)^T diag(1/c) (V^T x)
+        res = torch.einsum("bis,bist->bit", (data - locs).mul(mask), cov_eigvecs)
+        quad_gamma = (res**2 / cov_eigvals).sum(dim=[1, 2])
+
+        # log|C| = Σ log(c_i)
+        log_det_cov = cov_eigvals.log().sum(dim=[1, 2])
+
+    else:
+        # Low-rank path — Woodbury-based computation
+        if cov_eigvals.shape[1:] != (num_classes, rank):
+            raise ValueError(f"Invalid shape of cov_eigvals: {cov_eigvals.shape}")
+        if cov_eigvecs.shape[1:] != (num_classes, num_spots, rank):
+            raise ValueError(f"Invalid shape of cov_eigvecs: {cov_eigvecs.shape}")
+        if residual_eigval.shape[1:] != (num_classes, 1):
+            raise ValueError(
+                f"Invalid shape of residual_eigval: {residual_eigval.shape}"
+            )
+
+        x = (data - locs).mul(mask)  # (batch, n_classes, n_spots)
+
+        # z = V_k^T x,  shape (batch, n_classes, k)
+        z = torch.einsum("bis,bist->bit", x, cov_eigvecs)
+
+        # Quadratic form via Woodbury:
+        #   x^T C^{-1} x = (1/d)||x||^2 + Σ_i (1/c_k[i] - 1/d) z[i]^2
+        correction = 1.0 / cov_eigvals - 1.0 / residual_eigval  # (batch, n_classes, k)
+        quad_gamma = (z**2 * correction).sum(dim=[1, 2]) + (
+            x**2 / residual_eigval
+        ).sum(dim=[1, 2])
+
+        # Log-determinant:
+        #   log|C| = Σ_{i=1..k} log(c_k[i]) + (n - k) * Σ_{classes} log(d)
+        log_det_cov = cov_eigvals.log().sum(dim=[1, 2]) + (
+            num_spots - rank
+        ) * residual_eigval.log().sum(dim=[1, 2])
+
     log_2pi = torch.log(torch.tensor(2.0 * np.pi, device=data.device, dtype=data.dtype))
     log_prob = -0.5 * (
         num_spots_non_mask * num_classes * log_2pi + log_det_cov + quad_gamma

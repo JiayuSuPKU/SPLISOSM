@@ -652,6 +652,9 @@ class SpatialCovKernel(Kernel):
         self.Q = torch.from_numpy(eigvecs * sqrt_eigvals[None, :])
         self._rank = k_req
 
+        # Cache eigenvectors (same convention as dense eigendecomposition())
+        self.K_eigvecs = torch.from_numpy(eigvecs.copy())
+
         # Always cache eigenvalues (even for partial k)
         self.K_eigvals = torch.from_numpy(eigvals.copy())
         return self.K_eigvals if k is None else self.K_eigvals[:k]

@@ -8,11 +8,11 @@ from typing import Any, Optional, Union, Literal
 
 import pandas as pd
 import numpy as np
+import scipy.sparse
 from scipy.stats import chi2
 import torch
 from anndata import AnnData
 import torch.multiprocessing as mp
-from torch import nn
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
@@ -22,580 +22,23 @@ from splisosm.utils import (
 )
 from splisosm.dataset import IsoDataset
 from splisosm.kernel import SpatialCovKernel
-from splisosm.model import MultinomGLM, MultinomGLMM
+from splisosm.model import MultinomGLM
+from splisosm._glmm_workers import (
+    IsoFullModel,
+    IsoNullNoSpVar,
+    _fit_model_one_gene,
+    _fit_null_full_sv_one_gene,
+    _fit_perm_one_gene,
+    _calc_llr_spatial_variability,
+    _calc_score_differential_usage,
+    _calc_wald_differential_usage,
+)
 
 __all__ = ["SplisosmGLMM"]
 
-
-class IsoFullModel(MultinomGLMM):
-    """The full model with all parameters.
-
-    See model.MultinomGLMM for more details.
-
-    Examples
-    --------
-    Direct training:
-
-    >>> model = IsoFullModel()
-    >>> model.setup_data(counts, cov_sp, design_mat)
-    >>> model.fit()
-
-    Initialize from a trained null model without spatial variance:
-
-    >>> model = IsoFullModel.from_trained_null_sp_var_model(null_model)
-    >>> model.fit()
-
-    Initialize from a trained null model without a given factor:
-
-    >>> model = IsoFullModel.from_trained_null_no_beta_model(null_model, new_X_spot_col, factor_idx)
-    >>> model.fit()
-    """
-
-    @classmethod
-    def from_trained_null_no_sp_var_model(
-        cls, null_model: MultinomGLMM
-    ) -> "IsoFullModel":
-        # clone the model and convert it
-        new_model = null_model.clone()
-        new_model.__class__ = cls
-
-        # clear the fitting history
-        new_model.fitting_time = 0
-        new_model.register_buffer(
-            "convergence", torch.zeros(new_model.n_genes, dtype=bool)
-        )
-
-        # set fitting methods to gradient descent
-        if new_model.fitting_method == "joint_newton":
-            new_model.fitting_method = "joint_gd"
-        elif new_model.fitting_method == "marginal_newton":
-            new_model.fitting_method = "marginal_gd"
-
-        new_model.fitting_configs.update({"lr": 1e-3, "optim": "adam", "patience": 3})
-
-        # turn the gradient of the spatial variance term back on
-        if new_model.var_parameterization_sigma_theta:
-            new_model.theta_logit.detach_().fill_(-5.0).requires_grad_(True)
-        else:
-            new_model.sigma_sp.requires_grad_(True)
-
-        return new_model
-
-
-class IsoNullNoSpVar(MultinomGLMM):
-    """The null model without spatial variance.
-
-    See model.MultinomGLMM for more details.
-
-    Examples
-    --------
-    Direct training:
-
-    >>> model = IsoNullNoSpVar()
-    >>> model.setup_data(counts, cov_sp, design_mat)
-    >>> model.fit()
-
-    Initialize from a trained full model:
-
-    >>> model = IsoNullNoSpVar.from_trained_full_model(full_model)
-    >>> model.fit()
-    """
-
-    _supported_fitting_methods = ["joint_gd", "marginal_gd", "marginal_newton"]
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # currently only support fitting methods that update the variance using gradient descent
-        if self.fitting_method not in IsoNullNoSpVar._supported_fitting_methods:
-            raise ValueError(
-                f"The fitting method must be one of {IsoNullNoSpVar._supported_fitting_methods}."
-            )
-
-    def _configure_learnable_variables(self):
-        super()._configure_learnable_variables()
-        # make sure the spatial variance is turned off after configuration
-        self._turn_off_spatial_variance()
-
-    def _initialize_params(self):
-        super()._initialize_params()
-        # make sure the spatial variance is turned off after initialization
-        self._turn_off_spatial_variance()
-
-    def _turn_off_spatial_variance(self):
-        """Set spatial variance to zero and don't update it."""
-        if self.var_parameterization_sigma_theta:
-            self.theta_logit.detach_().fill_(-torch.inf).requires_grad_(False)
-        else:
-            self.sigma_sp.detach_().fill_(0.0).requires_grad_(False)
-
-    @classmethod
-    def from_trained_full_model(cls, full_model: MultinomGLMM) -> "IsoNullNoSpVar":
-        """Initialize an IsoNullNoSpVar model from a trained full model."""
-        # clone the model and convert it to the NullNoSpVar class
-        new_model = full_model.clone()
-        new_model.__class__ = cls
-
-        # clear the fitting history
-        new_model.fitting_time = 0
-        new_model.register_buffer(
-            "convergence", torch.zeros(new_model.n_genes, dtype=bool)
-        )
-
-        # set fitting methods to gradient descent
-        if new_model.fitting_method == "joint_newton":
-            new_model.fitting_method = "joint_gd"
-        elif new_model.fitting_method == "marginal_newton":
-            new_model.fitting_method = "marginal_gd"
-
-        new_model.fitting_configs.update({"lr": 1e-3, "optim": "adam", "patience": 3})
-
-        # remove spatial variance
-        new_model._turn_off_spatial_variance()
-
-        return new_model
-
-
-def _fit_model_one_gene(
-    model_configs,
-    model_type,
-    counts,
-    corr_sp_eigvals,
-    corr_sp_eigvecs,
-    design_mtx,
-    quiet=True,
-    random_seed=None,
-):
-    """Fit the MultinomGLMM model to the data.
-
-    This is a worker function for multiprocessing.
-
-    Parameters
-    ----------
-    model_configs : dict
-        The fitting configurations for the model.
-    model_type : str
-        The model type to fit. Can be one of 'glmm-full', 'glmm-null', 'glm'.
-    counts : torch.Tensor
-        Isoform counts.
-    corr_sp_eigvals : torch.Tensor
-        Eigenvalues of spatial covariance matrix.
-    corr_sp_eigvecs : torch.Tensor
-        Eigenvectors of spatial covariance matrix.
-    design_mtx : torch.Tensor or None
-        Design matrix.
-    quiet : bool, optional
-        Suppress fitting logs.
-    random_seed : int, optional
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    pars : dict
-        The fitted parameters extracted.
-    """
-    assert model_type in ["glmm-full", "glmm-null", "glm"]
-
-    if counts.is_sparse:
-        counts = counts.to_dense()
-
-    # initialize and setup the model
-    if model_type == "glm":
-        model = MultinomGLM()
-        model.setup_data(counts, design_mtx=design_mtx)
-        return_par_names = ["beta", "bias_eta"]
-    else:
-        if model_type == "glmm-full":
-            model = IsoFullModel(**model_configs)
-        elif model_type == "glmm-null":
-            model = IsoNullNoSpVar(**model_configs)
-        else:
-            raise ValueError(f"Invalid model type {model_type}.")
-
-        model.setup_data(
-            counts,
-            design_mtx=design_mtx,
-            corr_sp_eigvals=corr_sp_eigvals,
-            corr_sp_eigvecs=corr_sp_eigvecs,
-        )
-        return_par_names = [
-            "nu",
-            "beta",
-            "bias_eta",
-            "sigma",
-            "theta_logit",
-            "sigma_sp",
-            "sigma_nsp",
-        ]
-
-    # fit the model
-    model.fit(quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed)
-
-    # extract and return the fitted parameters
-    pars = {
-        k: v.detach() for k, v in model.state_dict().items() if k in return_par_names
-    }
-
-    return pars
-
-
-def _fit_null_full_sv_one_gene(
-    model_configs,
-    counts,
-    corr_sp_eigvals,
-    corr_sp_eigvecs,
-    design_mtx,
-    refit_null=True,
-    quiet=True,
-    random_seed=None,
-):
-    """Fit the null and full model to the data.
-
-    This is a worker function for multiprocessing. See splisosm.fit_null_full_sv() for more details.
-
-    Parameters
-    ----------
-    model_configs : dict
-        Model configuration dictionary.
-    counts : torch.Tensor
-        Isoform counts.
-    corr_sp_eigvals : torch.Tensor
-        Eigenvalues of spatial covariance.
-    corr_sp_eigvecs : torch.Tensor
-        Eigenvectors of spatial covariance.
-    design_mtx : torch.Tensor or None
-        Design matrix.
-    refit_null : bool, optional
-        Whether to refit null model.
-    quiet : bool, optional
-        Suppress logs.
-    random_seed : int, optional
-        Random seed.
-
-    Returns
-    -------
-    tuple of dict
-        (null_pars, full_pars), the fitted parameters of the null and full models.
-    """
-    if counts.is_sparse:
-        counts = counts.to_dense()
-
-    # fit the null model
-    null = IsoNullNoSpVar(**model_configs)
-    null.setup_data(
-        counts,
-        design_mtx=design_mtx,
-        corr_sp_eigvals=corr_sp_eigvals,
-        corr_sp_eigvecs=corr_sp_eigvecs,
-    )
-    null.fit(quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed)
-
-    # fit the full model from the null
-    full = IsoFullModel.from_trained_null_no_sp_var_model(null)
-    full.fit(quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed)
-
-    # refit the null model if needed
-    if refit_null:
-        null_refit = IsoNullNoSpVar.from_trained_full_model(full)
-        null_refit.fit(
-            quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed
-        )
-
-        # update the null if larger log-likelihood
-        if null_refit().mean() > null().mean():  # null() returns shape of (n_genes,)
-            null = null_refit
-
-        # refit the full model from the null if likelihood decreases
-        if null().mean() > full().mean():
-            full_refit = IsoFullModel.from_trained_null_no_sp_var_model(null)
-            full_refit.fit(
-                quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed
-            )
-            if full_refit().mean() > full().mean():
-                full = full_refit
-
-    return_par_names = [
-        "nu",
-        "beta",
-        "bias_eta",
-        "sigma",
-        "theta_logit",
-        "sigma_sp",
-        "sigma_nsp",
-    ]
-    null_pars = {
-        k: v.detach() for k, v in null.state_dict().items() if k in return_par_names
-    }
-    full_pars = {
-        k: v.detach() for k, v in full.state_dict().items() if k in return_par_names
-    }
-
-    return (null_pars, full_pars)
-
-
-def _fit_perm_one_gene(
-    perm_idx,
-    model_configs,
-    counts,
-    corr_sp_eigvals,
-    corr_sp_eigvecs,
-    design_mtx,
-    refit_null,
-    random_seed=None,
-):
-    """Calculate the likelihood ratio statistic for spatial variability using permutation.
-
-    This is a worker function for multiprocessing. See splisosm.fit_perm_sv_llr() for more details.
-
-    Parameters
-    ----------
-    perm_idx : torch.Tensor
-        Permutation indices.
-    model_configs : dict
-        Model configurations.
-    counts : torch.Tensor
-        Isoform counts.
-    corr_sp_eigvals : torch.Tensor
-        Eigenvalues of spatial covariance.
-    corr_sp_eigvecs : torch.Tensor
-        Eigenvectors of spatial covariance.
-    design_mtx : torch.Tensor or None
-        Design matrix.
-    refit_null : bool
-        Whether to refit null model.
-    random_seed : int, optional
-        Random seed.
-
-    Returns
-    -------
-    _sv_llr : torch.Tensor
-        Shape (1,), the likelihood ratio statistic.
-    """
-
-    if counts.is_sparse:
-        counts = counts.to_dense()
-
-    # permute the data coordinates
-    counts_perm = counts[:, perm_idx, :]  # (n_genes, n_spots, n_isos)
-    design_mtx_perm = design_mtx[perm_idx, :] if design_mtx is not None else None
-
-    # fit the null model
-    null = IsoNullNoSpVar(**model_configs)
-    null.setup_data(
-        counts_perm,
-        design_mtx=design_mtx_perm,
-        corr_sp_eigvals=corr_sp_eigvals,
-        corr_sp_eigvecs=corr_sp_eigvecs,
-    )
-    null.fit(quiet=True, verbose=False, diagnose=False, random_seed=random_seed)
-
-    # fit the full model from the null
-    full = IsoFullModel.from_trained_null_no_sp_var_model(null)
-    full.fit(quiet=True, verbose=False, diagnose=False, random_seed=random_seed)
-
-    # refit the null model if needed
-    if refit_null:
-        null_refit = IsoNullNoSpVar.from_trained_full_model(full)
-        null_refit.fit(
-            quiet=True, verbose=False, diagnose=False, random_seed=random_seed
-        )
-
-        # update the null if larger log-likelihood
-        if null_refit().mean() > null().mean():  # null() returns shape of (n_genes,)
-            null = null_refit
-
-        # refit the full model from the null if likelihood decreases
-        if null().mean() > full().mean():
-            full_refit = IsoFullModel.from_trained_null_no_sp_var_model(null)
-            full_refit.fit(
-                quiet=True, verbose=False, diagnose=False, random_seed=random_seed
-            )
-            if full_refit().mean() > full().mean():
-                full = full_refit
-
-    # calculate the likelihood ratio statistic
-    # use marginal likelihood for stability
-    # _sv_llr = (
-    # 	full._calc_log_prob_marginal().detach() - null._calc_log_prob_marginal().detach()
-    # ) * 2
-    _sv_llr, _ = _calc_llr_spatial_variability(null, full)
-
-    return _sv_llr
-
-
-def _calc_llr_spatial_variability(null_model: IsoNullNoSpVar, full_model: IsoFullModel):
-    """Calculate the likelihood ratio statistic for spatial variability.
-
-    Parameters
-    ----------
-    null_model : IsoNullNoSpVar
-        The fitted null model of one gene (sigma_sp = 0).
-    full_model : IsoFullModel
-        The fitted full model of one gene (sigma_sp != 0).
-
-    Returns
-    -------
-    sv_llr : torch.Tensor
-        Shape (n_genes,), the likelihood ratio statistic per gene.
-    df : int
-        The degrees of freedom for the likelihood ratio statistic (equal to the number of variance components).
-    """
-    # calculate the likelihood ratio statistic
-    # use marginal likelihood for stability
-    sv_llr = (
-        full_model._calc_log_prob_marginal().detach()
-        - null_model._calc_log_prob_marginal().detach()
-    ) * 2  # (n_genes,)
-
-    # the degrees of freedom for the likelihood ratio statistic
-    n_var_comps = 1 if full_model.share_variance else full_model.n_isos - 1
-
-    return sv_llr, n_var_comps
-
-
-def _calc_wald_differential_usage(fitted_full_model: MultinomGLM):
-    """Calculate the Wald statistic for differential usage.
-
-    H_0: beta[p,:] = 0
-    H_1: beta[p,:] != 0
-
-    Parameters
-    ----------
-    fitted_full_model : MultinomGLM
-        The fitted full model of one gene.
-
-    Returns
-    -------
-    wald_stat : torch.Tensor
-        Shape (n_genes, n_factors), the Wald statistic for each factor per gene.
-    df : int
-        The degrees of freedom for the Wald statistic (equal to n_isos - 1).
-    """
-    n_factors, n_isos = (
-        fitted_full_model.n_factors,
-        fitted_full_model.n_isos,
-    )
-    assert n_factors > 0, "No factor is included in the model."
-
-    # extract the Hessian for beta per factor
-    # beta_bias_hess.shape = (n_genes, (n_factors + 1)*(n_isos - 1), (n_factors + 1)*(n_isos - 1))
-    beta_bias_hess = fitted_full_model._get_log_lik_hessian_beta_bias().detach()
-    fisher_info = []  # -> (n_genes, n_factors, n_isos - 1, n_isos - 1)
-    for i in range(n_factors):
-        # retrieve the Hessian for beta per factor
-        beta_idx_per_factor = [i + j * (n_factors + 1) for j in range(n_isos - 1)]
-        # beta_hess.shape = (n_genes, n_isos - 1, n_isos - 1)
-        beta_hess = beta_bias_hess[:, beta_idx_per_factor, :][:, :, beta_idx_per_factor]
-        # the Fisher information matrix is the negative Hessian
-        fisher_info.append(-beta_hess)  # (n_genes, n_isos - 1, n_isos - 1)
-    fisher_info = torch.stack(
-        fisher_info, dim=1
-    )  # (n_genes, n_factors, n_isos - 1, n_isos - 1)
-
-    # extract the beta estimates
-    beta_est = fitted_full_model.beta.detach()  # (n_genes, n_factors, n_isos - 1)
-
-    # calculate the Wald statistic
-    wald_stat = (
-        beta_est.unsqueeze(-2) @ fisher_info @ beta_est.unsqueeze(-1)
-    )  # (n_genes, n_factors, 1, 1)
-
-    return wald_stat.squeeze(), n_isos - 1
-
-
-def _calc_score_differential_usage(fitted_full_model: MultinomGLM, covar_to_test):
-    """Calculate the score statistic for differential usage.
-
-    H_0: beta[p,:] = 0
-    H_1: beta[p,:] != 0
-
-    Parameters
-    ----------
-    fitted_full_model : MultinomGLM
-        The fitted full model of one gene without covariates.
-    covar_to_test : torch.Tensor
-        Shape (n_spots, n_covars), the design matrix of the covariates to test.
-
-    Returns
-    -------
-    score_stat : torch.Tensor
-        Shape (n_factors,), the score statistic for each factor.
-    df : int
-        The degrees of freedom for the score statistic (equal to n_isos - 1).
-    """
-    n_genes, n_factors_design, n_isos = (
-        fitted_full_model.n_genes,
-        fitted_full_model.n_factors,
-        fitted_full_model.n_isos,
-    )
-    # assert n_factors == 0, "No factor should be included in the model."
-
-    # in case of a single covariate, expand the design matrix
-    if covar_to_test.dim() == 1:
-        covar_to_test = covar_to_test.unsqueeze(-1)  # (n_spots, 1)
-    elif covar_to_test.dim() > 2:
-        raise ValueError("The covariate design matrix must be 2D.")
-
-    n_factors_covar = covar_to_test.shape[-1]
-    n_factors = n_factors_design + n_factors_covar
-
-    # clone the full model and reset the design matrix
-    m_full = fitted_full_model.clone()
-    with torch.no_grad():
-        # merge the design matrix with the covariates to test -> (1, n_spots, n_factors)
-        m_full.X_spot = torch.concat(
-            [m_full.X_spot, covar_to_test.unsqueeze(0)], axis=-1
-        )
-
-        # merge the coefficients with zeros for the covariates to test -> (n_genes, n_factors, n_isos - 1)
-        m_full.beta = nn.Parameter(
-            torch.concat(
-                [m_full.beta, torch.zeros(n_genes, n_factors_covar, n_isos - 1)], axis=1
-            ),
-            requires_grad=True,
-        )
-    # # calculate gradient using autograd (when the model is fitted with marginal likelihood)
-    # log_prob = m_full()
-    # log_prob.backward()
-    # score = m_full.beta.grad.detach() # n_factors x (n_isos - 1)
-    # score = score[n_factors_design:, :] # exclude the design matrix in the fitted model
-
-    # calculate the score aka the gradient of the log-joint-likelihood
-    d_l_d_eta = m_full.counts - m_full._alpha() * m_full.counts.sum(
-        axis=-1, keepdim=True
-    )  # (n_genes, n_spots, n_isos)
-    score = (
-        covar_to_test.T.unsqueeze(0) @ d_l_d_eta.detach()[..., :-1]
-    )  # (n_genes, n_factors_covar, n_isos - 1)
-
-    # calculate the Fisher information matrix
-    # beta_bias_hess.shape = (n_genes, (n_factors + 1)*(n_isos - 1), (n_factors + 1)*(n_isos - 1))
-    beta_bias_hess = m_full._get_log_lik_hessian_beta_bias().detach()
-    fisher_info = []  # -> (n_genes, n_factors, n_isos - 1, n_isos - 1)
-    for i in range(n_factors):
-        # retrieve the Hessian for beta per factor
-        beta_idx_per_factor = [i + j * (n_factors + 1) for j in range(n_isos - 1)]
-        # beta_hess.shape = (n_genes, n_isos - 1, n_isos - 1)
-        beta_hess = beta_bias_hess[:, beta_idx_per_factor, :][:, :, beta_idx_per_factor]
-
-        # add a small value to the diagonal to ensure invertibility
-        beta_hess += 1e-5 * torch.eye(beta_hess.shape[-1]).unsqueeze(0)
-
-        # the Fisher information matrix is the negative Hessian
-        fisher_info.append(-beta_hess)  # (n_genes, n_isos - 1, n_isos - 1)
-
-    fisher_info = torch.stack(
-        fisher_info, dim=1
-    )  # (n_genes, n_factors, n_isos - 1, n_isos - 1)
-    fisher_info = fisher_info[
-        :, n_factors_design:, :, :
-    ]  # exclude the design matrix in the fitted model
-
-    # calculate the score statistic
-    score_stat = (
-        score.unsqueeze(-2) @ torch.linalg.inv(fisher_info) @ score.unsqueeze(-1)
-    )  # (n_genes, n_factors_covar, 1, 1)
-
-    return score_stat.squeeze(), n_isos - 1
+# Sentinel object that signals "auto-select approx_rank at setup_data time".
+# Distinct from ``None``, which means "force full rank regardless of n_spots".
+_APPROX_RANK_AUTO = object()
 
 
 class SplisosmGLMM:
@@ -712,6 +155,9 @@ class SplisosmGLMM:
         init_ratio: str = "observed",
         fitting_method: str = "joint_gd",
         fitting_configs: dict = {"max_epochs": -1},
+        k_neighbors: int = 4,
+        rho: float = 0.99,
+        approx_rank=_APPROX_RANK_AUTO,
     ):
         """
         Parameters
@@ -756,6 +202,23 @@ class SplisosmGLMM:
             - ``'max_epochs'``: int, maximum number of epochs
             - ``'patience'``: int, number of epochs to wait for improvement before stopping
             - ``'update_nu_every_k'``: int, number of iterations to update ``nu`` when using ``fitting_method='marginal_newton'``
+        k_neighbors : int, optional
+            Number of nearest neighbours used to build the spatial k-NN adjacency graph
+            (default 4).  Passed to :class:`splisosm.kernel.SpatialCovKernel`.
+            Ignored when ``adj_key`` is provided to :meth:`setup_data`.
+        rho : float, optional
+            Spectral smoothing parameter for the ICAR-like spatial kernel (default 0.99).
+            Values close to 1 produce smoother spatial covariance.
+        approx_rank : int or None, optional
+            Number of leading eigenvectors of the spatial kernel to retain.
+
+            * **Not specified (default)**: automatically selects the rank at
+              :meth:`setup_data` time — full rank when ``n_spots ≤ 5000``,
+              otherwise ``ceil(sqrt(n_spots) * 4)``.
+            * ``None``: always use full rank regardless of ``n_spots`` (a warning
+              is emitted when ``n_spots > 5000`` because the eigendecomposition of
+              a large dense matrix is expensive).
+            * Positive integer: use exactly that many eigenvectors.
 
         See also
         --------
@@ -776,6 +239,12 @@ class SplisosmGLMM:
             "fitting_configs": fitting_configs,
         }
 
+        # kernel construction configs (used in setup_data)
+        self._kernel_k_neighbors = k_neighbors
+        self._kernel_rho = rho
+        self._kernel_standardize_cov = True  # always standardize; not user-configurable
+        self._approx_rank = approx_rank  # sentinel, None, or int
+
         # to be set after running setup_data()
         self.n_genes = None  # number of genes
         self.n_spots = None  # number of spots
@@ -783,6 +252,13 @@ class SplisosmGLMM:
         self.n_factors = None  # number of covariates to test for differential usage
         self.adata = None  # optional anndata source for the new setup path
         self._setup_input_mode = None  # "legacy" or "anndata"
+
+        # feature summary cache (populated by _compute_feature_summaries)
+        self._filtered_adata = None
+        self._counts_layer = None
+        self._group_iso_by = None
+        self._gene_summary = None
+        self._isoform_summary = None
 
         # to store the fitted models after running fit()
         self._is_trained = False
@@ -927,7 +403,7 @@ class SplisosmGLMM:
             resolved_design,
             resolved_cov_names,
             adj_matrix,
-            _,  # filtered_adata — not used by SplisosmGLMM
+            filtered_adata,
         ) = prepare_inputs_from_anndata(
             adata=adata,
             layer=layer,
@@ -941,11 +417,15 @@ class SplisosmGLMM:
             covariate_names=covariate_names,
             min_component_size=min_component_size,
             adj_key=adj_key,
-            k_neighbors=4,
+            k_neighbors=self._kernel_k_neighbors,
+            return_filtered_anndata=True,
         )
 
         self.adata = adata
         self._setup_input_mode = "anndata"
+        self._filtered_adata = filtered_adata
+        self._counts_layer = layer
+        self._group_iso_by = group_iso_by
 
         # Build dataset (handles grouping by n_isos for batching)
         _dataset = IsoDataset(data, resolved_gene_names, group_gene_by_n_iso)
@@ -959,29 +439,90 @@ class SplisosmGLMM:
         self._group_gene_by_n_iso = group_gene_by_n_iso
         self.coordinates = coordinates
 
-        # Build spatial kernel from the adjacency returned by prepare_inputs_from_anndata.
-        # adj_matrix is not None when:
-        # (1) min_component_size > 1, or,
-        # (2) adj_key is provided
-        # The kernel matrix will be realized potential memory issue
-        if adj_matrix is not None:
-            _kernel = SpatialCovKernel(
-                coords=None,
-                adj_matrix=adj_matrix,
-                rho=0.99,
-                standardize_cov=True,
-                centering=False,
-            )
+        # Build spatial kernel only when the model actually uses spatial random effects.
+        # For 'glm' there are no random effects at all.
+        # For 'glmm-null' the spatial variance is fixed at 0 (theta = -inf), so the
+        # kernel cancels out.  We use a rank-1 dummy covariance (constant vector scaled
+        # to unit norm) which, combined with theta = 0, gives the exact identity
+        # covariance C = σ²I via the low-rank Woodbury formula.
+        n_spots = self.n_spots
+
+        if self.model_type == "glm":
+            # No spatial random effects — eigvals/eigvecs are not used.
+            self.corr_sp = None
+            self._corr_sp_eigvals = None
+            self._corr_sp_eigvecs = None
+
+        elif self.model_type == "glmm-null":
+            # Spatial variance is always zero in the null model.
+            # Rank-1 dummy: V = (1/√n) 1_n, λ = 1.  With theta=0:
+            #   _cov_eigvals  = σ²(0·1 + 1) = σ²
+            #   residual_eigval = σ²(1-0) = σ²
+            #   correction = 1/σ² - 1/σ² = 0  →  C⁻¹ = (1/σ²)I  ✓
+            self.corr_sp = None
+            self._corr_sp_eigvals = torch.ones(1)  # (1,)
+            self._corr_sp_eigvecs = torch.full(
+                (n_spots, 1), 1.0 / np.sqrt(n_spots)
+            )  # (n_spots, 1)
+
         else:
-            _kernel = SpatialCovKernel(
-                coords=coordinates,
-                adj_matrix=None,
-                k_neighbors=4,
-                rho=0.99,
-                standardize_cov=True,
+            # model_type == "glmm-full" — build the real spatial kernel.
+            _kernel_kwargs = dict(
+                rho=self._kernel_rho,
+                standardize_cov=self._kernel_standardize_cov,
                 centering=False,
             )
-        self.corr_sp = _kernel.realization()
+            if adj_matrix is not None:
+                _kernel = SpatialCovKernel(
+                    coords=None,
+                    adj_matrix=adj_matrix,
+                    **_kernel_kwargs,
+                )
+            else:
+                _kernel = SpatialCovKernel(
+                    coords=coordinates,
+                    adj_matrix=None,
+                    k_neighbors=self._kernel_k_neighbors,
+                    **_kernel_kwargs,
+                )
+
+            # Determine the effective number of eigenvectors to retain.
+            if self._approx_rank is _APPROX_RANK_AUTO:
+                # Auto-select: full rank for small grids, truncated for large ones.
+                k = (
+                    None
+                    if n_spots <= SpatialCovKernel.DENSE_THRESHOLD
+                    else int(np.ceil(np.sqrt(n_spots) * 4))
+                )
+            elif self._approx_rank is None:
+                # User explicitly requested full rank.
+                if n_spots > SpatialCovKernel.DENSE_THRESHOLD:
+                    warnings.warn(
+                        f"approx_rank=None forces a full eigendecomposition of a "
+                        f"{n_spots}×{n_spots} matrix which may be very slow and "
+                        f"memory-intensive.  Consider omitting approx_rank (auto) "
+                        f"or passing a positive integer.",
+                        stacklevel=2,
+                    )
+                k = None
+            else:
+                k = min(int(self._approx_rank), n_spots)
+
+            # Trigger eigendecomposition via SpatialCovKernel (numpy eigh / eigsh).
+            # For dense mode (n ≤ DENSE_THRESHOLD), K_eigvecs always has n_spots columns
+            # regardless of k, so we slice explicitly when k is given.
+            _kernel.eigenvalues(
+                k=k
+            )  # populates K_eigvals, K_eigvecs (and K_sp for dense)
+            self.corr_sp = _kernel.realization() if k is None else None
+            if k is None:
+                # Full decomp: use all cached eigenpairs
+                self._corr_sp_eigvals = _kernel.K_eigvals  # (n_spots,)
+                self._corr_sp_eigvecs = _kernel.K_eigvecs  # (n_spots, n_spots)
+            else:
+                # Truncated: dense mode may have cached all n_spots; implicit stores exactly k.
+                self._corr_sp_eigvals = _kernel.K_eigvals[:k]  # (k,)
+                self._corr_sp_eigvecs = _kernel.K_eigvecs[:, :k]  # (n_spots, k)
 
         # Process design matrix.
         # GLMM fitting requires dense torch tensors, so sparse design matrices are
@@ -1028,19 +569,6 @@ class SplisosmGLMM:
             self.design_mtx = None
             self.covariate_names = None
 
-        # Store eigendecomposition of the spatial covariance matrix
-        try:
-            corr_sp_eigvals, corr_sp_eigvecs = torch.linalg.eigh(self.corr_sp)
-        except RuntimeError:
-            # Fall back to eig if eigh fails (known pytorch bug on M1 Macs:
-            # https://github.com/pytorch/pytorch/issues/83818)
-            corr_sp_eigvals, corr_sp_eigvecs = torch.linalg.eig(self.corr_sp)
-            corr_sp_eigvals = torch.real(corr_sp_eigvals)
-            corr_sp_eigvecs = torch.real(corr_sp_eigvecs)
-
-        self._corr_sp_eigvals = corr_sp_eigvals  # (n_spots,)
-        self._corr_sp_eigvecs = corr_sp_eigvecs  # (n_spots, n_spots)
-
     def _setup_from_prebuilt(
         self,
         data: list,
@@ -1074,6 +602,213 @@ class SplisosmGLMM:
         self.covariate_names = covariate_names
         self.adata = None
         self._setup_input_mode = "prebuilt"
+
+    # ------------------------------------------------------------------
+    # Feature summaries
+    # ------------------------------------------------------------------
+
+    def _compute_feature_summaries(self, print_progress: bool = True) -> None:
+        """Compute and cache both gene-level and isoform-level summaries."""
+        if self._filtered_adata is None:
+            raise RuntimeError("Data is not initialized. Call setup_data() first.")
+        if self._gene_summary is not None and self._isoform_summary is not None:
+            return
+
+        adata = self._filtered_adata
+        n_bins = int(adata.n_obs)
+        iso_counts = adata.layers[self._counts_layer]
+        is_sparse = scipy.sparse.issparse(iso_counts)
+
+        if is_sparse:
+            if not scipy.sparse.isspmatrix_csc(iso_counts):
+                iso_counts = iso_counts.tocsc()
+        else:
+            iso_counts = np.asarray(iso_counts, dtype=float)
+
+        # Derive per-gene isoform lists from the filtered adata var.
+        iso_groups = list(
+            adata.var.groupby(self._group_iso_by, observed=True, sort=False)
+        )
+
+        gene_rows: list[dict] = []
+        iso_rows: list[dict] = []
+
+        iterator = zip(self.gene_names, iso_groups)
+        if print_progress:
+            iterator = tqdm(iterator, desc="Genes", total=len(self.gene_names))
+
+        for gene_name, (_, iso_group_df) in iterator:
+            iso_names = iso_group_df.index.tolist()
+            iso_idx = adata.var_names.get_indexer(iso_names)
+
+            if is_sparse:
+                gene_counts = iso_counts[:, iso_idx]
+                iso_total = np.asarray(gene_counts.sum(axis=0), dtype=float).ravel()
+                iso_sumsq = np.asarray(
+                    gene_counts.power(2).sum(axis=0), dtype=float
+                ).ravel()
+                iso_nnz = np.diff(gene_counts.indptr).astype(float)
+                row_sums = np.asarray(gene_counts.sum(axis=1), dtype=float).ravel()
+            else:
+                gene_counts = np.asarray(iso_counts[:, iso_idx], dtype=float)
+                iso_total = gene_counts.sum(axis=0)
+                iso_sumsq = np.square(gene_counts).sum(axis=0)
+                iso_nnz = np.count_nonzero(gene_counts, axis=0).astype(float)
+                row_sums = gene_counts.sum(axis=1)
+
+            gene_total = float(iso_total.sum())
+            valid_rows = np.flatnonzero(row_sums > 0.0)
+            n_valid = int(valid_rows.size)
+
+            iso_count_avg = iso_total / n_bins
+            iso_count_var = np.maximum(
+                (iso_sumsq / n_bins) - np.square(iso_count_avg), 0.0
+            )
+            iso_count_std = np.sqrt(iso_count_var)
+            iso_pct_bin_on = iso_nnz / n_bins
+
+            if gene_total > 0.0:
+                ratio_total = iso_total / gene_total
+            else:
+                ratio_total = np.zeros(len(iso_names), dtype=float)
+
+            if n_valid > 0:
+                if is_sparse:
+                    ratio_counts = gene_counts.tocsr()[valid_rows]
+                    ratio_counts = ratio_counts.multiply(
+                        (1.0 / row_sums[valid_rows])[:, None]
+                    )
+                    ratio_sum = np.asarray(
+                        ratio_counts.sum(axis=0), dtype=float
+                    ).ravel()
+                    ratio_sumsq = np.asarray(
+                        ratio_counts.power(2).sum(axis=0), dtype=float
+                    ).ravel()
+                else:
+                    ratio_counts = gene_counts[valid_rows] / row_sums[valid_rows, None]
+                    ratio_sum = ratio_counts.sum(axis=0)
+                    ratio_sumsq = np.square(ratio_counts).sum(axis=0)
+
+                ratio_avg = ratio_sum / n_valid
+                ratio_var = np.maximum(
+                    (ratio_sumsq / n_valid) - np.square(ratio_avg), 0.0
+                )
+                ratio_std = np.sqrt(ratio_var)
+            else:
+                ratio_avg = np.zeros(len(iso_names), dtype=float)
+                ratio_std = np.zeros(len(iso_names), dtype=float)
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                entropy = -(np.log(ratio_total) * ratio_total)
+                entropy = float(np.nan_to_num(entropy).sum())
+
+            gene_count_avg = float(gene_total / n_bins)
+            gene_count_sumsq = float(np.square(row_sums).sum())
+            gene_count_var = max(gene_count_sumsq / n_bins - gene_count_avg**2, 0.0)
+            gene_pct_bin_on = float(np.count_nonzero(row_sums) / n_bins)
+
+            gene_rows.append(
+                {
+                    "gene": gene_name,
+                    "n_isos": len(iso_names),
+                    "perplexity": float(np.exp(entropy)),
+                    "pct_bin_on": gene_pct_bin_on,
+                    "count_avg": gene_count_avg,
+                    "count_std": float(np.sqrt(gene_count_var)),
+                }
+            )
+
+            for i, iso_name in enumerate(iso_names):
+                iso_rows.append(
+                    {
+                        **iso_group_df.loc[iso_name].to_dict(),
+                        "isoform": iso_name,
+                        "gene": gene_name,
+                        "pct_bin_on": float(iso_pct_bin_on[i]),
+                        "count_total": float(iso_total[i]),
+                        "count_avg": float(iso_count_avg[i]),
+                        "count_std": float(iso_count_std[i]),
+                        "ratio_total": float(ratio_total[i]),
+                        "ratio_avg": float(ratio_avg[i]),
+                        "ratio_std": float(ratio_std[i]),
+                    }
+                )
+
+        gene_df = pd.DataFrame(gene_rows).set_index("gene")
+        iso_df = pd.DataFrame(iso_rows).set_index("isoform")
+        self._gene_summary = gene_df
+        self._isoform_summary = iso_df
+
+    def extract_feature_summary(
+        self,
+        level: Literal["gene", "isoform"] = "gene",
+        print_progress: bool = True,
+    ) -> pd.DataFrame:
+        """Compute filtered feature-level summary statistics.
+
+        Gene-level statistics are aggregated across all isoforms that passed
+        the filters applied in :meth:`setup_data`.  Isoform-level statistics
+        are computed per isoform and augmented onto the corresponding rows of
+        ``adata.var``.
+
+        Results are cached: repeated calls with the same ``level`` return the
+        cached :class:`pandas.DataFrame` without recomputation.
+
+        Parameters
+        ----------
+        level
+            Summary granularity.
+            ``'gene'``: one row per gene.
+            ``'isoform'``: one row per isoform that passed filtering.
+        print_progress
+            Whether to show a progress bar.
+
+        Returns
+        -------
+        pandas.DataFrame
+            For ``level='gene'``, the index is the gene display name and the
+            columns are:
+
+            - ``'n_isos'``: int. Number of isoforms retained after filtering.
+            - ``'perplexity'``: float. Effective number of isoforms based on
+              the marginal isoform usage entropy.
+            - ``'pct_bin_on'``: float. Fraction of spots with non-zero total
+              gene counts.
+            - ``'count_avg'``: float. Mean per-spot total count for the gene.
+            - ``'count_std'``: float. Std of per-spot total count for the gene.
+
+            For ``level='isoform'``, the index is the isoform name (matching
+            ``adata.var_names``) and the columns are the original ``adata.var``
+            columns plus:
+
+            - ``'pct_bin_on'``: float. Fraction of spots with count > 0.
+            - ``'count_total'``: float. Total counts across all spots.
+            - ``'count_avg'``: float. Mean count per spot.
+            - ``'count_std'``: float. Std of count per spot.
+            - ``'ratio_total'``: float. Fraction of total gene counts
+              attributable to this isoform.
+            - ``'ratio_avg'``: float. Mean per-spot isoform usage ratio
+              (computed over spots with non-zero gene coverage).
+            - ``'ratio_std'``: float. Std of per-spot isoform usage ratio
+              (computed over spots with non-zero gene coverage).
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`setup_data` has not been called.
+        ValueError
+            If ``level`` is not ``'gene'`` or ``'isoform'``.
+        """
+        if self._filtered_adata is None:
+            raise RuntimeError("Data is not initialized. Call setup_data() first.")
+        if level not in {"gene", "isoform"}:
+            raise ValueError("`level` must be one of 'gene' or 'isoform'.")
+
+        self._compute_feature_summaries(print_progress=print_progress)
+
+        if level == "gene":
+            return self._gene_summary
+        return self._isoform_summary
 
     def get_formatted_test_results(
         self, test_type: Literal["sv", "du"]

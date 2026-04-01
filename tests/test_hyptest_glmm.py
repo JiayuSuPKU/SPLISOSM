@@ -811,7 +811,6 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
 
     def test_setup_data_numpy_1d_design_and_constant_warning(self):
         model = SplisosmGLMM()
-        coords_np = np.asarray(self.coords)
         design_1d_np = np.ones(self.coords.shape[0], dtype=np.float32)
         local_adata = _make_small_adata(self.counts_list, self.coords)
 
@@ -1159,6 +1158,209 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
                 fitting_method="joint_newton",
                 var_fix_sigma=False,
                 fitting_configs={"max_epochs": 1},
+            )
+
+
+class TestSplisosmGLMMNewFeatures(unittest.TestCase):
+    """Tests for the new SplisosmGLMM features: kernel configs and feature summaries."""
+
+    def setUp(self):
+        data = get_simulation_data(n_genes=5, n_isos=3, n_spots_per_dim=10)
+        gene_names = [f"gene_{i}" for i in range(5)]
+        iso_name_list = []
+        iso_gene_ids = []
+        counts_merged = []
+        for _gene_name, _counts in zip(gene_names, data["counts"]):
+            counts_merged.append(_counts)
+            for _iso_idx in range(3):
+                iso_name_list.append(f"{_gene_name}_iso_{_iso_idx}")
+                iso_gene_ids.append(_gene_name)
+
+        adata_counts = torch.concat(counts_merged, dim=1).numpy().astype(np.float32)
+        adata_var = pd.DataFrame({"gene_symbol": iso_gene_ids}, index=iso_name_list)
+        self.adata = AnnData(X=adata_counts, var=adata_var)
+        self.adata.layers["counts"] = adata_counts
+        self.adata.obsm["spatial"] = np.asarray(data["coords"]).astype(np.float32)
+        self.gene_names = gene_names
+
+    def _make_model(self, **kwargs):
+        """Helper: build and setup a default model."""
+        model = SplisosmGLMM(**kwargs)
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        return model
+
+    # ------------------------------------------------------------------
+    # Kernel config tests
+    # ------------------------------------------------------------------
+
+    def test_default_kernel_configs_stored(self):
+        """Default k_neighbors/rho are stored; standardize_cov is always True internally."""
+        model = SplisosmGLMM()
+        self.assertEqual(model._kernel_k_neighbors, 4)
+        self.assertAlmostEqual(model._kernel_rho, 0.99)
+        self.assertTrue(
+            model._kernel_standardize_cov
+        )  # always True — not user-configurable
+
+    def test_custom_kernel_configs_stored(self):
+        """Custom k_neighbors/rho passed to __init__ are stored."""
+        model = SplisosmGLMM(k_neighbors=6, rho=0.95)
+        self.assertEqual(model._kernel_k_neighbors, 6)
+        self.assertAlmostEqual(model._kernel_rho, 0.95)
+        self.assertTrue(
+            model._kernel_standardize_cov
+        )  # always True regardless of params
+
+    def test_custom_k_neighbors_affects_corr_sp(self):
+        """Different k_neighbors produce different spatial covariance matrices."""
+        model_k4 = self._make_model(k_neighbors=4)
+        model_k6 = self._make_model(k_neighbors=6)
+        # Matrices should differ (k=4 vs k=6 adjacency)
+        self.assertFalse(torch.allclose(model_k4.corr_sp, model_k6.corr_sp))
+
+    def test_eigvals_eigvecs_populated_after_setup(self):
+        """setup_data populates _corr_sp_eigvals and _corr_sp_eigvecs."""
+        model = self._make_model()
+        n = model.n_spots
+        self.assertEqual(model._corr_sp_eigvals.shape, (n,))
+        self.assertEqual(model._corr_sp_eigvecs.shape, (n, n))
+
+    def test_eigvals_consistent_with_corr_sp(self):
+        """Eigendecomposition reconstructs corr_sp correctly."""
+        model = self._make_model()
+        V = model._corr_sp_eigvecs
+        L = model._corr_sp_eigvals
+        recon = V @ torch.diag(L) @ V.t()
+        self.assertTrue(
+            torch.allclose(recon, model.corr_sp, atol=1e-4),
+            "Reconstructed corr_sp does not match stored corr_sp.",
+        )
+
+    # ------------------------------------------------------------------
+    # approx_rank tests
+    # ------------------------------------------------------------------
+
+    def test_approx_rank_default_small_n_is_full_rank(self):
+        """Default approx_rank uses full rank for small n_spots (<= 5000)."""
+        model = self._make_model()
+        n = model.n_spots
+        # Auto-selection: full rank for n <= 5000
+        self.assertEqual(model._corr_sp_eigvals.shape[0], n)
+        self.assertEqual(model._corr_sp_eigvecs.shape, (n, n))
+        self.assertIsNotNone(model.corr_sp)
+
+    def test_approx_rank_explicit_int(self):
+        """Passing approx_rank=k truncates eigenvectors to k columns."""
+        model = self._make_model(approx_rank=5)
+        n = model.n_spots
+        self.assertEqual(model._corr_sp_eigvals.shape[0], 5)
+        self.assertEqual(model._corr_sp_eigvecs.shape, (n, 5))
+        # corr_sp is None for truncated decomposition
+        self.assertIsNone(model.corr_sp)
+
+    def test_approx_rank_none_is_full_rank(self):
+        """Explicit approx_rank=None forces full-rank decomposition."""
+        model = self._make_model(approx_rank=None)
+        n = model.n_spots
+        self.assertEqual(model._corr_sp_eigvals.shape[0], n)
+        self.assertEqual(model._corr_sp_eigvecs.shape, (n, n))
+
+    def test_approx_rank_stored_on_init(self):
+        """approx_rank is stored as _approx_rank attribute."""
+        import splisosm.hyptest_glmm as hg
+
+        model_auto = SplisosmGLMM()
+        self.assertIs(model_auto._approx_rank, hg._APPROX_RANK_AUTO)
+
+        model_none = SplisosmGLMM(approx_rank=None)
+        self.assertIsNone(model_none._approx_rank)
+
+        model_int = SplisosmGLMM(approx_rank=10)
+        self.assertEqual(model_int._approx_rank, 10)
+
+    def test_approx_rank_model_fits_low_rank(self):
+        """Low-rank model (approx_rank=k) can be fit and produces results."""
+        model = self._make_model(approx_rank=5)
+        model.fit(quiet=True)
+        self.assertTrue(model._is_trained)
+
+    # ------------------------------------------------------------------
+    # Feature summary tests
+    # ------------------------------------------------------------------
+
+    def test_extract_feature_summary_errors_before_setup(self):
+        """extract_feature_summary raises RuntimeError if called before setup_data."""
+        model = SplisosmGLMM()
+        with self.assertRaises(RuntimeError):
+            model.extract_feature_summary(level="gene")
+
+    def test_extract_feature_summary_invalid_level(self):
+        """extract_feature_summary raises ValueError for unknown level."""
+        model = self._make_model()
+        with self.assertRaises(ValueError):
+            model.extract_feature_summary(level="invalid")
+
+    def test_extract_gene_summary_shape_and_columns(self):
+        """Gene-level summary has one row per gene and expected columns."""
+        model = self._make_model()
+        df = model.extract_feature_summary(level="gene", print_progress=False)
+        self.assertEqual(len(df), len(self.gene_names))
+        for col in ("n_isos", "perplexity", "pct_bin_on", "count_avg", "count_std"):
+            self.assertIn(col, df.columns)
+
+    def test_extract_isoform_summary_shape_and_columns(self):
+        """Isoform-level summary has one row per isoform and expected columns."""
+        model = self._make_model()
+        df = model.extract_feature_summary(level="isoform", print_progress=False)
+        n_isoforms = sum(3 for _ in self.gene_names)  # 3 isos per gene
+        self.assertEqual(len(df), n_isoforms)
+        for col in (
+            "pct_bin_on",
+            "count_total",
+            "count_avg",
+            "count_std",
+            "ratio_total",
+            "ratio_avg",
+            "ratio_std",
+        ):
+            self.assertIn(col, df.columns)
+
+    def test_gene_summary_values_are_non_negative(self):
+        """Gene-level summary statistics are non-negative."""
+        model = self._make_model()
+        df = model.extract_feature_summary(level="gene", print_progress=False)
+        for col in ("n_isos", "perplexity", "pct_bin_on", "count_avg", "count_std"):
+            self.assertTrue(
+                (df[col] >= 0).all(), f"Column {col!r} has negative values."
+            )
+
+    def test_feature_summary_is_cached(self):
+        """Repeated calls return the same object (caching works)."""
+        model = self._make_model()
+        df1 = model.extract_feature_summary(level="gene", print_progress=False)
+        df2 = model.extract_feature_summary(level="gene", print_progress=False)
+        self.assertIs(df1, df2)
+
+    def test_feature_summary_ratio_sums_to_one(self):
+        """Per-gene ratio_total should sum to 1 (or 0 for all-zero genes)."""
+        model = self._make_model()
+        iso_df = model.extract_feature_summary(level="isoform", print_progress=False)
+        gene_df = model.extract_feature_summary(level="gene", print_progress=False)
+        for gene in gene_df.index:
+            iso_subset = iso_df[iso_df["gene"] == gene]
+            ratio_sum = iso_subset["ratio_total"].sum()
+            # Either sums to ~1 (expressed gene) or ~0 (unexpressed gene)
+            self.assertTrue(
+                abs(ratio_sum - 1.0) < 1e-5 or abs(ratio_sum) < 1e-5,
+                f"Gene {gene!r}: ratio_total sums to {ratio_sum} (expected ~0 or ~1).",
             )
 
 
