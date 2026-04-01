@@ -219,7 +219,7 @@ class MultinomGLM(BaseModel, nn.Module):
         self,
         counts: torch.Tensor,
         design_mtx: Optional[torch.Tensor] = None,
-        device: Literal["cpu", "cuda"] = "cpu",
+        device: Literal["cpu", "cuda", "mps"] = "cpu",
     ) -> None:
         """Set up the data for the model.
 
@@ -232,7 +232,7 @@ class MultinomGLM(BaseModel, nn.Module):
             Shape (n_spots, n_factors). Design matrix of spatial covariates.
             If None, an intercept-only design matrix will be used.
         device
-            'cpu' or 'cuda'. 'mps' currently not supported (torch.lgamma not supported on mps).
+            'cpu', 'cuda', or 'mps' (torch v2.11.0+).
         """
         # need to switch to a different count model (e.g., Poisson) when only one isoform is provided
         if counts.shape[-1] == 1:
@@ -240,7 +240,9 @@ class MultinomGLM(BaseModel, nn.Module):
                 "Only one isoform provided. Please use a different count model."
             )
 
-        assert device in ["cpu", "cuda"]
+        assert device in ["cpu", "cuda", "mps"], (
+            f"device must be 'cpu', 'cuda', or 'mps'; got {device!r}"
+        )
         self.device = torch.device(device)
 
         if counts.ndim == 2:
@@ -774,7 +776,9 @@ class MultinomGLM(BaseModel, nn.Module):
         new_model = type(self)(
             fitting_method=self.fitting_method, fitting_configs=self.fitting_configs
         )
-        new_model.setup_data(counts=self.counts, design_mtx=self.X_spot)
+        new_model.setup_data(
+            counts=self.counts, design_mtx=self.X_spot, device=self.device.type
+        )
         new_model.load_state_dict(self.state_dict())
 
         return new_model
@@ -1061,7 +1065,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         counts: torch.Tensor,
         corr_sp: Optional[torch.Tensor] = None,
         design_mtx: Optional[torch.Tensor] = None,
-        device: Literal["cpu", "cuda"] = "cpu",
+        device: Literal["cpu", "cuda", "mps"] = "cpu",
         corr_sp_eigvals: Optional[torch.Tensor] = None,
         corr_sp_eigvecs: Optional[torch.Tensor] = None,
     ) -> None:
@@ -1079,7 +1083,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             Shape (n_spots, n_factors). Design matrix of spatial covariates.
             If None, an intercept-only design matrix will be used.
         device
-            'cpu' or 'cuda'. 'mps' currently not supported (torch.lgamma not supported on mps).
+            'cpu', 'cuda', or 'mps' (torch v2.11.0+).
         corr_sp_eigvals
             Shape (n_spots,), eigenvalues of spatial covariance.
             If None, the spatial covariance matrix `corr_sp` must be provided.
@@ -1089,7 +1093,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         """
         # need to switch to a different count model (e.g., Poisson) when only one isoform is provided
 
-        assert device in ["cpu", "cuda"]
+        assert device in ["cpu", "cuda", "mps"], (
+            f"device must be 'cpu', 'cuda', or 'mps'; got {device!r}"
+        )
         self.device = torch.device(device)
 
         if counts.ndim == 2:
@@ -1206,10 +1212,11 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         # set up learnable parameters according to the model architecture
         self._configure_learnable_variables()
-        self._initialize_params()
 
-        # send to device
+        # send to device before initialising params so that parameters and
+        # counts are on the same device (avoids cross-device ops for non-CPU)
         self.to(self.device)
+        self._initialize_params()
 
     def _configure_learnable_variables(self):
         """Set up learnable parameters according to the model architecture."""
@@ -1987,6 +1994,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             design_mtx=self.X_spot,
             corr_sp_eigvals=self.corr_sp_eigvals,
             corr_sp_eigvecs=self.corr_sp_eigvecs,
+            device=self.device.type,
         )
         new_model.load_state_dict(self.state_dict())
 

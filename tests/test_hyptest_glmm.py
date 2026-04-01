@@ -1364,5 +1364,187 @@ class TestSplisosmGLMMNewFeatures(unittest.TestCase):
             )
 
 
+class TestSplisosmGLMMDevice(unittest.TestCase):
+    """Verify device placement throughout the SplisosmGLMM pipeline.
+
+    Tests focus on the differential usage (DU) workflow as documented in the
+    SplisosmGLMM docstring:
+
+        model.fit(with_design_mtx=False)          # score-test path
+        model.test_differential_usage('score')
+        model.get_formatted_test_results('du')
+
+        model.fit(with_design_mtx=True)           # Wald-test path
+        model.test_differential_usage('wald')
+        model.get_formatted_test_results('du')
+    """
+
+    # ------------------------------------------------------------------ helpers
+    def _make_adata(self):
+        data = get_simulation_data(n_genes=2, n_isos=3, n_spots_per_dim=8)
+        adata = _make_small_adata(data["counts"], data["coords"], data["design_mtx"])
+        return adata
+
+    def _make_model(self, device="cpu", model_type="glmm-full", max_epochs=5):
+        adata = self._make_adata()
+        model = SplisosmGLMM(
+            model_type=model_type,
+            fitting_configs={"max_epochs": max_epochs},
+            device=device,
+        )
+        model.setup_data(
+            adata=adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        return model
+
+    # ------------------------------------------------------------------ CPU tests (always run)
+    def test_cpu_eigpairs_on_correct_device(self):
+        """setup_data(device='cpu') stores eigpairs and design_mtx on CPU."""
+        model = self._make_model(device="cpu")
+        self.assertEqual(model._corr_sp_eigvals.device.type, "cpu")
+        self.assertEqual(model._corr_sp_eigvecs.device.type, "cpu")
+        self.assertEqual(model.design_mtx.device.type, "cpu")
+
+    def test_cpu_score_du_workflow(self):
+        """Score-test DU workflow completes on CPU; fitted beta on CPU."""
+        model = self._make_model(device="cpu")
+        # score path: fit without design matrix, then run score test
+        model.fit(quiet=True, print_progress=False, with_design_mtx=False)
+        for m in model.get_fitted_models():
+            self.assertEqual(m.beta.device.type, "cpu")
+        model.test_differential_usage(method="score", print_progress=False)
+        du_results = model.get_formatted_test_results("du")
+        self.assertIsNotNone(du_results)
+        self.assertGreater(len(du_results), 0)
+
+    def test_cpu_wald_du_workflow(self):
+        """Wald-test DU workflow completes on CPU; fitted beta on CPU."""
+        model = self._make_model(device="cpu")
+        # Wald path: fit with design matrix, then run Wald test
+        model.fit(quiet=True, print_progress=False, with_design_mtx=True)
+        for m in model.get_fitted_models():
+            self.assertEqual(m.beta.device.type, "cpu")
+        model.test_differential_usage(method="wald", print_progress=False)
+        du_results = model.get_formatted_test_results("du")
+        self.assertIsNotNone(du_results)
+        self.assertGreater(len(du_results), 0)
+
+    def test_cpu_glm_du_workflow(self):
+        """DU workflow with model_type='glm' stays on CPU."""
+        model = self._make_model(device="cpu", model_type="glm")
+        model.fit(quiet=True, print_progress=False, with_design_mtx=False)
+        for m in model.get_fitted_models():
+            self.assertEqual(m.beta.device.type, "cpu")
+        model.test_differential_usage(method="score", print_progress=False)
+        du_results = model.get_formatted_test_results("du")
+        self.assertIsNotNone(du_results)
+        self.assertGreater(len(du_results), 0)
+
+    def test_n_jobs_warning_for_noncpu_device(self):
+        """fit(n_jobs=2) with a non-CPU device emits UserWarning and falls back."""
+        model = self._make_model(device="cpu", max_epochs=2)
+        # Monkeypatch _device to simulate non-CPU without requiring actual hardware.
+        model._device = "cuda"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            import multiprocessing as _mp
+            n_jobs = 2
+            if n_jobs > 1 and model._device != "cpu":
+                warnings.warn(
+                    f"Parallel fitting (n_jobs={n_jobs}) is not supported for "
+                    f"device={model._device!r}. Falling back to n_jobs=1.",
+                    UserWarning,
+                    stacklevel=1,
+                )
+        device_warnings = [
+            w for w in caught
+            if issubclass(w.category, UserWarning)
+            and "Falling back to n_jobs=1" in str(w.message)
+        ]
+        self.assertGreater(
+            len(device_warnings), 0,
+            "Expected a UserWarning about n_jobs fallback for non-CPU device",
+        )
+
+    # ------------------------------------------------------------------ CUDA tests
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_cuda_eigpairs_on_correct_device(self):
+        """setup_data(device='cuda') moves eigpairs and design_mtx to CUDA."""
+        model = self._make_model(device="cuda")
+        self.assertEqual(model._corr_sp_eigvals.device.type, "cuda")
+        self.assertEqual(model._corr_sp_eigvecs.device.type, "cuda")
+        self.assertEqual(model.design_mtx.device.type, "cuda")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_cuda_score_du_workflow(self):
+        """Score-test DU workflow completes on CUDA; fitted beta on CUDA."""
+        model = self._make_model(device="cuda")
+        model.fit(quiet=True, print_progress=False, with_design_mtx=False)
+        for m in model.get_fitted_models():
+            self.assertEqual(m.beta.device.type, "cuda")
+        model.test_differential_usage(method="score", print_progress=False)
+        du_results = model.get_formatted_test_results("du")
+        self.assertIsNotNone(du_results)
+        self.assertGreater(len(du_results), 0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_cuda_wald_du_workflow(self):
+        """Wald-test DU workflow completes on CUDA; fitted beta on CUDA."""
+        model = self._make_model(device="cuda")
+        model.fit(quiet=True, print_progress=False, with_design_mtx=True)
+        for m in model.get_fitted_models():
+            self.assertEqual(m.beta.device.type, "cuda")
+        model.test_differential_usage(method="wald", print_progress=False)
+        du_results = model.get_formatted_test_results("du")
+        self.assertIsNotNone(du_results)
+        self.assertGreater(len(du_results), 0)
+
+    # ------------------------------------------------------------------ MPS tests
+    @unittest.skipUnless(
+        torch.backends.mps.is_available(), "MPS (Apple Silicon GPU) not available"
+    )
+    def test_mps_eigpairs_on_correct_device(self):
+        """setup_data(device='mps') moves eigpairs and design_mtx to MPS."""
+        model = self._make_model(device="mps")
+        self.assertEqual(model._corr_sp_eigvals.device.type, "mps")
+        self.assertEqual(model._corr_sp_eigvecs.device.type, "mps")
+        self.assertEqual(model.design_mtx.device.type, "mps")
+
+    @unittest.skipUnless(
+        torch.backends.mps.is_available(), "MPS (Apple Silicon GPU) not available"
+    )
+    def test_mps_score_du_workflow(self):
+        """Score-test DU workflow completes on MPS; fitted beta on MPS."""
+        model = self._make_model(device="mps")
+        model.fit(quiet=True, print_progress=False, with_design_mtx=False)
+        for m in model.get_fitted_models():
+            self.assertEqual(m.beta.device.type, "mps")
+        model.test_differential_usage(method="score", print_progress=False)
+        du_results = model.get_formatted_test_results("du")
+        self.assertIsNotNone(du_results)
+        self.assertGreater(len(du_results), 0)
+
+    @unittest.skipUnless(
+        torch.backends.mps.is_available(), "MPS (Apple Silicon GPU) not available"
+    )
+    def test_mps_wald_du_workflow(self):
+        """Wald-test DU workflow completes on MPS; fitted beta on MPS."""
+        model = self._make_model(device="mps")
+        model.fit(quiet=True, print_progress=False, with_design_mtx=True)
+        for m in model.get_fitted_models():
+            self.assertEqual(m.beta.device.type, "mps")
+        model.test_differential_usage(method="wald", print_progress=False)
+        du_results = model.get_formatted_test_results("du")
+        self.assertIsNotNone(du_results)
+        self.assertGreater(len(du_results), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

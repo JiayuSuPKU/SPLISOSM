@@ -157,6 +157,7 @@ def _fit_model_one_gene(
     design_mtx,
     quiet=True,
     random_seed=None,
+    device: str = "cpu",
 ):
     """Fit the MultinomGLMM model to the data.
 
@@ -194,7 +195,7 @@ def _fit_model_one_gene(
     # initialize and setup the model
     if model_type == "glm":
         model = MultinomGLM()
-        model.setup_data(counts, design_mtx=design_mtx)
+        model.setup_data(counts, design_mtx=design_mtx, device=device)
         return_par_names = ["beta", "bias_eta"]
     else:
         if model_type == "glmm-full":
@@ -209,6 +210,7 @@ def _fit_model_one_gene(
             design_mtx=design_mtx,
             corr_sp_eigvals=corr_sp_eigvals,
             corr_sp_eigvecs=corr_sp_eigvecs,
+            device=device,
         )
         return_par_names = [
             "nu",
@@ -240,6 +242,7 @@ def _fit_null_full_sv_one_gene(
     refit_null=True,
     quiet=True,
     random_seed=None,
+    device: str = "cpu",
 ):
     """Fit the null and full model to the data.
 
@@ -279,6 +282,7 @@ def _fit_null_full_sv_one_gene(
         design_mtx=design_mtx,
         corr_sp_eigvals=corr_sp_eigvals,
         corr_sp_eigvecs=corr_sp_eigvecs,
+        device=device,
     )
     null.fit(quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed)
 
@@ -334,6 +338,7 @@ def _fit_perm_one_gene(
     design_mtx,
     refit_null,
     random_seed=None,
+    device: str = "cpu",
 ):
     """Calculate the likelihood ratio statistic for spatial variability using permutation.
 
@@ -378,6 +383,7 @@ def _fit_perm_one_gene(
         design_mtx=design_mtx_perm,
         corr_sp_eigvals=corr_sp_eigvals,
         corr_sp_eigvecs=corr_sp_eigvecs,
+        device=device,
     )
     null.fit(quiet=True, verbose=False, diagnose=False, random_seed=random_seed)
 
@@ -544,7 +550,13 @@ def _calc_score_differential_usage(fitted_full_model: MultinomGLM, covar_to_test
         # merge the coefficients with zeros for the covariates to test -> (n_genes, n_factors, n_isos - 1)
         m_full.beta = nn.Parameter(
             torch.concat(
-                [m_full.beta, torch.zeros(n_genes, n_factors_covar, n_isos - 1)], axis=1
+                [
+                    m_full.beta,
+                    torch.zeros(
+                        n_genes, n_factors_covar, n_isos - 1, device=m_full.beta.device
+                    ),
+                ],
+                axis=1,
             ),
             requires_grad=True,
         )
@@ -568,7 +580,9 @@ def _calc_score_differential_usage(fitted_full_model: MultinomGLM, covar_to_test
         beta_hess = beta_bias_hess[:, beta_idx_per_factor, :][:, :, beta_idx_per_factor]
 
         # add a small value to the diagonal to ensure invertibility
-        beta_hess += 1e-5 * torch.eye(beta_hess.shape[-1]).unsqueeze(0)
+        beta_hess += 1e-5 * torch.eye(
+            beta_hess.shape[-1], device=beta_hess.device
+        ).unsqueeze(0)
 
         # the Fisher information matrix is the negative Hessian
         fisher_info.append(-beta_hess)  # (n_genes, n_isos - 1, n_isos - 1)

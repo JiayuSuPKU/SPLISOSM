@@ -158,6 +158,7 @@ class SplisosmGLMM:
         k_neighbors: int = 4,
         rho: float = 0.99,
         approx_rank=_APPROX_RANK_AUTO,
+        device: Literal["cpu", "cuda", "mps"] = "cpu",
     ):
         """
         Parameters
@@ -219,6 +220,11 @@ class SplisosmGLMM:
               is emitted when ``n_spots > 5000`` because the eigendecomposition of
               a large dense matrix is expensive).
             * Positive integer: use exactly that many eigenvectors.
+        device : {"cpu", "cuda", "mps"}, optional
+            Device for all model computation (default ``"cpu"``).
+            Use ``"cuda"`` for NVIDIA GPU or ``"mps"`` for Apple Silicon.
+            Parallel fitting (``n_jobs > 1``) is not supported for non-CPU devices
+            and will automatically fall back to single-core with a warning.
 
         See also
         --------
@@ -244,6 +250,7 @@ class SplisosmGLMM:
         self._kernel_rho = rho
         self._kernel_standardize_cov = True  # always standardize; not user-configurable
         self._approx_rank = approx_rank  # sentinel, None, or int
+        self._device = device
 
         # to be set after running setup_data()
         self.n_genes = None  # number of genes
@@ -568,6 +575,14 @@ class SplisosmGLMM:
             self.n_factors = 0
             self.design_mtx = None
             self.covariate_names = None
+
+        # Move spatial eigenpairs and design matrix to the target device
+        _dev = torch.device(self._device)
+        if self._corr_sp_eigvals is not None:
+            self._corr_sp_eigvals = self._corr_sp_eigvals.to(_dev)
+            self._corr_sp_eigvecs = self._corr_sp_eigvecs.to(_dev)
+        if self.design_mtx is not None:
+            self.design_mtx = self.design_mtx.to(_dev)
 
     def _setup_from_prebuilt(
         self,
@@ -1048,6 +1063,7 @@ class SplisosmGLMM:
                     model.setup_data(
                         _g_counts,
                         design_mtx=self.design_mtx if with_design_mtx else None,
+                        device=self._device,
                     )
                 else:
                     if self.model_type == "glmm-full":
@@ -1062,6 +1078,7 @@ class SplisosmGLMM:
                         design_mtx=self.design_mtx if with_design_mtx else None,
                         corr_sp_eigvals=self._corr_sp_eigvals,
                         corr_sp_eigvecs=self._corr_sp_eigvecs,
+                        device=self._device,
                     )
 
                 # update model parameters
@@ -1105,6 +1122,14 @@ class SplisosmGLMM:
 
         # decide whether to use multiprocessing
         n_jobs = mp.cpu_count() if n_jobs == -1 else n_jobs
+        if n_jobs > 1 and self._device != "cpu":
+            warnings.warn(
+                f"Parallel fitting (n_jobs={n_jobs}) is not supported for "
+                f"device={self._device!r}. Falling back to n_jobs=1.",
+                UserWarning,
+                stacklevel=2,
+            )
+            n_jobs = 1
 
         # start timer
         t_start = timer()
@@ -1132,6 +1157,7 @@ class SplisosmGLMM:
                     model.setup_data(
                         b_counts,
                         design_mtx=self.design_mtx if with_design_mtx else None,
+                        device=self._device,
                     )
                 else:
                     if self.model_type == "glmm-full":
@@ -1145,6 +1171,7 @@ class SplisosmGLMM:
                         design_mtx=self.design_mtx if with_design_mtx else None,
                         corr_sp_eigvals=self._corr_sp_eigvals,
                         corr_sp_eigvecs=self._corr_sp_eigvecs,
+                        device=self._device,
                     )
 
                 # fit the model
@@ -1172,6 +1199,7 @@ class SplisosmGLMM:
                     self.design_mtx if with_design_mtx else None,
                     quiet,
                     random_seed,
+                    self._device,
                 )
                 for batch in data
             )
@@ -1193,6 +1221,7 @@ class SplisosmGLMM:
                     model.setup_data(
                         b_counts,
                         design_mtx=self.design_mtx if with_design_mtx else None,
+                        device=self._device,
                     )
                 else:
                     if self.model_type == "glmm-full":
@@ -1206,6 +1235,7 @@ class SplisosmGLMM:
                         design_mtx=self.design_mtx if with_design_mtx else None,
                         corr_sp_eigvals=self._corr_sp_eigvals,
                         corr_sp_eigvecs=self._corr_sp_eigvecs,
+                        device=self._device,
                     )
 
                 # update model parameters
@@ -1271,6 +1301,14 @@ class SplisosmGLMM:
 
         # decide whether to use multiprocessing
         n_jobs = mp.cpu_count() if n_jobs == -1 else n_jobs
+        if n_jobs > 1 and self._device != "cpu":
+            warnings.warn(
+                f"Parallel fitting (n_jobs={n_jobs}) is not supported for "
+                f"device={self._device!r}. Falling back to n_jobs=1.",
+                UserWarning,
+                stacklevel=2,
+            )
+            n_jobs = 1
 
         # start timer
         t_start = timer()
@@ -1296,6 +1334,7 @@ class SplisosmGLMM:
                     design_mtx=self.design_mtx if with_design_mtx else None,
                     corr_sp_eigvals=self._corr_sp_eigvals,
                     corr_sp_eigvecs=self._corr_sp_eigvecs,
+                    device=self._device,
                 )
                 null.fit(
                     quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed
@@ -1357,8 +1396,10 @@ class SplisosmGLMM:
                     self._corr_sp_eigvals,
                     self._corr_sp_eigvecs,
                     self.design_mtx if with_design_mtx else None,
+                    refit_null,
                     quiet,
                     random_seed,
+                    self._device,
                 )
                 for batch in data
             )
@@ -1381,6 +1422,7 @@ class SplisosmGLMM:
                     design_mtx=self.design_mtx if with_design_mtx else None,
                     corr_sp_eigvals=self._corr_sp_eigvals,
                     corr_sp_eigvecs=self._corr_sp_eigvecs,
+                    device=self._device,
                 )
                 # update model parameters
                 null.update_params_from_dict(n_par)
@@ -1451,6 +1493,14 @@ class SplisosmGLMM:
 
         # decide whether to use multiprocessing
         n_jobs = mp.cpu_count() if n_jobs == -1 else n_jobs
+        if n_jobs > 1 and self._device != "cpu":
+            warnings.warn(
+                f"Parallel fitting (n_jobs={n_jobs}) is not supported for "
+                f"device={self._device!r}. Falling back to n_jobs=1.",
+                UserWarning,
+                stacklevel=2,
+            )
+            n_jobs = 1
 
         # start timer
         t_start = timer()
@@ -1468,7 +1518,7 @@ class SplisosmGLMM:
                 perm_idx = torch.randperm(self.n_spots)
 
                 # fit a new SplisosmGLMM model using pre-built tensors (fast path)
-                new_model = SplisosmGLMM(**self.model_configs)
+                new_model = SplisosmGLMM(**self.model_configs, device=self._device)
                 new_design_mtx = (
                     self.design_mtx[perm_idx, :]
                     if (self.design_mtx is not None and with_design_mtx)
@@ -1541,6 +1591,7 @@ class SplisosmGLMM:
                     self.design_mtx if with_design_mtx else None,
                     refit_null,
                     random_seed,
+                    self._device,
                 )
                 for batch in data
                 for _ in range(n_perms)
@@ -1650,14 +1701,15 @@ class SplisosmGLMM:
             ) / len(_sv_llr_perm)
         else:
             # calculate the p-value using chi-square distribution
-            _sv_llr_pvals = 1 - chi2.cdf(_sv_llr_stats, df=_sv_llr_dfs)
+            # move to CPU before scipy (scipy does not support non-CPU tensors)
+            _sv_llr_pvals = 1 - chi2.cdf(_sv_llr_stats.cpu(), df=_sv_llr_dfs.cpu())
             _sv_llr_pvals = torch.tensor(_sv_llr_pvals)
 
-        # store the results
+        # store the results (always on CPU for downstream pandas/numpy usage)
         self.sv_test_results = {
-            "statistic": _sv_llr_stats.numpy(),
-            "pvalue": _sv_llr_pvals.numpy(),
-            "df": _sv_llr_dfs.numpy(),
+            "statistic": _sv_llr_stats.cpu().numpy(),
+            "pvalue": _sv_llr_pvals.cpu().numpy(),
+            "df": _sv_llr_dfs.cpu().numpy(),
             "method": method,
             "use_perm_null": use_perm_null,
         }
@@ -1755,13 +1807,16 @@ class SplisosmGLMM:
             )  # (n_genes, n_factors)
 
             # calculate the p-value using chi-square distribution
-            _du_score_pvals = 1 - chi2.cdf(_du_score_stats, df=_du_score_dfs)
+            # move to CPU before scipy (scipy does not support non-CPU tensors)
+            _du_score_pvals = 1 - chi2.cdf(
+                _du_score_stats.cpu(), df=_du_score_dfs.cpu()
+            )
             _du_score_pvals = torch.tensor(_du_score_pvals)
 
-            # store the results
+            # store the results (always on CPU for downstream pandas/numpy usage)
             self.du_test_results = {
-                "statistic": _du_score_stats,  # (n_genes, n_factors)
-                "pvalue": _du_score_pvals,  # (n_genes, n_factors)
+                "statistic": _du_score_stats.cpu(),  # (n_genes, n_factors)
+                "pvalue": _du_score_pvals.cpu(),  # (n_genes, n_factors)
                 "method": method,
             }
 
@@ -1791,13 +1846,16 @@ class SplisosmGLMM:
             )  # (n_genes, n_factors)
 
             # calculate the p-value using chi-square distribution
-            _du_wald_pvals = 1 - chi2.cdf(_du_wald_stats, df=_du_wald_dfs)
+            # move to CPU before scipy (scipy does not support non-CPU tensors)
+            _du_wald_pvals = 1 - chi2.cdf(
+                _du_wald_stats.cpu(), df=_du_wald_dfs.cpu()
+            )
             _du_wald_pvals = torch.tensor(_du_wald_pvals)
 
-            # store the results
+            # store the results (always on CPU for downstream pandas/numpy usage)
             self.du_test_results = {
-                "statistic": _du_wald_stats,  # (n_genes, n_factors)
-                "pvalue": _du_wald_pvals,  # (n_genes, n_factors)
+                "statistic": _du_wald_stats.cpu(),  # (n_genes, n_factors)
+                "pvalue": _du_wald_pvals.cpu(),  # (n_genes, n_factors)
                 "method": method,
             }
 
