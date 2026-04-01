@@ -17,11 +17,11 @@ from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
 from splisosm.utils import (
-    get_cov_sp,
     false_discovery_control,
     prepare_inputs_from_anndata,
 )
 from splisosm.dataset import IsoDataset
+from splisosm.kernel import SpatialCovKernel
 from splisosm.model import MultinomGLM, MultinomGLMM
 
 __all__ = ["SplisosmGLMM"]
@@ -842,144 +842,113 @@ class SplisosmGLMM:
 
     def setup_data(
         self,
-        data: Optional[list[Union[torch.Tensor, np.ndarray]]] = None,
-        coordinates: Optional[Union[np.ndarray, torch.Tensor, pd.DataFrame]] = None,
+        adata: AnnData,
+        *,
+        spatial_key: str = "spatial",
+        adj_key: Optional[str] = None,
+        layer: str = "counts",
+        group_iso_by: str = "gene_symbol",
+        gene_names: Optional[str] = None,
+        group_gene_by_n_iso: bool = False,
         design_mtx: Optional[
             Union[np.ndarray, torch.Tensor, pd.DataFrame, str, list[str]]
         ] = None,
-        gene_names: Optional[Union[list[str], str]] = None,
-        group_gene_by_n_iso: bool = False,
         covariate_names: Optional[list[str]] = None,
-        *,
-        adata: Optional[AnnData] = None,
-        spatial_key: str = "spatial",
-        layer: str = "counts",
-        group_iso_by: str = "gene_symbol",
         min_counts: int = 10,
         min_bin_pct: float = 0.0,
         filter_single_iso_genes: bool = True,
+        min_component_size: int = 1,
     ) -> None:
-        """Setup the data for the model.
-
-        This method supports two input modes for backward compatibility.
-
-        - Legacy mode: pass ``data`` and ``coordinates`` directly.
-        - AnnData mode: pass ``adata``, where counts are extracted from
-          ``adata.layers[layer]`` grouped by ``group_iso_by``, and coordinates
-          are read from ``adata.obsm[spatial_key]``.
-          See :func:`splisosm.utils.prepare_inputs_from_anndata` for details.
+        """Setup the data for the GLMM model.
 
         Parameters
         ----------
-        data : list of torch.Tensor or numpy.ndarray, optional
-            Legacy mode only. List of isoform count arrays, one per gene, each of
-            shape ``(n_spots, n_isos)``.
-        coordinates : torch.Tensor, numpy.ndarray, or pandas.DataFrame, optional
-            Legacy mode only. Spatial coordinates of shape ``(n_spots, 2)``.
-        design_mtx : torch.Tensor, numpy.ndarray, pandas.DataFrame, str, or list of str, optional
-            Design matrix for fixed effects.
-
-            - Legacy mode: array/tensor/DataFrame of shape ``(n_spots, n_factors)``.
-            - AnnData mode: array/tensor/DataFrame, one obs-column name (str),
-              or a list of obs-column names.
-        gene_names : list of str, str, or None, optional
-            Gene names.
-
-            - Legacy mode: list of gene name strings.
-            - AnnData mode: column name in ``adata.var`` used as display names for
-              grouped genes; if ``None``, the values of ``group_iso_by`` are used.
-        group_gene_by_n_iso : bool, optional
-            If ``True``, genes are sorted and grouped by their isoform count before
-            batching.  Required for ``batch_size > 1`` in :meth:`fit` because the
-            GLMM model expects a fixed isoform count per batch.
-        covariate_names : list of str or None, optional
-            Covariate names for columns of the design matrix.  If not provided,
-            names are inferred from DataFrame column names when available; otherwise
-            auto-generated as ``factor_1``, ``factor_2``, etc.
-
-            When explicitly provided, must match the number of factors in the design
-            matrix.
-        adata : anndata.AnnData or None, optional
-            AnnData object for AnnData input mode.
+        adata : anndata.AnnData
+            Annotated data matrix.  Counts are read from
+            ``adata.layers[layer]`` grouped by ``group_iso_by``, and
+            spatial coordinates from ``adata.obsm[spatial_key]``.
         spatial_key : str, optional
-            Key in ``adata.obsm`` for spatial coordinates.
+            Key in ``adata.obsm`` for spatial coordinates (default
+            ``"spatial"``).
+        adj_key : str or None, optional
+            Key in ``adata.obsp`` for a pre-built adjacency matrix.
+            When provided, it overrides the k-NN graph construction
+            from coordinates and be used directly to build the spatial kernel.
+            The adjacency matrix is symmetrized internally.
         layer : str, optional
-            Layer in ``adata.layers`` that stores isoform counts.
+            Layer in ``adata.layers`` storing isoform counts (default
+            ``"counts"``).
         group_iso_by : str, optional
-            Column in ``adata.var`` used to group isoforms by gene.
+            Column in ``adata.var`` used to group isoforms by gene
+            (default ``"gene_symbol"``).
+        gene_names : str or None, optional
+            Column name in ``adata.var`` used as display names for genes.
+            If ``None``, the values of ``group_iso_by`` are used.
+        group_gene_by_n_iso : bool, optional
+            If ``True``, genes are sorted and grouped by their isoform
+            count before batching.  Required for ``batch_size > 1`` in
+            :meth:`fit` because the GLMM model expects a fixed isoform
+            count per batch (default ``False``).
+        design_mtx : tensor, array, DataFrame, str, or list of str, optional
+            Design matrix for fixed effects.  Accepts an
+            array/tensor/DataFrame of shape ``(n_spots, n_factors)``, a
+            single obs-column name (str), or a list of obs-column names.
+        covariate_names : list of str or None, optional
+            Explicit covariate names.  When not provided, names are
+            inferred from column names or auto-generated.
         min_counts : int, optional
-            Minimum total isoform count across spots required to retain an
-            isoform in AnnData mode.
+            Minimum total isoform count across spots to retain an isoform
+            (default 10).
         min_bin_pct : float, optional
-            Minimum fraction/percentage of spots where an isoform must be expressed.
-            Values in ``[0, 1]`` are fractions; values in ``(1, 100]`` are percentages.
+            Minimum fraction/percentage of spots where an isoform must be
+            expressed (default 0.0).
         filter_single_iso_genes : bool, optional
-            AnnData mode only. Whether to remove genes with fewer than two
-            retained isoforms.
+            Whether to remove genes with fewer than two retained isoforms
+            (default ``True``).
+        min_component_size : int, optional
+            Minimum number of spots a connected component must contain to
+            be retained.  Spots in smaller components are removed from all
+            data structures before the spatial kernel is built.  Default 1
+            disables filtering.  A ``UserWarning`` is issued when spots are
+            removed.
 
         Raises
         ------
         ValueError
             If input arguments are invalid or required fields are missing.
         """
-        if adata is not None:
-            if data is not None or coordinates is not None:
-                raise ValueError(
-                    "When `adata` is provided, `data` and `coordinates` should not be provided."
-                )
+        if not isinstance(adata, AnnData):
+            raise ValueError("`adata` must be an AnnData object.")
 
-            (
-                extracted_data,
-                extracted_coordinates,
-                extracted_gene_names,
-                extracted_design_mtx,
-                extracted_covariate_names,
-            ) = prepare_inputs_from_anndata(
-                adata=adata,
-                design_mtx=design_mtx,
-                gene_names=gene_names,
-                covariate_names=covariate_names,
-                spatial_key=spatial_key,
-                layer=layer,
-                group_iso_by=group_iso_by,
-                min_counts=min_counts,
-                min_bin_pct=min_bin_pct,
-                filter_single_iso_genes=filter_single_iso_genes,
-            )
+        (
+            data,
+            coordinates,
+            resolved_gene_names,
+            resolved_design,
+            resolved_cov_names,
+            adj_matrix,
+            _,  # filtered_adata — not used by SplisosmGLMM
+        ) = prepare_inputs_from_anndata(
+            adata=adata,
+            layer=layer,
+            group_iso_by=group_iso_by,
+            spatial_key=spatial_key,
+            min_counts=min_counts,
+            min_bin_pct=min_bin_pct,
+            filter_single_iso_genes=filter_single_iso_genes,
+            gene_names=gene_names,
+            design_mtx=design_mtx,
+            covariate_names=covariate_names,
+            min_component_size=min_component_size,
+            adj_key=adj_key,
+            k_neighbors=4,
+        )
 
-            data = extracted_data
-            coordinates = extracted_coordinates
-            design_mtx = extracted_design_mtx
-            gene_names = extracted_gene_names
-            covariate_names = extracted_covariate_names
+        self.adata = adata
+        self._setup_input_mode = "anndata"
 
-            self.adata = adata
-            self._setup_input_mode = "anndata"
-        else:
-            if data is None or coordinates is None:
-                raise ValueError(
-                    "Provide either (`data`, `coordinates`) for legacy mode, or `adata` for AnnData mode."
-                )
-
-            if isinstance(gene_names, str):
-                raise ValueError(
-                    "In legacy mode, `gene_names` must be a list of names or None."
-                )
-
-            if isinstance(design_mtx, str) or (
-                isinstance(design_mtx, list)
-                and len(design_mtx) > 0
-                and isinstance(design_mtx[0], str)
-            ):
-                raise ValueError(
-                    "In legacy mode, `design_mtx` must be a matrix-like object, not column names."
-                )
-
-            self.adata = None
-            self._setup_input_mode = "legacy"
-
-        # create the dataset and extract statistics
-        _dataset = IsoDataset(data, gene_names, group_gene_by_n_iso)
+        # Build dataset (handles grouping by n_isos for batching)
+        _dataset = IsoDataset(data, resolved_gene_names, group_gene_by_n_iso)
         self.n_genes, self.n_spots, self.n_isos_per_gene = (
             _dataset.n_genes,
             _dataset.n_spots,
@@ -988,104 +957,123 @@ class SplisosmGLMM:
         self.gene_names = _dataset.gene_names
         self._dataset = _dataset
         self._group_gene_by_n_iso = group_gene_by_n_iso
-
-        # create spatial covariance matrix from the coordinates
-        if coordinates.shape[0] != self.n_spots:
-            raise ValueError(
-                "The number of coordinate rows must match the number of spots."
-            )
-        if isinstance(coordinates, np.ndarray):
-            coordinates = torch.from_numpy(coordinates)
-        elif isinstance(coordinates, pd.DataFrame):
-            coordinates = torch.from_numpy(coordinates.values)
         self.coordinates = coordinates
-        self.corr_sp = get_cov_sp(coordinates, k=4, rho=0.99)
 
-        # check and process the design matrix
-        if design_mtx is not None:
-            # Infer covariate names from DataFrame columns if available
-            inferred_cov_names = None
-            if isinstance(design_mtx, pd.DataFrame):
-                inferred_cov_names = list(design_mtx.columns)
-                design_mtx = design_mtx.values
+        # Build spatial kernel from the adjacency returned by prepare_inputs_from_anndata.
+        # adj_matrix is not None when:
+        # (1) min_component_size > 1, or,
+        # (2) adj_key is provided
+        # The kernel matrix will be realized potential memory issue
+        if adj_matrix is not None:
+            _kernel = SpatialCovKernel(
+                coords=None,
+                adj_matrix=adj_matrix,
+                rho=0.99,
+                standardize_cov=True,
+                centering=False,
+            )
+        else:
+            _kernel = SpatialCovKernel(
+                coords=coordinates,
+                adj_matrix=None,
+                k_neighbors=4,
+                rho=0.99,
+                standardize_cov=True,
+                centering=False,
+            )
+        self.corr_sp = _kernel.realization()
 
-            # Convert sparse matrices to dense
-            if hasattr(design_mtx, "toarray"):  # scipy sparse matrix
-                design_mtx = design_mtx.toarray()
+        # Process design matrix.
+        # GLMM fitting requires dense torch tensors, so sparse design matrices are
+        # densified here (unlike SplisosmNP which keeps them sparse).
+        if resolved_design is not None:
+            import scipy.sparse as _sp
 
-            # Convert numpy to torch
-            if isinstance(design_mtx, np.ndarray):
-                design_mtx = torch.from_numpy(design_mtx.astype(np.float32))
-            elif isinstance(design_mtx, torch.Tensor):
-                design_mtx = design_mtx.float()
-            else:
-                raise TypeError(
-                    f"Unsupported design_mtx type: {type(design_mtx)}. "
-                    "Expected numpy array, torch tensor, pandas DataFrame, or sparse matrix."
-                )
+            if _sp.issparse(resolved_design):
+                resolved_design = resolved_design.toarray()
+            design_mtx_t = torch.from_numpy(
+                np.asarray(resolved_design, dtype=np.float32)
+            )
+            if design_mtx_t.dim() == 1:
+                design_mtx_t = design_mtx_t.unsqueeze(1)
+            n_factors = design_mtx_t.shape[1]
 
-            # Validate shape
-            if design_mtx.shape[0] != self.n_spots:
+            if design_mtx_t.shape[0] != self.n_spots:
                 raise ValueError(
-                    f"Design matrix row count ({design_mtx.shape[0]}) must match "
-                    f"number of spots ({self.n_spots})."
+                    f"Design matrix row count ({design_mtx_t.shape[0]}) must "
+                    f"match number of spots ({self.n_spots}) after filtering."
                 )
-
-            # Handle 1D design matrix (single covariate)
-            if design_mtx.dim() == 1:
-                design_mtx = design_mtx.unsqueeze(1)
-
-            # Ensure float dtype
-            design_mtx = design_mtx.float()
-
-            # Determine covariate names with priority: explicit > inferred > generated
-            n_factors = design_mtx.shape[1]
-            if covariate_names is not None:
-                # Explicit covariate_names provided by user
-                if len(covariate_names) != n_factors:
-                    raise ValueError(
-                        f"Number of covariate_names ({len(covariate_names)}) must match "
-                        f"design matrix columns ({n_factors})."
-                    )
-            elif inferred_cov_names is not None:
-                # Inferred from DataFrame columns
-                if len(inferred_cov_names) != n_factors:
-                    raise ValueError(
-                        f"DataFrame column count ({len(inferred_cov_names)}) does not match "
-                        f"design matrix columns ({n_factors})."
-                    )
-                covariate_names = inferred_cov_names
-            else:
-                # Generate default covariate names
-                covariate_names = [f"factor_{i+1}" for i in range(n_factors)]
 
             # Check for constant/zero-variance covariates
             with warnings.catch_warnings():
                 warnings.simplefilter("always")
-                cov_stds = design_mtx.std(dim=0)
+                cov_stds = design_mtx_t.std(dim=0)
                 zero_var_indices = torch.where(cov_stds < 1e-5)[0]
                 for idx in zero_var_indices:
+                    _cname = (
+                        resolved_cov_names[idx]
+                        if resolved_cov_names is not None
+                        else str(idx.item())
+                    )
                     warnings.warn(
-                        f"Covariate '{covariate_names[idx]}' has near-zero variance "
+                        f"Covariate '{_cname}' has near-zero variance "
                         "(std < 1e-5). Consider removing it."
                     )
 
-        self.n_factors = design_mtx.shape[1] if design_mtx is not None else 0
-        self.design_mtx = design_mtx
-        self.covariate_names = covariate_names
+            self.n_factors = n_factors
+            self.design_mtx = design_mtx_t
+            self.covariate_names = resolved_cov_names
+        else:
+            self.n_factors = 0
+            self.design_mtx = None
+            self.covariate_names = None
 
-        # store the eigendecomposition of the spatial covariance matrix
+        # Store eigendecomposition of the spatial covariance matrix
         try:
             corr_sp_eigvals, corr_sp_eigvecs = torch.linalg.eigh(self.corr_sp)
         except RuntimeError:
-            # fall back to eig if eigh fails
-            # related to a pytorch bug on M1 macs, see https://github.com/pytorch/pytorch/issues/83818
+            # Fall back to eig if eigh fails (known pytorch bug on M1 Macs:
+            # https://github.com/pytorch/pytorch/issues/83818)
             corr_sp_eigvals, corr_sp_eigvecs = torch.linalg.eig(self.corr_sp)
             corr_sp_eigvals = torch.real(corr_sp_eigvals)
             corr_sp_eigvecs = torch.real(corr_sp_eigvecs)
 
         self._corr_sp_eigvals = corr_sp_eigvals  # (n_spots,)
         self._corr_sp_eigvecs = corr_sp_eigvecs  # (n_spots, n_spots)
+
+    def _setup_from_prebuilt(
+        self,
+        data: list,
+        coordinates: torch.Tensor,
+        corr_sp: torch.Tensor,
+        corr_sp_eigvals: torch.Tensor,
+        corr_sp_eigvecs: torch.Tensor,
+        design_mtx: Optional[torch.Tensor],
+        gene_names: list,
+        group_gene_by_n_iso: bool,
+        covariate_names: Optional[list],
+    ) -> None:
+        """Internal fast-path setup from pre-built tensors (used by permutation loop).
+
+        Skips AnnData parsing, k-NN construction, and eigendecomposition —
+        all of which are inherited from the parent model.
+        """
+        _dataset = IsoDataset(data, gene_names, group_gene_by_n_iso)
+        self.n_genes = _dataset.n_genes
+        self.n_spots = _dataset.n_spots
+        self.n_isos_per_gene = _dataset.n_isos_per_gene
+        self.gene_names = _dataset.gene_names
+        self._dataset = _dataset
+        self._group_gene_by_n_iso = group_gene_by_n_iso
+        self.coordinates = coordinates
+        self.corr_sp = corr_sp
+        self._corr_sp_eigvals = corr_sp_eigvals
+        self._corr_sp_eigvecs = corr_sp_eigvecs
+        self.design_mtx = design_mtx
+        self.n_factors = design_mtx.shape[1] if design_mtx is not None else 0
+        self.covariate_names = covariate_names
+        self.adata = None
+        self._setup_input_mode = "prebuilt"
 
     def get_formatted_test_results(
         self, test_type: Literal["sv", "du"]
@@ -1744,7 +1732,7 @@ class SplisosmGLMM:
                 # randomly shuffle the spatial locations
                 perm_idx = torch.randperm(self.n_spots)
 
-                # fit a new SplisosmGLMM model
+                # fit a new SplisosmGLMM model using pre-built tensors (fast path)
                 new_model = SplisosmGLMM(**self.model_configs)
                 new_design_mtx = (
                     self.design_mtx[perm_idx, :]
@@ -1752,11 +1740,16 @@ class SplisosmGLMM:
                     else None
                 )
                 new_data = [_d[perm_idx, :] for _d in self._dataset.data]
-                new_model.setup_data(
-                    new_data,
-                    self.coordinates,
-                    new_design_mtx,
+                new_model._setup_from_prebuilt(
+                    data=new_data,
+                    coordinates=self.coordinates,
+                    corr_sp=self.corr_sp,
+                    corr_sp_eigvals=self._corr_sp_eigvals,
+                    corr_sp_eigvecs=self._corr_sp_eigvecs,
+                    design_mtx=new_design_mtx,
+                    gene_names=self.gene_names,
                     group_gene_by_n_iso=self._group_gene_by_n_iso,
+                    covariate_names=self.covariate_names,
                 )
                 new_model._fit_null_full_sv(
                     refit_null=refit_null,

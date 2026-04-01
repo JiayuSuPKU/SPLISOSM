@@ -8,7 +8,6 @@ import numpy as np
 import scipy.sparse
 import pandas as pd
 from anndata import AnnData
-from splisosm.utils import extract_counts_n_ratios
 from splisosm.model import MultinomGLMM
 
 from splisosm.simulation import simulate_isoform_counts
@@ -50,6 +49,38 @@ def get_simulation_data(n_genes=2, n_isos=3, n_spots_per_dim=20):
     )
 
     return data
+
+
+def _make_small_adata(counts_list, coords, design_mtx=None):
+    """Build a minimal AnnData from per-gene (n_spots, n_isos) count tensors."""
+    coords_np = coords.numpy() if hasattr(coords, "numpy") else np.asarray(coords)
+    n_spots = coords_np.shape[0]
+    all_c, gene_ids, iso_names = [], [], []
+    for i, c in enumerate(counts_list):
+        c_np = (
+            c.detach().numpy().astype(np.float32)
+            if hasattr(c, "numpy")
+            else np.asarray(c, dtype=np.float32)
+        )
+        all_c.append(c_np)
+        for j in range(c_np.shape[1]):
+            gene_ids.append(f"gene_{i}")
+            iso_names.append(f"gene_{i}_iso_{j}")
+    X = np.concatenate(all_c, axis=1)
+    var = pd.DataFrame({"gene_symbol": gene_ids}, index=iso_names)
+    if design_mtx is not None:
+        dm = (
+            design_mtx.detach().numpy()
+            if hasattr(design_mtx, "numpy")
+            else np.asarray(design_mtx, dtype=np.float32)
+        )
+        obs = pd.DataFrame({f"cov_{i+1}": dm[:, i] for i in range(dm.shape[1])})
+    else:
+        obs = pd.DataFrame(index=[str(i) for i in range(n_spots)])
+    adata = AnnData(X=X, obs=obs, var=var)
+    adata.layers["counts"] = X
+    adata.obsm["spatial"] = coords_np.astype(np.float32)
+    return adata
 
 
 class TestHypTestGLMM(unittest.TestCase):
@@ -142,21 +173,18 @@ class TestHypTestGLMM(unittest.TestCase):
         self.assertIsInstance(df, int)
 
     def test_sparse_data_handling(self):
-        # 1. Prepare sparse data using AnnData and extract_counts_n_ratios
         n_spots = self.counts[0].shape[
             0
         ]  # roughly 400 from get_simulation_data defaults
         n_isos_per_gene = [3, 2]
         total_isos = sum(n_isos_per_gene)
 
-        # Create random counts with some zeros
         counts_dense = np.random.randint(0, 5, size=(n_spots, total_isos)).astype(
             np.float32
         )
         counts_dense[counts_dense < 2] = 0
         counts_sparse = scipy.sparse.csr_matrix(counts_dense)
 
-        # Create var dataframe
         gene_ids = []
         for i, n in enumerate(n_isos_per_gene):
             gene_ids.extend([f"gene_sparse_{i}"] * n)
@@ -164,34 +192,27 @@ class TestHypTestGLMM(unittest.TestCase):
             {"gene_symbol": gene_ids}, index=[f"iso_{i}" for i in range(total_isos)]
         )
 
-        adata = AnnData(X=counts_sparse, var=var)
-        adata.layers["counts"] = counts_sparse
-
-        # Extract sparse tensors
-        data_sparse, _, gene_names, _ = extract_counts_n_ratios(
-            adata, "counts", "gene_symbol", return_sparse=True
-        )
-
-        # Ensure coordinates match n_spots (self.cov_sp might be for different N if we aren't careful)
-        # In setUp, data is generated with n_spots_per_dim=20 => 400 spots.
-        # We used same n_spots.
-
-        # Need coordinates for setup_data
-        # We can simulate coordinates or use dummy ones
         coords = torch.rand(n_spots, 2)
 
         # 2. Test SplisosmGLMM with sparse data
         # Use a very low max_epochs to speed up test
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 1})
 
-        # Using self.design_mtx might fail if dimensions don't match, let's create a matching one
-        design_mtx = torch.randn(n_spots, 2)
+        design_mtx_np = np.random.randn(n_spots, 2).astype(np.float32)
+        obs = pd.DataFrame({"cov_1": design_mtx_np[:, 0], "cov_2": design_mtx_np[:, 1]})
+        sparse_adata = AnnData(X=counts_sparse, obs=obs, var=var)
+        sparse_adata.layers["counts"] = counts_sparse
+        sparse_adata.obsm["spatial"] = coords.numpy().astype(np.float32)
 
         model.setup_data(
-            data=data_sparse,
-            coordinates=coords,
-            design_mtx=design_mtx,
-            gene_names=gene_names,
+            adata=sparse_adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
 
         # Fit the model
@@ -264,10 +285,14 @@ class TestSplisosmGLMM(unittest.TestCase):
     def test_splisosm_glmm_setup_data(self):
         model = SplisosmGLMM()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         self.assertIsNotNone(model.design_mtx)
@@ -299,12 +324,18 @@ class TestSplisosmGLMM(unittest.TestCase):
         counts = [g for g in data_3_iso["counts"]] + [g for g in data_4_iso["counts"]]
         coordinates = data_3_iso["coords"]
         design_mtx = data_3_iso["design_mtx"]
+        local_adata = _make_small_adata(counts, coordinates, design_mtx)
 
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
         model.setup_data(
-            data=counts,
-            coordinates=coordinates,
-            design_mtx=design_mtx,
+            adata=local_adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(
@@ -321,15 +352,20 @@ class TestSplisosmGLMM(unittest.TestCase):
 
         model.test_differential_usage(method="score")
         du_results = model.get_formatted_test_results("du")
-        self.assertEqual(len(du_results), 6 * design_mtx.shape[1])
+        self.assertEqual(len(du_results), 6 * 2)  # 6 genes × 2 covariates
 
     def test_splisosm_glm_fit(self):
         model = SplisosmGLMM(model_type="glm")
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(quiet=True, batch_size=5)
@@ -339,10 +375,14 @@ class TestSplisosmGLMM(unittest.TestCase):
     def test_splisosm_glmm_fit(self):
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(quiet=True, batch_size=5)
@@ -354,10 +394,14 @@ class TestSplisosmGLMM(unittest.TestCase):
             model_type="glmm-full", fitting_configs={"max_epochs": 100}
         )
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=False, from_null=True, quiet=True)
@@ -373,10 +417,14 @@ class TestSplisosmGLMM(unittest.TestCase):
             model_type="glmm-full", fitting_configs={"max_epochs": 100}
         )
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=False, quiet=True)
@@ -393,10 +441,14 @@ class TestSplisosmGLMM(unittest.TestCase):
             model_type="glmm-full", fitting_configs={"max_epochs": 100}
         )
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=True, quiet=True)
@@ -408,10 +460,14 @@ class TestSplisosmGLMM(unittest.TestCase):
         """Test spatial variability with permutation-based null."""
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=False, from_null=True, quiet=True)
@@ -425,10 +481,14 @@ class TestSplisosmGLMM(unittest.TestCase):
         """Test spatial variability with return_results=True."""
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=False, from_null=True, quiet=True)
@@ -440,10 +500,14 @@ class TestSplisosmGLMM(unittest.TestCase):
         """Test differential usage with return_results=True."""
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=False, quiet=True)
@@ -455,10 +519,14 @@ class TestSplisosmGLMM(unittest.TestCase):
         """Test setup_data without design matrix."""
         model = SplisosmGLMM()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
             design_mtx=None,
-            gene_names=self.gene_names,
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         self.assertIsNone(model.design_mtx)
 
@@ -466,10 +534,14 @@ class TestSplisosmGLMM(unittest.TestCase):
         """Test fitting with design matrix."""
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=True, quiet=True)
@@ -479,10 +551,14 @@ class TestSplisosmGLMM(unittest.TestCase):
         """Test fitting with different batch_size."""
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(quiet=True, batch_size=10)
@@ -737,14 +813,20 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
         model = SplisosmGLMM()
         coords_np = np.asarray(self.coords)
         design_1d_np = np.ones(self.coords.shape[0], dtype=np.float32)
+        local_adata = _make_small_adata(self.counts_list, self.coords)
 
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
             model.setup_data(
-                data=self.counts_list,
-                coordinates=coords_np,
+                adata=local_adata,
+                layer="counts",
+                spatial_key="spatial",
+                group_iso_by="gene_symbol",
                 design_mtx=design_1d_np,
                 covariate_names=["const"],
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
             )
 
         self.assertEqual(model.design_mtx.shape[1], 1)
@@ -758,6 +840,7 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
         n_spots = self.coords.shape[0]
         eigvals = torch.ones(n_spots, dtype=torch.complex64)
         eigvecs = torch.eye(n_spots, dtype=torch.complex64)
+        local_adata = _make_small_adata(self.counts_list, self.coords, self.design_mtx)
 
         with (
             patch(
@@ -770,9 +853,14 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             ),
         ):
             model.setup_data(
-                data=self.counts_list,
-                coordinates=self.coords,
-                design_mtx=self.design_mtx,
+                adata=local_adata,
+                layer="counts",
+                spatial_key="spatial",
+                group_iso_by="gene_symbol",
+                design_mtx=["cov_1", "cov_2"],
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
             )
 
         self.assertTrue(torch.is_floating_point(model._corr_sp_eigvals))
@@ -780,10 +868,16 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
 
     def test_fit_warns_when_batch_size_without_grouping(self):
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 1})
+        local_adata = _make_small_adata(self.counts_list, self.coords, self.design_mtx)
         model.setup_data(
-            data=self.counts_list,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
+            adata=local_adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=False,
         )
 
@@ -799,10 +893,16 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
 
     def test_get_fitted_models_glmm_null_and_save(self):
         model = SplisosmGLMM(model_type="glmm-null", fitting_configs={"max_epochs": 1})
+        local_adata = _make_small_adata(self.counts_list, self.coords, self.design_mtx)
         model.setup_data(
-            data=self.counts_list,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
+            adata=local_adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(quiet=True, print_progress=False, with_design_mtx=False, batch_size=1)
@@ -882,10 +982,16 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
 
     def test_spatial_variability_requires_null_models(self):
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 1})
+        local_adata = _make_small_adata(self.counts_list, self.coords, self.design_mtx)
         model.setup_data(
-            data=self.counts_list,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
+            adata=local_adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(
@@ -897,10 +1003,16 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
 
     def test_spatial_variability_uses_cached_permutation_results(self):
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 1})
+        local_adata = _make_small_adata(self.counts_list, self.coords, self.design_mtx)
         model.setup_data(
-            data=self.counts_list,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
+            adata=local_adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(
@@ -922,11 +1034,18 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
         print_mock.assert_any_call("Using cached permutation results...")
 
     def test_differential_usage_error_paths(self):
+        local_adata = _make_small_adata(self.counts_list, self.coords, self.design_mtx)
+
         model_no_design = SplisosmGLMM(fitting_configs={"max_epochs": 1})
         model_no_design.setup_data(
-            data=self.counts_list,
-            coordinates=self.coords,
+            adata=local_adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
             design_mtx=None,
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         with self.assertRaises(ValueError):
@@ -936,9 +1055,14 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
 
         model_score = SplisosmGLMM(fitting_configs={"max_epochs": 1})
         model_score.setup_data(
-            data=self.counts_list,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
+            adata=local_adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         with self.assertRaises(ValueError):
@@ -955,9 +1079,14 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
 
         model_wald = SplisosmGLMM(fitting_configs={"max_epochs": 1})
         model_wald.setup_data(
-            data=self.counts_list,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
+            adata=local_adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         with self.assertRaises(ValueError):

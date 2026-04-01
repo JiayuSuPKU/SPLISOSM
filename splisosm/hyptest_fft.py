@@ -330,6 +330,7 @@ def _du_worker_fft(
         torch.from_numpy(counts_flat).float(),
         transformation=ratio_transformation,
         nan_filling="none",
+        fill_before_transform=False,
     )
     y_cube = ratios.numpy().reshape(ny_g, nx_g, -1)
 
@@ -430,6 +431,7 @@ def _sv_worker_fft(
             torch.from_numpy(counts_flat).float(),
             transformation=ratio_transformation,
             nan_filling="none",
+            fill_before_transform=False,
         )
         y_cube = ratios.numpy().reshape(kernel.ny, kernel.nx, -1)
 

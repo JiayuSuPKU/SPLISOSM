@@ -21,6 +21,7 @@ from typing import Any, Literal, Optional, Union
 
 import numpy as np
 import scipy.fft
+import scipy.sparse
 import torch
 from scipy.optimize import minimize, minimize_scalar
 
@@ -398,18 +399,31 @@ class FFTKernelOp(SpatialKernelOp):
 
 
 def linear_hsic_test(
-    X: torch.Tensor, Y: torch.Tensor, centering: bool = True
+    X: "torch.Tensor | scipy.sparse.spmatrix",
+    Y: "torch.Tensor | scipy.sparse.spmatrix",
+    centering: bool = True,
 ) -> tuple[float, float]:
     """The linear HSIC test (multivariate RV coefficient).
 
     Equivalent to a multivariate extension of Pearson correlation.
 
+    Supports sparse inputs for memory and speed efficiency:
+
+    * **Sparse X** (scipy sparse matrix, shape ``(n, p)``): the cross-product
+      ``Y_c.T @ X_c`` is computed via a sparse matrix multiply
+      (``X.T.dot(Y_c)``).  Because ``Y`` is mean-centred, the ``X`` centering
+      correction reduces to zero, so only the original sparse ``X`` is needed.
+      ``X_c.T @ X_c`` is obtained as ``X.T @ X  -  n * mean_X ⊗ mean_X``,
+      keeping the first term sparse.
+    * **Sparse Y** (scipy sparse or torch sparse COO): densified once upfront
+      before any computation.
+
     Parameters
     ----------
-    X : torch.Tensor, shape (n_samples, n_x)
-    Y : torch.Tensor, shape (n_samples, n_y)
+    X : torch.Tensor or scipy.sparse.spmatrix, shape (n_samples, n_x)
+    Y : torch.Tensor or scipy.sparse.spmatrix, shape (n_samples, n_y)
     centering : bool
-        Whether to mean-centre X and Y.
+        Whether to mean-centre X and Y before computing the statistic.
 
     Returns
     -------
@@ -418,23 +432,78 @@ def linear_hsic_test(
     pvalue : float
         P-value from the asymptotic chi-squared mixture distribution.
     """
-    is_nan = torch.isnan(X).any(1) | torch.isnan(Y).any(1)
-    X = X[~is_nan]
-    Y = Y[~is_nan]
-
-    if centering:
-        X = X - X.mean(0)
-        Y = Y - Y.mean(0)
-
-    n = X.shape[0]
     eigv_th = 1e-5
 
-    hsic_scaled = torch.norm(Y.T @ X, p="fro").pow(2)
+    # ── Normalise Y to a dense float32 tensor ─────────────────────────────
+    if scipy.sparse.issparse(Y):
+        Y = torch.from_numpy(np.asarray(Y.todense(), dtype=np.float32))
+    elif isinstance(Y, torch.Tensor) and Y.is_sparse:
+        Y = Y.to_dense().float()
+    elif isinstance(Y, np.ndarray):
+        Y = torch.from_numpy(Y.astype(np.float32))
+    else:
+        Y = Y.float()
 
-    lambda_x = torch.linalg.eigvalsh(X.T @ X)
-    lambda_x = lambda_x[lambda_x > eigv_th]
-    lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
-    lambda_y = lambda_y[lambda_y > eigv_th]
+    X_is_sparse = scipy.sparse.issparse(X)
+
+    # ── NaN filtering ─────────────────────────────────────────────────────
+    is_nan_y = torch.isnan(Y).any(1)
+    if X_is_sparse:
+        # Sparse matrices contain no NaN by construction.
+        is_nan = is_nan_y
+    else:
+        if isinstance(X, np.ndarray):
+            X = torch.from_numpy(X.astype(np.float32))
+        else:
+            X = X.float()
+        is_nan = is_nan_y | torch.isnan(X).any(1)
+
+    if is_nan.any():
+        keep = ~is_nan
+        Y = Y[keep]
+        if X_is_sparse:
+            X = X[keep.numpy()]
+        else:
+            X = X[keep]
+
+    n = Y.shape[0]
+
+    # ── Sparse-X path ─────────────────────────────────────────────────────
+    if X_is_sparse:
+        X_sp = X.tocsr()
+        if centering:
+            Y = Y - Y.mean(0)
+
+        # Key identity: when Y is centred, Y_c.T @ X_c == Y_c.T @ X
+        # because the correction term Y_c.sum(0) == 0 vanishes.
+        # So we can use the original (non-centred) sparse X directly.
+        YcTX = torch.from_numpy(
+            X_sp.T.dot(Y.numpy()).astype(np.float32)
+        ).T  # (n_y, n_x)
+        hsic_scaled = YcTX.pow(2).sum()
+
+        # X_c.T @ X_c = X.T @ X - n * mean_X.outer(mean_X)
+        X_mean = np.asarray(X_sp.mean(axis=0), dtype=np.float32).ravel()
+        XcTXc = torch.from_numpy(
+            X_sp.T.dot(X_sp).toarray().astype(np.float32) - n * np.outer(X_mean, X_mean)
+        )
+        lambda_x = torch.linalg.eigvalsh(XcTXc)
+        lambda_x = lambda_x[lambda_x > eigv_th]
+        lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
+        lambda_y = lambda_y[lambda_y > eigv_th]
+
+    # ── Dense-X path (original) ───────────────────────────────────────────
+    else:
+        if centering:
+            X = X - X.mean(0)
+            Y = Y - Y.mean(0)
+
+        hsic_scaled = torch.norm(Y.T @ X, p="fro").pow(2)
+
+        lambda_x = torch.linalg.eigvalsh(X.T @ X)
+        lambda_x = lambda_x[lambda_x > eigv_th]
+        lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
+        lambda_y = lambda_y[lambda_y > eigv_th]
 
     lambda_xy = (lambda_x.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
     pval = liu_sf((hsic_scaled * n).numpy(), lambda_xy.numpy())

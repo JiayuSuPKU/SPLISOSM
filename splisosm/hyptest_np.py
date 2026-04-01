@@ -7,6 +7,7 @@ import re
 from typing import Any, Optional, Union, Literal
 from scipy.stats import ttest_ind, combine_pvalues, norm as _norm_dist
 import numpy as np
+import scipy.sparse
 import pandas as pd
 import torch
 from tqdm import tqdm
@@ -44,9 +45,12 @@ def _calc_ttest_differential_usage(
     Parameters
     ----------
     data : torch.Tensor
-        Shape (n_spots, n_isos), the observed isoforms counts for a given gene.
-    groups : torch.Tensor
-        Shape (n_spots), the binary group labels for each spot.
+        Shape (n_spots, n_isos), the observed isoform ratios for a given gene.
+    groups : torch.Tensor or scipy.sparse.spmatrix
+        Shape ``(n_spots,)`` or ``(n_spots, 1)``, the binary group labels for
+        each spot.  When a scipy sparse matrix is provided (e.g. a column from
+        a one-hot-encoded design matrix), the nonzero rows are taken as group 1
+        and zero rows as group 0, avoiding full densification of the column.
     combine_pval : bool, optional
         Whether to combine p-values across isoforms.
     combine_method : str, optional
@@ -54,26 +58,40 @@ def _calc_ttest_differential_usage(
 
     Returns
     -------
-    stats : torch.Tensor
-        Shape (n_isos) or (1,), the t-test statistic.
-    pval : torch.Tensor
-        Shape (n_isos) or (1,), the p-value.
+    stats : float or numpy scalar
+        Combined test statistic (scalar when combine_pval=True).
+    pval : float or numpy scalar
+        P-value.
     """
-    # check if groups contains more than two unique values
-    _g = torch.unique(groups)  # group labels
-    if len(_g) > 2:
-        raise ValueError(
-            "More than two groups detected. Only two are allowed for the two-sample t-test."
+    if scipy.sparse.issparse(groups):
+        # Sparse column (n, 1): nonzero rows belong to group 1, zeros to group 0.
+        # This avoids creating a full dense boolean mask.
+        groups_csr = groups.tocsr()
+        g1_idx = groups_csr.nonzero()[0]  # row indices where value is nonzero
+        n = groups_csr.shape[0]
+        g0_mask = np.ones(n, dtype=bool)
+        g0_mask[g1_idx] = False
+        t1 = data[g1_idx]  # (k, n_isos)
+        t2 = data[g0_mask]  # (n - k, n_isos)
+    else:
+        # Dense path: groups is a 1-D tensor or array.
+        _g = torch.unique(
+            groups
+            if isinstance(groups, torch.Tensor)
+            else torch.from_numpy(np.asarray(groups))
         )
+        if len(_g) > 2:
+            raise ValueError(
+                "More than two groups detected. Only two are allowed for the two-sample t-test."
+            )
+        t1 = data[groups == _g[0], :]  # (k, n_isos)
+        t2 = data[groups == _g[1], :]  # (n_spots - k, n_isos)
 
-    # run t-test per isoform
-    t1 = data[groups == _g[0], :]  # (k, n_isos)
-    t2 = data[groups == _g[1], :]  # (n_spots - k, n_isos)
-    stats, pval = ttest_ind(t1, t2, axis=0, nan_policy="omit")  # each of len n_isos
+    stats, pval = ttest_ind(t1, t2, axis=0, nan_policy="omit")
 
     # combine p-values across isoforms
     if combine_pval:
-        stats, pval = combine_pvalues(pval, method=combine_method)  # each of len 1
+        stats, pval = combine_pvalues(pval, method=combine_method)
 
     return stats, pval
 
@@ -110,6 +128,15 @@ class SplisosmNP:
     >>> du_results = model.get_formatted_test_results('du')
     >>> print(du_results.head())
     """
+
+    k_neighbors: int
+    """Number of nearest neighbours for the CAR spatial kernel (set in :meth:`__init__`)."""
+
+    rho: float
+    """Spatial autocorrelation strength for the CAR kernel (set in :meth:`__init__`)."""
+
+    standardize_cov: bool
+    """Whether to standardise the spatial covariance matrix (set in :meth:`__init__`)."""
 
     n_genes: int
     """Number of genes."""
@@ -169,7 +196,31 @@ class SplisosmNP:
     - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes, n_factors), the BH adjusted p-value for each gene and covariate. Each column/covariate is adjusted separately.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        k_neighbors: int = 4,
+        rho: float = 0.99,
+        standardize_cov: bool = True,
+    ) -> None:
+        """Initialise the model.
+
+        Parameters
+        ----------
+        k_neighbors : int, optional
+            Number of nearest neighbours used to build the spatial adjacency
+            graph for the CAR kernel (default 4).
+        rho : float, optional
+            Spatial autocorrelation strength in the CAR model (default 0.99).
+            Values close to 1 give a smoother spatial kernel.
+        standardize_cov : bool, optional
+            Whether to standardise the spatial covariance matrix so that its
+            diagonal entries are 1 (default ``True``).
+        """
+        # spatial kernel hyperparameters (used in setup_data)
+        self.k_neighbors = k_neighbors
+        self.rho = rho
+        self.standardize_cov = standardize_cov
+
         # to be set after running setup_data()
         self.n_genes = None  # number of genes
         self.n_spots = None  # number of spots
@@ -177,6 +228,11 @@ class SplisosmNP:
         self.n_factors = None  # number of covariates to test for differential usage
         self.adata = None  # optional anndata source for the new setup path
         self._setup_input_mode = None  # "legacy" or "anndata"
+
+        # feature summary cache (populated by _compute_feature_summaries)
+        self._filtered_adata = None
+        self._gene_summary = None
+        self._isoform_summary = None
 
         # to store the spatial variability test results after running test_spatial_variability()
         self.sv_test_results = {}
@@ -209,262 +265,443 @@ class SplisosmNP:
 
     def setup_data(
         self,
-        data: Optional[list[Union[torch.Tensor, np.ndarray]]] = None,
-        coordinates: Optional[Union[torch.Tensor, np.ndarray, pd.DataFrame]] = None,
+        adata: AnnData,
+        *,
+        spatial_key: str = "spatial",
+        adj_key: Optional[str] = None,
+        layer: str = "counts",
+        group_iso_by: str = "gene_symbol",
+        gene_names: Optional[str] = None,
         design_mtx: Optional[
             Union[torch.Tensor, np.ndarray, pd.DataFrame, str, list[str]]
         ] = None,
-        gene_names: Optional[Union[list[str], str]] = None,
         covariate_names: Optional[list[str]] = None,
-        *,
-        adata: Optional[AnnData] = None,
-        spatial_key: str = "spatial",
-        layer: str = "counts",
-        group_iso_by: str = "gene_symbol",
         min_counts: int = 10,
         min_bin_pct: float = 0.0,
         filter_single_iso_genes: bool = True,
+        min_component_size: int = 1,
     ) -> None:
         """Setup isoform-level spatial data for hypothesis testing.
 
-        This method supports two input modes for backward compatibility.
-
-        - Legacy mode: pass ``data`` and ``coordinates`` directly.
-        - AnnData mode: pass ``adata``, where counts are extracted from
-          ``adata.layers[layer]`` grouped by ``group_iso_by``, and coordinates
-          are read from ``adata.obsm[spatial_key]``.
-          See :func:`splisosm.utils.prepare_inputs_from_anndata` for details.
+        Extracts isoform count tensors from an AnnData object, optionally
+        filters disconnected graph components, builds a spatial covariance
+        kernel, and resolves the design matrix.
 
         Parameters
         ----------
-        data : list of torch.Tensor or numpy.ndarray, optional
-            Legacy mode only. List of isoform count arrays, one per gene, each of
-            shape ``(n_spots, n_isos)``.
-        coordinates : torch.Tensor, numpy.ndarray, or pandas.DataFrame, optional
-            Legacy mode only. Spatial coordinates of shape ``(n_spots, n_dims)``.
-        design_mtx : torch.Tensor, numpy.ndarray, pandas.DataFrame, str, or list of str, optional
-            Design matrix for differential usage tests.
-
-            - Legacy mode: array/tensor/DataFrame of shape ``(n_spots, n_factors)``.
-            - AnnData mode: array/tensor/DataFrame, one obs-column name (str),
-              or a list of obs-column names.
-
-            Categorical obs columns are one-hot encoded automatically. Covariate names
-            are inferred when not explicitly provided (see ``covariate_names``).
-        gene_names : list of str, str, or None, optional
-            Gene names.
-
-            - Legacy mode: list of gene name strings.
-            - AnnData mode: column name in ``adata.var`` used as display names for
-              grouped genes; if ``None``, the values of ``group_iso_by`` are used.
-        covariate_names : list of str or None, optional
-            Covariate names for columns of the design matrix. If not provided,
-            names are inferred as follows:
-
-            - **AnnData mode with column name(s)**: column names are used, with
-              categorical columns expanded to one-hot names (e.g., ``col_cat0``,
-              ``col_cat1`` for ``col``).
-            - **Legacy mode with DataFrame**: DataFrame column names are used.
-            - **Otherwise**: auto-generated as ``factor_1``, ``factor_2``, etc.
-
-            When explicitly provided, must match the number of factors in the design
-            matrix after any categorical encoding.
-        adata : anndata.AnnData or None, optional
-            AnnData object for AnnData input mode.
+        adata : anndata.AnnData
+            Annotated data matrix.  Counts are read from
+            ``adata.layers[layer]`` grouped by ``group_iso_by``, and
+            spatial coordinates from ``adata.obsm[spatial_key]``.
+            See :func:`splisosm.utils.prepare_inputs_from_anndata` for
+            full preprocessing details.
         spatial_key : str, optional
-            Key in ``adata.obsm`` for spatial coordinates.
+            Key in ``adata.obsm`` for spatial coordinates (default
+            ``"spatial"``).
+        adj_key : str or None, optional
+            Key in ``adata.obsp`` for a pre-built adjacency matrix.
+            When provided, it overrides the k-NN graph construction
+            from coordinates and be used directly to build the spatial kernel.
+            The adjacency matrix is symmetrized internally.
         layer : str, optional
-            Layer in ``adata.layers`` that stores isoform counts.
+            Layer in ``adata.layers`` that stores isoform counts (default
+            ``"counts"``).
         group_iso_by : str, optional
-            Column in ``adata.var`` used to group isoforms by gene.
+            Column in ``adata.var`` used to group isoforms by gene
+            (default ``"gene_symbol"``).
+        gene_names : str or None, optional
+            Column name in ``adata.var`` used as display names for genes.
+            If ``None``, the values of ``group_iso_by`` are used.
+        design_mtx : tensor, array, DataFrame, str, or list of str, optional
+            Design matrix for differential-usage tests.  Accepts an
+            array/tensor/DataFrame of shape ``(n_spots, n_factors)``, a
+            single obs-column name (str), or a list of obs-column names.
+            Categorical obs columns are one-hot encoded automatically.
+
+            When a **scipy sparse matrix** is passed directly, it is stored as
+            scipy CSR internally and all differential-usage methods handle it
+            without densifying: ``"hsic"`` uses a sparse matrix-multiply path
+            in :func:`linear_hsic_test`; ``"t-fisher"`` and ``"t-tippett"``
+            extract group indices directly from the sparse non-zero structure.
+            ``"hsic-gp"`` densifies each column via :meth:`_get_design_col`
+            before GPR fitting (GPR residuals are always dense).
+
+            All other input types (obs column names, array, tensor, DataFrame)
+            are converted to a dense torch float32 tensor.
+        covariate_names : list of str or None, optional
+            Explicit covariate names.  When ``design_mtx`` is given as
+            column name(s) and this is ``None``, the column names are used
+            automatically; otherwise auto-generated as ``factor_1``, etc.
         min_counts : int, optional
-            Minimum total isoform count across spots required to retain an isoform
-            in AnnData mode.
+            Minimum total isoform count across spots required to retain an
+            isoform (default 10).
         min_bin_pct : float, optional
-            Minimum fraction/percentage of spots where an isoform must be expressed.
-            Values in ``[0, 1]`` are fractions; values in ``(1, 100]`` are percentages.
+            Minimum fraction/percentage of spots where an isoform must be
+            expressed (default 0.0).
         filter_single_iso_genes : bool, optional
-            AnnData mode only. Whether to remove genes with fewer than two retained
-            isoforms.
+            Whether to remove genes with fewer than two retained isoforms
+            (default ``True``).
+        min_component_size : int, optional
+            Minimum number of spots a connected component must contain to
+            be retained.  Spots in smaller components are removed from all
+            data structures before the spatial kernel is built.  Default 1
+            disables filtering.  A ``UserWarning`` is issued when spots are
+            removed.
 
         Raises
         ------
         ValueError
             If input arguments are invalid or required fields are missing.
         """
-        if adata is not None:
-            if data is not None or coordinates is not None:
-                raise ValueError(
-                    "When `adata` is provided, `data` and `coordinates` should not be provided."
-                )
+        if not isinstance(adata, AnnData):
+            raise ValueError("`adata` must be an AnnData object.")
 
-            (
-                extracted_data,
-                extracted_coordinates,
-                extracted_gene_names,
-                extracted_design_mtx,
-                extracted_covariate_names,
-            ) = prepare_inputs_from_anndata(
-                adata=adata,
-                design_mtx=design_mtx,
-                gene_names=gene_names,
-                covariate_names=covariate_names,
-                spatial_key=spatial_key,
-                layer=layer,
-                group_iso_by=group_iso_by,
-                min_counts=min_counts,
-                min_bin_pct=min_bin_pct,
-                filter_single_iso_genes=filter_single_iso_genes,
-            )
-
-            data = extracted_data
-            coordinates = extracted_coordinates
-            design_mtx = extracted_design_mtx
-            gene_names = extracted_gene_names
-            covariate_names = extracted_covariate_names
-
-            self.adata = adata
-            self._setup_input_mode = "anndata"
-        else:
-            if data is None or coordinates is None:
-                raise ValueError(
-                    "Provide either (`data`, `coordinates`) for legacy mode, or `adata` for AnnData mode."
-                )
-
-            if isinstance(gene_names, str):
-                raise ValueError(
-                    "In legacy mode, `gene_names` must be a list of names or None."
-                )
-
-            if isinstance(design_mtx, str) or (
-                isinstance(design_mtx, list)
-                and len(design_mtx) > 0
-                and isinstance(design_mtx[0], str)
-            ):
-                raise ValueError(
-                    "In legacy mode, `design_mtx` must be a matrix-like object, not column names."
-                )
-
-            self.adata = None
-            self._setup_input_mode = "legacy"
-
-        self.n_genes = len(data)  # number of genes
-        self.n_spots = len(data[0])  # number of spots
-        self.n_isos = [
-            data_g.shape[1] for data_g in data
-        ]  # number of isoforms for each gene
-        self.gene_names = (
-            gene_names
-            if gene_names is not None
-            else [f"gene_{i + 1}" for i in range(self.n_genes)]
+        (
+            data,
+            coordinates,
+            resolved_gene_names,
+            resolved_design,
+            resolved_cov_names,
+            adj_matrix,
+            filtered_adata,
+        ) = prepare_inputs_from_anndata(
+            adata=adata,
+            layer=layer,
+            group_iso_by=group_iso_by,
+            spatial_key=spatial_key,
+            min_counts=min_counts,
+            min_bin_pct=min_bin_pct,
+            filter_single_iso_genes=filter_single_iso_genes,
+            gene_names=gene_names,
+            design_mtx=design_mtx,
+            covariate_names=covariate_names,
+            min_component_size=min_component_size,
+            adj_key=adj_key,
+            k_neighbors=self.k_neighbors,
+            return_filtered_anndata=True,
         )
-        if len(self.gene_names) != self.n_genes:
-            raise ValueError("Gene names must match the number of genes.")
-        if filter_single_iso_genes and min(self.n_isos) <= 1:
-            raise ValueError("At least two isoforms are required for each gene.")
 
-        # convert numpy.array to torch.tensor float if not already
-        _data = [
-            torch.from_numpy(arr) if isinstance(arr, np.ndarray) else arr
-            for arr in data
-        ]
-        self.data = [
-            data_g.float() for data_g in _data
-        ]  # [tensor(n_spots, n_isos)] * n_genes
+        self.adata = adata
+        self._setup_input_mode = "anndata"
+        self._counts_layer = layer
+        self._group_iso_by = group_iso_by
+        self._filtered_adata = filtered_adata
+        self._gene_summary = None
+        self._isoform_summary = None
 
-        # create spatial covariance matrix from the coordinates
-        if coordinates.shape[0] != self.n_spots:
-            raise ValueError(
-                "The number of coordinate rows must match the number of spots."
-            )
-        if isinstance(coordinates, np.ndarray):
-            coordinates = torch.from_numpy(coordinates).float()
-        elif isinstance(coordinates, pd.DataFrame):
-            coordinates = torch.from_numpy(coordinates.values).float()
+        self.n_genes = len(data)
+        self.n_spots = coordinates.shape[0]
+        self.n_isos = [g.shape[1] for g in data]
+        self.gene_names = resolved_gene_names
 
+        # Convert to float tensors
+        self.data = [g.float() for g in data]
         self.coordinates = coordinates
 
-        # compute the spatial kernel (dense for n ≤ 5000; implicit LU-solve above)
-        self.corr_sp = SpatialCovKernel(
-            coordinates,
-            k_neighbors=4,
-            rho=0.99,
-            centering=True,
-            standardize_cov=True,
-        )
+        # Build spatial kernel from the adjacency returned by prepare_inputs_from_anndata.
+        # adj_matrix is not None when:
+        # (1) min_component_size > 1, or,
+        # (2) adj_key is provided
+        if adj_matrix is not None:
+            self.corr_sp = SpatialCovKernel(
+                coords=None,
+                adj_matrix=adj_matrix,
+                rho=self.rho,
+                standardize_cov=self.standardize_cov,
+                centering=True,
+            )
+        else:
+            self.corr_sp = SpatialCovKernel(
+                coords=coordinates,
+                adj_matrix=None,
+                k_neighbors=self.k_neighbors,
+                rho=self.rho,
+                standardize_cov=self.standardize_cov,
+                centering=True,
+            )
 
-        # check and process the design matrix
-        if design_mtx is not None:
-            # Infer covariate names from DataFrame columns if available
-            inferred_cov_names = None
-            if isinstance(design_mtx, pd.DataFrame):
-                inferred_cov_names = list(design_mtx.columns)
-                design_mtx = design_mtx.values
+        # Process design matrix from _process_design_mtx.
+        # resolved_design is a numpy float32 array, a scipy sparse CSR matrix, or None.
+        # Sparse design matrices are kept as scipy CSR to avoid densifying large
+        # one-hot-encoded covariate tables; columns are extracted one at a time during
+        # hypothesis testing.
+        if resolved_design is not None:
+            n_factors = resolved_design.shape[1]
 
-            # Convert sparse matrices to dense
-            if hasattr(design_mtx, "toarray"):  # scipy sparse matrix
-                design_mtx = design_mtx.toarray()
-
-            # Convert numpy to torch
-            if isinstance(design_mtx, np.ndarray):
-                design_mtx = torch.from_numpy(design_mtx.astype(np.float32))
-            elif isinstance(design_mtx, torch.Tensor):
-                design_mtx = design_mtx.float()
-            else:
-                raise TypeError(
-                    f"Unsupported design_mtx type: {type(design_mtx)}. "
-                    "Expected numpy array, torch tensor, pandas DataFrame, or sparse matrix."
-                )
-
-            # Validate shape
-            if design_mtx.shape[0] != self.n_spots:
-                raise ValueError(
-                    f"Design matrix row count ({design_mtx.shape[0]}) must match "
-                    f"number of spots ({self.n_spots})."
-                )
-
-            # Handle 1D design matrix (single covariate)
-            if design_mtx.dim() == 1:
-                design_mtx = design_mtx.unsqueeze(1)
-
-            # Ensure float dtype
-            design_mtx = design_mtx.float()
-
-            # Determine covariate names with priority: explicit > inferred > generated
-            n_factors = design_mtx.shape[1]
-            if covariate_names is not None:
-                # Explicit covariate_names provided by user
-                if len(covariate_names) != n_factors:
-                    raise ValueError(
-                        f"Number of covariate_names ({len(covariate_names)}) must match "
-                        f"design matrix columns ({n_factors})."
-                    )
-            elif inferred_cov_names is not None:
-                # Inferred from DataFrame columns
-                if len(inferred_cov_names) != n_factors:
-                    raise ValueError(
-                        f"DataFrame column count ({len(inferred_cov_names)}) does not match "
-                        f"design matrix columns ({n_factors})."
-                    )
-                covariate_names = inferred_cov_names
-            else:
-                # Generate default covariate names
-                covariate_names = [f"factor_{i+1}" for i in range(n_factors)]
-
-            # Check for constant/zero-variance covariates
+            # Check for constant/zero-variance covariates without densifying
             with warnings.catch_warnings():
                 warnings.simplefilter("always")
-                cov_stds = design_mtx.std(dim=0)
-                zero_var_indices = torch.where(cov_stds < 1e-5)[0]
+                if scipy.sparse.issparse(resolved_design):
+                    _means = np.asarray(resolved_design.mean(axis=0)).ravel()
+                    _sq_means = np.asarray(
+                        resolved_design.power(2).mean(axis=0)
+                    ).ravel()
+                    _stds = np.sqrt(np.maximum(_sq_means - _means**2, 0.0))
+                    zero_var_indices = np.where(_stds < 1e-5)[0]
+                else:
+                    design_mtx_t = torch.from_numpy(
+                        np.asarray(resolved_design, dtype=np.float32)
+                    )
+                    if design_mtx_t.dim() == 1:
+                        design_mtx_t = design_mtx_t.unsqueeze(1)
+                    _stds_t = design_mtx_t.std(dim=0)
+                    zero_var_indices = torch.where(_stds_t < 1e-5)[0].numpy()
                 for idx in zero_var_indices:
+                    _cname = (
+                        resolved_cov_names[int(idx)]
+                        if resolved_cov_names is not None
+                        else str(int(idx))
+                    )
                     warnings.warn(
-                        f"Covariate '{covariate_names[idx]}' has near-zero variance "
+                        f"Covariate '{_cname}' has near-zero variance "
                         "(std < 1e-5). Consider removing it."
                     )
 
-        self.design_mtx = design_mtx
-        self.n_factors = design_mtx.shape[1] if design_mtx is not None else 0
-        self.covariate_names = covariate_names
+            # Store: sparse CSR when the input was sparse; dense torch tensor otherwise.
+            if scipy.sparse.issparse(resolved_design):
+                self.design_mtx = resolved_design.tocsr()
+            else:
+                self.design_mtx = design_mtx_t  # already constructed above
+            self.n_factors = n_factors
+            self.covariate_names = resolved_cov_names
+        else:
+            self.design_mtx = None
+            self.n_factors = 0
+            self.covariate_names = None
+
+    def _get_design_col(self, factor_idx: int) -> torch.Tensor:
+        """Extract one covariate column as a dense (n_spots, 1) float32 tensor.
+
+        Works for both torch-tensor and scipy-sparse design matrices so that
+        the bulk of the design matrix is never fully densified.
+        """
+        if scipy.sparse.issparse(self.design_mtx):
+            col = np.asarray(self.design_mtx.getcol(factor_idx).todense()).ravel()
+            return torch.from_numpy(col.astype(np.float32)).unsqueeze(1)
+        return self.design_mtx[:, factor_idx].clone().float().unsqueeze(1)
+
+    def _compute_feature_summaries(self, print_progress: bool = True) -> None:
+        """Compute and cache both gene-level and isoform-level summaries."""
+        if self._filtered_adata is None:
+            raise RuntimeError("Data is not initialized. Call setup_data() first.")
+        if self._gene_summary is not None and self._isoform_summary is not None:
+            return
+
+        adata = self._filtered_adata
+        n_bins = int(adata.n_obs)
+        iso_counts = adata.layers[self._counts_layer]
+        is_sparse = scipy.sparse.issparse(iso_counts)
+
+        if is_sparse:
+            if not scipy.sparse.isspmatrix_csc(iso_counts):
+                iso_counts = iso_counts.tocsc()
+        else:
+            iso_counts = np.asarray(iso_counts, dtype=float)
+
+        # Derive per-gene isoform lists from the filtered adata var.
+        # adata.var columns are already in the same order as counts_list
+        # (i.e., all isos of gene 0 first, then gene 1, etc.)
+        iso_groups = list(
+            adata.var.groupby(self._group_iso_by, observed=True, sort=False)
+        )
+
+        gene_rows: list[dict] = []
+        iso_rows: list[dict] = []
+        all_iso_names: list[str] = []
+
+        iterator = zip(self.gene_names, iso_groups)
+        if print_progress:
+            iterator = tqdm(iterator, desc="Genes", total=len(self.gene_names))
+
+        for gene_name, (_, iso_group_df) in iterator:
+            iso_names = iso_group_df.index.tolist()
+            iso_idx = adata.var_names.get_indexer(iso_names)
+
+            if is_sparse:
+                gene_counts = iso_counts[:, iso_idx]
+                iso_total = np.asarray(gene_counts.sum(axis=0), dtype=float).ravel()
+                iso_sumsq = np.asarray(
+                    gene_counts.power(2).sum(axis=0), dtype=float
+                ).ravel()
+                iso_nnz = np.diff(gene_counts.indptr).astype(float)
+                row_sums = np.asarray(gene_counts.sum(axis=1), dtype=float).ravel()
+            else:
+                gene_counts = np.asarray(iso_counts[:, iso_idx], dtype=float)
+                iso_total = gene_counts.sum(axis=0)
+                iso_sumsq = np.square(gene_counts).sum(axis=0)
+                iso_nnz = np.count_nonzero(gene_counts, axis=0).astype(float)
+                row_sums = gene_counts.sum(axis=1)
+
+            gene_total = float(iso_total.sum())
+            valid_rows = np.flatnonzero(row_sums > 0.0)
+            n_valid = int(valid_rows.size)
+
+            iso_count_avg = iso_total / n_bins
+            iso_count_var = np.maximum(
+                (iso_sumsq / n_bins) - np.square(iso_count_avg), 0.0
+            )
+            iso_count_std = np.sqrt(iso_count_var)
+            iso_pct_bin_on = iso_nnz / n_bins
+
+            if gene_total > 0.0:
+                ratio_total = iso_total / gene_total
+            else:
+                ratio_total = np.zeros(len(iso_names), dtype=float)
+
+            if n_valid > 0:
+                if is_sparse:
+                    ratio_counts = gene_counts.tocsr()[valid_rows]
+                    ratio_counts = ratio_counts.multiply(
+                        (1.0 / row_sums[valid_rows])[:, None]
+                    )
+                    ratio_sum = np.asarray(
+                        ratio_counts.sum(axis=0), dtype=float
+                    ).ravel()
+                    ratio_sumsq = np.asarray(
+                        ratio_counts.power(2).sum(axis=0), dtype=float
+                    ).ravel()
+                else:
+                    ratio_counts = gene_counts[valid_rows] / row_sums[valid_rows, None]
+                    ratio_sum = ratio_counts.sum(axis=0)
+                    ratio_sumsq = np.square(ratio_counts).sum(axis=0)
+
+                ratio_avg = ratio_sum / n_valid
+                ratio_var = np.maximum(
+                    (ratio_sumsq / n_valid) - np.square(ratio_avg), 0.0
+                )
+                ratio_std = np.sqrt(ratio_var)
+            else:
+                ratio_avg = np.zeros(len(iso_names), dtype=float)
+                ratio_std = np.zeros(len(iso_names), dtype=float)
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                entropy = -(np.log(ratio_total) * ratio_total)
+                entropy = float(np.nan_to_num(entropy).sum())
+
+            gene_count_avg = float(gene_total / n_bins)
+            gene_count_sumsq = float(np.square(row_sums).sum())
+            gene_count_var = max((gene_count_sumsq / n_bins) - (gene_count_avg**2), 0.0)
+
+            gene_rows.append(
+                {
+                    "gene": gene_name,
+                    "n_isos": len(iso_names),
+                    "perplexity": float(np.exp(entropy)),
+                    "pct_bin_on": float(n_valid / n_bins),
+                    "count_avg": gene_count_avg,
+                    "count_std": float(np.sqrt(gene_count_var)),
+                }
+            )
+
+            all_iso_names.extend(iso_names)
+            for (
+                iso_name,
+                pct_bin_on,
+                count_total,
+                count_avg,
+                count_std,
+                iso_ratio_total,
+                iso_ratio_avg,
+                iso_ratio_std,
+            ) in zip(
+                iso_names,
+                iso_pct_bin_on,
+                iso_total,
+                iso_count_avg,
+                iso_count_std,
+                ratio_total,
+                ratio_avg,
+                ratio_std,
+            ):
+                iso_rows.append(
+                    {
+                        "isoform": iso_name,
+                        "pct_bin_on": float(pct_bin_on),
+                        "count_total": float(count_total),
+                        "count_avg": float(count_avg),
+                        "count_std": float(count_std),
+                        "ratio_total": float(iso_ratio_total),
+                        "ratio_avg": float(iso_ratio_avg),
+                        "ratio_std": float(iso_ratio_std),
+                    }
+                )
+
+        self._gene_summary = pd.DataFrame(gene_rows).set_index("gene")
+
+        var_df = adata.var.loc[all_iso_names].copy()
+        stats_df = pd.DataFrame(iso_rows).set_index("isoform")
+        self._isoform_summary = pd.concat([var_df, stats_df], axis=1)
+
+    def extract_feature_summary(
+        self,
+        level: Literal["gene", "isoform"] = "gene",
+        print_progress: bool = True,
+    ) -> pd.DataFrame:
+        """Compute filtered feature-level summary statistics.
+
+        Gene-level statistics are aggregated across all isoforms that passed
+        the filters applied in :meth:`setup_data`.  Isoform-level statistics
+        are computed per isoform and augmented onto the corresponding rows of
+        ``adata.var``.
+
+        Results are cached: repeated calls with the same ``level`` return the
+        cached :class:`pandas.DataFrame` without recomputation.
+
+        Parameters
+        ----------
+        level
+            Summary granularity.
+            ``'gene'``: one row per gene.
+            ``'isoform'``: one row per isoform that passed filtering.
+        print_progress
+            Whether to show a progress bar.
+
+        Returns
+        -------
+        pandas.DataFrame
+            For ``level='gene'``, the index is the gene display name and the
+            columns are:
+
+            - ``'n_isos'``: int. Number of isoforms retained after filtering.
+            - ``'perplexity'``: float. Effective number of isoforms based on
+              the marginal isoform usage entropy.
+            - ``'pct_bin_on'``: float. Fraction of spots with non-zero total
+              gene counts.
+            - ``'count_avg'``: float. Mean per-spot total count for the gene.
+            - ``'count_std'``: float. Std of per-spot total count for the gene.
+
+            For ``level='isoform'``, the index is the isoform name (matching
+            ``adata.var_names``) and the columns are the original ``adata.var``
+            columns plus:
+
+            - ``'pct_bin_on'``: float. Fraction of spots with count > 0.
+            - ``'count_total'``: float. Total counts across all spots.
+            - ``'count_avg'``: float. Mean count per spot.
+            - ``'count_std'``: float. Std of count per spot.
+            - ``'ratio_total'``: float. Fraction of total gene counts
+              attributable to this isoform.
+            - ``'ratio_avg'``: float. Mean per-spot isoform usage ratio
+              (computed over spots with non-zero gene coverage).
+            - ``'ratio_std'``: float. Std of per-spot isoform usage ratio
+              (computed over spots with non-zero gene coverage).
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`setup_data` has not been called.
+        ValueError
+            If ``level`` is not ``'gene'`` or ``'isoform'``.
+        """
+        if self._filtered_adata is None:
+            raise RuntimeError("Data is not initialized. Call setup_data() first.")
+        if level not in {"gene", "isoform"}:
+            raise ValueError("`level` must be one of 'gene' or 'isoform'.")
+
+        self._compute_feature_summaries(print_progress=print_progress)
+
+        if level == "gene":
+            return self._gene_summary
+        return self._isoform_summary
 
     def get_formatted_test_results(
         self, test_type: Literal["sv", "du"]
@@ -633,6 +870,13 @@ class SplisosmNP:
                     )
                 lambda_sp = self.corr_sp.eigenvalues(k=approx_rank)
                 lambda_sp = lambda_sp[lambda_sp > 1e-5]
+                k_eff = len(lambda_sp)
+                # Extract low-rank factor Q_k (shape n × k_eff) so that
+                # K ≈ Q_k Q_k^T. Used to compute a rank-consistent test stat
+                # for p-value, preventing scale mismatch with the Liu null.
+                _Q_sp = (
+                    self.corr_sp.Q[:, :k_eff] if self.corr_sp.Q is not None else None
+                )
             elif null_method == "trace":
                 trK = self.corr_sp.trace()
                 trK2 = self.corr_sp.square_trace()
@@ -652,7 +896,8 @@ class SplisosmNP:
                     y = counts_to_ratios(
                         counts,
                         transformation=ratio_transformation,
-                        nan_filling=nan_filling,
+                        nan_filling="none",
+                        fill_before_transform=False,
                     )
                     # remove spots with NaN values
                     is_nan = torch.isnan(y).any(1)  # spots with NaN values
@@ -691,14 +936,22 @@ class SplisosmNP:
                         y = counts_to_ratios(
                             counts,
                             transformation=ratio_transformation,
-                            nan_filling=nan_filling,
+                            nan_filling="mean",
+                            fill_before_transform=False,
                         )
                         y = y - y.mean(0, keepdim=True)  # centering per isoform
 
-                    # calculate the HSIC statistic
-                    hsic_scaled = torch.trace(
-                        K_sp.xtKx(y)
-                    )  # equivalent to y.T @ K_sp @ y
+                    # compute the hsic statistic
+                    if null_method == "eig" and _Q_sp is not None:
+                        # when low-rank approximation is available,
+                        # compute the statistic using the low-rank factor to align with
+                        # the eigenvalues used in the Liu null distribution
+                        xtQ = y.t() @ _Q_sp  # (n_isos, k_eff)
+                        hsic_scaled = torch.trace(xtQ @ xtQ.t())
+                    else:
+                        # use the exact full kernel to compute the quadratic form
+                        # even when low-rank approximation K_sp.Q is available
+                        hsic_scaled = torch.trace(K_sp.xtKx_exact(y))
 
                 hsic_list.append(hsic_scaled / (n_spots - 1) ** 2)
 
@@ -912,12 +1165,20 @@ class SplisosmNP:
         n_genes = self.n_genes
 
         if method == "hsic":  # unconditional HSIC test (multivariate RV coefficient)
-            # Pre-compute normalized covariates (n_factors small tensors, never sparse)
+            # Pre-compute covariates: keep sparse when design_mtx is scipy sparse
+            # so that linear_hsic_test can use the memory-efficient sparse-X path.
             z_list = []
             for _ind in range(n_factors):
-                z = self.design_mtx[:, _ind].clone().unsqueeze(1)  # (n_spots, 1)
+                if scipy.sparse.issparse(self.design_mtx):
+                    z = self.design_mtx.getcol(_ind)  # scipy sparse (n_spots, 1)
+                    _mean = float(z.mean())
+                    _sq_mean = float(z.multiply(z).mean())
+                    _std = float(np.sqrt(max(_sq_mean - _mean**2, 0.0)))
+                else:
+                    z = self._get_design_col(_ind)  # dense (n_spots, 1) tensor
+                    _std = float(z.std())
                 assert (
-                    z.std() > 0
+                    _std > 1e-5
                 ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
                 z_list.append(z)
 
@@ -931,7 +1192,10 @@ class SplisosmNP:
                 if counts.is_sparse:
                     counts = counts.to_dense()
                 y = counts_to_ratios(
-                    counts, transformation=ratio_transformation, nan_filling=nan_filling
+                    counts,
+                    transformation=ratio_transformation,
+                    nan_filling=nan_filling,
+                    fill_before_transform=False,
                 )
                 for _f, z in enumerate(z_list):
                     hsic_all[_g, _f], pvals_all[_g, _f] = linear_hsic_test(
@@ -965,7 +1229,7 @@ class SplisosmNP:
             for _ind in tqdm(
                 range(n_factors), disable=(not print_progress), dynamic_ncols=True
             ):
-                z = self.design_mtx[:, _ind].clone()
+                z = self._get_design_col(_ind).squeeze(1)
                 assert (
                     z.std() > 0
                 ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
@@ -994,7 +1258,10 @@ class SplisosmNP:
                 if counts.is_sparse:
                     counts = counts.to_dense()
                 y = counts_to_ratios(
-                    counts, transformation=ratio_transformation, nan_filling=nan_filling
+                    counts,
+                    transformation=ratio_transformation,
+                    nan_filling=nan_filling,
+                    fill_before_transform=False,
                 )
 
                 if residualize == "both":
@@ -1018,6 +1285,18 @@ class SplisosmNP:
             stats_all = np.empty((n_genes, n_factors))
             pvals_all = np.empty((n_genes, n_factors))
 
+            # Pre-extract group columns once (sparse or dense) to avoid repeated
+            # column lookups inside the gene loop.
+            _design_is_sparse = scipy.sparse.issparse(self.design_mtx)
+            groups_list = [
+                (
+                    self.design_mtx.getcol(_ind)  # scipy sparse (n, 1)
+                    if _design_is_sparse
+                    else self.design_mtx[:, _ind]
+                )  # dense 1-D tensor
+                for _ind in range(n_factors)
+            ]
+
             # Outer loop: one gene at a time so each sparse tensor is densified once
             for _g, counts in enumerate(
                 tqdm(self.data, disable=(not print_progress), dynamic_ncols=True)
@@ -1028,11 +1307,12 @@ class SplisosmNP:
                     counts,
                     transformation=ratio_transformation,
                     nan_filling=nan_filling,
+                    fill_before_transform=False,
                 )
-                for _ind in range(n_factors):
+                for _ind, groups in enumerate(groups_list):
                     _stats, _pvals = _calc_ttest_differential_usage(
                         ratios,
-                        self.design_mtx[:, _ind],
+                        groups,
                         combine_pval=True,
                         combine_method=combine_method,
                     )

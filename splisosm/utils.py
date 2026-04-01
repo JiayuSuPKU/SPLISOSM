@@ -104,12 +104,32 @@ def counts_to_ratios(
     counts: np.ndarray | torch.Tensor,
     transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
     nan_filling: Literal["mean", "none"] = "mean",
+    fill_before_transform: Optional[bool] = None,
 ) -> torch.Tensor:
     """Convert isoform counts to proportions.
 
-    By default, isoform ratios at zero-coverage spots are filled with the mean ratio per isoform across all spots.
-    After conversion, the isoform ratios can be further transformed using log-ratio-based transformations
-    (clr, ilr, alr) or radial transformation :cite:`park2022kernel`.
+    Spots with zero total counts ("zero-coverage spots") are handled according to
+    ``nan_filling`` and ``fill_before_transform``.  When ``nan_filling='mean'`` the
+    zero-coverage rows are replaced with the per-isoform mean of the remaining rows.
+    The timing of this fill relative to the ratio transformation is controlled by
+    ``fill_before_transform``:
+
+    * ``False`` (**new default**): zero-coverage rows are filled with the column-wise
+      mean of the **transformed** values (i.e. after the ratio transform is applied).
+      For log-ratio transforms (clr, ilr, alr) this means pseudocount-filled rows are
+      replaced with the mean of the true transformed values.
+    * ``True`` (**old behaviour**): zero-coverage rows are filled with the mean of the
+      raw isoform ratios **before** the transformation is applied.  For log-ratio
+      transforms the pseudocount-based rows are kept as-is (no explicit fill).
+
+    .. note::
+        **Behaviour change since v1.1.0:** the default filling now happens *after*
+        transformation.  Code that relied on the previous before-transform fill
+        should pass ``fill_before_transform=True`` explicitly.  Passing
+        ``fill_before_transform=False`` adopts the new default without a warning.
+
+    After conversion, the isoform ratios can be further transformed using log-ratio-based
+    transformations (clr, ilr, alr) or radial transformation :cite:`park2022kernel`.
 
     Parameters
     ----------
@@ -124,8 +144,17 @@ def counts_to_ratios(
         ``'radial'``: radial transformation :cite:`park2022kernel`.
     nan_filling
         Method to fill all-zero rows.
-        ``'mean'``: fill all-zero rows with the mean of the mean per column **before transformation**.
+        ``'mean'``: fill all-zero rows with the per-isoform mean across expressed spots
+        (timing controlled by ``fill_before_transform``).
         ``'none'``: do not fill rows and return NaNs at all-zero rows.
+    fill_before_transform
+        Controls when zero-coverage rows are mean-filled relative to the ratio
+        transformation.  Only relevant when ``nan_filling='mean'`` and
+        ``transformation != 'none'``.
+        ``False``: fill **after** transformation (new default).
+        ``True``: fill **before** transformation (old behaviour).
+        ``None`` (default): use the new default (``False``) and emit a
+        :class:`FutureWarning` to inform callers of the behaviour change.
 
     Returns
     -------
@@ -153,6 +182,23 @@ def counts_to_ratios(
 
     assert nan_filling in ["mean", "none"]
 
+    # Resolve fill timing; warn when the new default differs from old behaviour.
+    if fill_before_transform is None:
+        if nan_filling == "mean" and transformation != "none":
+            warnings.warn(
+                "The default NaN-filling timing for `counts_to_ratios` has changed: "
+                "zero-coverage spots are now filled with the per-isoform mean "
+                "**after** the ratio transformation (previously filled before). "
+                "Pass `fill_before_transform=False` to silence this warning and "
+                "use the new default, or `fill_before_transform=True` to restore "
+                "the previous behaviour.",
+                FutureWarning,
+                stacklevel=2,
+            )
+        _fill_before = False
+    else:
+        _fill_before = fill_before_transform
+
     if isinstance(counts, np.ndarray):
         counts = torch.from_numpy(counts).float()
 
@@ -161,14 +207,20 @@ def counts_to_ratios(
 
     # calculate isoform ratios
     if transformation in ["clr", "ilr", "alr"]:
-        # add pseudocounts equal to 1% of the global mean per isoform to avoid zeros in the ratio
+        # add pseudocounts equal to 1% of the global mean per isoform to avoid zeros
         y = (1 - 1e-2) * counts + 1e-2 * counts.mean(0, keepdim=True)
-        y = y / y.sum(1, keepdim=True)  # isoform ratio without nans and zeros
+        y = y / y.sum(1, keepdim=True)
+        if nan_filling == "mean" and _fill_before:
+            # old behaviour: replace pseudocount-filled rows with the mean of
+            # the raw (pre-pseudocount) ratios of expressed spots
+            _raw = counts / counts.sum(1, keepdim=True)
+            if (~is_nan).any():
+                y[is_nan] = _raw[~is_nan].mean(0, keepdim=True)
     else:
-        y = counts / counts.sum(1, keepdim=True)  # isoform ratio with nans
-        # fill nan values with the mean ratio per column (isoform)
-        if nan_filling == "mean":
-            y[is_nan] = y[~is_nan].mean(0, keepdim=True)
+        y = counts / counts.sum(1, keepdim=True)  # NaN where is_nan
+        if nan_filling == "mean" and _fill_before:
+            if (~is_nan).any():
+                y[is_nan] = y[~is_nan].mean(0, keepdim=True)
 
     # apply transformation
     if transformation == "clr":
@@ -178,10 +230,13 @@ def counts_to_ratios(
     elif transformation == "alr":
         y = torch.from_numpy(alr(y)).float()  # (n_spots, n_isos - 1)
     elif transformation == "radial":
-        y = y / y.norm(dim=1, keepdim=True)  # radial transformation with nans
+        y = y / y.norm(dim=1, keepdim=True)  # NaN rows stay NaN
 
-    # fill back nan to rows with zero counts if needed
-    if nan_filling == "none":
+    # post-transform fill (new default) or explicit NaN restore
+    if nan_filling == "mean" and not _fill_before:
+        if is_nan.any() and (~is_nan).any():
+            y[is_nan] = y[~is_nan].mean(0, keepdim=True)
+    elif nan_filling == "none":
         y[is_nan] = torch.nan
 
     return y
@@ -478,6 +533,7 @@ def prepare_inputs_from_anndata(
     covariate_names: Optional[list[str]] = None,
     min_component_size: int = 1,
     k_neighbors: int = 4,
+    return_filtered_anndata: bool = False,
 ) -> tuple[
     list[torch.Tensor],
     torch.Tensor,
@@ -485,6 +541,7 @@ def prepare_inputs_from_anndata(
     Optional[Any],
     Optional[list[str]],
     "scipy.sparse.spmatrix | None",
+    "AnnData | None",
 ]:
     """Extract and filter isoform count tensors from an AnnData object.
 
@@ -537,6 +594,11 @@ def prepare_inputs_from_anndata(
         Number of nearest neighbours for the k-NN graph when
         ``adj_key`` is ``None`` and component filtering is active.
         Default 4.
+    return_filtered_anndata
+        If ``True``, return a copy of ``adata`` restricted to the spots and
+        isoforms that survived all filtering steps, with columns ordered to
+        match ``counts_list``.  Default ``False`` returns ``None`` as the
+        seventh element.
 
     Returns
     -------
@@ -562,6 +624,13 @@ def prepare_inputs_from_anndata(
           ``min_component_size > 1`` and filtering removed spots, or
         * ``None`` otherwise (caller should build k-NN inside
           :class:`~splisosm.kernel.SpatialCovKernel`).
+    filtered_adata : anndata.AnnData
+        A view of ``adata`` restricted to the spots and isoforms that survived
+        all filtering steps (component filtering + min_counts / min_bin_pct /
+        single-isoform-gene filtering).  Columns are ordered to match the
+        concatenation order of isoforms across genes in ``counts_list``.
+        This is useful for computing per-feature summary statistics without
+        re-running the filtering logic.
 
     Raises
     ------
@@ -791,6 +860,12 @@ def prepare_inputs_from_anndata(
         adata, design_mtx, covariate_names
     )
 
+    # Optionally build filtered adata: spots retained after component filtering, isoforms
+    # in the same order as all_iso_names_flat (matches counts_list gene/iso ordering).
+    filtered_adata = (
+        adata[:, all_iso_names_flat].copy() if return_filtered_anndata else None
+    )
+
     return (
         counts_list,
         coordinates,
@@ -798,6 +873,7 @@ def prepare_inputs_from_anndata(
         resolved_design,
         resolved_covariates,
         _adj_out,
+        filtered_adata,
     )
 
 
@@ -1305,6 +1381,7 @@ def run_hsic_gc(
             _,
             _,
             _adj_prebuilt,
+            _,  # filtered_adata — not used by run_hsic_gc
         ) = prepare_inputs_from_anndata(
             adata=adata,
             layer=layer,

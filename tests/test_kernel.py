@@ -2,7 +2,10 @@ import unittest
 import numpy as np
 import torch
 import itertools
-from splisosm.kernel import SpatialCovKernel, _build_adj_from_coords
+from splisosm.kernel import (
+    SpatialCovKernel,
+    _build_adj_from_coords,
+)
 from splisosm.utils import get_cov_sp
 
 
