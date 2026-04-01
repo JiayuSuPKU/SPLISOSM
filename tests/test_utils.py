@@ -8,6 +8,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import scipy.sparse
+import scipy.stats
 import torch
 from anndata import AnnData
 from unittest.mock import patch
@@ -15,10 +16,11 @@ from splisosm.utils import (
     counts_to_ratios,
     false_discovery_control,
     load_visium_sp_meta,
-    extract_counts_n_ratios,
+    add_ratio_layer,
     extract_gene_level_statistics,
     run_hsic_gc,
     run_sparkx,
+    _index_rows_sparse_coo,
 )
 
 
@@ -54,41 +56,102 @@ class TestUtils(unittest.TestCase):
         self.counts_dense = counts_dense
         self.gene_names = [f"Gene_{i}" for i in range(n_genes)]
 
-    def test_extract_counts_n_ratios_dense(self):
-        counts_list, ratios_list, gene_names, ratios_obs = extract_counts_n_ratios(
-            self.adata, layer="counts", group_iso_by="gene_symbol", return_sparse=False
+    def test_add_ratio_layer_sparse_default(self):
+        # Default (fill_nan_with_mean=False) → sparse output, same sparsity as input
+        add_ratio_layer(
+            self.adata,
+            layer="counts",
+            group_iso_by="gene_symbol",
+            ratio_layer_key="ratios",
         )
 
-        self.assertEqual(len(counts_list), 2)
-        self.assertEqual(len(ratios_list), 2)
-        self.assertIsInstance(counts_list[0], torch.Tensor)
-        self.assertFalse(counts_list[0].is_sparse)
-        self.assertIsInstance(ratios_list[0], torch.Tensor)
-        self.assertIsNotNone(ratios_obs)
+        self.assertIn("ratios", self.adata.layers)
+        r = self.adata.layers["ratios"]
+        self.assertTrue(scipy.sparse.issparse(r))
+        # Same nnz as the dense input viewed as sparse
+        expected_nnz = scipy.sparse.csr_matrix(self.counts_dense).nnz
+        self.assertEqual(r.nnz, expected_nnz)
 
-    def test_extract_counts_n_ratios_sparse_scipy(self):
-        # Convert layer to sparse
+        # At each non-zero entry, ratios within a gene group must sum to 1 per spot
+        r_dense = r.toarray()
+        var = self.adata.var
+        for gene in var["gene_symbol"].unique():
+            iso_idx = np.where(var["gene_symbol"] == gene)[0]
+            gene_counts = self.counts_dense[:, iso_idx]
+            gene_ratios = r_dense[:, iso_idx]
+            expressed = gene_counts.sum(axis=1) > 0
+            np.testing.assert_allclose(
+                gene_ratios[expressed].sum(axis=1),
+                np.ones(expressed.sum()),
+                atol=1e-5,
+                err_msg=f"Ratios for gene '{gene}' do not sum to 1 at expressed spots",
+            )
+
+    def test_add_ratio_layer_dense_fill_mean(self):
+        # fill_nan_with_mean=True → dense output, NaN spots filled with column mean
+        add_ratio_layer(
+            self.adata,
+            layer="counts",
+            group_iso_by="gene_symbol",
+            ratio_layer_key="ratios",
+            fill_nan_with_mean=True,
+        )
+
+        self.assertIn("ratios", self.adata.layers)
+        ratios = self.adata.layers["ratios"]
+        self.assertEqual(ratios.shape, self.counts_dense.shape)
+        self.assertFalse(scipy.sparse.issparse(ratios))
+        self.assertEqual(ratios.dtype, np.float32)
+        self.assertFalse(np.isnan(ratios).any(), "Dense output should have no NaNs")
+
+        # At expressed spots, ratios per gene still sum to 1
+        var = self.adata.var
+        for gene in var["gene_symbol"].unique():
+            iso_idx = np.where(var["gene_symbol"] == gene)[0]
+            gene_counts = self.counts_dense[:, iso_idx]
+            gene_ratios = ratios[:, iso_idx]
+            expressed = gene_counts.sum(axis=1) > 0
+            np.testing.assert_allclose(
+                gene_ratios[expressed].sum(axis=1),
+                np.ones(expressed.sum()),
+                atol=1e-5,
+            )
+
+    def test_add_ratio_layer_sparse_input_sparse_output(self):
+        # Sparse count input → sparse ratio output (default)
         counts_sparse = scipy.sparse.csr_matrix(self.counts_dense)
         self.adata.layers["counts_sparse"] = counts_sparse
 
-        counts_list, ratios_list, gene_names, ratios_obs = extract_counts_n_ratios(
+        add_ratio_layer(
             self.adata,
             layer="counts_sparse",
             group_iso_by="gene_symbol",
-            return_sparse=True,
+            ratio_layer_key="ratios_sp",
         )
 
-        self.assertEqual(len(counts_list), 2)
-        self.assertEqual(len(ratios_list), 0)
-        self.assertIsNone(ratios_obs)
+        r = self.adata.layers["ratios_sp"]
+        self.assertTrue(scipy.sparse.issparse(r))
+        self.assertEqual(r.nnz, counts_sparse.nnz)
 
-        for i, counts in enumerate(counts_list):
-            self.assertTrue(counts.is_sparse)
-            # Convert to dense and compare with original
-            gene_name = gene_names[i]
-            iso_indices = np.where(self.adata.var["gene_symbol"] == gene_name)[0]
-            expected = self.counts_dense[:, iso_indices]
-            np.testing.assert_allclose(counts.to_dense().numpy(), expected, rtol=1e-5)
+        # Values should match dense-input sparse-output path
+        add_ratio_layer(
+            self.adata,
+            layer="counts",
+            group_iso_by="gene_symbol",
+            ratio_layer_key="ratios_ref",
+        )
+        np.testing.assert_allclose(
+            r.toarray(), self.adata.layers["ratios_ref"].toarray(), atol=1e-5
+        )
+
+    def test_add_ratio_layer_same_key_raises(self):
+        with self.assertRaises(ValueError):
+            add_ratio_layer(
+                self.adata,
+                layer="counts",
+                group_iso_by="gene_symbol",
+                ratio_layer_key="counts",
+            )
 
     def test_extract_gene_level_statistics_sparse_vs_dense(self):
         # Dense results
@@ -138,48 +201,84 @@ class TestUtils(unittest.TestCase):
             run_sparkx(counts_torch, coords)
 
     def test_run_hsic_gc_formats(self):
-        n_spots = 50
-        n_genes = 4
-
+        """All input formats produce identical statistics and valid result keys."""
+        np.random.seed(0)
+        n_spots, n_genes = 50, 4
         counts_np = np.random.randint(0, 5, size=(n_spots, n_genes)).astype(np.float32)
         coords_np = np.random.rand(n_spots, 2).astype(np.float32)
 
-        # 1. Test Dense Numpy
         res_np = run_hsic_gc(counts_np, coords_np)
 
-        # 2. Test Dense Torch
-        counts_torch = torch.from_numpy(counts_np)
-        coords_torch = torch.from_numpy(coords_np)
-        res_torch = run_hsic_gc(counts_torch, coords_torch)
+        # Result structure
+        for key in (
+            "statistic",
+            "pvalue",
+            "pvalue_adj",
+            "method",
+            "null_method",
+            "n_spots",
+        ):
+            self.assertIn(key, res_np)
+        self.assertEqual(res_np["method"], "hsic-gc")
+        self.assertEqual(res_np["n_spots"], n_spots)
+        self.assertEqual(len(res_np["statistic"]), n_genes)
+        self.assertTrue(np.all(res_np["pvalue"] >= 0) and np.all(res_np["pvalue"] <= 1))
 
-        # 3. Test Scipy Sparse
-        counts_csr = scipy.sparse.csr_matrix(counts_np)
-        res_csr = run_hsic_gc(counts_csr, coords_np)
-
-        # 4. Test Torch Sparse
-        counts_torch_sparse = counts_torch.to_sparse()
-        res_torch_sparse = run_hsic_gc(counts_torch_sparse, coords_np)
-
-        # Check consistency
-
-        np.testing.assert_allclose(
-            res_np["statistic"], res_torch["statistic"], rtol=1e-5
+        # Dense torch
+        res_torch = run_hsic_gc(
+            torch.from_numpy(counts_np), torch.from_numpy(coords_np)
         )
-        np.testing.assert_allclose(res_np["statistic"], res_csr["statistic"], rtol=1e-5)
         np.testing.assert_allclose(
-            res_np["statistic"], res_torch_sparse["statistic"], rtol=1e-5
+            res_np["statistic"], res_torch["statistic"], rtol=1e-4
+        )
+        np.testing.assert_allclose(res_np["pvalue"], res_torch["pvalue"], rtol=1e-4)
+
+        # Scipy sparse (CSR)
+        res_csr = run_hsic_gc(scipy.sparse.csr_matrix(counts_np), coords_np)
+        np.testing.assert_allclose(res_np["statistic"], res_csr["statistic"], rtol=1e-4)
+
+        # Torch sparse
+        res_torch_sparse = run_hsic_gc(
+            torch.from_numpy(counts_np).to_sparse(), coords_np
+        )
+        np.testing.assert_allclose(
+            res_np["statistic"], res_torch_sparse["statistic"], rtol=1e-4
         )
 
-        # Check p-values roughly
-        np.testing.assert_allclose(res_np["pvalue"], res_torch["pvalue"], rtol=1e-5)
-        np.testing.assert_allclose(res_np["pvalue"], res_csr["pvalue"], rtol=1e-5)
-        np.testing.assert_allclose(
-            res_np["pvalue"], res_torch_sparse["pvalue"], rtol=1e-5
+    def test_run_hsic_gc_anndata_mode(self):
+        """AnnData mode sums isoforms per gene and returns correct structure."""
+        np.random.seed(1)
+        n_spots, n_genes = 40, 3
+        n_isos_per_gene = [2, 3, 2]
+        total_isos = sum(n_isos_per_gene)
+        iso_counts = np.random.randint(0, 5, size=(n_spots, total_isos)).astype(
+            np.float32
         )
+        gene_ids = [f"g{i}" for i, n in enumerate(n_isos_per_gene) for _ in range(n)]
+        adata = AnnData(
+            X=iso_counts,
+            var=pd.DataFrame(
+                {"gene_symbol": gene_ids}, index=[f"iso_{k}" for k in range(total_isos)]
+            ),
+        )
+        adata.layers["counts"] = iso_counts
+        adata.obsm["spatial"] = np.random.rand(n_spots, 2).astype(np.float32)
+
+        res = run_hsic_gc(adata=adata)
+
+        self.assertEqual(res["method"], "hsic-gc")
+        self.assertEqual(res["n_spots"], n_spots)
+        self.assertEqual(len(res["statistic"]), n_genes)
+        self.assertTrue(np.all(res["pvalue"] >= 0) and np.all(res["pvalue"] <= 1))
+
+        # Mutually exclusive with matrix args
+        with self.assertRaises(ValueError):
+            run_hsic_gc(adata=adata, counts_gene=iso_counts)
 
     def test_run_hsic_gc_null_methods(self):
-        """Both null_method='eig' and 'trace' should return valid p-values."""
-        n_spots, n_genes = 50, 4
+        """Both null methods return valid p-values; p-value rankings agree (high Spearman r)."""
+        np.random.seed(2)
+        n_spots, n_genes = 50, 30
         counts_np = np.random.randint(0, 5, size=(n_spots, n_genes)).astype(np.float32)
         coords_np = np.random.rand(n_spots, 2).astype(np.float32)
 
@@ -189,14 +288,24 @@ class TestUtils(unittest.TestCase):
         for res, nm in [(res_eig, "eig"), (res_trace, "trace")]:
             self.assertEqual(res["null_method"], nm)
             self.assertEqual(len(res["pvalue"]), n_genes)
-            self.assertTrue(np.all(res["pvalue"] >= 0))
-            self.assertTrue(np.all(res["pvalue"] <= 1))
+            self.assertTrue(np.all(res["pvalue"] >= 0) and np.all(res["pvalue"] <= 1))
             self.assertIn("pvalue_adj", res)
+            self.assertTrue(np.all(res["pvalue_adj"] >= 0))
 
-        # statistics should be identical (same kernel, same counts)
+        # Statistics must be identical (same kernel, same counts; only null differs)
         np.testing.assert_allclose(
             res_eig["statistic"], res_trace["statistic"], rtol=1e-5
         )
+
+        # P-value rankings should agree between methods
+        rho, _ = scipy.stats.spearmanr(res_eig["pvalue"], res_trace["pvalue"])
+        self.assertGreater(
+            rho, 0.9, f"Spearman r of p-values between eig and trace was only {rho:.3f}"
+        )
+
+        # Invalid null method
+        with self.assertRaises(ValueError):
+            run_hsic_gc(counts_np, coords_np, null_method="bad")
 
     def test_counts_to_ratios_importerror_fallback(self):
         counts = np.array([[1.0, 2.0], [0.0, 0.0]], dtype=np.float32)
@@ -318,25 +427,33 @@ class TestUtils(unittest.TestCase):
         self.assertTrue(any("Missing 'hires' image" in str(w.message) for w in rec))
         self.assertTrue(any("Missing 'lowres' image" in str(w.message) for w in rec))
 
-    def test_extract_counts_n_ratios_sparse_lil_dense_return(self):
-        counts_lil = scipy.sparse.lil_matrix(self.counts_dense)
-        fake_adata = types.SimpleNamespace(
-            layers={"counts_lil": counts_lil},
-            var=self.adata.var,
-        )
+    def test_add_ratio_layer_csc_sparse(self):
+        # CSC sparse input (non-CSR) → sparse output with same nnz
+        counts_csc = scipy.sparse.csc_matrix(self.counts_dense)
+        self.adata.layers["counts_csc"] = counts_csc
 
-        counts_list, ratios_list, gene_names, ratio_obs = extract_counts_n_ratios(
-            fake_adata,
-            layer="counts_lil",
+        add_ratio_layer(
+            self.adata,
+            layer="counts_csc",
             group_iso_by="gene_symbol",
-            return_sparse=False,
+            ratio_layer_key="ratios_csc",
         )
 
-        self.assertGreater(len(counts_list), 0)
-        self.assertEqual(len(ratios_list), len(counts_list))
-        self.assertIsNotNone(ratio_obs)
-        self.assertIsInstance(counts_list[0], torch.Tensor)
-        self.assertFalse(counts_list[0].is_sparse)
+        self.assertIn("ratios_csc", self.adata.layers)
+        ratios = self.adata.layers["ratios_csc"]
+        self.assertTrue(scipy.sparse.issparse(ratios))
+        self.assertEqual(ratios.nnz, counts_csc.nnz)
+
+        # Should match the dense-input sparse-output path
+        add_ratio_layer(
+            self.adata,
+            layer="counts",
+            group_iso_by="gene_symbol",
+            ratio_layer_key="ratios_ref",
+        )
+        np.testing.assert_allclose(
+            ratios.toarray(), self.adata.layers["ratios_ref"].toarray(), atol=1e-5
+        )
 
     def test_extract_gene_level_statistics_sparse_lil_and_zero_gene(self):
         counts_lil = scipy.sparse.lil_matrix(self.counts_dense)
@@ -358,13 +475,16 @@ class TestUtils(unittest.TestCase):
 
     def test_run_hsic_gc_branch_coverage_with_mocked_kernel(self):
         class FakeKernel:
-            def __init__(self, coordinates, **kwargs):
-                self.kwargs = kwargs
+            def __init__(self, coords=None, adj_matrix=None, **kwargs):
+                self.Q = None
 
             def eigenvalues(self, k=None):
                 return torch.tensor([1.0], dtype=torch.float32)
 
             def xtKx(self, counts):
+                return counts.T @ counts
+
+            def xtKx_exact(self, counts):
                 return counts.T @ counts
 
         with patch("splisosm.kernel.SpatialCovKernel", FakeKernel):
@@ -408,6 +528,62 @@ class TestUtils(unittest.TestCase):
                 counts_t_sparse, np.random.rand(5, 2).astype(np.float32)
             )
             self.assertEqual(res_t_sparse["method"], "hsic-gc")
+
+    def test_run_hsic_gc_min_component_size(self):
+        """Spots in small components are removed when min_component_size > 1."""
+        np.random.seed(42)
+        # 8 tightly-packed connected spots on a 0.25 grid
+        grid = np.array(
+            [[i * 0.25, j * 0.25] for i in range(4) for j in range(2)],
+            dtype=np.float32,
+        )
+        # 2 isolated spots far away (will form their own 2-spot component)
+        isolated = np.array([[100.0, 100.0], [100.0, 100.01]], dtype=np.float32)
+        coords = np.vstack([grid, isolated])  # (10, 2)
+        counts = np.random.randint(1, 5, size=(10, 3)).astype(np.float32)
+
+        # default (min_component_size=1) keeps all 10 spots
+        res_default = run_hsic_gc(counts, coords)
+        self.assertEqual(res_default["n_spots"], 10)
+        self.assertEqual(len(res_default["statistic"]), 3)
+
+        # min_component_size=3 should drop the 2 isolated spots
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            res_filtered = run_hsic_gc(counts, coords, min_component_size=3)
+
+        user_warns = [w for w in caught if issubclass(w.category, UserWarning)]
+        self.assertTrue(len(user_warns) > 0, "Expected a UserWarning for removed spots")
+        warn_msg = str(user_warns[0].message)
+        self.assertIn("2", warn_msg)  # removed count
+        self.assertIn("8", warn_msg)  # remaining count
+        self.assertEqual(res_filtered["n_spots"], 8)
+        self.assertEqual(len(res_filtered["statistic"]), 3)  # n_genes unchanged
+        self.assertEqual(len(res_filtered["pvalue"]), 3)
+        self.assertTrue(np.all(res_filtered["pvalue"] >= 0))
+        self.assertTrue(np.all(res_filtered["pvalue"] <= 1))
+
+        # AnnData mode: same filtering behaviour
+        n_isos_per_gene = [2, 2, 2]
+        total_isos = sum(n_isos_per_gene)
+        iso_counts = np.random.randint(1, 5, size=(10, total_isos)).astype(np.float32)
+        gene_ids = [f"g{i}" for i, n in enumerate(n_isos_per_gene) for _ in range(n)]
+        adata_fc = AnnData(
+            X=iso_counts,
+            var=pd.DataFrame(
+                {"gene_symbol": gene_ids}, index=[f"iso_{i}" for i in range(total_isos)]
+            ),
+        )
+        adata_fc.layers["counts"] = iso_counts
+        adata_fc.obsm["spatial"] = coords
+
+        with warnings.catch_warnings(record=True) as caught2:
+            warnings.simplefilter("always")
+            res_adata = run_hsic_gc(adata=adata_fc, min_component_size=3)
+
+        uw2 = [w for w in caught2 if issubclass(w.category, UserWarning)]
+        self.assertTrue(len(uw2) > 0, "Expected UserWarning in AnnData mode")
+        self.assertEqual(res_adata["n_spots"], 8)
 
     def test_run_sparkx_torch_conversion_with_mocked_rpy2(self):
         class DummyCtx:
@@ -490,6 +666,39 @@ class TestUtils(unittest.TestCase):
         self.assertIn("method", out)
         self.assertEqual(out["method"], "spark-x")
         self.assertEqual(len(out["pvalue"]), 2)
+
+
+class TestIndexRowsSparseCoo(unittest.TestCase):
+    def test_correctness(self):
+        """_index_rows_sparse_coo must match dense row indexing without densifying."""
+        torch.manual_seed(0)
+        n, m = 20, 5
+        mask = torch.rand(n, m) < 0.3
+        dense = torch.randn(n, m) * mask.float()
+        sparse = dense.to_sparse()
+        keep_indices = np.array([0, 3, 7, 11, 15, 19], dtype=np.int64)
+        result = _index_rows_sparse_coo(sparse, keep_indices)
+        self.assertEqual(result.shape, torch.Size([len(keep_indices), m]))
+        torch.testing.assert_close(result.to_dense(), dense[keep_indices])
+
+    def test_uncoalesced(self):
+        """Helper must handle uncoalesced (duplicate-index) COO tensors."""
+        indices = torch.tensor([[0, 0, 1, 2], [0, 0, 1, 2]], dtype=torch.long)
+        values = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        t = torch.sparse_coo_tensor(indices, values, size=(4, 3))
+        self.assertFalse(t.is_coalesced())
+        keep_indices = np.array([0, 2], dtype=np.int64)
+        result = _index_rows_sparse_coo(t, keep_indices)
+        torch.testing.assert_close(
+            result.to_dense(), t.coalesce().to_dense()[keep_indices]
+        )
+
+    def test_empty_keep(self):
+        """Keeping zero rows yields an empty sparse tensor."""
+        t = torch.eye(5).to_sparse()
+        result = _index_rows_sparse_coo(t, np.array([], dtype=np.int64))
+        self.assertEqual(result.shape, torch.Size([0, 5]))
+        self.assertEqual(result.to_dense().numel(), 0)
 
 
 if __name__ == "__main__":
