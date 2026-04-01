@@ -246,34 +246,42 @@ class TestUtils(unittest.TestCase):
         )
 
     def test_run_hsic_gc_anndata_mode(self):
-        """AnnData mode sums isoforms per gene and returns correct structure."""
+        """AnnData mode loads adata.X / adata.layers[layer] as gene-level counts."""
         np.random.seed(1)
-        n_spots, n_genes = 40, 3
-        n_isos_per_gene = [2, 3, 2]
-        total_isos = sum(n_isos_per_gene)
-        iso_counts = np.random.randint(0, 5, size=(n_spots, total_isos)).astype(
-            np.float32
-        )
-        gene_ids = [f"g{i}" for i, n in enumerate(n_isos_per_gene) for _ in range(n)]
+        n_spots, n_genes = 40, 5
+        gene_counts = np.random.randint(0, 5, size=(n_spots, n_genes)).astype(np.float32)
         adata = AnnData(
-            X=iso_counts,
-            var=pd.DataFrame(
-                {"gene_symbol": gene_ids}, index=[f"iso_{k}" for k in range(total_isos)]
-            ),
+            X=gene_counts,
+            var=pd.DataFrame(index=[f"gene_{k}" for k in range(n_genes)]),
         )
-        adata.layers["counts"] = iso_counts
+        adata.layers["raw"] = gene_counts
         adata.obsm["spatial"] = np.random.rand(n_spots, 2).astype(np.float32)
 
+        # Default: uses adata.X
         res = run_hsic_gc(adata=adata)
-
         self.assertEqual(res["method"], "hsic-gc")
         self.assertEqual(res["n_spots"], n_spots)
         self.assertEqual(len(res["statistic"]), n_genes)
         self.assertTrue(np.all(res["pvalue"] >= 0) and np.all(res["pvalue"] <= 1))
+        for key in ("statistic", "pvalue", "pvalue_adj", "method", "null_method", "n_spots"):
+            self.assertIn(key, res)
+
+        # layer= selects adata.layers[layer]; results should match (same data)
+        res_layer = run_hsic_gc(adata=adata, layer="raw")
+        np.testing.assert_allclose(res["statistic"], res_layer["statistic"], rtol=1e-5)
+
+        # Sparse adata.X also works
+        adata_sp = AnnData(
+            X=scipy.sparse.csr_matrix(gene_counts),
+            var=adata.var.copy(),
+        )
+        adata_sp.obsm["spatial"] = adata.obsm["spatial"]
+        res_sp = run_hsic_gc(adata=adata_sp)
+        np.testing.assert_allclose(res["statistic"], res_sp["statistic"], rtol=1e-4)
 
         # Mutually exclusive with matrix args
         with self.assertRaises(ValueError):
-            run_hsic_gc(adata=adata, counts_gene=iso_counts)
+            run_hsic_gc(adata=adata, counts_gene=gene_counts)
 
     def test_run_hsic_gc_null_methods(self):
         """Both null methods return valid p-values; p-value rankings agree (high Spearman r)."""
@@ -564,17 +572,11 @@ class TestUtils(unittest.TestCase):
         self.assertTrue(np.all(res_filtered["pvalue"] <= 1))
 
         # AnnData mode: same filtering behaviour
-        n_isos_per_gene = [2, 2, 2]
-        total_isos = sum(n_isos_per_gene)
-        iso_counts = np.random.randint(1, 5, size=(10, total_isos)).astype(np.float32)
-        gene_ids = [f"g{i}" for i, n in enumerate(n_isos_per_gene) for _ in range(n)]
+        gene_counts_fc = np.random.randint(1, 5, size=(10, 3)).astype(np.float32)
         adata_fc = AnnData(
-            X=iso_counts,
-            var=pd.DataFrame(
-                {"gene_symbol": gene_ids}, index=[f"iso_{i}" for i in range(total_isos)]
-            ),
+            X=gene_counts_fc,
+            var=pd.DataFrame(index=[f"gene_{i}" for i in range(3)]),
         )
-        adata_fc.layers["counts"] = iso_counts
         adata_fc.obsm["spatial"] = coords
 
         with warnings.catch_warnings(record=True) as caught2:
@@ -699,6 +701,254 @@ class TestIndexRowsSparseCoo(unittest.TestCase):
         result = _index_rows_sparse_coo(t, np.array([], dtype=np.int64))
         self.assertEqual(result.shape, torch.Size([0, 5]))
         self.assertEqual(result.to_dense().numel(), 0)
+
+
+class TestRunHsicGc(unittest.TestCase):
+    """Comprehensive tests for run_hsic_gc — matrix mode and AnnData mode."""
+
+    # ── shared fixtures ────────────────────────────────────────────────────────
+
+    @classmethod
+    def _make_matrix_inputs(cls, n_spots=50, n_genes=6, seed=0):
+        rng = np.random.default_rng(seed)
+        counts = rng.integers(0, 8, size=(n_spots, n_genes)).astype(np.float32)
+        coords = rng.random((n_spots, 2)).astype(np.float32)
+        return counts, coords
+
+    @classmethod
+    def _make_adata(cls, n_spots=50, n_genes=6, seed=1, sparse=False):
+        rng = np.random.default_rng(seed)
+        X = rng.integers(0, 8, size=(n_spots, n_genes)).astype(np.float32)
+        coords = rng.random((n_spots, 2)).astype(np.float32)
+        if sparse:
+            X_store = scipy.sparse.csr_matrix(X)
+        else:
+            X_store = X
+        adata = AnnData(
+            X=X_store,
+            var=pd.DataFrame(index=[f"gene_{i}" for i in range(n_genes)]),
+        )
+        adata.layers["raw"] = X_store
+        adata.obsm["spatial"] = coords
+        return adata, X, coords
+
+    # ── matrix mode ───────────────────────────────────────────────────────────
+
+    def test_matrix_mode_numpy_basic(self):
+        """Matrix mode with numpy arrays returns correct result structure."""
+        counts, coords = self._make_matrix_inputs()
+        res = run_hsic_gc(counts, coords)
+        for key in ("statistic", "pvalue", "pvalue_adj", "method", "null_method", "n_spots"):
+            self.assertIn(key, res)
+        self.assertEqual(res["method"], "hsic-gc")
+        self.assertEqual(res["null_method"], "eig")
+        self.assertEqual(res["n_spots"], counts.shape[0])
+        self.assertEqual(len(res["statistic"]), counts.shape[1])
+        self.assertTrue(np.all(res["pvalue"] >= 0))
+        self.assertTrue(np.all(res["pvalue"] <= 1))
+        self.assertTrue(np.all(res["pvalue_adj"] >= 0))
+        self.assertTrue(np.all(res["pvalue_adj"] <= 1))
+
+    def test_matrix_mode_torch_dense(self):
+        """Matrix mode with torch dense tensor matches numpy result."""
+        counts, coords = self._make_matrix_inputs()
+        res_np = run_hsic_gc(counts, coords)
+        res_t = run_hsic_gc(torch.from_numpy(counts), torch.from_numpy(coords))
+        np.testing.assert_allclose(res_np["statistic"], res_t["statistic"], rtol=1e-4)
+        np.testing.assert_allclose(res_np["pvalue"], res_t["pvalue"], rtol=1e-4)
+
+    def test_matrix_mode_scipy_sparse(self):
+        """Matrix mode with scipy sparse (CSR and CSC) matches numpy result."""
+        counts, coords = self._make_matrix_inputs()
+        res_np = run_hsic_gc(counts, coords)
+        for fmt in (scipy.sparse.csr_matrix, scipy.sparse.csc_matrix):
+            res = run_hsic_gc(fmt(counts), coords)
+            np.testing.assert_allclose(res_np["statistic"], res["statistic"], rtol=1e-4)
+
+    def test_matrix_mode_torch_sparse(self):
+        """Matrix mode with torch sparse COO matches numpy result."""
+        counts, coords = self._make_matrix_inputs()
+        res_np = run_hsic_gc(counts, coords)
+        res_sp = run_hsic_gc(torch.from_numpy(counts).to_sparse(), coords)
+        np.testing.assert_allclose(res_np["statistic"], res_sp["statistic"], rtol=1e-4)
+
+    def test_matrix_mode_null_method_trace(self):
+        """'trace' null method returns valid p-values and same statistic as 'eig'."""
+        counts, coords = self._make_matrix_inputs()
+        res_eig = run_hsic_gc(counts, coords, null_method="eig")
+        res_trace = run_hsic_gc(counts, coords, null_method="trace")
+        self.assertEqual(res_trace["null_method"], "trace")
+        np.testing.assert_allclose(
+            res_eig["statistic"], res_trace["statistic"], rtol=1e-5
+        )
+        self.assertTrue(np.all(res_trace["pvalue"] >= 0))
+        self.assertTrue(np.all(res_trace["pvalue"] <= 1))
+
+    def test_matrix_mode_invalid_null_method(self):
+        """Invalid null_method raises ValueError."""
+        counts, coords = self._make_matrix_inputs()
+        with self.assertRaises(ValueError):
+            run_hsic_gc(counts, coords, null_method="bogus")
+
+    def test_matrix_mode_missing_both_args(self):
+        """Calling with neither adata nor counts_gene raises ValueError."""
+        with self.assertRaises(ValueError):
+            run_hsic_gc(counts_gene=None, coordinates=None)
+
+    def test_matrix_mode_missing_coordinates(self):
+        """Calling with counts_gene but no coordinates raises ValueError."""
+        counts, _ = self._make_matrix_inputs()
+        with self.assertRaises(ValueError):
+            run_hsic_gc(counts_gene=counts)
+
+    def test_matrix_mode_min_component_size_removes_isolated_spots(self):
+        """min_component_size > 1 removes spots in small components (matrix mode)."""
+        rng = np.random.default_rng(7)
+        # 8 spots on a tight 0.1-spaced grid
+        grid = np.array(
+            [[i * 0.1, j * 0.1] for i in range(4) for j in range(2)], dtype=np.float32
+        )
+        # 2 isolated spots far away
+        isolated = np.array([[50.0, 50.0], [50.0, 50.01]], dtype=np.float32)
+        coords = np.vstack([grid, isolated])
+        counts = rng.integers(1, 5, size=(10, 4)).astype(np.float32)
+
+        # Default keeps all spots
+        res_default = run_hsic_gc(counts, coords)
+        self.assertEqual(res_default["n_spots"], 10)
+
+        # min_component_size=3 drops the 2-spot island
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            res_filt = run_hsic_gc(counts, coords, min_component_size=3)
+        user_warns = [w for w in caught if issubclass(w.category, UserWarning)]
+        self.assertTrue(len(user_warns) > 0)
+        self.assertIn("2", str(user_warns[0].message))
+        self.assertEqual(res_filt["n_spots"], 8)
+        self.assertEqual(len(res_filt["statistic"]), 4)
+
+    def test_matrix_mode_statistic_is_nonneg(self):
+        """All HSIC statistics are non-negative."""
+        counts, coords = self._make_matrix_inputs(n_genes=10)
+        res = run_hsic_gc(counts, coords)
+        self.assertTrue(np.all(res["statistic"] >= 0))
+
+    # ── AnnData mode ──────────────────────────────────────────────────────────
+
+    def test_anndata_mode_dense_X(self):
+        """AnnData with dense adata.X returns correct gene-level results."""
+        adata, X, _ = self._make_adata()
+        res = run_hsic_gc(adata=adata)
+        for key in ("statistic", "pvalue", "pvalue_adj", "method", "null_method", "n_spots"):
+            self.assertIn(key, res)
+        self.assertEqual(res["method"], "hsic-gc")
+        self.assertEqual(res["n_spots"], X.shape[0])
+        self.assertEqual(len(res["statistic"]), X.shape[1])
+        self.assertTrue(np.all(res["pvalue"] >= 0))
+        self.assertTrue(np.all(res["pvalue"] <= 1))
+
+    def test_anndata_mode_sparse_X(self):
+        """AnnData with sparse adata.X matches dense result."""
+        adata_dense, _, _ = self._make_adata(sparse=False)
+        adata_sparse, _, _ = self._make_adata(sparse=True)
+        res_dense = run_hsic_gc(adata=adata_dense)
+        res_sparse = run_hsic_gc(adata=adata_sparse)
+        np.testing.assert_allclose(
+            res_dense["statistic"], res_sparse["statistic"], rtol=1e-4
+        )
+
+    def test_anndata_mode_layer_selects_layer(self):
+        """layer= selects adata.layers[layer] (same data → same result as adata.X)."""
+        adata, _, _ = self._make_adata()
+        res_X = run_hsic_gc(adata=adata)
+        res_layer = run_hsic_gc(adata=adata, layer="raw")
+        np.testing.assert_allclose(
+            res_X["statistic"], res_layer["statistic"], rtol=1e-5
+        )
+
+    def test_anndata_mode_matches_matrix_mode(self):
+        """AnnData mode produces the same statistic as equivalent matrix-mode call."""
+        adata, X, coords = self._make_adata()
+        res_adata = run_hsic_gc(adata=adata)
+        res_matrix = run_hsic_gc(X, coords)
+        np.testing.assert_allclose(
+            res_adata["statistic"], res_matrix["statistic"], rtol=1e-4
+        )
+
+    def test_anndata_mode_min_counts_filter(self):
+        """min_counts filters out low-expression genes."""
+        rng = np.random.default_rng(3)
+        n_spots, n_genes = 40, 8
+        X = rng.integers(0, 4, size=(n_spots, n_genes)).astype(np.float32)
+        # Force first gene to all zeros → total count = 0
+        X[:, 0] = 0.0
+        adata = AnnData(
+            X=X, var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+        )
+        adata.obsm["spatial"] = rng.random((n_spots, 2)).astype(np.float32)
+        res = run_hsic_gc(adata=adata, min_counts=1)
+        # Gene 0 (all-zero) should be filtered out
+        self.assertLess(len(res["statistic"]), n_genes)
+
+    def test_anndata_mode_min_bin_pct_filter(self):
+        """min_bin_pct filters out genes expressed in too few spots."""
+        rng = np.random.default_rng(4)
+        n_spots, n_genes = 40, 8
+        X = rng.integers(0, 4, size=(n_spots, n_genes)).astype(np.float32)
+        # Force gene 0 to be non-zero in only 1 spot
+        X[:, 0] = 0.0
+        X[0, 0] = 5.0
+        adata = AnnData(
+            X=X, var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+        )
+        adata.obsm["spatial"] = rng.random((n_spots, 2)).astype(np.float32)
+        # gene 0 expressed in 1/40 = 0.025 of spots → filtered when pct > 0.05
+        res = run_hsic_gc(adata=adata, min_bin_pct=0.05)
+        self.assertLess(len(res["statistic"]), n_genes)
+
+    def test_anndata_mode_min_component_size(self):
+        """AnnData mode removes spots in small components when min_component_size > 1."""
+        rng = np.random.default_rng(5)
+        grid = np.array(
+            [[i * 0.1, j * 0.1] for i in range(4) for j in range(2)], dtype=np.float32
+        )
+        isolated = np.array([[50.0, 50.0], [50.0, 50.01]], dtype=np.float32)
+        coords = np.vstack([grid, isolated])
+        X = rng.integers(1, 5, size=(10, 3)).astype(np.float32)
+        adata = AnnData(
+            X=X, var=pd.DataFrame(index=[f"g{i}" for i in range(3)])
+        )
+        adata.obsm["spatial"] = coords
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            res = run_hsic_gc(adata=adata, min_component_size=3)
+        user_warns = [w for w in caught if issubclass(w.category, UserWarning)]
+        self.assertTrue(len(user_warns) > 0)
+        self.assertEqual(res["n_spots"], 8)
+        self.assertEqual(len(res["statistic"]), 3)
+
+    def test_anndata_mode_mutex_with_matrix_args(self):
+        """Providing adata together with counts_gene or coordinates raises ValueError."""
+        adata, X, coords = self._make_adata()
+        with self.assertRaises(ValueError):
+            run_hsic_gc(adata=adata, counts_gene=X)
+        with self.assertRaises(ValueError):
+            run_hsic_gc(adata=adata, counts_gene=X, coordinates=coords)
+
+    def test_anndata_mode_adj_key(self):
+        """adj_key loads a pre-built adjacency from adata.obsp."""
+        from splisosm.kernel import _build_adj_from_coords
+
+        adata, X, coords = self._make_adata()
+        coords_t = torch.from_numpy(coords)
+        adj = _build_adj_from_coords(coords_t, k_neighbors=4, mutual_neighbors=True)
+        adata.obsp["spatial_adj"] = adj
+
+        res_adj = run_hsic_gc(adata=adata, adj_key="spatial_adj")
+        # Should complete without error and return correct n_genes
+        self.assertEqual(len(res_adj["statistic"]), X.shape[1])
+        self.assertTrue(np.all(res_adj["pvalue"] >= 0))
 
 
 if __name__ == "__main__":

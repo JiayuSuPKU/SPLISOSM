@@ -850,7 +850,9 @@ def prepare_inputs_from_anndata(
                 np.vstack((_coo.row, _coo.col)).astype(np.int64, copy=False)
             )
             _v = torch.from_numpy(_coo.data)  # already float32
-            _counts = torch.sparse_coo_tensor(_i, _v, torch.Size(_coo.shape))
+            _counts = torch.sparse_coo_tensor(
+                _i, _v, torch.Size(_coo.shape), check_invariants=False
+            )
         else:
             _counts = sub_tensor[:, start:end]  # zero-copy view
         counts_list.append(_counts)
@@ -992,7 +994,7 @@ def extract_counts_n_ratios(
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[str], Optional[np.ndarray]]:
     """Extract per-gene lists of isoform counts and ratios from anndata.
 
-    .. deprecated::
+    .. deprecated:: 1.1.0
         Use :func:`add_ratio_layer` to compute ratios and store them in
         ``adata.layers``, then use
         :func:`prepare_inputs_from_anndata` with the ratio layer key to
@@ -1134,6 +1136,12 @@ def extract_gene_level_statistics(
         - ``'count_std'``: float. Standard deviation of counts per gene.
         - ``'perplexity'``: float. Expression-based effective number of isoforms.
         - ``'major_ratio_avg'``: float. Average ratio of the major isoform.
+
+    See Also
+    --------
+    :func:`splisosm.hyptest_np.SplisosmNP.extract_feature_summary`
+    :func:`splisosm.hyptest_glmm.SplisosmGLMM.extract_feature_summary`
+
     """
     # extract isoform counts
     iso_counts = adata.layers[layer]  # (n_spots, n_isos_total)
@@ -1284,13 +1292,11 @@ def run_hsic_gc(
     null_configs: Optional[dict[str, Any]] = None,
     min_component_size: int = 1,
     adata: "AnnData | None" = None,
-    layer: str = "counts",
-    group_iso_by: str = "gene_symbol",
+    layer: "str | None" = None,
     spatial_key: str = "spatial",
     adj_key: "str | None" = None,
     min_counts: int = 0,
     min_bin_pct: float = 0.0,
-    filter_single_iso_genes: bool = False,
     **spatial_kernel_kwargs: Any,
 ) -> dict[str, Any]:
     """Compute the HSIC-GC statistic for gene-level counts.
@@ -1324,15 +1330,13 @@ def run_hsic_gc(
         The default value of ``1`` disables filtering.
         A ``UserWarning`` is issued whenever spots are removed.
     adata : AnnData or None, optional
-        If provided, extract gene-level counts by summing isoforms per gene
-        from ``adata.layers[layer]`` grouped by ``group_iso_by``, and use
-        ``adata.obsm[spatial_key]`` for coordinates.  Mutually exclusive
-        with ``counts_gene`` / ``coordinates``.
-    layer : str, optional
-        Layer key in ``adata.layers``.  Used only in AnnData mode.
-    group_iso_by : str, optional
-        Column in ``adata.var`` grouping isoforms by gene.  Used only in
-        AnnData mode.
+        If provided, use ``adata.X`` (when ``layer=None``) or
+        ``adata.layers[layer]`` as ``counts_gene`` — a ``(n_spots, n_genes)``
+        count matrix (dense or sparse) — and ``adata.obsm[spatial_key]`` for
+        coordinates.  Mutually exclusive with ``counts_gene`` / ``coordinates``.
+    layer : str or None, optional
+        Layer key in ``adata.layers``.  When ``None`` (default), ``adata.X``
+        is used.  Used only in AnnData mode.
     spatial_key : str, optional
         Key in ``adata.obsm`` for spatial coordinates.  Used only in
         AnnData mode.
@@ -1342,13 +1346,9 @@ def run_hsic_gc(
         ``adata.obsp[adj_key]`` and used for both component filtering and
         the spatial kernel construction.  Ignored in matrix mode.
     min_counts : int, optional
-        Minimum total isoform count to retain an isoform in AnnData mode.
-        Default 0.
+        Minimum total count to retain a gene in AnnData mode.  Default 0.
     min_bin_pct : float, optional
-        Minimum fraction of spots expressing an isoform.  Default 0.
-    filter_single_iso_genes : bool, optional
-        Whether to remove single-isoform genes in AnnData mode.  Default
-        ``False`` (gene-level analysis does not require multiple isoforms).
+        Minimum fraction of spots expressing a gene (count > 0).  Default 0.
     **spatial_kernel_kwargs
         Additional arguments forwarded to :class:`~splisosm.kernel.SpatialCovKernel`.
 
@@ -1365,7 +1365,7 @@ def run_hsic_gc(
         - ``'n_spots'``: number of spots after component filtering.
     """
 
-    # ── AnnData mode: extract gene-level counts ───────────────────────────────
+    # ── AnnData mode: load gene-level counts directly ────────────────────────
     _adj_prebuilt: "scipy.sparse.spmatrix | None" = None
     if adata is not None:
         if counts_gene is not None or coordinates is not None:
@@ -1373,40 +1373,80 @@ def run_hsic_gc(
                 "When `adata` is provided, `counts_gene` and `coordinates` "
                 "must not be provided."
             )
-        _k = spatial_kernel_kwargs.get("k_neighbors", 4)
-        (
-            _counts_list,
-            _coords_t,
-            _,
-            _,
-            _,
-            _adj_prebuilt,
-            _,  # filtered_adata — not used by run_hsic_gc
-        ) = prepare_inputs_from_anndata(
-            adata=adata,
-            layer=layer,
-            group_iso_by=group_iso_by,
-            spatial_key=spatial_key,
-            min_counts=min_counts,
-            min_bin_pct=min_bin_pct,
-            filter_single_iso_genes=filter_single_iso_genes,
-            gene_names=None,
-            design_mtx=None,
-            covariate_names=None,
-            min_component_size=min_component_size,
-            adj_key=adj_key,
-            k_neighbors=_k,
+
+        # Load count matrix: adata.X or adata.layers[layer]
+        _raw = adata.X if layer is None else adata.layers[layer]
+
+        # Convert to torch (keep sparse as COO for now)
+        if scipy.sparse.issparse(_raw):
+            _coo = _raw.tocoo().astype(np.float32)
+            _i = torch.from_numpy(
+                np.vstack((_coo.row, _coo.col)).astype(np.int64, copy=False)
+            )
+            _v = torch.from_numpy(_coo.data)
+            counts_gene = torch.sparse_coo_tensor(
+                _i, _v, torch.Size(_coo.shape), check_invariants=False
+            )
+        else:
+            counts_gene = torch.as_tensor(np.asarray(_raw, dtype=np.float32))
+
+        # Apply gene-level filters (min_counts, min_bin_pct)
+        if min_counts > 0 or min_bin_pct > 0:
+            _dense = counts_gene.to_dense() if counts_gene.is_sparse else counts_gene
+            _gene_totals = _dense.sum(0)  # (n_genes,)
+            _gene_bin_pcts = (_dense > 0).float().mean(0)  # (n_genes,)
+            _gene_mask = (_gene_totals >= min_counts) & (_gene_bin_pcts >= min_bin_pct)
+            counts_gene = (
+                counts_gene.to_dense()[:, _gene_mask]
+                if counts_gene.is_sparse
+                else counts_gene[:, _gene_mask]
+            )
+
+        # Load spatial coordinates
+        coordinates = torch.as_tensor(
+            np.asarray(adata.obsm[spatial_key], dtype=np.float32)
         )
-        # Sum isoforms per gene → (n_spots, n_genes) dense float tensor
-        _gene_counts = []
-        for _c in _counts_list:
-            if _c.is_sparse:
-                _gene_counts.append(_c.to_dense().sum(dim=1))
+
+        # Load pre-built adjacency if provided
+        if adj_key is not None:
+            _adj_prebuilt = adata.obsp[adj_key]
+
+        # Component filtering (same logic as matrix mode below)
+        if min_component_size > 1:
+            from splisosm.kernel import _build_adj_from_coords
+
+            _k_adata = spatial_kernel_kwargs.get("k_neighbors", 4)
+            if _adj_prebuilt is not None:
+                _adj_for_comp = scipy.sparse.csc_matrix(_adj_prebuilt)
             else:
-                _gene_counts.append(_c.sum(dim=1))
-        counts_gene = torch.stack(_gene_counts, dim=1).float()
-        coordinates = _coords_t
-        # Filtering already done above — skip in the rest of this function
+                _adj_for_comp = _build_adj_from_coords(
+                    coordinates, k_neighbors=_k_adata, mutual_neighbors=True
+                ).tocsc()
+            _, _labels = _connected_components(_adj_for_comp, directed=False)
+            _comp_sizes = np.bincount(_labels)
+            _keep_mask = _comp_sizes[_labels] >= min_component_size
+            _n_removed = int((~_keep_mask).sum())
+            if _n_removed > 0:
+                warnings.warn(
+                    f"Removed {_n_removed} spot(s) belonging to graph components "
+                    f"with fewer than {min_component_size} member(s). "
+                    f"{int(_keep_mask.sum())} spot(s) remain.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                _dense_cg = (
+                    counts_gene.to_dense() if counts_gene.is_sparse else counts_gene
+                )
+                counts_gene = _dense_cg[_keep_mask]
+                coordinates = coordinates[_keep_mask]
+                if _adj_prebuilt is not None:
+                    _adj_prebuilt = scipy.sparse.csc_matrix(_adj_prebuilt)[_keep_mask][
+                        :, _keep_mask
+                    ]
+                else:
+                    _adj_prebuilt = _adj_for_comp[_keep_mask][:, _keep_mask]
+
+        # Filtering already done above — skip component filtering below
         min_component_size = 1
     elif counts_gene is None or coordinates is None:
         raise ValueError(
