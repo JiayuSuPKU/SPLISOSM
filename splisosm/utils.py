@@ -625,7 +625,7 @@ def prepare_inputs_from_anndata(
         * ``None`` otherwise (caller should build k-NN inside
           :class:`~splisosm.kernel.SpatialCovKernel`).
     filtered_adata : anndata.AnnData
-        A view of ``adata`` restricted to the spots and isoforms that survived
+        A copy of ``adata`` restricted to the spots and isoforms that survived
         all filtering steps (component filtering + min_counts / min_bin_pct /
         single-isoform-gene filtering).  Columns are ordered to match the
         concatenation order of isoforms across genes in ``counts_list``.

@@ -8,53 +8,111 @@ Choosing a model class
 
 SPLISOSM provides three model classes:
 
-- :class:`~splisosm.SplisosmNP` — Non-parametric HSIC tests with low-rank kernel approximation. Works on both regular and irregular geometries (e.g., segmented spatial data or even single-cell data).
-- :class:`~splisosm.SplisosmGLMM` — Parametric GLMM-based DU test with spatial random effects.
-- :class:`~splisosm.SplisosmFFT` — FFT-accelerated HSIC tests on **regular grids** (Visium HD, Xenium binned data). Shares the same statistical model as :class:`~splisosm.SplisosmNP`. Recommended for large datasets for fast computation and memory efficiency.
+- :class:`~splisosm.SplisosmNP` — Non-parametric HSIC tests with a sparse CAR spatial kernel. Works on both regular and irregular geometries (e.g., segmented spatial data or even single-cell data).
+- :class:`~splisosm.SplisosmFFT` — Same tests as :class:`~splisosm.SplisosmNP` but with FFT-accelerated implementation for data on **regular grids** (e.g., Visium HD, Xenium binned data).
+- :class:`~splisosm.SplisosmGLMM` — Parametric Multinomial-based DU test with spatial random effects. The GLM model is similar to conventional (bulk) differential splicing analysis. The GLMM model is extended to handle cross-spot variability.
+
+Use the decision tree below to pick the right class for your dataset.
+For methodological details of each test, see :doc:`Statistical Methods <methods>`.
+
+.. code-block:: text
+
+   Is your data on a REGULAR GRID (Visium HD, Xenium binned, etc.)?
+   ├── YES  →  SplisosmFFT  (fastest, requires SpatialData input)
+   └── NO  (Slide-seq, single-cell segmented data, etc.)
+       │
+       Are you interested in parametric model fitting (effect sizes, covariates)?
+       ├── YES  →  SplisosmGLMM (not calibrated for SV, but can be used for DU testing)
+       └── NO  →  SplisosmNP  (the most general, supports both SV and DU testing)
+
+Summary of class features:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 8 8 15 15 15 24
+
+   * - Model class
+     - SV
+     - DU
+     - Input type
+     - Geometry
+     - Speed
+     - Low-rank approximation
+   * - :class:`~splisosm.SplisosmNP`
+     - ✓
+     - ✓
+     - AnnData
+     - any
+     - fast
+     - optional via ``null_configs={"approx_rank": k}`` for SV, and ``gpr_configs={"covariate": {"n_inducing": m}}`` for DU.
+   * - :class:`~splisosm.SplisosmFFT`
+     - ✓
+     - ✓
+     - SpatialData
+     - grid only
+     - fastest
+     - N/A (FFT-based; no eigendecomposition)
+   * - :class:`~splisosm.SplisosmGLMM`
+     - ✗
+     - ✓
+     - AnnData
+     - any
+     - slow
+     - optional via ``approx_rank=k`` at ``SplisosmGLMM()`` construction time.
 
 Inputs and outputs
 ------------------
 
 :class:`~splisosm.SplisosmNP` and :class:`~splisosm.SplisosmGLMM` accept isoform-level quantification as either an ``AnnData`` object or as raw tensors.
-See :doc:`Feature Quantification page <txquant>` for guidance on preparing input data for different platforms.
 
 .. code-block:: python
 
    model.setup_data(
-       adata,                    # AnnData of shape (n_spots, n_isoforms)
-       spatial_key="spatial",    # key in adata.obsm for spatial coordinates
-       layer="counts",           # layer containing raw isoform counts
-       group_iso_by="gene_symbol",  # adata.var column grouping isoforms by gene
-       gene_names="gene_symbol",  # adata.var column for gene names
-       min_counts=10,
-       min_bin_pct=0.01,
-       design_mtx=covariates,        # (n_spots, n_factors) optional for DU testing
-       covariate_names=covariate_names,  # list of covariate names
+       adata,                        # AnnData of shape (n_spots, n_isoforms)
+       spatial_key="spatial",        # key in adata.obsm for spatial coordinates
+       layer="counts",               # layer containing raw isoform counts
+       group_iso_by="gene_symbol",   # adata.var column grouping isoforms by gene
+       gene_names="gene_symbol",     # adata.var column for gene names
+       # ----- Differential usage testing
+       design_mtx=covariates,           # (n_spots, n_factors)
+       covariate_names=covariate_names, # list of covariate names
+       # ----- Spot filtering options (for removing disconnected tissue fragments, etc.)
+       min_component_size=1,         # minimal size of a connected spatial k-NN graph component to keep
+       # ----- Feature filtering options (applied after spot filtering)
+       min_counts=10,                # minimal total counts per isoform to keep
+       min_bin_pct=0.01,             # minimal proportion of non-zero expression spots per isoform to keep
+       filter_single_iso_genes=True, # remove genes with only one isoform (no usage variation)
    )
 
 .. note::
-    For versions of SPLISOSM prior to v1.0.4, `setup_data` takes the legacy arguments 
-    ``data``, ``coordinates``, which can be computed from `adata` via :func:`splisosm.utils.extract_counts_n_ratios`.
-    Please check the API documentation :func:`SplisosmNP.setup_data` for details.
+    Since ``v1.1.0``, the ``approx_rank`` argument was moved out of ``setup_data``:
+
+    * **SplisosmNP** — pass ``null_configs={"approx_rank": k}`` to
+      :meth:`~splisosm.SplisosmNP.test_spatial_variability` to cap the eigenvalue
+      rank used for the HSIC null distribution.
+    * **SplisosmGLMM** — pass ``approx_rank=k`` to :class:`~splisosm.SplisosmGLMM`
+      at construction time to control the low-rank spatial kernel approximation.
+    * **SplisosmFFT** uses FFT-based convolutions instead of eigendecomposition and
+      does not support ``approx_rank`` or ``null_configs``.
 
 For :class:`~splisosm.SplisosmFFT`, pass a ``SpatialData`` object with isoform-level counts to ``setup_data``.
 
 .. code-block:: python
 
    model.setup_data(
-       sdata,                    # SpatialData object
+       sdata,                     # SpatialData object
        bins="Visium_HD_Mouse_Brain_square_016um",  # SpatialData bin element name
        table_name="square_016um", # adata containing isoform-level counts
-       col_key="array_col",
-       row_key="array_row",
-       layer="counts",
-       group_iso_by="gene_ids",  # adata.var column grouping isoforms by gene
+       col_key="array_col",       # adata.obs column for array column indices
+       row_key="array_row",       # adata.obs column for array row indices
+       layer="counts",            # layer containing raw isoform counts
+       group_iso_by="gene_ids",   # adata.var column grouping isoforms by gene
        gene_names="gene_name",    # adata.var column for gene names
        min_counts=10,
        min_bin_pct=0.01,
    )
 
-
+See :doc:`Feature Quantification page <txquant>` for guidance on preparing input data from different spatial transcriptomics platforms. 
 All model classes share the same output convention:
 
 - **SV results**: a ``DataFrame`` with per-gene test statistics and p-values.
@@ -104,18 +162,20 @@ SPLISOSM tests for statistical independence between isoform expression and spati
        spatial_key="spatial",
        layer="counts",
        group_iso_by="gene_symbol",
-       approx_rank=100,   # lower rank speeds up computation for large datasets
        min_counts=10,
        min_bin_pct=0.01,
    )
    model.test_spatial_variability(
        method="hsic-ir",
-       ratio_transformation="none",  # 'none', 'clr', 'ilr', 'alr', 'radial'
+       ratio_transformation="none",
        nan_filling="mean",
+       # null_method: 'eig' (default, Liu's method), 'trace' (normal approx)
+       # null_configs: optional dict; e.g. {"approx_rank": 20} to cap eigenvalues
+       null_method="eig",
    )
    df_sv_res = model.get_formatted_test_results(test_type="sv")
 
-**SplisosmFFT** (regular grids only — binned Visium HD, Xenium)
+**SplisosmFFT** (regular grids only — SpatialData input)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: python
@@ -141,12 +201,12 @@ SPLISOSM tests for statistical independence between isoform expression and spati
 Testing for differential isoform usage (DU)
 --------------------------------------------
 
-DU tests identify genes whose isoform usage is associated with a covariate (e.g., spatial domain, RBP expression), conditioned on spatial correlation. Two approaches are available.
+DU tests identify genes whose isoform usage is associated with a covariate (e.g., spatial domain, RBP expression), conditioned on spatial correlation.
 
 **SplisosmNP** (non-parametric, HSIC-based)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Uses conditional HSIC with Gaussian process (GP) spatial detrending:
+Uses Gaussian process regression (GPR) to remove spatial autocorrelation.
 
 .. code-block:: python
 
@@ -162,17 +222,44 @@ Uses conditional HSIC with Gaussian process (GP) spatial detrending:
        adata=adata_svp,
        spatial_key="spatial",
        layer="counts",
-       design_mtx=covariates,        # (n_spots, n_factors)
        group_iso_by="gene_symbol",
-       covariate_names=covariate_names,
-       approx_rank=None
+       design_mtx=covariates,        # (n_spots, n_factors)
+       covariate_names=covariate_names, # list of RBP names
    )
    model.test_differential_usage(
-       method="hsic-gp",  # 'hsic', 'hsic-knn', 'hsic-gp', 't-fisher', 't-tippett'
+       method="hsic-gp",  # 'hsic', 'hsic-gp', 't-fisher', 't-tippett'
        ratio_transformation="none",
        nan_filling="mean",
        print_progress=True,
    )
+   df_du_res = model.get_formatted_test_results(test_type="du")
+
+
+**SplisosmFFT** (Same as SplisosmNP but regular grids only)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Same test as :class:`~splisosm.SplisosmNP` but with FFT-accelerated implementation of Gaussian process regression for regular grid data.
+
+.. code-block:: python
+
+   from splisosm import SplisosmFFT
+
+   model = SplisosmFFT(neighbor_degree=1, rho=0.99)
+   model_du_fft.setup_data(
+       sdata=sdata,
+       bins=test_bins_element, # the 16um bin for rasterization
+       table_name="square_016um_svp", # probe counts from SVP genes
+       # design_mtx : can be stored as a separate table in the same SpatialData object
+       design_mtx="square_016um_rbp_sve",
+       col_key="array_col",
+       row_key="array_row",
+       layer="counts",
+       group_iso_by="gene_ids",
+       gene_names="gene_name",
+       min_counts=10,
+       min_bin_pct=0.01,
+    )
+   model.test_differential_usage(method="hsic-gp", n_jobs=-1, print_progress=True)
    df_du_res = model.get_formatted_test_results(test_type="du")
 
 
@@ -186,23 +273,198 @@ Fits a multinomial GLMM with a Gaussian random field spatial random effect. The 
    from splisosm import SplisosmGLMM
 
    model_p = SplisosmGLMM(
-       model_type="glmm-full",  # 'glmm-full', 'glmm-null', 'glm'
+       model_type="glmm-full",   # 'glmm-full' | 'glmm-null' | 'glm'
        fitting_method="joint_gd",
+       device="cpu",             # 'cpu' | 'cuda' (NVIDIA GPU) | 'mps' (Apple Silicon)
+       approx_rank=None,         # None = full rank; int = low-rank approximation
    )
    model_p.setup_data(
        adata=adata_svp,
        spatial_key="spatial",
        layer="counts",
-       design_mtx=covariates,        # (n_spots, n_factors)
        group_iso_by="gene_symbol",
+       group_gene_by_n_iso=True,    # required for batch_size > 1
+       design_mtx=covariates,       # (n_spots, n_factors) array or obs column name
        covariate_names=covariate_names,
-       group_gene_by_n_iso=True,
    )
    model_p.fit(
        n_jobs=2, batch_size=20,
-       with_design_mtx=False,  # fit null model first for score test
+       with_design_mtx=False,       # False → score test (recommended); True → Wald test
        refit_null=True,
        print_progress=True,
    )
    model_p.test_differential_usage(method="score", print_progress=True)
    df_du_res = model_p.get_formatted_test_results(test_type="du")
+
+Performance tuning and configuration reference
+------------------------------------------------
+
+Each model class has its own set of tuning knobs.  All options have sensible defaults;
+adjust them only when you hit performance or accuracy limits.
+
+
+.. raw:: html
+
+   <details>
+   <summary><strong>SplisosmNP / run_hsic_gc — configuration options (click to expand)</strong></summary>
+   <br>
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 36 14 24
+
+   * - Feature
+     - How to set
+     - Default
+     - Trade-off
+   * - **SV null approximation**
+     - ``null_method=`` in ``test_spatial_variability`` / ``run_hsic_gc``
+     - ``"eig"`` (Liu's chi-square mixture)
+     - ``"trace"`` (moment-matching normal) avoids eigendecomposition
+       entirely — fastest for very large *n* but p-values may be slightly
+       less calibrated in the tails.  ``"perm"`` uses permutation; slowest
+       but assumption-free.
+   * - **SV null low-rank** (when ``null_method="eig"``)
+     - ``null_configs={"approx_rank": k}`` in ``test_spatial_variability`` /
+       ``run_hsic_gc``
+     - Auto: full rank when ``n_spots ≤ 5000``, else ``⌈4√n⌉``
+     - Restricts test statistic and null computation to the top-*k* eigenvalues; 
+       significant speedup for large *n* with potential power loss for high-frequency patterns 
+       (usually rare in real spatial data).
+   * - **Conditional DU test** (``method="hsic-gp"``)
+     - ``residualize=`` in ``test_differential_usage``
+     - ``"cov_only"``
+     - ``"cov_only"`` removes spatial effects from covariates only — fastest and
+       recommended in most cases.  ``"both"`` additionally residualizes
+       isoform ratios, which is more conservative and can be more robust in case 
+       the covariate residualization is incomplete.
+   * - **GPR backend** (DU, ``method="hsic-gp"``)
+     - ``gpr_backend=`` in ``test_differential_usage``
+     - ``"sklearn"``
+     - ``"gpytorch"`` uses the FITC sparse-GP approximation with GPU support.  
+        Tends to be slower than ``"sklearn"`` on CPU due to overhead.
+   * - **GPR inducing points** (DU, ``method="hsic-gp"``)
+     - ``gpr_configs={"covariate": {"n_inducing": M}}`` in
+       ``test_differential_usage``
+     - ``5000`` (subset-of-data for sklearn; FITC for gpytorch)
+     - Reduces GP fitting cost from O(*n*³) to O(*nM*²).
+       Accuracy degrades if *M* is too small.
+       Set to ``None`` for exact GP (warns when ``n_spots > 10000``).
+   * - **Other GPR configuration**
+     - ``gpr_configs=`` in ``test_differential_usage``
+     - See :func:`test_differential_usage <splisosm.hyptest_np.SplisosmNP.test_differential_usage>` docstring for details
+     - Adjust ``constant_value_bounds`` or ``length_scale_bounds`` to tune the hyperparameter
+       searching ranges.
+
+.. raw:: html
+
+   </details>
+
+.. raw:: html
+
+   <details>
+   <summary><strong>SplisosmFFT — configuration options (click to expand)</strong></summary>
+   <br>
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 36 14 24
+
+   * - Feature
+     - How to set
+     - Default
+     - Trade-off
+   * - **FFT thread count**
+     - ``SplisosmFFT(workers=N)``
+     - ``None`` (all available CPUs, via ``scipy.fft``)
+     - Controls the number of threads used for the FFT-based spatial
+       convolutions.  Set to ``1`` to disable multi-threading (e.g. when
+       already parallelising at the gene level with ``n_jobs``).
+   * - **SV parallel jobs**
+     - ``n_jobs=`` in ``test_spatial_variability``
+     - ``-1`` (all CPUs)
+     - Number of joblib workers for gene-wise HSIC computation.  Set to
+       ``1`` to disable parallelism (useful when ``workers > 1`` already
+       saturates the CPU).
+   * - **DU parallel jobs**
+     - ``n_jobs=`` in ``test_differential_usage``
+     - ``-1`` (all CPUs)
+     - Number of joblib workers for (gene, covariate) pair computation.
+       Same trade-off as for ``test_spatial_variability``.
+   * - **Conditional DU test** (``method="hsic-gp"``)
+     - ``residualize=`` in ``test_differential_usage``
+     - ``"cov_only"``
+     - Same semantics as :class:`~splisosm.SplisosmNP`: ``"cov_only"``
+       residualizes covariates only; ``"both"`` also residualizes isoform
+       ratios.
+   * - **Other GPR configuration**
+     - ``gpr_configs=`` in ``test_differential_usage``
+     - See :func:`test_differential_usage <splisosm.hyptest_fft.SplisosmFFT.test_differential_usage>` docstring for details
+     - Adjust ``constant_value_bounds`` or ``length_scale_bounds`` to tune the hyperparameter
+       searching ranges.
+
+.. raw:: html
+
+   </details>
+
+
+.. raw:: html
+
+   <details>
+   <summary><strong>SplisosmGLMM — configuration options (click to expand)</strong></summary>
+   <br>
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 32 14 28
+
+   * - Feature
+     - How to set
+     - Default
+     - Trade-off
+   * - **GPU acceleration**
+     - ``SplisosmGLMM(device=...)``
+     - ``"cpu"``
+     - Use ``"cuda"`` (NVIDIA) or ``"mps"`` (Apple Silicon) for a large
+       per-gene speed-up.  Parallel fitting (``n_jobs > 1``) is
+       auto-disabled on non-CPU devices because fork-based workers cannot
+       share GPU context.
+   * - **Low-rank spatial kernel**
+     - ``SplisosmGLMM(approx_rank=k)``
+     - Auto: full rank when ``n_spots ≤ 5 000``, else ``⌈4√n⌉``
+     - Fewer eigenvectors → faster fitting and lower memory (with accuracy loss).
+       Pass ``None`` to force full rank regardless of ``n_spots``.
+   * - **Fitting method**
+     - ``SplisosmGLMM(fitting_method=...)``
+     - ``"joint_gd"``
+     - ``"joint_gd"`` maximises the joint likelihood by gradient descent —
+       fastest.  ``"marginal_gd"`` / ``"marginal_newton"`` integrate out the
+       random effect via second-order Laplace approximation and give more accurate
+       variance posteriors at but are significantly more expensive.
+   * - **Parallel gene fitting** (CPU only)
+     - ``fit(n_jobs=N, batch_size=B)``
+     - ``n_jobs=1``, ``batch_size=1``
+     - Near-linear speed-up with ``n_jobs`` on multi-core CPUs; 
+       disabled automatically when ``device != "cpu"``.
+       ``batch_size > 1`` requires ``group_gene_by_n_iso=True`` in
+       ``setup_data``, which batches genes with the same number of isoforms together 
+       to utilize PyTorch's efficient batched operations.
+   * - **Model complexity**
+     - ``SplisosmGLMM(model_type=...)``
+     - ``"glmm-full"``
+     - ``"glm"`` fits a GLM without any random effect — fastest but ignores
+       spatial autocorrelation and may inflate FDR.  Use for quick
+       screening or as a baseline.
+   * - **Variance sharing across isoforms**
+     - ``SplisosmGLMM(share_variance=False)``
+     - ``True`` (one shared σ)
+     - ``False`` fits one variance component per isoform — more flexible
+       but slower and prone to overfitting for genes with many isoforms.
+   * - **Other GLMM configuration**
+     - ``SplisosmGLMM(...)``
+     - See :class:`SplisosmGLMM <splisosm.hyptest_glmm.SplisosmGLMM>` docstring for details
+     - Adjust ``var_fix_sigma`` to disable total variance estimation and fix σ to a constant value.
+
+.. raw:: html
+
+   </details>

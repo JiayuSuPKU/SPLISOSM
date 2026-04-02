@@ -49,29 +49,38 @@ class SplisosmGLMM:
 
     Examples
     --------
-    Setup data:
+    Prepare an AnnData object and fit a GLMM:
 
     >>> from splisosm import SplisosmGLMM
-    >>> import torch
-    >>> # Simulate data for 10 genes with different number of isoforms
-    >>> data_3_iso = [torch.randint(low=0, high=5, size=(100, 3)) for _ in range(5)]  # 5 genes with 3 isoforms
-    >>> data_4_iso = [torch.randint(low=0, high=5, size=(100, 4)) for _ in range(5)]  # 5 genes with 4 isoforms
-    >>> data = data_3_iso + data_4_iso
-    >>> coordinates = torch.rand(100, 2)  # 100 spots with 2D coordinates
-    >>> design_mtx = torch.rand(100, 2)  # 100 spots with 2 covariates
-
-    Model fitting:
-
-    >>> model = SplisosmGLMM(model_type='glmm-full')
-    >>> model.setup_data(data, coordinates, design_mtx=design_mtx, group_gene_by_n_iso=True)
-    >>> model.fit(n_jobs=1, batch_size=5, with_design_mtx=False)
+    >>> # adata : AnnData of shape (n_spots, n_isoforms)
+    >>> #   adata.layers["counts"]    — raw isoform counts
+    >>> #   adata.var["gene_symbol"]  — column grouping isoforms by gene
+    >>> #   adata.obsm["spatial"]     — (n_spots, 2) spatial coordinates
+    >>> #   adata.obs["covariate"]    — optional covariate column for DU testing
+    >>> model = SplisosmGLMM(
+    ...     model_type="glmm-full",    # 'glmm-full' | 'glmm-null' | 'glm'
+    ...     fitting_method="joint_gd", # 'joint_gd' | 'joint_newton' | 'marginal_gd' | 'marginal_newton'
+    ...     device="cpu",              # 'cpu' | 'cuda' (NVIDIA) | 'mps' (Apple Silicon)
+    ...     approx_rank=None,          # None (exact) or int (low-rank spatial kernel)
+    ... )
+    >>> model.setup_data(
+    ...     adata,
+    ...     layer="counts",
+    ...     group_iso_by="gene_symbol",
+    ...     group_gene_by_n_iso=True,  # required for batch_size > 1 in fit()
+    ...     design_mtx="covariate",    # obs column name, or (n_spots, n_factors) array
+    ... )
+    >>> model.fit(
+    ...     n_jobs=1, batch_size=20,
+    ...     with_design_mtx=False,     # False → score test (recommended for DU)
+    ...     refit_null=True,
+    ... )
     >>> fitted_models = model.get_fitted_models()
-    >>> print(fitted_models[0])  # print the fitted model for the first gene
 
     Differential usage test:
 
-    >>> model.test_differential_usage(method='score')
-    >>> du_results = model.get_formatted_test_results('du')
+    >>> model.test_differential_usage(method="score")  # or "wald" if with_design_mtx=True
+    >>> du_results = model.get_formatted_test_results("du")
     >>> print(du_results.head())
     """
 
@@ -1847,9 +1856,7 @@ class SplisosmGLMM:
 
             # calculate the p-value using chi-square distribution
             # move to CPU before scipy (scipy does not support non-CPU tensors)
-            _du_wald_pvals = 1 - chi2.cdf(
-                _du_wald_stats.cpu(), df=_du_wald_dfs.cpu()
-            )
+            _du_wald_pvals = 1 - chi2.cdf(_du_wald_stats.cpu(), df=_du_wald_dfs.cpu())
             _du_wald_pvals = torch.tensor(_du_wald_pvals)
 
             # store the results (always on CPU for downstream pandas/numpy usage)

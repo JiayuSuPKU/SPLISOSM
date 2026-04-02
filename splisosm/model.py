@@ -240,9 +240,11 @@ class MultinomGLM(BaseModel, nn.Module):
                 "Only one isoform provided. Please use a different count model."
             )
 
-        assert device in ["cpu", "cuda", "mps"], (
-            f"device must be 'cpu', 'cuda', or 'mps'; got {device!r}"
-        )
+        assert device in [
+            "cpu",
+            "cuda",
+            "mps",
+        ], f"device must be 'cpu', 'cuda', or 'mps'; got {device!r}"
         self.device = torch.device(device)
 
         if counts.ndim == 2:
@@ -1093,9 +1095,11 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         """
         # need to switch to a different count model (e.g., Poisson) when only one isoform is provided
 
-        assert device in ["cpu", "cuda", "mps"], (
-            f"device must be 'cpu', 'cuda', or 'mps'; got {device!r}"
-        )
+        assert device in [
+            "cpu",
+            "cuda",
+            "mps",
+        ], f"device must be 'cpu', 'cuda', or 'mps'; got {device!r}"
         self.device = torch.device(device)
 
         if counts.ndim == 2:

@@ -1454,7 +1454,7 @@ class TestSplisosmGLMMDevice(unittest.TestCase):
         model._device = "cuda"
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            import multiprocessing as _mp
+
             n_jobs = 2
             if n_jobs > 1 and model._device != "cpu":
                 warnings.warn(
@@ -1464,12 +1464,14 @@ class TestSplisosmGLMMDevice(unittest.TestCase):
                     stacklevel=1,
                 )
         device_warnings = [
-            w for w in caught
+            w
+            for w in caught
             if issubclass(w.category, UserWarning)
             and "Falling back to n_jobs=1" in str(w.message)
         ]
         self.assertGreater(
-            len(device_warnings), 0,
+            len(device_warnings),
+            0,
             "Expected a UserWarning about n_jobs fallback for non-CPU device",
         )
 

@@ -249,7 +249,9 @@ class TestUtils(unittest.TestCase):
         """AnnData mode loads adata.X / adata.layers[layer] as gene-level counts."""
         np.random.seed(1)
         n_spots, n_genes = 40, 5
-        gene_counts = np.random.randint(0, 5, size=(n_spots, n_genes)).astype(np.float32)
+        gene_counts = np.random.randint(0, 5, size=(n_spots, n_genes)).astype(
+            np.float32
+        )
         adata = AnnData(
             X=gene_counts,
             var=pd.DataFrame(index=[f"gene_{k}" for k in range(n_genes)]),
@@ -263,7 +265,14 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(res["n_spots"], n_spots)
         self.assertEqual(len(res["statistic"]), n_genes)
         self.assertTrue(np.all(res["pvalue"] >= 0) and np.all(res["pvalue"] <= 1))
-        for key in ("statistic", "pvalue", "pvalue_adj", "method", "null_method", "n_spots"):
+        for key in (
+            "statistic",
+            "pvalue",
+            "pvalue_adj",
+            "method",
+            "null_method",
+            "n_spots",
+        ):
             self.assertIn(key, res)
 
         # layer= selects adata.layers[layer]; results should match (same data)
@@ -738,7 +747,14 @@ class TestRunHsicGc(unittest.TestCase):
         """Matrix mode with numpy arrays returns correct result structure."""
         counts, coords = self._make_matrix_inputs()
         res = run_hsic_gc(counts, coords)
-        for key in ("statistic", "pvalue", "pvalue_adj", "method", "null_method", "n_spots"):
+        for key in (
+            "statistic",
+            "pvalue",
+            "pvalue_adj",
+            "method",
+            "null_method",
+            "n_spots",
+        ):
             self.assertIn(key, res)
         self.assertEqual(res["method"], "hsic-gc")
         self.assertEqual(res["null_method"], "eig")
@@ -839,7 +855,14 @@ class TestRunHsicGc(unittest.TestCase):
         """AnnData with dense adata.X returns correct gene-level results."""
         adata, X, _ = self._make_adata()
         res = run_hsic_gc(adata=adata)
-        for key in ("statistic", "pvalue", "pvalue_adj", "method", "null_method", "n_spots"):
+        for key in (
+            "statistic",
+            "pvalue",
+            "pvalue_adj",
+            "method",
+            "null_method",
+            "n_spots",
+        ):
             self.assertIn(key, res)
         self.assertEqual(res["method"], "hsic-gc")
         self.assertEqual(res["n_spots"], X.shape[0])
@@ -882,9 +905,7 @@ class TestRunHsicGc(unittest.TestCase):
         X = rng.integers(0, 4, size=(n_spots, n_genes)).astype(np.float32)
         # Force first gene to all zeros → total count = 0
         X[:, 0] = 0.0
-        adata = AnnData(
-            X=X, var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
-        )
+        adata = AnnData(X=X, var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)]))
         adata.obsm["spatial"] = rng.random((n_spots, 2)).astype(np.float32)
         res = run_hsic_gc(adata=adata, min_counts=1)
         # Gene 0 (all-zero) should be filtered out
@@ -898,9 +919,7 @@ class TestRunHsicGc(unittest.TestCase):
         # Force gene 0 to be non-zero in only 1 spot
         X[:, 0] = 0.0
         X[0, 0] = 5.0
-        adata = AnnData(
-            X=X, var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
-        )
+        adata = AnnData(X=X, var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)]))
         adata.obsm["spatial"] = rng.random((n_spots, 2)).astype(np.float32)
         # gene 0 expressed in 1/40 = 0.025 of spots → filtered when pct > 0.05
         res = run_hsic_gc(adata=adata, min_bin_pct=0.05)
@@ -915,9 +934,7 @@ class TestRunHsicGc(unittest.TestCase):
         isolated = np.array([[50.0, 50.0], [50.0, 50.01]], dtype=np.float32)
         coords = np.vstack([grid, isolated])
         X = rng.integers(1, 5, size=(10, 3)).astype(np.float32)
-        adata = AnnData(
-            X=X, var=pd.DataFrame(index=[f"g{i}" for i in range(3)])
-        )
+        adata = AnnData(X=X, var=pd.DataFrame(index=[f"g{i}" for i in range(3)]))
         adata.obsm["spatial"] = coords
 
         with warnings.catch_warnings(record=True) as caught:
