@@ -158,22 +158,50 @@ SPLISOSM tests for statistical independence between isoform expression and spati
 
    model = SplisosmNP()
    model.setup_data(
+      adata_ont, spatial_key="spatial", 
+      layer="counts", group_iso_by="gene_symbol"
+   )
+   model.test_spatial_variability(method="hsic-ir")
+   df_sv_res = model.get_formatted_test_results("sv")
+
+.. raw:: html
+
+   <details>
+   <summary>Show full call with all defaults</summary>
+   <br>
+
+.. code-block:: python
+
+   model = SplisosmNP(
+       k_neighbors=4,        # k-NN graph degree for CAR spatial kernel
+       rho=0.99,             # spatial autocorrelation strength (0 < rho < 1)
+       standardize_cov=True, # set kernel diagonal to 1 (to downweight outliers)
+   )
+   model.setup_data(
        adata=adata_ont,
-       spatial_key="spatial",
+       spatial_key="spatial",    # key in adata.obsm for 2-D coordinates
+       adj_key=None,             # key in adata.obsp if using precomputed adjacency
        layer="counts",
        group_iso_by="gene_symbol",
-       min_counts=10,
-       min_bin_pct=0.01,
+       min_counts=10,            # min total counts per isoform to keep
+       min_bin_pct=0.0,          # min fraction of spots expressing the isoform
+       filter_single_iso_genes=True,
+       min_component_size=1,     # set > 1 to drop small tissue fragments
+       skip_spatial_kernel=False,  # True → use IdentityKernel (DU-only mode)
    )
    model.test_spatial_variability(
-       method="hsic-ir",
-       ratio_transformation="none",
-       nan_filling="mean",
-       # null_method: 'eig' (default, Liu's method), 'trace' (normal approx)
-       # null_configs: optional dict; e.g. {"approx_rank": 20} to cap eigenvalues
-       null_method="eig",
+       method="hsic-ir",          # 'hsic-ir' | 'hsic-gc' | 'hsic-ic' | 'spark-x'
+       ratio_transformation="none",  # 'none' | 'clr' | 'ilr' | 'alr'
+       nan_filling="mean",           # if 'none', use only non-zero spots per gene (slow)
+       null_method="eig",            # 'eig' (Liu) | 'trace' (normal approx) | 'perm'
+       null_configs=None,            # e.g. {"approx_rank": 20} to cap eigenvalues
+       print_progress=True,
    )
-   df_sv_res = model.get_formatted_test_results(test_type="sv")
+   df_sv_res = model.get_formatted_test_results("sv")
+
+.. raw:: html
+
+   </details>
 
 **SplisosmFFT** (regular grids only — SpatialData input)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -182,21 +210,56 @@ SPLISOSM tests for statistical independence between isoform expression and spati
 
    from splisosm import SplisosmFFT
 
-   model = SplisosmFFT(neighbor_degree=1, rho=0.99)
+   model = SplisosmFFT()
    model.setup_data(
-       sdata=sdata,
-       bins="Visium_HD_Mouse_Brain_square_016um",  # SpatialData bin element name
+       sdata,
+       bins="Visium_HD_Mouse_Brain_square_016um",
        table_name="square_016um",
        col_key="array_col",
        row_key="array_row",
        layer="counts",
        group_iso_by="gene_ids",
-       gene_names="gene_name",
-       min_counts=10,
-       min_bin_pct=0.01,
    )
-   model.test_spatial_variability(method="hsic-ir", n_jobs=-1)
-   df_sv_res = model.get_formatted_test_results(test_type="sv")
+   model.test_spatial_variability(method="hsic-ir")
+   df_sv_res = model.get_formatted_test_results("sv")
+
+.. raw:: html
+
+   <details>
+   <summary>Show full call with all defaults</summary>
+   <br>
+
+.. code-block:: python
+
+   model = SplisosmFFT(
+       neighbor_degree=1,   # grid adjacency degree (1 = 4-connectivity, 2 = 8-connectivity)
+       rho=0.99,            # spatial autocorrelation strength
+       workers=None,        # scipy.fft thread count; None = all available CPUs
+   )
+   model.setup_data(
+       sdata,
+       bins="Visium_HD_Mouse_Brain_square_016um",
+       table_name="square_016um",
+       col_key="array_col",
+       row_key="array_row",
+       layer="counts",
+       group_iso_by="gene_ids",
+       gene_names="gene_name",  # adata.var column to change gene display names in results
+       min_counts=10,
+       min_bin_pct=0.0,
+       filter_single_iso_genes=True,
+   )
+   model.test_spatial_variability(
+       method="hsic-ir",    # 'hsic-ir' | 'hsic-gc' | 'hsic-ic'
+       ratio_transformation="none",  # 'none' | 'clr' | 'ilr' | 'alr'
+       n_jobs=-1,           # gene-level parallelism; -1 = all CPUs
+       print_progress=True,
+   )
+   df_sv_res = model.get_formatted_test_results("sv")
+
+.. raw:: html
+
+   </details>
 
 Testing for differential isoform usage (DU)
 --------------------------------------------
@@ -213,43 +276,96 @@ Uses Gaussian process regression (GPR) to remove spatial autocorrelation.
    from splisosm import SplisosmNP
 
    # Focus on SVP genes from the SV step
-   svp_genes = df_sv_res.loc[df_sv_res['pvalue_adj'] < 0.05, 'gene'].tolist()
+   svp_genes = df_sv_res.query("pvalue_adj < 0.05")['gene'].tolist()
    adata_svp = adata_ont[:, adata_ont.var['gene_symbol'].isin(svp_genes)].copy()
 
-   # Run DU test for each covariate (e.g., RBP expression)
+   model = SplisosmNP()
+   model.setup_data(
+       adata_svp, spatial_key="spatial",
+       layer="counts", group_iso_by="gene_symbol",
+       design_mtx=covariates, covariate_names=covariate_names,
+       skip_spatial_kernel=True,  # DU-only; skip expensive CAR kernel construction
+   )
+   model.test_differential_usage(method="hsic-gp")
+   df_du_res = model.get_formatted_test_results("du")
+
+.. raw:: html
+
+   <details>
+   <summary>Show full call with all defaults</summary>
+   <br>
+
+.. code-block:: python
+
    model = SplisosmNP()
    model.setup_data(
        adata=adata_svp,
        spatial_key="spatial",
+       adj_key=None,                    # key in adata.obsp if using precomputed adjacency
        layer="counts",
        group_iso_by="gene_symbol",
-       design_mtx=covariates,        # (n_spots, n_factors)
-       covariate_names=covariate_names, # list of RBP names
+       design_mtx=covariates,           # (n_spots, n_factors) array/tensor/DataFrame
+       covariate_names=covariate_names, # list of covariate display names
+       skip_spatial_kernel=True,        # skip CAR kernel — not needed for DU
+       min_counts=10,
+       min_bin_pct=0.0,
+       filter_single_iso_genes=True,
+       min_component_size=1,     # set > 1 to drop small tissue fragments
    )
    model.test_differential_usage(
-       method="hsic-gp",  # 'hsic', 'hsic-gp', 't-fisher', 't-tippett'
-       ratio_transformation="none",
-       nan_filling="mean",
+       method="hsic-gp",              # 'hsic' | 'hsic-gp' | 't-fisher' | 't-tippett'
+       ratio_transformation="none",   # 'none' | 'clr' | 'ilr' | 'alr'
+       nan_filling="mean",            # if 'none', use only non-zero spots per gene (slow)
+       residualize="cov_only",        # 'cov_only' (faster) | 'both' (more conservative)
+       gpr_backend="sklearn",         # 'sklearn' | 'gpytorch' (FITC sparse GP with GPU)
+       gpr_configs=None,              # e.g. {"covariate": {"n_inducing": 500}}
        print_progress=True,
    )
-   df_du_res = model.get_formatted_test_results(test_type="du")
+   df_du_res = model.get_formatted_test_results("du")
+
+.. raw:: html
+
+   </details>
 
 
-**SplisosmFFT** (Same as SplisosmNP but regular grids only)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+**SplisosmFFT** (same tests but for regular grids only)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Same test as :class:`~splisosm.SplisosmNP` but with FFT-accelerated implementation of Gaussian process regression for regular grid data.
+Same test as :class:`~splisosm.SplisosmNP` but with FFT-accelerated GPR for regular grid data.
 
 .. code-block:: python
 
    from splisosm import SplisosmFFT
 
-   model = SplisosmFFT(neighbor_degree=1, rho=0.99)
-   model_du_fft.setup_data(
-       sdata=sdata,
-       bins=test_bins_element, # the 16um bin for rasterization
-       table_name="square_016um_svp", # probe counts from SVP genes
-       # design_mtx : can be stored as a separate table in the same SpatialData object
+   model = SplisosmFFT()
+   model.setup_data(
+       sdata,
+       bins="Visium_HD_Mouse_Brain_square_016um",
+       table_name="square_016um_svp",
+       design_mtx="square_016um_rbp_sve",  # design stored as a separate sdata table
+       col_key="array_col", row_key="array_row",
+       layer="counts", group_iso_by="gene_ids",
+   )
+   model.test_differential_usage(method="hsic-gp")
+   df_du_res = model.get_formatted_test_results("du")
+
+.. raw:: html
+
+   <details>
+   <summary>Show full call with all defaults</summary>
+   <br>
+
+.. code-block:: python
+
+   model = SplisosmFFT(
+       neighbor_degree=1,
+       rho=0.99,
+       workers=None,   # scipy.fft thread count; None = all CPUs
+   )
+   model.setup_data(
+       sdata,
+       bins="Visium_HD_Mouse_Brain_square_016um",
+       table_name="square_016um_svp",
        design_mtx="square_016um_rbp_sve",
        col_key="array_col",
        row_key="array_row",
@@ -257,10 +373,20 @@ Same test as :class:`~splisosm.SplisosmNP` but with FFT-accelerated implementati
        group_iso_by="gene_ids",
        gene_names="gene_name",
        min_counts=10,
-       min_bin_pct=0.01,
-    )
-   model.test_differential_usage(method="hsic-gp", n_jobs=-1, print_progress=True)
-   df_du_res = model.get_formatted_test_results(test_type="du")
+       min_bin_pct=0.0,
+       filter_single_iso_genes=True,
+   )
+   model.test_differential_usage(
+       method="hsic-gp",
+       residualize="cov_only",   # 'cov_only' | 'both'
+       n_jobs=-1,                # gene-level parallelism
+       print_progress=True,
+   )
+   df_du_res = model.get_formatted_test_results("du")
+
+.. raw:: html
+
+   </details>
 
 
 **SplisosmGLMM** (parametric, GLM/GLMM-based)
@@ -272,29 +398,57 @@ Fits a multinomial GLMM with a Gaussian random field spatial random effect. The 
 
    from splisosm import SplisosmGLMM
 
-   model_p = SplisosmGLMM(
-       model_type="glmm-full",   # 'glmm-full' | 'glmm-null' | 'glm'
-       fitting_method="joint_gd",
-       device="cpu",             # 'cpu' | 'cuda' (NVIDIA GPU) | 'mps' (Apple Silicon)
-       approx_rank=None,         # None = full rank; int = low-rank approximation
+   model = SplisosmGLMM(model_type="glmm-full")
+   model.setup_data(
+       adata_svp, spatial_key="spatial",
+       layer="counts", group_iso_by="gene_symbol",
+       group_gene_by_n_iso=True,
+       design_mtx=covariates, covariate_names=covariate_names,
    )
-   model_p.setup_data(
+   model.fit(with_design_mtx=False)
+   model.test_differential_usage(method="score")
+   df_du_res = model.get_formatted_test_results("du")
+
+.. raw:: html
+
+   <details>
+   <summary>Show full call with all defaults</summary>
+   <br>
+
+.. code-block:: python
+
+   model = SplisosmGLMM(
+       model_type="glmm-full",      # 'glmm-full' | 'glmm-null' | 'glm'
+       fitting_method="joint_gd",   # 'joint_gd' | 'marginal_gd' | 'marginal_newton'
+       device="cpu",                # 'cpu' | 'cuda' (NVIDIA) | 'mps' (Apple Silicon)
+       approx_rank=None,            # None = auto; int = fixed low-rank kernel
+   )
+   model.setup_data(
        adata=adata_svp,
        spatial_key="spatial",
+       adj_key=None,                   # key in adata.obsp if using precomputed adjacency
        layer="counts",
        group_iso_by="gene_symbol",
-       group_gene_by_n_iso=True,    # required for batch_size > 1
-       design_mtx=covariates,       # (n_spots, n_factors) array or obs column name
+       group_gene_by_n_iso=True,       # required for batch_size > 1
+       design_mtx=covariates,
        covariate_names=covariate_names,
    )
-   model_p.fit(
-       n_jobs=2, batch_size=20,
-       with_design_mtx=False,       # False → score test (recommended); True → Wald test
-       refit_null=True,
+   model.fit(
+       n_jobs=1,               # parallel gene fitting (CPU only; auto-disabled on GPU)
+       batch_size=1,           # genes per batch; > 1 requires group_gene_by_n_iso=True
+       with_design_mtx=False,  # False → score test (recommended); True → Wald test
+       from_null=False,        # if True, initialize from glmm-null model 
        print_progress=True,
    )
-   model_p.test_differential_usage(method="score", print_progress=True)
-   df_du_res = model_p.get_formatted_test_results(test_type="du")
+   model.test_differential_usage(
+       method="score",   # 'score' | 'wald' (not recommended)
+       print_progress=True,
+   )
+   df_du_res = model.get_formatted_test_results("du")
+
+.. raw:: html
+
+   </details>
 
 Performance tuning and configuration reference
 ------------------------------------------------
@@ -317,6 +471,11 @@ adjust them only when you hit performance or accuracy limits.
      - How to set
      - Default
      - Trade-off
+   * - **Ratio transformation**
+     - ``ratio_transformation=`` in ``test_spatial_variability`` / ``test_differential_usage``
+     - ``"none"`` (no compositional constraint)
+     - log-based transformations (``"clr"``, ``"ilr"``, ``"alr"``) require pseudocounts to handle zero ratios; 
+       ``"radial"`` is not calibrated. Performance of ``"none"`` is better in most cases.
    * - **SV null approximation**
      - ``null_method=`` in ``test_spatial_variability`` / ``run_hsic_gc``
      - ``"eig"`` (Liu's chi-square mixture)
@@ -374,6 +533,11 @@ adjust them only when you hit performance or accuracy limits.
      - How to set
      - Default
      - Trade-off
+   * - **Ratio transformation**
+     - ``ratio_transformation=`` in ``test_spatial_variability`` / ``test_differential_usage``
+     - ``"none"`` (no compositional constraint)
+     - log-based transformations (``"clr"``, ``"ilr"``, ``"alr"``) require pseudocounts to handle zero ratios; 
+       ``"radial"`` is not calibrated. Performance of ``"none"`` is better in most cases.
    * - **FFT thread count**
      - ``SplisosmFFT(workers=N)``
      - ``None`` (all available CPUs, via ``scipy.fft``)
