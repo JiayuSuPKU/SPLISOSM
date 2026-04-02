@@ -10,7 +10,7 @@ import numpy as np
 import scipy.sparse
 import pandas as pd
 import torch
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from anndata import AnnData
 
 from splisosm.utils import (
@@ -509,9 +509,12 @@ class SplisosmNP:
         iso_rows: list[dict] = []
         all_iso_names: list[str] = []
 
-        iterator = zip(self.gene_names, iso_groups)
-        if print_progress:
-            iterator = tqdm(iterator, desc="Genes", total=len(self.gene_names))
+        iterator = tqdm(
+            zip(self.gene_names, iso_groups),
+            desc="Genes",
+            total=len(self.gene_names),
+            disable=not print_progress,
+        )
 
         for gene_name, (_, iso_group_df) in iterator:
             iso_names = iso_group_df.index.tolist()
@@ -886,7 +889,12 @@ class SplisosmNP:
 
             # iterate over genes and calculate the HSIC statistic
             hsic_list, pvals_list = [], []
-            for counts in tqdm(self.data, disable=(not print_progress)):
+            for counts in tqdm(
+                self.data,
+                desc=f"SV [{method}]",
+                total=self.n_genes,
+                disable=not print_progress,
+            ):
                 if counts.is_sparse:
                     counts = counts.to_dense()
 
@@ -1187,7 +1195,12 @@ class SplisosmNP:
 
             # Outer loop: one gene at a time to avoid materialising all dense counts
             for _g, counts in enumerate(
-                tqdm(self.data, disable=(not print_progress), dynamic_ncols=True)
+                tqdm(
+                    self.data,
+                    desc=f"DU [{method}]",
+                    total=self.n_genes,
+                    disable=not print_progress,
+                )
             ):
                 if counts.is_sparse:
                     counts = counts.to_dense()
@@ -1227,7 +1240,10 @@ class SplisosmNP:
             gpr_cov = make_kernel_gpr(gpr_backend, **cov_config)
             z_res_list = []
             for _ind in tqdm(
-                range(n_factors), disable=(not print_progress), dynamic_ncols=True
+                range(n_factors),
+                desc="Covariates",
+                total=n_factors,
+                disable=not print_progress,
             ):
                 z = self._get_design_col(_ind).squeeze(1)
                 assert (
@@ -1253,7 +1269,12 @@ class SplisosmNP:
             pvals_all = torch.empty(n_genes, n_factors)
 
             for _g, counts in enumerate(
-                tqdm(self.data, disable=(not print_progress), dynamic_ncols=True)
+                tqdm(
+                    self.data,
+                    desc=f"DU [{method}]",
+                    total=self.n_genes,
+                    disable=not print_progress,
+                )
             ):
                 if counts.is_sparse:
                     counts = counts.to_dense()
@@ -1299,7 +1320,12 @@ class SplisosmNP:
 
             # Outer loop: one gene at a time so each sparse tensor is densified once
             for _g, counts in enumerate(
-                tqdm(self.data, disable=(not print_progress), dynamic_ncols=True)
+                tqdm(
+                    self.data,
+                    desc=f"DU [{method}]",
+                    total=self.n_genes,
+                    disable=not print_progress,
+                )
             ):
                 if counts.is_sparse:
                     counts = counts.to_dense()

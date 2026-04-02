@@ -28,7 +28,7 @@ import scipy.sparse as sp
 import torch
 from anndata import AnnData
 from joblib import Parallel, delayed
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from splisosm.kernel_gpr import (
     FFTKernelOp,
@@ -1004,9 +1004,12 @@ class SplisosmFFT:
         if n_jobs == -1:
             n_jobs = os.cpu_count() or 1
 
-        iterator = self._gene_iso_names
-        if print_progress:
-            iterator = tqdm(iterator, desc=f"SV ({method})")
+        iterator = tqdm(
+            self._gene_iso_names,
+            desc=f"SV [{method}]",
+            total=len(self._gene_iso_names),
+            disable=not print_progress,
+        )
 
         results = Parallel(n_jobs=n_jobs, prefer="threads")(
             delayed(_sv_worker_fft)(
@@ -1221,9 +1224,12 @@ class SplisosmFFT:
         show_gene_bar = print_progress and n_chunks == 1
         show_chunk_bar = print_progress and n_chunks > 1
 
-        chunk_range = range(0, n_factors, _COV_CHUNK)
-        if show_chunk_bar:
-            chunk_range = tqdm(chunk_range, desc=f"DU [{method}] factor chunks")
+        chunk_range = tqdm(
+            range(0, n_factors, _COV_CHUNK),
+            desc="Covariates",
+            total=n_chunks,
+            disable=not show_chunk_bar,
+        )
 
         for f_start in chunk_range:
             f_end = min(f_start + _COV_CHUNK, n_factors)
@@ -1263,9 +1269,12 @@ class SplisosmFFT:
                     z_res = z_cube.copy()
                 z_chunk.append(z_res)
 
-            gene_iter = self._gene_iso_names
-            if show_gene_bar:
-                gene_iter = tqdm(gene_iter, desc=f"DU [{method}]")
+            gene_iter = tqdm(
+                self._gene_iso_names,
+                desc=f"DU [{method}]",
+                total=len(self._gene_iso_names),
+                disable=not show_gene_bar,
+            )
 
             chunk_results = Parallel(n_jobs=n_jobs, prefer="threads")(
                 delayed(_du_worker_fft)(
@@ -1377,9 +1386,12 @@ class SplisosmFFT:
         iso_rows: list[dict[str, Any]] = []
         all_iso_names: list[str] = []
 
-        iterator = zip(self.gene_names, self._gene_iso_names)
-        if print_progress:
-            iterator = tqdm(iterator, desc="Genes", total=len(self.gene_names))
+        iterator = tqdm(
+            zip(self.gene_names, self._gene_iso_names),
+            desc="Genes",
+            total=len(self.gene_names),
+            disable=not print_progress,
+        )
 
         for gene_name, iso_names in iterator:
             iso_idx = var_names_index.get_indexer(iso_names)

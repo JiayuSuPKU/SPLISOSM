@@ -657,9 +657,12 @@ class SplisosmGLMM:
         gene_rows: list[dict] = []
         iso_rows: list[dict] = []
 
-        iterator = zip(self.gene_names, iso_groups)
-        if print_progress:
-            iterator = tqdm(iterator, desc="Genes", total=len(self.gene_names))
+        iterator = tqdm(
+            zip(self.gene_names, iso_groups),
+            desc="Genes",
+            total=len(self.gene_names),
+            disable=not print_progress,
+        )
 
         for gene_name, (_, iso_group_df) in iterator:
             iso_names = iso_group_df.index.tolist()
@@ -1154,7 +1157,9 @@ class SplisosmGLMM:
                 )
 
             # iterate over genes and fit the selected model
-            for batch in tqdm(data, disable=not print_progress, total=n_batches):
+            for batch in tqdm(
+                data, desc="Fitting", total=n_batches, disable=not print_progress
+            ):
                 _, b_counts, _ = (batch["n_isos"], batch["x"], batch["gene_name"])
 
                 if b_counts.is_sparse:
@@ -1214,7 +1219,12 @@ class SplisosmGLMM:
             )
 
             fitted_pars = Parallel(n_jobs=n_jobs)(
-                tqdm(tasks_gen, total=n_batches, disable=not print_progress)
+                tqdm(
+                    tasks_gen,
+                    desc="Fitting",
+                    total=n_batches,
+                    disable=not print_progress,
+                )
             )
 
             # convert the fitted parameters to models
@@ -1333,7 +1343,9 @@ class SplisosmGLMM:
                 )
 
             # iterate over genes and fit the selected model
-            for batch in tqdm(data, disable=not print_progress, total=n_batches):
+            for batch in tqdm(
+                data, desc="Fitting", total=n_batches, disable=not print_progress
+            ):
                 _, b_counts, _ = (batch["n_isos"], batch["x"], batch["gene_name"])
 
                 # fit the null model
@@ -1414,7 +1426,12 @@ class SplisosmGLMM:
             )
 
             fitted_pars = Parallel(n_jobs=n_jobs)(
-                tqdm(tasks_gen, total=n_batches, disable=not print_progress)
+                tqdm(
+                    tasks_gen,
+                    desc="Fitting",
+                    total=n_batches,
+                    disable=not print_progress,
+                )
             )
 
             # convert the fitted parameters to models
@@ -1522,7 +1539,12 @@ class SplisosmGLMM:
                 )
 
             # run n_perms permutations for each gene
-            for _ in tqdm(range(n_perms), disable=not print_progress):
+            for _ in tqdm(
+                range(n_perms),
+                desc="Permutations",
+                total=n_perms,
+                disable=not print_progress,
+            ):
                 # randomly shuffle the spatial locations
                 perm_idx = torch.randperm(self.n_spots)
 
@@ -1607,7 +1629,12 @@ class SplisosmGLMM:
             )
 
             _sv_llr_perm_stats = Parallel(n_jobs=n_jobs)(
-                tqdm(tasks_gen, total=(n_batches * n_perms), disable=not print_progress)
+                tqdm(
+                    tasks_gen,
+                    desc="Permutations",
+                    total=(n_batches * n_perms),
+                    disable=not print_progress,
+                )
             )
 
             self.fitting_results["sv_llr_perm_stats"] = torch.concat(
@@ -1801,7 +1828,12 @@ class SplisosmGLMM:
 
             _du_score_stats, _du_score_dfs = [], []
             # iterate over genes and calculate the score statistic
-            for m in tqdm(fitted_models, disable=(not print_progress)):
+            for m in tqdm(
+                fitted_models,
+                desc=f"DU [{method}]",
+                total=len(fitted_models),
+                disable=not print_progress,
+            ):
                 score_stat, score_df = _calc_score_differential_usage(
                     m, self.design_mtx
                 )
@@ -1842,7 +1874,12 @@ class SplisosmGLMM:
 
             _du_wald_stats, _du_wald_dfs = [], []
             # iterate over genes and calculate the Wald statistic
-            for m in tqdm(fitted_models, disable=(not print_progress)):
+            for m in tqdm(
+                fitted_models,
+                desc=f"DU [{method}]",
+                total=len(fitted_models),
+                disable=not print_progress,
+            ):
                 wald_stat, wald_df = _calc_wald_differential_usage(m)
                 _du_wald_stats.append(wald_stat)
                 _du_wald_dfs.append(wald_df)

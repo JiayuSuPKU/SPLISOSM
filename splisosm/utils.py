@@ -10,7 +10,7 @@ from scipy.sparse.csgraph import connected_components as _connected_components
 import numpy as np
 from numpy.typing import ArrayLike
 import scipy.sparse
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import pandas as pd
 import torch
 from anndata import AnnData
@@ -850,9 +850,8 @@ def prepare_inputs_from_anndata(
                 np.vstack((_coo.row, _coo.col)).astype(np.int64, copy=False)
             )
             _v = torch.from_numpy(_coo.data)  # already float32
-            _counts = torch.sparse_coo_tensor(
-                _i, _v, torch.Size(_coo.shape), check_invariants=False
-            )
+            with torch.sparse.check_sparse_tensor_invariants(False):
+                _counts = torch.sparse_coo_tensor(_i, _v, torch.Size(_coo.shape))
         else:
             _counts = sub_tensor[:, start:end]  # zero-copy view
         counts_list.append(_counts)
@@ -1051,9 +1050,8 @@ def extract_counts_n_ratios(
     gene_name_list = []  # of length n_genes
     iso_ind_list = []  # of length n_genes
 
-    for _gene, _group in tqdm(
-        adata.var.reset_index().groupby(group_iso_by, observed=True)
-    ):
+    _gene_groups = adata.var.reset_index().groupby(group_iso_by, observed=True)
+    for _gene, _group in tqdm(_gene_groups, desc="Genes", total=_gene_groups.ngroups):
         # filter single-isoform genes if needed
         if filter_single_iso_genes and _group.shape[0] < 2:
             continue
@@ -1079,7 +1077,8 @@ def extract_counts_n_ratios(
             i = torch.LongTensor(indices)
             v = torch.FloatTensor(values)
             shape = _counts_coo.shape
-            _counts = torch.sparse_coo_tensor(i, v, torch.Size(shape))
+            with torch.sparse.check_sparse_tensor_invariants(False):
+                _counts = torch.sparse_coo_tensor(i, v, torch.Size(shape))
             counts_list.append(_counts)
         else:
             if is_sparse_input:
@@ -1157,9 +1156,8 @@ def extract_gene_level_statistics(
 
     df_list = []
     # loop through genes
-    for _gene, _group in tqdm(
-        adata.var.reset_index().groupby(group_iso_by, observed=True)
-    ):
+    _gene_groups = adata.var.reset_index().groupby(group_iso_by, observed=True)
+    for _gene, _group in tqdm(_gene_groups, desc="Genes", total=_gene_groups.ngroups):
         # extract isoform counts and relative ratio
         iso_indices = _group.index.tolist()
         _counts = iso_counts[:, iso_indices]
@@ -1384,9 +1382,8 @@ def run_hsic_gc(
                 np.vstack((_coo.row, _coo.col)).astype(np.int64, copy=False)
             )
             _v = torch.from_numpy(_coo.data)
-            counts_gene = torch.sparse_coo_tensor(
-                _i, _v, torch.Size(_coo.shape), check_invariants=False
-            )
+            with torch.sparse.check_sparse_tensor_invariants(False):
+                counts_gene = torch.sparse_coo_tensor(_i, _v, torch.Size(_coo.shape))
         else:
             counts_gene = torch.as_tensor(np.asarray(_raw, dtype=np.float32))
 
@@ -1580,7 +1577,7 @@ def run_hsic_gc(
         )  # center the counts, (n_spots, n_genes)
 
     hsic_list, pvals_list = [], []
-    for i in tqdm(range(n_genes)):
+    for i in tqdm(range(n_genes), desc="Genes", total=n_genes):
         if is_scipy_sparse:
             col = counts_gene[:, i].toarray()  # dense (n_spots, 1)
             counts = torch.from_numpy(col).float()
