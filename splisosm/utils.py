@@ -176,7 +176,9 @@ def counts_to_ratios(
             )  # for ratio transformation
         except ImportError:
             warnings.warn(
-                f"Please install scikit-bio to use ratio transformation='{transformation}'. Switching to 'none'."
+                f"Please install scikit-bio to use ratio transformation='{transformation}'. Switching to 'none'.",
+                UserWarning,
+                stacklevel=2,
             )
             transformation = "none"
 
@@ -286,7 +288,11 @@ def false_discovery_control(
 
     # Handle NaNs
     if np.isnan(ps).any():
-        warnings.warn("NaNs encountered in p-values. These will be ignored.")
+        warnings.warn(
+            "NaNs encountered in p-values. These will be ignored.",
+            UserWarning,
+            stacklevel=2,
+        )
         # ignore NaNs in the p-values
         ps_in_range = np.issubdtype(ps.dtype, np.number) and np.all(
             ps[~np.isnan(ps)] == np.clip(ps[~np.isnan(ps)], 0, 1)
@@ -1507,7 +1513,10 @@ def run_hsic_gc(
     if spatial_kernel_kwargs is not None:
         if "centering" in spatial_kernel_kwargs:
             warnings.warn(
-                "The 'centering' argument in spatial_kernel_kwargs will be ignored. It is always set to True for HSIC-GC."
+                "The 'centering' argument in spatial_kernel_kwargs will be ignored. "
+                "It is always set to True for HSIC-GC.",
+                UserWarning,
+                stacklevel=2,
             )
             spatial_kernel_kwargs.pop("centering")
         default_spatial_kernel_kwargs.update(spatial_kernel_kwargs)

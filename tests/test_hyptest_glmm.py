@@ -74,7 +74,10 @@ def _make_small_adata(counts_list, coords, design_mtx=None):
             if hasattr(design_mtx, "numpy")
             else np.asarray(design_mtx, dtype=np.float32)
         )
-        obs = pd.DataFrame({f"cov_{i+1}": dm[:, i] for i in range(dm.shape[1])})
+        obs = pd.DataFrame(
+            {f"cov_{i+1}": dm[:, i] for i in range(dm.shape[1])},
+            index=[str(i) for i in range(dm.shape[0])],
+        )
     else:
         obs = pd.DataFrame(index=[str(i) for i in range(n_spots)])
     adata = AnnData(X=X, obs=obs, var=var)
@@ -199,7 +202,10 @@ class TestHypTestGLMM(unittest.TestCase):
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 1})
 
         design_mtx_np = np.random.randn(n_spots, 2).astype(np.float32)
-        obs = pd.DataFrame({"cov_1": design_mtx_np[:, 0], "cov_2": design_mtx_np[:, 1]})
+        obs = pd.DataFrame(
+            {"cov_1": design_mtx_np[:, 0], "cov_2": design_mtx_np[:, 1]},
+            index=[str(i) for i in range(design_mtx_np.shape[0])],
+        )
         sparse_adata = AnnData(X=counts_sparse, obs=obs, var=var)
         sparse_adata.layers["counts"] = counts_sparse
         sparse_adata.obsm["spatial"] = coords.numpy().astype(np.float32)
@@ -276,7 +282,8 @@ class TestSplisosmGLMM(unittest.TestCase):
             {
                 "cov_1": design_np[:, 0],
                 "cov_2": design_np[:, 1],
-            }
+            },
+            index=[str(i) for i in range(design_np.shape[0])],
         )
         self.adata = AnnData(X=adata_counts, obs=adata_obs, var=adata_var)
         self.adata.layers["counts"] = adata_counts

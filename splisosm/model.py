@@ -750,7 +750,9 @@ class MultinomGLM(BaseModel, nn.Module):
         if num_not_converge:
             warnings.warn(
                 f"{num_not_converge} Genes did not converge after epoch {max_epochs}. "
-                "Try larger max_epochs."
+                "Try larger max_epochs.",
+                UserWarning,
+                stacklevel=2,
             )
 
         # save runtime
@@ -1163,7 +1165,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             if corr_sp_eigvals is not None or corr_sp_eigvecs is not None:
                 warnings.warn(
                     "Both the correlation matrix and its eigendecomposition are provided. "
-                    "The latter will be ignored."
+                    "The latter will be ignored.",
+                    UserWarning,
+                    stacklevel=2,
                 )
 
             assert corr_sp.shape == (self.n_spots, self.n_spots)
@@ -1312,7 +1316,11 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             var_total = self.sigma_sp**2 + self.sigma_nsp**2
 
         if var_total.min() < 1e-2:
-            warnings.warn("Total variance is close to zero.")
+            warnings.warn(
+                "Total variance is close to zero.",
+                UserWarning,
+                stacklevel=2,
+            )
         var_total = torch.clip(var_total, min=1e-2)  # (n_genes, n_var_components)
         return var_total
 
@@ -1915,7 +1923,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         if num_not_converge:
             warnings.warn(
                 f"{num_not_converge} Genes did not converge after epoch {max_epochs}. "
-                "Try larger max_epochs."
+                "Try larger max_epochs.",
+                UserWarning,
+                stacklevel=2,
             )
 
         # save runtime

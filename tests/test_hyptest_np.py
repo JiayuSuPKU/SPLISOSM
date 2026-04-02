@@ -61,7 +61,10 @@ def _make_small_adata(counts_list, coords, design_mtx=None):
             if hasattr(design_mtx, "numpy")
             else np.asarray(design_mtx, dtype=np.float32)
         )
-        obs = pd.DataFrame({f"cov_{i+1}": dm[:, i] for i in range(dm.shape[1])})
+        obs = pd.DataFrame(
+            {f"cov_{i+1}": dm[:, i] for i in range(dm.shape[1])},
+            index=[str(i) for i in range(n_spots)],
+        )
     else:
         obs = pd.DataFrame(index=[str(i) for i in range(n_spots)])
     adata = AnnData(X=X, obs=obs, var=var)
@@ -116,7 +119,8 @@ class TestSplisosmNP(unittest.TestCase):
             {
                 "cov_1": design_np[:, 0],
                 "cov_2": design_np[:, 1],
-            }
+            },
+            index=[str(i) for i in range(design_np.shape[0])],
         )
         self.adata = AnnData(X=adata_counts, obs=adata_obs, var=adata_var)
         self.adata.layers["counts"] = adata_counts
@@ -1007,7 +1011,9 @@ class TestSplisosmNP(unittest.TestCase):
                 print_progress=False,
                 return_results=True,
             )
-            pvals[null_method] = -np.log10(np.clip(res["pvalue"], 1e-300, 1))
+            pvals[null_method] = -np.log10(
+                np.clip(res["pvalue"].astype(np.float64), 1e-300, 1)
+            )
 
         # Thresholds: asymptotic methods should agree tightly; perm is noisier.
         thresholds = {

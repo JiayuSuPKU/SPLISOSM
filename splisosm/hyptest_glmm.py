@@ -73,7 +73,6 @@ class SplisosmGLMM:
     >>> model.fit(
     ...     n_jobs=1, batch_size=20,
     ...     with_design_mtx=False,     # False → score test (recommended for DU)
-    ...     refit_null=True,
     ... )
     >>> fitted_models = model.get_fitted_models()
 
@@ -520,6 +519,7 @@ class SplisosmGLMM:
                         f"{n_spots}×{n_spots} matrix which may be very slow and "
                         f"memory-intensive.  Consider omitting approx_rank (auto) "
                         f"or passing a positive integer.",
+                        UserWarning,
                         stacklevel=2,
                     )
                 k = None
@@ -576,7 +576,9 @@ class SplisosmGLMM:
                     )
                     warnings.warn(
                         f"Covariate '{_cname}' has near-zero variance "
-                        "(std < 1e-5). Consider removing it."
+                        "(std < 1e-5). Consider removing it.",
+                        UserWarning,
+                        stacklevel=2,
                     )
 
             self.n_factors = n_factors
@@ -916,6 +918,7 @@ class SplisosmGLMM:
             with zero spatial variability (white-noise random effect).
         refit_null : bool, optional
             Whether to refit the null model after fitting the full model.
+            Only applicable when ``from_null=True``.
         random_seed : int or None, optional
             The random seed for reproducibility. Default to None.
 
@@ -927,7 +930,9 @@ class SplisosmGLMM:
         if batch_size > 1 and not self._group_gene_by_n_iso:
             warnings.warn(
                 "Ignoring batch size argument since the dataset is not grouped. "
-                + "For batch fitting please set 'group_gene_by_n_iso = True' when setup_data()"
+                "For batch fitting please set 'group_gene_by_n_iso = True' when setup_data().",
+                UserWarning,
+                stacklevel=2,
             )
             batch_size = 1
 

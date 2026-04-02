@@ -468,7 +468,9 @@ class SplisosmNP:
                     )
                     warnings.warn(
                         f"Covariate '{_cname}' has near-zero variance "
-                        "(std < 1e-5). Consider removing it."
+                        "(std < 1e-5). Consider removing it.",
+                        UserWarning,
+                        stacklevel=2,
                     )
 
             # Store: sparse CSR when the input was sparse; dense torch tensor otherwise.

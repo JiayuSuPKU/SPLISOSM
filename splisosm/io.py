@@ -76,7 +76,9 @@ def load_visium_sp_meta(
             )
         except Exception:
             warnings.warn(
-                f"Missing '{res}' image in {path_to_spatial}. Will be ignored."
+                f"Missing '{res}' image in {path_to_spatial}. Will be ignored.",
+                UserWarning,
+                stacklevel=2,
             )
             adata.uns["spatial"][library_id]["images"][res] = None
 
@@ -385,6 +387,7 @@ def load_visiumhd_probe(
             warnings.warn(
                 f"Bin table '{bin_name}' not found in SpatialData object; skipping.",
                 UserWarning,
+                stacklevel=2,
             )
             continue
 
@@ -548,6 +551,7 @@ def _add_xenium_cell_codeword_table_from_parquet(
             f"Could not find Xenium transcripts parquet at {transcripts_path}; "
             "skipping `table_codeword` generation.",
             UserWarning,
+            stacklevel=2,
         )
         return
 

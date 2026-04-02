@@ -1,4 +1,5 @@
 import unittest
+import warnings
 import numpy as np
 import torch
 import itertools
@@ -57,10 +58,14 @@ class TestSpatialCovKernel(unittest.TestCase):
         R = K.realization()
         self.assertTrue(torch.allclose(R, R.T, atol=1e-5))
 
-        # adj_matrix keyword path via constructor should produce same result
-        K2 = SpatialCovKernel(
-            adj_matrix=W, rho=0.99, standardize_cov=True, centering=False
-        )
+        # adj_matrix keyword path via constructor should produce same result.
+        # The 5×5 grid has ~82 edges, which exceeds the 10% density threshold
+        # for the "inefficient for large n" RuntimeWarning — expected here.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            K2 = SpatialCovKernel(
+                adj_matrix=W, rho=0.99, standardize_cov=True, centering=False
+            )
         self.assertTrue(torch.allclose(R, K2.realization(), atol=1e-5))
 
         # Should match from_coordinates with the same params

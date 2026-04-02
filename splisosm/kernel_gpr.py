@@ -857,6 +857,7 @@ class SklearnKernelGPR(KernelGPR):
             warnings.warn(
                 f"n={coords.shape[0]} > n_inducing={self.n_inducing}; "
                 "large-n subset-of-data path will be used; precompute_shared_kernel skipped.",
+                UserWarning,
                 stacklevel=2,
             )
             return
@@ -864,6 +865,7 @@ class SklearnKernelGPR(KernelGPR):
             warnings.warn(
                 "precompute_shared_kernel() has no effect when signal bounds "
                 "are not fixed; the full GP will still be fitted per target.",
+                UserWarning,
                 stacklevel=2,
             )
             return
