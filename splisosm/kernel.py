@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from scipy.sparse.linalg import splu
 from sklearn.neighbors import NearestNeighbors
 
-__all__ = ["SpatialCovKernel"]
+__all__ = ["IdentityKernel", "SpatialCovKernel"]
 
 
 class Kernel(ABC):
@@ -85,6 +85,82 @@ class Kernel(ABC):
         torch.Tensor
             Scalar value.
         """
+
+    @abstractmethod
+    def xtKx_approx(self, x: torch.Tensor, k: int | None = None) -> torch.Tensor:
+        """Compute ``x^T K_k x`` using a rank-``k`` approximation.
+
+        Implementations must use only the top-``k`` eigenvalues/vectors and
+        must not expose :attr:`Q` to callers.  When ``k`` is ``None`` the
+        full kernel approximation is used.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input matrix of shape ``(n_spots, d)``.
+        k : int or None
+            Number of leading eigenvalues to include.  ``None`` uses all
+            available eigenvalues (full-rank approximation).
+
+        Returns
+        -------
+        torch.Tensor
+            Approximated quadratic form of shape ``(d, d)``.
+        """
+
+
+class IdentityKernel(Kernel):
+    """Identity kernel K = I (placeholder when spatial kernel is skipped).
+
+    All spots are treated as independent; no spatial smoothing is applied.
+    This is used when ``setup_data(skip_spatial_kernel=True)`` is called
+    and spatial variability testing is not needed.
+
+    Parameters
+    ----------
+    n_spots : int
+        Number of spatial locations.
+    """
+
+    def __init__(self, n_spots: int) -> None:
+        self._n = n_spots
+        # Store Q as a sparse identity to avoid allocating a dense n×n matrix.
+        # K = I = Q @ Q.T, but Q is never accessed externally — use xtKx_approx().
+        _idx = torch.arange(n_spots).unsqueeze(0).repeat(2, 1)  # (2, n_spots)
+        _val = torch.ones(n_spots)
+        with torch.sparse.check_sparse_tensor_invariants(False):
+            self.Q: torch.Tensor = torch.sparse_coo_tensor(
+                _idx, _val, (n_spots, n_spots)
+            )
+
+    def realization(self) -> torch.Tensor:
+        """Return the identity matrix of shape ``(n_spots, n_spots)``."""
+        return torch.eye(self._n)
+
+    def xtKx(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute ``x^T I x = x^T x``."""
+        return x.t() @ x
+
+    def xtKx_exact(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute ``x^T I x = x^T x`` (exact, same as :meth:`xtKx`)."""
+        return x.t() @ x
+
+    def xtKx_approx(self, x: torch.Tensor, k: int | None = None) -> torch.Tensor:
+        """Compute ``x^T I x = x^T x`` (K = I; no approximation required)."""
+        return x.t() @ x
+
+    def eigenvalues(self, k: int | None = None) -> torch.Tensor:
+        """Return ``k`` ones (all eigenvalues of I are 1)."""
+        n = k if k is not None else self._n
+        return torch.ones(n)
+
+    def trace(self) -> torch.Tensor:
+        """Return tr(I) = n_spots."""
+        return torch.tensor(float(self._n))
+
+    def square_trace(self) -> torch.Tensor:
+        """Return tr(I²) = n_spots."""
+        return torch.tensor(float(self._n))
 
 
 def _build_adj_from_coords(
@@ -587,6 +663,32 @@ class SpatialCovKernel(Kernel):
         x_np = x.numpy().astype(np.float64)
         u = lu.solve(x_np)  # shape (n, d)
         return torch.from_numpy((x_np.T @ u).astype(np.float32))
+
+    def xtKx_approx(self, x: torch.Tensor, k: int | None = None) -> torch.Tensor:
+        """Compute ``x^T K_k x`` via the top-``k`` low-rank factor.
+
+        Calls :meth:`eigenvalues` to ensure :attr:`Q` is populated for at
+        least ``k`` components, then computes ``(x^T Q_k)(Q_k^T x)`` where
+        ``Q_k = Q[:, :k]``.  The result is consistent with the rank-``k``
+        eigenvalue approximation used in the Liu null distribution.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input matrix of shape ``(n_spots, d)``.
+        k : int or None
+            Number of leading eigenvalues to include.  ``None`` uses all
+            available eigenvalues (populates the full Q first).
+
+        Returns
+        -------
+        torch.Tensor
+            Approximated quadratic form of shape ``(d, d)``.
+        """
+        self.eigenvalues(k=k)  # ensures Q is populated to at least rank k
+        Q_k = self.Q if k is None else self.Q[:, :k]
+        xtQ = x.t() @ Q_k
+        return xtQ @ xtQ.t()
 
     def eigenvalues(self, k: int | None = None) -> torch.Tensor:
         """Return leading eigenvalues in descending order.

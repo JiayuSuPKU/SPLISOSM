@@ -190,7 +190,7 @@ class TestSplisosmNP(unittest.TestCase):
             filter_single_iso_genes=False,
         )
         model_str = str(model)
-        self.assertIn("Non-parametric SPLISOSM", model_str)
+        self.assertIn("SplisosmNP", model_str)
 
     def test_calc_ttest_differential_usage(self):
         data = torch.rand(self.n_spots, 2)

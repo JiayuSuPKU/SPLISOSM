@@ -19,7 +19,7 @@ from splisosm.utils import (
     prepare_inputs_from_anndata,
     run_sparkx,
 )
-from splisosm.kernel import SpatialCovKernel
+from splisosm.kernel import IdentityKernel, SpatialCovKernel
 from splisosm.likelihood import liu_sf
 from splisosm.kernel_gpr import (
     linear_hsic_test,
@@ -253,15 +253,17 @@ class SplisosmNP:
             else "NA"
         )
         return (
-            "=== Non-parametric SPLISOSM model for spatial isoform testings\n"
+            "=== SplisosmNP\n"
             + f"- Number of genes: {self.n_genes}\n"
             + f"- Number of spots: {self.n_spots}\n"
             + f"- Number of covariates: {self.n_factors}\n"
-            + f"- Average number of isoforms per gene: {np.mean(self.n_isos) if self.n_isos is not None else None}\n"
+            + f"- Average isoforms per gene: {np.mean(self.n_isos) if self.n_isos is not None else None}\n"
             + "=== Test results\n"
-            + f"- Spatial variability test: {_sv_status}\n"
-            + f"- Differential usage test: {_du_status}"
+            + f"- Spatial variability: {_sv_status}\n"
+            + f"- Differential usage: {_du_status}"
         )
+
+    __repr__ = __str__
 
     def setup_data(
         self,
@@ -280,6 +282,7 @@ class SplisosmNP:
         min_bin_pct: float = 0.0,
         filter_single_iso_genes: bool = True,
         min_component_size: int = 1,
+        skip_spatial_kernel: bool = False,
     ) -> None:
         """Setup isoform-level spatial data for hypothesis testing.
 
@@ -347,6 +350,15 @@ class SplisosmNP:
             data structures before the spatial kernel is built.  Default 1
             disables filtering.  A ``UserWarning`` is issued when spots are
             removed.
+        skip_spatial_kernel : bool, optional
+            If ``True``, skip construction of the CAR spatial kernel and
+            store an :class:`~splisosm.kernel.IdentityKernel` placeholder as
+            ``self.corr_sp`` instead.  Use this when only
+            :meth:`test_differential_usage` is needed — that method uses GPR
+            to handle spatial autocorrelation and does not read ``corr_sp``.
+            Calling :meth:`test_spatial_variability` on a model set up with
+            ``skip_spatial_kernel=True`` will raise a ``RuntimeError``.
+            Default ``False``.
 
         Raises
         ------
@@ -402,7 +414,9 @@ class SplisosmNP:
         # adj_matrix is not None when:
         # (1) min_component_size > 1, or,
         # (2) adj_key is provided
-        if adj_matrix is not None:
+        if skip_spatial_kernel:
+            self.corr_sp = IdentityKernel(self.n_spots)
+        elif adj_matrix is not None:
             self.corr_sp = SpatialCovKernel(
                 coords=None,
                 adj_matrix=adj_matrix,
@@ -722,17 +736,14 @@ class SplisosmNP:
         pandas.DataFrame
             Formatted test results.
         """
-        assert test_type in [
-            "sv",
-            "du",
-        ], "Invalid test type. Must be one of 'sv' or 'du'."
+        if test_type not in {"sv", "du"}:
+            raise ValueError("test_type must be 'sv' or 'du'.")
         if test_type == "sv":
-            # check if the spatial variability test has been run
-            assert (
-                len(self.sv_test_results) > 0
-            ), "No spatial variability test results found. Please run test_spatial_variability() first."
-            # format the results
-            res = pd.DataFrame(
+            if len(self.sv_test_results) == 0:
+                raise ValueError(
+                    "No spatial variability results. Run test_spatial_variability() first."
+                )
+            return pd.DataFrame(
                 {
                     "gene": self.gene_names,
                     "statistic": self.sv_test_results["statistic"],
@@ -740,23 +751,22 @@ class SplisosmNP:
                     "pvalue_adj": self.sv_test_results["pvalue_adj"],
                 }
             )
-            return res
-        else:
-            # check if the differential usage test has been run
-            assert (
-                len(self.du_test_results) > 0
-            ), "No differential usage test results found. Please run test_differential_usage() first."
-            # format the results
-            res = pd.DataFrame(
-                {
-                    "gene": np.repeat(self.gene_names, self.n_factors),
-                    "covariate": np.tile(self.covariate_names, self.n_genes),
-                    "statistic": self.du_test_results["statistic"].reshape(-1),
-                    "pvalue": self.du_test_results["pvalue"].reshape(-1),
-                    "pvalue_adj": self.du_test_results["pvalue_adj"].reshape(-1),
-                }
+        if len(self.du_test_results) == 0:
+            raise ValueError(
+                "No differential usage results. Run test_differential_usage() first."
             )
-            return res
+        covariate_names = self.covariate_names or [
+            f"factor_{i}" for i in range(self.n_factors)
+        ]
+        return pd.DataFrame(
+            {
+                "gene": np.repeat(self.gene_names, self.n_factors),
+                "covariate": np.tile(covariate_names, self.n_genes),
+                "statistic": self.du_test_results["statistic"].reshape(-1),
+                "pvalue": self.du_test_results["pvalue"].reshape(-1),
+                "pvalue_adj": self.du_test_results["pvalue_adj"].reshape(-1),
+            }
+        )
 
     def test_spatial_variability(
         self,
@@ -825,6 +835,13 @@ class SplisosmNP:
         To run the SPARK-X test, the R-package `SPARK` must be installed and accessible from Python via `rpy2`.
         """
 
+        if isinstance(self.corr_sp, IdentityKernel):
+            raise RuntimeError(
+                "setup_data was called with skip_spatial_kernel=True; the spatial "
+                "kernel is a placeholder IdentityKernel. Re-run setup_data with "
+                "skip_spatial_kernel=False to enable spatial variability testing."
+            )
+
         valid_methods = ["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"]
         valid_null_methods = ["eig", "trace", "perm"]
         valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
@@ -874,12 +891,6 @@ class SplisosmNP:
                 lambda_sp = self.corr_sp.eigenvalues(k=approx_rank)
                 lambda_sp = lambda_sp[lambda_sp > 1e-5]
                 k_eff = len(lambda_sp)
-                # Extract low-rank factor Q_k (shape n × k_eff) so that
-                # K ≈ Q_k Q_k^T. Used to compute a rank-consistent test stat
-                # for p-value, preventing scale mismatch with the Liu null.
-                _Q_sp = (
-                    self.corr_sp.Q[:, :k_eff] if self.corr_sp.Q is not None else None
-                )
             elif null_method == "trace":
                 trK = self.corr_sp.trace()
                 trK2 = self.corr_sp.square_trace()
@@ -950,15 +961,11 @@ class SplisosmNP:
                         y = y - y.mean(0, keepdim=True)  # centering per isoform
 
                     # compute the hsic statistic
-                    if null_method == "eig" and _Q_sp is not None:
-                        # when low-rank approximation is available,
-                        # compute the statistic using the low-rank factor to align with
-                        # the eigenvalues used in the Liu null distribution
-                        xtQ = y.t() @ _Q_sp  # (n_isos, k_eff)
-                        hsic_scaled = torch.trace(xtQ @ xtQ.t())
+                    if null_method == "eig":
+                        # use rank-k approx consistent with the Liu null eigenvalues
+                        hsic_scaled = torch.trace(K_sp.xtKx_approx(y, k=k_eff))
                     else:
-                        # use the exact full kernel to compute the quadratic form
-                        # even when low-rank approximation K_sp.Q is available
+                        # use the exact full kernel for trace/perm null methods
                         hsic_scaled = torch.trace(K_sp.xtKx_exact(y))
 
                 hsic_list.append(hsic_scaled / (n_spots - 1) ** 2)
@@ -1232,7 +1239,9 @@ class SplisosmNP:
                     iso_config.update(gpr_configs["isoform"])
 
             # Normalize spatial coordinates once
-            x = self.coordinates.clone()  # (n_spots, n_dims)
+            x = torch.as_tensor(
+                self.coordinates, dtype=torch.float64
+            ).clone()  # (n_spots, n_dims)
             x = (x - x.mean(0)) / x.std(0)
             x[torch.isinf(x)] = 0  # guard against constant coordinate axes
 
