@@ -213,7 +213,7 @@ class TestSplisosmFFT(unittest.TestCase):
         # g3 (single-isoform gene) is always filtered.
         self.assertEqual(model.n_genes, 2)
         self.assertEqual(model.n_grid, 30)
-        self.assertIn("FFT SPLISOSM", str(model))
+        self.assertIn("SplisosmFFT", str(model))
 
     def test_setup_data_gene_names_column(self):
         """gene_names column in adata.var should be used as display names."""

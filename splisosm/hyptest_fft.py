@@ -634,16 +634,18 @@ class SplisosmFFT:
             else "NA"
         )
         return (
-            "=== FFT SPLISOSM model for spatial isoform testings\n"
+            "=== SplisosmFFT\n"
             f"- Number of genes: {self.n_genes}\n"
-            f"- Number of observed spots: {self.n_spots}\n"
+            f"- Number of spots: {self.n_spots}\n"
             f"- Number of raster cells: {self.n_grid}\n"
             f"- Number of covariates: {self.n_factors}\n"
-            f"- Average number of isoforms per gene: {np.mean(self.n_isos) if self.n_isos else None}\n"
+            f"- Average isoforms per gene: {np.mean(self.n_isos) if self.n_isos is not None else None}\n"
             "=== Test results\n"
-            f"- Spatial variability test: {sv_status}\n"
-            f"- Differential usage test: {du_status}"
+            f"- Spatial variability: {sv_status}\n"
+            f"- Differential usage: {du_status}"
         )
+
+    __repr__ = __str__
 
     def _rasterize_bins(self, bins, table_name, col_key, row_key) -> str:
         """Rasterize bins and cache image key in sdata."""
@@ -1345,23 +1347,18 @@ class SplisosmFFT:
                 "No differential usage results found. Run test_differential_usage() first."
             )
 
-        du = self.du_test_results
         covariate_names = self.covariate_names or [
             f"factor_{i}" for i in range(self.n_factors)
         ]
-        rows = []
-        for _g, gene in enumerate(self.gene_names):
-            for _f, covariate in enumerate(covariate_names):
-                rows.append(
-                    {
-                        "gene": gene,
-                        "covariate": covariate,
-                        "statistic": du["statistic"][_g, _f],
-                        "pvalue": du["pvalue"][_g, _f],
-                        "pvalue_adj": du["pvalue_adj"][_g, _f],
-                    }
-                )
-        return pd.DataFrame(rows)
+        return pd.DataFrame(
+            {
+                "gene": np.repeat(self.gene_names, self.n_factors),
+                "covariate": np.tile(covariate_names, self.n_genes),
+                "statistic": self.du_test_results["statistic"].reshape(-1),
+                "pvalue": self.du_test_results["pvalue"].reshape(-1),
+                "pvalue_adj": self.du_test_results["pvalue_adj"].reshape(-1),
+            }
+        )
 
     def _compute_feature_summaries(self, print_progress: bool = True) -> None:
         """Compute and cache both gene-level and isoform-level summaries."""
@@ -1576,7 +1573,7 @@ class SplisosmFFT:
             If ``level`` is not ``'gene'`` or ``'isoform'``.
         """
         if self._adata is None:
-            raise RuntimeError("Data is not initialized. Call setup_data() first.")
+            raise RuntimeError("Call setup_data() first.")
         if level not in {"gene", "isoform"}:
             raise ValueError("`level` must be one of 'gene' or 'isoform'.")
 

@@ -302,11 +302,11 @@ class SplisosmGLMM:
             else "NA"
         )
         return (
-            "=== Parametric SPLISOSM model for spatial isoform testings\n"
+            "=== SplisosmGLMM\n"
             + f"- Number of genes: {self.n_genes}\n"
             + f"- Number of spots: {self.n_spots}\n"
             + f"- Number of covariates: {self.n_factors}\n"
-            + f"- Average number of isoforms per gene: {np.mean(self.n_isos_per_gene) if self.n_isos_per_gene is not None else None}\n"
+            + f"- Average isoforms per gene: {np.mean(self.n_isos_per_gene) if self.n_isos_per_gene is not None else None}\n"
             + "=== Model configurations\n"
             + f"- Model type: {self.model_type}\n"
             + f"- Parameterized using sigma and theta: {self.model_configs['var_parameterization_sigma_theta']}\n"
@@ -314,14 +314,16 @@ class SplisosmGLMM:
             + f"- Same variance across classes: {self.model_configs['share_variance']}\n"
             + f"- Prior on total variance: {self.model_configs['var_prior_model']}\n"
             + f"- Initialization method: {self.model_configs['init_ratio']}\n"
-            + "=== Fitting configurations \n"
+            + "=== Fitting configurations\n"
             + f"- Trained: {self._is_trained}\n"
-            + f"- Fitting methods: {self.model_configs['fitting_method']}\n"
+            + f"- Fitting method: {self.model_configs['fitting_method']}\n"
             + f"- Parameters: {self.model_configs['fitting_configs']}\n"
             + "=== Test results\n"
-            + f"- Spatial variability test: {_sv_status}\n"
-            + f"- Differential usage test: {_du_status}"
+            + f"- Spatial variability: {_sv_status}\n"
+            + f"- Differential usage: {_du_status}"
         )
+
+    __repr__ = __str__
 
     @property
     def n_isos(self) -> list[int]:
@@ -852,17 +854,14 @@ class SplisosmGLMM:
         pandas.DataFrame
             Formatted test results.
         """
-        assert test_type in [
-            "sv",
-            "du",
-        ], "Invalid test type. Must be one of 'sv' or 'du'."
+        if test_type not in {"sv", "du"}:
+            raise ValueError("test_type must be 'sv' or 'du'.")
         if test_type == "sv":
-            # check if the spatial variability test has been run
-            assert (
-                len(self.sv_test_results) > 0
-            ), "No spatial variability test results found. Please run test_spatial_variability() first."
-            # format the results
-            res = pd.DataFrame(
+            if len(self.sv_test_results) == 0:
+                raise ValueError(
+                    "No spatial variability results. Run test_spatial_variability() first."
+                )
+            return pd.DataFrame(
                 {
                     "gene": self.gene_names,
                     "statistic": self.sv_test_results["statistic"],
@@ -870,23 +869,22 @@ class SplisosmGLMM:
                     "pvalue_adj": self.sv_test_results["pvalue_adj"],
                 }
             )
-            return res
-        else:
-            # check if the differential usage test has been run
-            assert (
-                len(self.du_test_results) > 0
-            ), "No differential usage test results found. Please run test_differential_usage() first."
-            # format the results
-            res = pd.DataFrame(
-                {
-                    "gene": np.repeat(self.gene_names, self.n_factors),
-                    "covariate": np.tile(self.covariate_names, self.n_genes),
-                    "statistic": self.du_test_results["statistic"].reshape(-1),
-                    "pvalue": self.du_test_results["pvalue"].reshape(-1),
-                    "pvalue_adj": self.du_test_results["pvalue_adj"].reshape(-1),
-                }
+        if len(self.du_test_results) == 0:
+            raise ValueError(
+                "No differential usage results. Run test_differential_usage() first."
             )
-            return res
+        covariate_names = self.covariate_names or [
+            f"factor_{i}" for i in range(self.n_factors)
+        ]
+        return pd.DataFrame(
+            {
+                "gene": np.repeat(self.gene_names, self.n_factors),
+                "covariate": np.tile(covariate_names, self.n_genes),
+                "statistic": self.du_test_results["statistic"].reshape(-1),
+                "pvalue": self.du_test_results["pvalue"].reshape(-1),
+                "pvalue_adj": self.du_test_results["pvalue_adj"].reshape(-1),
+            }
+        )
 
     def fit(
         self,
