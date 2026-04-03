@@ -60,6 +60,26 @@ Summary of class features:
      - slow
      - optional via ``approx_rank=k`` at ``SplisosmGLMM()`` construction time.
 
+.. note::
+
+   **SplisosmNP vs SplisosmFFT:** same test, different assumptions, potentially different results.
+
+.. raw:: html
+   
+   <details>
+   <summary>Show details</summary>
+
+   While classes compute the same HSIC test statistic and use the same spectrum-based null, 
+   results can still differ because SplisosmFFT (i) assumes **periodic boundaries** 
+   (the grid wraps around, so edge bins become neighbours) and
+   (ii) operates on the **full raster grid**, zero-padding unobserved bins. On the other hand,
+   SplisosmNP works only on the observed spots with a k-NN graph that has no wrap-around.  
+   The discrepancy is small when the grid is densely observed and 
+   the tissue is far from the slide edges (i.e. boundaries are already all zero).
+
+... raw:: html
+   </details>
+
 Inputs and outputs
 ------------------
 
@@ -195,6 +215,7 @@ SPLISOSM tests for statistical independence between isoform expression and spati
        nan_filling="mean",           # if 'none', use only non-zero spots per gene (slow)
        null_method="eig",            # 'eig' (Liu) | 'trace' (normal approx) | 'perm'
        null_configs=None,            # e.g. {"approx_rank": 20} to cap eigenvalues
+       n_jobs=-1,                    # gene-level parallelism; -1 = all CPUs
        print_progress=True,
    )
    df_sv_res = model.get_formatted_test_results("sv")
@@ -319,6 +340,7 @@ Uses Gaussian process regression (GPR) to remove spatial autocorrelation.
        residualize="cov_only",        # 'cov_only' (faster) | 'both' (more conservative)
        gpr_backend="sklearn",         # 'sklearn' | 'gpytorch' (FITC sparse GP with GPU)
        gpr_configs=None,              # e.g. {"covariate": {"n_inducing": 500}}
+       n_jobs=-1,                     # gene-level parallelism; -1 = all CPUs
        print_progress=True,
    )
    df_du_res = model.get_formatted_test_results("du")
@@ -377,9 +399,11 @@ Same test as :class:`~splisosm.SplisosmNP` but with FFT-accelerated GPR for regu
        filter_single_iso_genes=True,
    )
    model.test_differential_usage(
-       method="hsic-gp",
-       residualize="cov_only",   # 'cov_only' | 'both'
-       n_jobs=-1,                # gene-level parallelism
+       method="hsic-gp",              # 'hsic' | 'hsic-gp' | 't-fisher' | 't-tippett'
+       ratio_transformation="none",   # 'none' | 'clr' | 'ilr' | 'alr'
+       residualize="cov_only",        # 'cov_only' | 'both'
+       gpr_configs=None,              # e.g. {"covariate": {"length_scale_bounds": "fixed"}}
+       n_jobs=-1,                     # gene-level parallelism
        print_progress=True,
    )
    df_du_res = model.get_formatted_test_results("du")
@@ -419,9 +443,9 @@ Fits a multinomial GLMM with a Gaussian random field spatial random effect. The 
 
    model = SplisosmGLMM(
        model_type="glmm-full",      # 'glmm-full' | 'glmm-null' | 'glm'
-       fitting_method="joint_gd",   # 'joint_gd' | 'marginal_gd' | 'marginal_newton'
+       fitting_method="joint_gd",   # 'joint_gd' | 'joint_newton' | 'marginal_gd' | 'marginal_newton'
        device="cpu",                # 'cpu' | 'cuda' (NVIDIA) | 'mps' (Apple Silicon)
-       approx_rank=None,            # None = auto; int = fixed low-rank kernel
+       approx_rank="auto",          # 'auto' (default) | None (full rank) | int (fixed low-rank)
    )
    model.setup_data(
        adata=adata_svp,
@@ -509,6 +533,13 @@ adjust them only when you hit performance or accuracy limits.
      - Reduces GP fitting cost from O(*n*³) to O(*nM*²).
        Accuracy degrades if *M* is too small.
        Set to ``None`` for exact GP (warns when ``n_spots > 10000``).
+   * - **Parallel jobs**
+     - ``n_jobs=`` in ``test_spatial_variability`` / ``test_differential_usage``
+     - ``-1`` (all CPUs)
+     - Number of joblib workers for gene-wise computation.
+       Uses ``prefer="threads"`` to avoid pickling large shared objects.
+       When ``gpr_backend="gpytorch"`` with ``device != "cpu"``, parallelism
+       is automatically disabled (CUDA not thread-safe).
    * - **Other GPR configuration**
      - ``gpr_configs=`` in ``test_differential_usage``
      - See :func:`test_differential_usage <splisosm.hyptest_np.SplisosmNP.test_differential_usage>` docstring for details
@@ -595,16 +626,19 @@ adjust them only when you hit performance or accuracy limits.
        share GPU context.
    * - **Low-rank spatial kernel**
      - ``SplisosmGLMM(approx_rank=k)``
-     - Auto: full rank when ``n_spots ≤ 5 000``, else ``⌈4√n⌉``
+     - ``"auto"``: full rank when ``n_spots ≤ 5 000``, else ``⌈4√n⌉``
      - Fewer eigenvectors → faster fitting and lower memory (with accuracy loss).
-       Pass ``None`` to force full rank regardless of ``n_spots``.
+       Pass ``None`` to force full rank regardless of ``n_spots``;
+       pass an integer to set a fixed rank.
    * - **Fitting method**
      - ``SplisosmGLMM(fitting_method=...)``
      - ``"joint_gd"``
      - ``"joint_gd"`` maximises the joint likelihood by gradient descent —
-       fastest.  ``"marginal_gd"`` / ``"marginal_newton"`` integrate out the
+       fastest.  ``"joint_newton"`` adds a Newton step for the variance
+       parameters.  ``"marginal_gd"`` / ``"marginal_newton"`` integrate out the
        random effect via second-order Laplace approximation and give more accurate
-       variance posteriors at but are significantly more expensive.
+       variance posteriors but are significantly more expensive
+       (O(n³) Cholesky per epoch; see warning for ``n_spots > 300``).
    * - **Parallel gene fitting** (CPU only)
      - ``fit(n_jobs=N, batch_size=B)``
      - ``n_jobs=1``, ``batch_size=1``

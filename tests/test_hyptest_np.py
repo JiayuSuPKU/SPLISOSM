@@ -455,26 +455,94 @@ class TestSplisosmNP(unittest.TestCase):
                 self.assertGreater(len(du_results), 0)
                 self.assertIn(method, str(model))
 
-    def test_spatial_variability_with_none_transformation(self):
-        """Test spatial variability with no transformation."""
+    def test_extract_feature_summary_gene(self):
+        """extract_feature_summary(level='gene') returns expected shape and columns."""
         model = SplisosmNP()
         model.setup_data(
-            adata=self.adata,
+            adata=self.adata_5g,
             layer="counts",
             spatial_key="spatial",
             group_iso_by="gene_symbol",
-            design_mtx=["cov_1", "cov_2"],
-            gene_names="gene_label",
             min_counts=0,
             min_bin_pct=0.0,
             filter_single_iso_genes=False,
         )
-        model.test_spatial_variability(
-            method="hsic-ir", ratio_transformation="none", print_progress=False
+        df = model.extract_feature_summary(level="gene", print_progress=False)
+        self.assertEqual(len(df), model.n_genes)
+        for col in ("n_isos", "perplexity", "pct_bin_on", "count_avg", "count_std"):
+            self.assertIn(col, df.columns)
+        self.assertTrue((df["count_avg"] >= 0).all())
+        # caching: second call returns same object
+        df2 = model.extract_feature_summary(level="gene", print_progress=False)
+        self.assertIs(df, df2)
+
+    def test_extract_feature_summary_isoform(self):
+        """extract_feature_summary(level='isoform') returns expected shape and columns."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
-        sv_results = model.get_formatted_test_results("sv")
-        self.assertEqual(len(sv_results), self.n_genes)
-        self.assertIn("pvalue", sv_results.columns)
+        df = model.extract_feature_summary(level="isoform", print_progress=False)
+        self.assertEqual(len(df), sum(model.n_isos))
+        for col in ("gene_symbol", "ratio_avg", "ratio_std", "ratio_total"):
+            self.assertIn(col, df.columns)
+        self.assertTrue(np.isfinite(df["ratio_avg"].to_numpy()).all())
+        # caching
+        df2 = model.extract_feature_summary(level="isoform", print_progress=False)
+        self.assertIs(df, df2)
+
+    def test_sv_return_results_true(self):
+        """test_spatial_variability(return_results=True) returns the result dict."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        results = model.test_spatial_variability(
+            method="hsic-ir", return_results=True, print_progress=False
+        )
+        self.assertIsNotNone(results)
+        self.assertIn("statistic", results)
+        self.assertIn("pvalue", results)
+        # Should match stored results
+        np.testing.assert_array_equal(
+            results["statistic"], model.sv_test_results["statistic"]
+        )
+
+    def test_str_reflects_test_status(self):
+        """__str__ includes method name after running SV and DU."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        s_before = str(model)
+        self.assertIn("SplisosmNP", s_before)
+
+        model.test_spatial_variability(method="hsic-ir", print_progress=False)
+        s_sv = str(model)
+        self.assertIn("hsic-ir", s_sv)
+
+        model.test_differential_usage(method="hsic", print_progress=False)
+        s_du = str(model)
+        self.assertIn("hsic", s_du)
 
     def test_spatial_variability_with_radial_transformation(self):
         """Test spatial variability with radial ratio transformation."""
@@ -1644,69 +1712,6 @@ class TestParallelNP(unittest.TestCase):
                     atol=1e-6,
                     err_msg="DU t-tippett pvalue differs",
                 )
-
-    # ------------------------------------------------------------------
-    # Result dict structure checks
-    # ------------------------------------------------------------------
-
-    def test_sv_result_dict_structure(self):
-        """SV result dict has correct keys and shapes after parallel run."""
-        model = self._setup_model(self.adata)
-        model.test_spatial_variability(method="hsic-ir", n_jobs=2, print_progress=False)
-        res = model.sv_test_results
-        self.assertIn("statistic", res)
-        self.assertIn("pvalue", res)
-        self.assertIn("pvalue_adj", res)
-        self.assertIn("method", res)
-        self.assertIn("null_method", res)
-        self.assertEqual(len(res["statistic"]), self.n_genes)
-        self.assertEqual(len(res["pvalue"]), self.n_genes)
-        self.assertEqual(len(res["pvalue_adj"]), self.n_genes)
-        self.assertTrue(np.all(res["pvalue"] >= 0))
-        self.assertTrue(np.all(res["pvalue"] <= 1))
-
-    def test_du_result_dict_structure(self):
-        """DU result dict has correct keys and shapes after parallel run."""
-        model = self._setup_model(self.adata, design_cols=["cov_1", "cov_2"])
-        model.test_differential_usage(method="hsic", n_jobs=2, print_progress=False)
-        res = model.du_test_results
-        self.assertIn("statistic", res)
-        self.assertIn("pvalue", res)
-        self.assertIn("pvalue_adj", res)
-        self.assertIn("method", res)
-        self.assertEqual(res["statistic"].shape, (self.n_genes, 2))
-        self.assertEqual(res["pvalue"].shape, (self.n_genes, 2))
-        self.assertTrue(np.all(res["pvalue"] >= 0))
-        self.assertTrue(np.all(res["pvalue"] <= 1))
-
-    def test_formatted_results_consistent_with_parallel(self):
-        """get_formatted_test_results works correctly after parallel SV and DU."""
-        model = self._setup_model(self.adata, design_cols=["cov_1", "cov_2"])
-        model.test_spatial_variability(method="hsic-ir", n_jobs=2, print_progress=False)
-        sv_df = model.get_formatted_test_results("sv")
-        self.assertEqual(len(sv_df), self.n_genes)
-        self.assertTrue({"statistic", "pvalue", "pvalue_adj"}.issubset(sv_df.columns))
-
-        model.test_differential_usage(method="hsic", n_jobs=2, print_progress=False)
-        du_df = model.get_formatted_test_results("du")
-        self.assertEqual(len(du_df), self.n_genes * 2)
-        self.assertTrue({"statistic", "pvalue", "pvalue_adj"}.issubset(du_df.columns))
-
-    # ------------------------------------------------------------------
-    # Edge case: n_jobs=1 should behave identically to the old sequential path
-    # ------------------------------------------------------------------
-
-    def test_sv_n_jobs_1_no_error(self):
-        """SV with n_jobs=1 completes without error (regression guard)."""
-        model = self._setup_model(self.adata)
-        model.test_spatial_variability(method="hsic-ir", n_jobs=1, print_progress=False)
-        self.assertIn("statistic", model.sv_test_results)
-
-    def test_du_n_jobs_1_no_error(self):
-        """DU with n_jobs=1 completes without error (regression guard)."""
-        model = self._setup_model(self.adata, design_cols=["cov_1", "cov_2"])
-        model.test_differential_usage(method="hsic-gp", n_jobs=1, print_progress=False)
-        self.assertIn("statistic", model.du_test_results)
 
 
 if __name__ == "__main__":

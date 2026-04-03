@@ -231,7 +231,11 @@ it will report false positive associations that merely reflect shared spatial st
 Conditional test (``method='hsic-gp'``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-To condition on spatial autocorrelation, SPLISOSM first **residualises** the covariate against a Gaussian Process (GP) spatial model, then tests the independence of the residuals against isoform usage:
+Given spatial coordinates :math:`X`, the conditional test assesses the association between :math:`Z | X` and :math:`Y | X`.
+This is a difficult problem because in most spatial data, each spatial location is observed only once (i.e., the above conditionals are point mass).
+To condition on spatial autocorrelation, we adopt a **residualisation** approach :cite:`zhang2012kernel`.
+
+Specifically, SPLISOSM first **residualises** the covariate against a Gaussian Process (GP) spatial model, then tests the independence of the residuals against isoform usage:
 
 1. **Fit a GP** to the covariate :math:`z` using spatial coordinates :math:`x`:
 
@@ -243,17 +247,20 @@ To condition on spatial autocorrelation, SPLISOSM first **residualises** the cov
 
 2. **Compute covariate residuals** :math:`\tilde{Z} = Z - \hat{f}(X)`, capturing the part of covariate variation *not explained by* spatial position.
 
-3. **Test** :math:`\widehat{\mathrm{HSIC}}(\tilde{Z},\, Y)` using the linear covariate kernel :math:`K_{\tilde{Z}} = \tilde{Z}\tilde{Z}^\top / \|\tilde{Z}\|^2`.
+3. **Test** :math:`\widehat{\mathrm{HSIC}}(\tilde{Z},\, Y)` using the linear covariate kernel :math:`K_{\tilde{Z}} = \tilde{Z}\tilde{Z}^\top / \|\tilde{Z}\|^2` and a similar linear kernel for :math:`Y`.
+   Since both kernels are low-rank, the null distribution can be efficiently computed via the eigenvalue method.
 
-Theoretically, the conditional association between :math:`Z` and :math:`Y` given spatial position :math:`X` requires only one of the two residualisation
-:math:`Z | X` or :math:`Y | X` to be performed. In practice, residualising both can give more conservative results, as it is more robust to underfitting of the GP model.
-For flexibility, we provide the two options via the ``residualize`` argument:
+.. note::
+
+   Theoretically, the conditional association between :math:`Z` and :math:`Y` given spatial position :math:`X` requires both residualisations
+   :math:`Z | X` or :math:`Y | X` to be performed. However, :math:`\tilde{Z} \perp\!\!\!\perp Y` implies :math:`Z \perp\!\!\!\perp Y | X` (but not vice versa), 
+   so any significant dependency found by residualising only the covariate is also a true positive for the conditional association.
+
+In practice, we found the covariate-only residualisation delivers massive computational savings and remains well-calibrated.
+For flexibility, we provide optional control via the ``residualize`` argument:
 
 - ``residualize='cov_only'`` (default): only :math:`Z` the spatial covariate is residualised; :math:`Y` the isoform ratio matrix is used as-is.
 - ``residualize='both'``: both :math:`Z` and :math:`Y` are GP-residualised before testing.
-
-Since we are using two linear kernels, the null distribution for :math:`\widehat{\mathrm{HSIC}}(\tilde{Z}, Y)` can be efficiently computed via the eigenvalue method (``null_method='eig'``), 
-using the (low-rank) Gram matrix of :math:`\tilde{Z}` as the covariate kernel.
 
 .. note::
 
@@ -264,6 +271,38 @@ using the (low-rank) Gram matrix of :math:`\tilde{Z}` as the covariate kernel.
    - ``gpr_backend='gpytorch'``: Exact or sparse GP with ``n_inducing`` inducing points.
 
    For very large datasets, pass ``gpr_configs={"covariate": {"n_inducing": 1000}}`` to control the number of inducing points for both backends.
+
+FFT-accelerated conditional DU test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:class:`~splisosm.SplisosmFFT` accelerates the conditional DU test (``method='hsic-gp'``)
+by replacing the dense GP with an **FFT-based Gaussian process**.
+
+On a regular grid the GP covariance kernel :math:`k_\theta(x, x')` is stationary, so
+the Gram matrix :math:`K_\theta` is block-circulant.  All operations required for GP
+fitting and prediction, including matrix-vector products, log-determinants, and gradient
+computations, can be performed via 2-D FFTs:
+
+.. math::
+
+   K_\theta \cdot v = \mathcal{F}^{-1}\!\bigl(\hat{k}_\theta \odot \mathcal{F}(v)\bigr),
+   \quad
+   \log|K_\theta| = \sum_{h,w} \log \hat{k}_{\theta,(h,w)},
+
+where :math:`\hat{k}_\theta` is the 2-D DFT of the kernel's first row.
+This reduces the per-step GP cost from :math:`O(n^3)` (dense Cholesky) or
+:math:`O(nM^2)` (inducing-point) to :math:`O(n \log n)` per L-BFGS iteration,
+with no approximation error for stationary kernels on the grid.
+
+The GP hyperparameters (signal variance, length scale, noise variance) are optimised by
+maximising the marginal log-likelihood using L-BFGS with gradients computed in Fourier
+space.  Covariate residuals :math:`\tilde{Z} = Z - \hat{f}(X)` are then obtained via
+the FFT-based posterior mean.
+
+After residualisation, the HSIC test itself proceeds identically to the
+:class:`~splisosm.SplisosmNP` path: linear-kernel HSIC via :math:`\mathrm{tr}(Y^\top K_{\tilde{Z}} Y)=\|\tilde{Z}^\top Y\|^2`,
+and p-value via the FFT-derived spatial kernel spectrum.
+
 
 Parametric test: SplisosmGLMM
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -307,32 +346,37 @@ Summary
      - Conditioning
      - Null method
    * - HSIC-IR (SVP)
-     - NP / FFT
+     - SplisosmNP / FFT
      - Isoform ratios
      - None
      - ``eig`` / ``trace`` / ``perm``
    * - HSIC-GC (SVE)
-     - NP / FFT
+     - SplisosmNP / FFT
      - Gene counts
      - None
      - ``eig`` / ``trace`` / ``perm``
    * - HSIC-IC
-     - NP / FFT
+     - SplisosmNP / FFT
      - Isoform counts
      - None
      - ``eig`` / ``trace`` / ``perm``
    * - DU (unconditional)
-     - NP / FFT
+     - SplisosmNP / FFT
      - Isoform ratios
      - None
      - ``eig``
    * - DU (GP-conditional)
-     - NP / FFT
+     - SplisosmNP / FFT
      - Isoform ratios
      - GP spatial residualisation
      - ``eig``
+   * - DU (GLM score)
+     - SplisosmGLMM
+     - Isoform counts
+     - None
+     - Chi-squared (score)
    * - DU (GLMM score)
-     - GLMM
+     - SplisosmGLMM
      - Isoform counts
      - GRF random effect
      - Chi-squared (score)

@@ -62,8 +62,8 @@ Platform compatibility
         min_bin_pct=0.05,  # optional: drop genes expressed in < 5% of spots
     )
 
-Running SPLISOSM
---------------------
+Choosing a model class
+---------------------------------
 
 **3. What is the difference between SplisosmNP, SplisosmFFT, and SplisosmGLMM?**
 
@@ -81,21 +81,49 @@ Running SPLISOSM
     fast computation and lower memory footprint.*
 
   - :class:`~splisosm.SplisosmGLMM` — **parametric multinomial GLMM** with a Gaussian random field
-    spatial random effect. Supports DU testing only. The marginal likelihood is approximated via
-    Laplace at the mode. More interpretable (effect sizes, confidence intervals) but requires
+    spatial random effect. **Supports DU testing only**. Potentially more interpretable 
+    (effect sizes, confidence intervals etc.) but requires
     fitting a model per gene, which is computationally intensive.
-    *Use when a parametric model is preferred or when you need effect-size estimates.*
+    *Use when you need effect-size estimates.*
 
   See :doc:`Quick Start <quickstart>` for a model-selection decision tree.
 
+**4. Why SplisosmNP and SplisosmFFT give different results?**
 
-**4. Which differential usage test method should I use: parametric or non-parametric?**
+  While sharing the same statistical methodology, p-values from the two classes
+  can differ for three reasons:
 
-  We recommend using the non-parametric test (:class:`splisosm.hyptest_np.SplisosmNP` with ``method='hsic-gp'``) as the default choice. It is more robust to model misspecification and generally provides better control of the false positive rate.
-  The parametric test (:class:`splisosm.hyptest_glmm.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
+  1. **Periodic boundary assumption.**
+  :class:`~splisosm.SplisosmFFT` treats the grid as periodic (block-circulant kernel), which means bins at
+  opposite edges of the grid are treated as spatial neighbours. 
+  In contrast, :class:`~splisosm.SplisosmNP` builds a k-NN graph from the actual coordinates and has no wrap-around. 
+  Note that in most cases, the tissue does not occupy the entire grid; the periodic assumption
+  holds since the boundary bins are mostly unobserved (zero-padded).
 
-  Note that both conditional tests ('hsic-gp' and 'glmm') are computationally intensive and may take hours to run on large datasets. 
-  For 'hsic-gp', we have implemented several optimizations for large datasets, including inducing-point approximations and GPU acceleration (via the `gpytorch` backend).
+  2. **Rasterisation and zero-padding.**
+  :class:`~splisosm.SplisosmFFT` operates on the full :math:`H \times W` raster grid.  Unobserved bins
+  (positions absent in the ``sdata.tables`` AnnData) are zero-padded (as if they had zero counts). 
+  :class:`~splisosm.SplisosmNP` operates only on the :math:`n \le H \times W` observed spots recorded in the AnnData, 
+  so the effective sample size and kernel matrix dimensions can differ.
+
+  3. **SplisosmNP low-rank approximation.**
+  For large datasets, :class:`~splisosm.SplisosmNP` approximates the kernel with a low-rank eigen-decomposition,
+  which can lead to slightly different p-values compared to the full-rank version. 
+  The approximation rank is controlled via ``null_configs={"approx_rank": r}``, with default :math:`r = \lceil 4\sqrt{n} \rceil` when :math:`n > 5000`.
+
+  In practice, when the grid is densely observed (few missing bins) and the tissue is far
+  from the grid boundary, the two classes give very similar results. 
+  When low-rank approximation is used, :class:`~splisosm.SplisosmNP` loses sensitivity for high-frequency patterns in favor of higher power for low-frequency patterns.
+  This is a design trade-off.
+
+**5. Which differential usage test method should I use: parametric or non-parametric?**
+
+  We recommend using the non-parametric test (:class:`~splisosm.hyptest_np.SplisosmNP` with ``method='hsic-gp'``) as the default choice. It is more robust to model misspecification and generally provides better control of the false positive rate.
+  The parametric test (:class:`~splisosm.hyptest_glmm.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
+
+  Note that both conditional tests (``'hsic-gp'`` and ``'glmm'``) are computationally intensive and may take hours to run on large datasets. 
+  For ``'hsic-gp'``, inducing-point approximations and GPU acceleration (via the `gpytorch` backend) are available.
+  For ``'glmm'``, model fitting is handled naively with pytorch with GPU device support, and low-rank kernel approximation is also available (via ``SplisosmGLMM(approx_rank=...)``).
 
   .. code-block:: python
 
@@ -110,7 +138,7 @@ Running SPLISOSM
         gpr_configs={"covariate": {"n_inducing": 1000}}
     )
 
-  Alternatively, consider the faster unconditional tests ('hsic' or 'glm'). While they do not account for spatial autocorrelation and may lead to inflated p-values,
+  Alternatively, consider the faster unconditional tests (``'hsic'`` or ``'glm'``). While they do not account for spatial autocorrelation and may lead to inflated p-values,
   the overall ranking of gene-covariate associations is often similar to the conditional tests, especially for top hits.
 
   .. code-block:: python
@@ -131,12 +159,15 @@ Running SPLISOSM
     model_glm.test_differential_usage(method='score')
 
 
-**5. Can I run SPLISOSM on single-cell spatial transcriptomics data?**
+Running SPLISOSM
+--------------------
+
+**6. Can I run SPLISOSM on single-cell spatial transcriptomics data?**
 
   Yes. See the :doc:`Feature Quantification page <txquant>` for guidance on preparing input data from Space Ranger and Xenium Ranger segmentation outputs.
 
 
-**6. Can I run SPLISOSM on a subset of cells/spots instead of the whole tissue?**
+**7. Can I run SPLISOSM on a subset of cells/spots instead of the whole tissue?**
 
   Yes. SPLISOSM can be run on any subset of cells or spots. This is useful when focusing on specific regions of interest or cell types. 
   Simply filter your AnnData object to the subset of interest before passing it to SPLISOSM. 
@@ -146,19 +177,21 @@ Running SPLISOSM
   SPLISOSM will then ignore these spots in the statistical tests while still using their coordinates to build the spatial kernel.
 
 
-**7. Can I run SPLISOSM on single-cell non-spatial transcriptomics data?**
+**8. Can I run SPLISOSM on single-cell non-spatial transcriptomics data?**
 
   Yes. While SPLISOSM is designed to identify patterns associated with physical spatial coordinates, it is technically possible to run it on non-spatial single-cell RNA-seq data.
   This can be done by treating cell embeddings (e.g., PCA or UMAP coordinates) as "pseudo-spatial coordinates."
-  :class:`~splisosm.SplisosmNP` natively supports high-dimensional coordinate arrays (any number of dimensions ≥ 2) — simply pass the PCA embedding matrix as the ``spatial_key`` in ``setup_data``.
-  However, this approach should be used with caution. The resulting 'spatial' patterns are only as meaningful as the biological relationships captured by the embedding.
-  Furthermore, be aware of potential circularity if the isoform data was used to generate the embeddings in the first place, as this could lead to spurious associations.
+  :class:`~splisosm.SplisosmNP` natively supports high-dimensional coordinate arrays (any number of dimensions ≥ 2) — simply pass the PCA embedding matrix as the ``spatial_key`` 
+  (or a pre-computed graph adjacency matrix, such as ``adata.obsp['connectivities']`` as the ``adj_key``) in ``setup_data``.
+
+  This approach should be used with caution: 'spatial' patterns in this case are only as meaningful as the biological relationships captured by the embedding.
+  Furthermore, be aware of potential circularity if the isoform data was used to generate the embeddings, as this may lead to spurious associations.
 
 
 Interpretation of Results
 --------------------------
 
-**8. For genes with spatially variable RNA processing (SVP), can I tell which isoforms are driving the spatial variability?**
+**9. For genes with spatially variable RNA processing (SVP), can I tell which isoforms are driving the spatial variability?**
 
   Yes and no. Isoform usage ratios are compositional, meaning they sum to one for each gene in a given spot or cell. If one isoform's usage increases in a spatial region, the usage of one or more other isoforms must decrease. For this reason, SPLISOSM's primary differential usage test (HSIC-IR) is a gene-level multivariate test that aggregates signals across all of a gene's isoforms.
 
@@ -188,10 +221,10 @@ Interpretation of Results
    This per-isoform ranking is for exploratory purposes only. The adjusted p-values from this analysis should not be considered as formal hypothesis testing, as the usage ratios of isoforms from the same gene are inherently correlated.
 
 
-**9. How many spatially variably expressed (SVE) genes or spatially variably processed (SVP) genes should I expect to find?**
+**10. How many spatially variably expressed (SVE) genes or spatially variably processed (SVP) genes should I expect to find?**
 
   The number of detected SVE/SVP genes depends on many factors, including the biological system, data quality, and sequencing depth. 
-  For example, in our analyses of the adult mouse brain, the number of detected SVP genes did not saturate at the sequencing depths tested. 
+  For example, in our analyses of the adult mouse brain (Visium + ONT and Visium 3'), the number of detected SVP genes did not saturate at the sequencing depths tested. 
   We observed that the number of detected SVP genes increased linearly as sequencing depth rose to ~8,000 UMIs per Visium spot.
 
   .. _faq:umi-depth:
@@ -206,7 +239,7 @@ Interpretation of Results
    ONT-CBS1 and ONT-CBS2 are two long-read SiT (Visium-ONT) CBS samples.
    SR-Hippocampus: Slide-seqV2 hippocampus sample with higher spatial resolution but fewer UMIs per spot.
   
-**10. I have finished running SPLISOSM, what should I do next?**
+**11. I have finished running SPLISOSM, what should I do next?**
 
   After obtaining the test results from SPLISOSM, you can perform various downstream analyses to gain further biological insights. Examples include:
 

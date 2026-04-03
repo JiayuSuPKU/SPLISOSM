@@ -457,6 +457,79 @@ class TestSplisosmFFT(unittest.TestCase):
         with self.assertRaises(ValueError):
             model.extract_feature_summary(level="bad-level")
 
+    def test_str_repr(self):
+        """__str__ includes class name and method after running SV."""
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+        )
+        s_before = str(model)
+        self.assertIn("SplisosmFFT", s_before)
+
+        model.test_spatial_variability(method="hsic-ir", n_jobs=1, print_progress=False)
+        s_after = str(model)
+        self.assertIn("hsic-ir", s_after)
+
+    def test_sv_parallel_determinism(self):
+        """SV n_jobs=1 vs n_jobs=2 give identical results."""
+        for n_jobs in [1, 2]:
+            model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+            model.setup_data(
+                self.sdata,
+                bins="grid_bins",
+                table_name=self.table_name,
+                col_key="array_col",
+                row_key="array_row",
+            )
+            model.test_spatial_variability(
+                method="hsic-ir", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model.sv_test_results
+            else:
+                np.testing.assert_allclose(
+                    model.sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="FFT SV statistic differs between n_jobs=1 and n_jobs=2",
+                )
+                np.testing.assert_allclose(
+                    model.sv_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="FFT SV pvalue differs between n_jobs=1 and n_jobs=2",
+                )
+
+    def test_du_parallel_determinism(self):
+        """DU n_jobs=1 vs n_jobs=2 give identical results."""
+        adata = self.sdata.tables[self.table_name]
+        rng = np.random.default_rng(77)
+        design = rng.standard_normal((adata.n_obs, 1))
+        for n_jobs in [1, 2]:
+            model = self._setup_model(design_mtx=design)
+            model.test_differential_usage(
+                method="hsic", n_jobs=n_jobs, return_results=False, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model.du_test_results
+            else:
+                np.testing.assert_allclose(
+                    model.du_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="FFT DU statistic differs between n_jobs=1 and n_jobs=2",
+                )
+                np.testing.assert_allclose(
+                    model.du_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="FFT DU pvalue differs between n_jobs=1 and n_jobs=2",
+                )
+
     def _setup_model(self, design_mtx=None):
         model = SplisosmFFT(rho=0.9, neighbor_degree=1)
         model.setup_data(
