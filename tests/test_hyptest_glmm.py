@@ -1643,8 +1643,10 @@ class TestSplisosmGLMMNewFeatures(unittest.TestCase):
         model = self._make_model()
         iso_df = model.extract_feature_summary(level="isoform", print_progress=False)
         gene_df = model.extract_feature_summary(level="gene", print_progress=False)
+        # The gene column in the isoform summary comes from adata.var
+        gene_col = "gene_symbol"  # matches group_iso_by used in setup_data
         for gene in gene_df.index:
-            iso_subset = iso_df[iso_df["gene"] == gene]
+            iso_subset = iso_df[iso_df[gene_col] == gene]
             ratio_sum = iso_subset["ratio_total"].sum()
             # Either sums to ~1 (expressed gene) or ~0 (unexpressed gene)
             self.assertTrue(

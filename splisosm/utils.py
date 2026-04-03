@@ -25,6 +25,7 @@ __all__ = [
     "prepare_inputs_from_anndata",
     "add_ratio_layer",
     "extract_counts_n_ratios",
+    "compute_feature_summaries",
     "extract_gene_level_statistics",
     "run_sparkx",
     "run_hsic_gc",
@@ -1116,10 +1117,192 @@ def extract_counts_n_ratios(
     return counts_list, ratios_list, gene_name_list, ratio_obs_merged
 
 
+def compute_feature_summaries(
+    adata: AnnData,
+    gene_names: list[str],
+    layer: str = "counts",
+    group_iso_by: str = "gene_symbol",
+    print_progress: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute gene-level and isoform-level summary statistics.
+
+    This is the shared implementation behind
+    :meth:`~splisosm.SplisosmNP.extract_feature_summary`,
+    :meth:`~splisosm.SplisosmFFT.extract_feature_summary`, and
+    :meth:`~splisosm.SplisosmGLMM.extract_feature_summary`.
+
+    Parameters
+    ----------
+    adata
+        Annotated data matrix (typically the filtered AnnData from ``setup_data``).
+    gene_names
+        Ordered list of gene display names (length ``n_genes``).
+    layer
+        Layer in ``adata.layers`` containing raw isoform counts.
+    group_iso_by
+        Column in ``adata.var`` that groups isoforms by gene.
+    print_progress
+        Show a tqdm progress bar.
+
+    Returns
+    -------
+    gene_summary : pandas.DataFrame
+        Indexed by gene name with columns: ``n_isos``, ``perplexity``,
+        ``pct_bin_on``, ``count_avg``, ``count_std``, ``major_ratio_avg``.
+    isoform_summary : pandas.DataFrame
+        Indexed by isoform name with original ``adata.var`` columns plus:
+        ``pct_bin_on``, ``count_total``, ``count_avg``, ``count_std``,
+        ``ratio_total``, ``ratio_avg``, ``ratio_std``.
+    """
+    iso_counts = adata.layers[layer]
+    n_bins = iso_counts.shape[0]
+    is_sparse = scipy.sparse.issparse(iso_counts)
+
+    if is_sparse:
+        if not scipy.sparse.isspmatrix_csc(iso_counts):
+            iso_counts = iso_counts.tocsc()
+    else:
+        iso_counts = np.asarray(iso_counts, dtype=float)
+
+    iso_groups = list(adata.var.groupby(group_iso_by, observed=True, sort=False))
+
+    gene_rows: list[dict] = []
+    iso_rows: list[dict] = []
+    all_iso_names: list[str] = []
+
+    iterator = tqdm(
+        zip(gene_names, iso_groups),
+        desc="Genes",
+        total=len(gene_names),
+        disable=not print_progress,
+    )
+
+    for gene_name, (_, iso_group_df) in iterator:
+        iso_names = iso_group_df.index.tolist()
+        iso_idx = adata.var_names.get_indexer(iso_names)
+
+        if is_sparse:
+            gene_counts = iso_counts[:, iso_idx]
+            iso_total = np.asarray(gene_counts.sum(axis=0), dtype=float).ravel()
+            iso_sumsq = np.asarray(
+                gene_counts.power(2).sum(axis=0), dtype=float
+            ).ravel()
+            iso_nnz = np.diff(gene_counts.indptr).astype(float)
+            row_sums = np.asarray(gene_counts.sum(axis=1), dtype=float).ravel()
+        else:
+            gene_counts = np.asarray(iso_counts[:, iso_idx], dtype=float)
+            iso_total = gene_counts.sum(axis=0)
+            iso_sumsq = np.square(gene_counts).sum(axis=0)
+            iso_nnz = np.count_nonzero(gene_counts, axis=0).astype(float)
+            row_sums = gene_counts.sum(axis=1)
+
+        gene_total = float(iso_total.sum())
+        valid_rows = np.flatnonzero(row_sums > 0.0)
+        n_valid = int(valid_rows.size)
+
+        iso_count_avg = iso_total / n_bins
+        iso_count_var = np.maximum((iso_sumsq / n_bins) - np.square(iso_count_avg), 0.0)
+        iso_count_std = np.sqrt(iso_count_var)
+        iso_pct_bin_on = iso_nnz / n_bins
+
+        if gene_total > 0.0:
+            ratio_total = iso_total / gene_total
+        else:
+            ratio_total = np.zeros(len(iso_names), dtype=float)
+
+        if n_valid > 0:
+            if is_sparse:
+                ratio_counts = gene_counts.tocsr()[valid_rows]
+                ratio_counts = ratio_counts.multiply(
+                    (1.0 / row_sums[valid_rows])[:, None]
+                )
+                ratio_sum = np.asarray(ratio_counts.sum(axis=0), dtype=float).ravel()
+                ratio_sumsq = np.asarray(
+                    ratio_counts.power(2).sum(axis=0), dtype=float
+                ).ravel()
+            else:
+                ratio_counts = gene_counts[valid_rows] / row_sums[valid_rows, None]
+                ratio_sum = ratio_counts.sum(axis=0)
+                ratio_sumsq = np.square(ratio_counts).sum(axis=0)
+
+            ratio_avg = ratio_sum / n_valid
+            ratio_var = np.maximum((ratio_sumsq / n_valid) - np.square(ratio_avg), 0.0)
+            ratio_std = np.sqrt(ratio_var)
+        else:
+            ratio_avg = np.zeros(len(iso_names), dtype=float)
+            ratio_std = np.zeros(len(iso_names), dtype=float)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            entropy = -(np.log(ratio_total) * ratio_total)
+            entropy = float(np.nan_to_num(entropy).sum())
+
+        gene_count_avg = float(gene_total / n_bins)
+        gene_count_sumsq = float(np.square(row_sums).sum())
+        gene_count_var = max((gene_count_sumsq / n_bins) - (gene_count_avg**2), 0.0)
+
+        gene_rows.append(
+            {
+                "gene": gene_name,
+                "n_isos": len(iso_names),
+                "perplexity": float(np.exp(entropy)),
+                "pct_bin_on": float(n_valid / n_bins),
+                "count_avg": gene_count_avg,
+                "count_std": float(np.sqrt(gene_count_var)),
+                "major_ratio_avg": (
+                    float(ratio_total.max()) if ratio_total.size > 0 else 0.0
+                ),
+            }
+        )
+
+        all_iso_names.extend(iso_names)
+        for (
+            iso_name,
+            pct_bin_on,
+            count_total,
+            count_avg,
+            count_std,
+            iso_ratio_total,
+            iso_ratio_avg,
+            iso_ratio_std,
+        ) in zip(
+            iso_names,
+            iso_pct_bin_on,
+            iso_total,
+            iso_count_avg,
+            iso_count_std,
+            ratio_total,
+            ratio_avg,
+            ratio_std,
+        ):
+            iso_rows.append(
+                {
+                    "isoform": iso_name,
+                    "pct_bin_on": float(pct_bin_on),
+                    "count_total": float(count_total),
+                    "count_avg": float(count_avg),
+                    "count_std": float(count_std),
+                    "ratio_total": float(iso_ratio_total),
+                    "ratio_avg": float(iso_ratio_avg),
+                    "ratio_std": float(iso_ratio_std),
+                }
+            )
+
+    gene_summary = pd.DataFrame(gene_rows).set_index("gene")
+    var_df = adata.var.loc[all_iso_names].copy()
+    stats_df = pd.DataFrame(iso_rows).set_index("isoform")
+    isoform_summary = pd.concat([var_df, stats_df], axis=1)
+
+    return gene_summary, isoform_summary
+
+
 def extract_gene_level_statistics(
     adata: AnnData, layer: str = "counts", group_iso_by: str = "gene_symbol"
 ) -> pd.DataFrame:
     """Extract gene-level metadata from isoform-level counts anndata.
+
+    .. deprecated::
+        Use :func:`compute_feature_summaries` instead, which returns both
+        gene-level and isoform-level statistics.
 
     Parameters
     ----------
@@ -1133,89 +1316,22 @@ def extract_gene_level_statistics(
     Returns
     -------
     pandas.DataFrame
-        Gene-level metadata with columns:
-
-        - ``'n_iso'``: int. Number of isoforms per gene.
-        - ``'pct_spot_on'``: float. Percentage of spots with non-zero counts.
-        - ``'count_avg'``: float. Average counts per gene.
-        - ``'count_std'``: float. Standard deviation of counts per gene.
-        - ``'perplexity'``: float. Expression-based effective number of isoforms.
-        - ``'major_ratio_avg'``: float. Average ratio of the major isoform.
-
-    See Also
-    --------
-    :func:`splisosm.hyptest_np.SplisosmNP.extract_feature_summary`
-    :func:`splisosm.hyptest_glmm.SplisosmGLMM.extract_feature_summary`
-
+        Gene-level metadata.
     """
-    # extract isoform counts
-    iso_counts = adata.layers[layer]  # (n_spots, n_isos_total)
-
-    # Check if input is sparse
-    is_sparse_input = scipy.sparse.issparse(iso_counts)
-    if (
-        is_sparse_input
-        and not scipy.sparse.isspmatrix_csc(iso_counts)
-        and not scipy.sparse.isspmatrix_csr(iso_counts)
-    ):
-        iso_counts = iso_counts.tocsr()
-
-    df_list = []
-    # loop through genes
-    _gene_groups = adata.var.reset_index().groupby(group_iso_by, observed=True)
-    for _gene, _group in tqdm(_gene_groups, desc="Genes", total=_gene_groups.ngroups):
-        # extract isoform counts and relative ratio
-        iso_indices = _group.index.tolist()
-        _counts = iso_counts[:, iso_indices]
-
-        if is_sparse_input:
-            # Calculate statistics on sparse matrix without densifying
-            _sum_per_iso = np.asarray(_counts.sum(0)).flatten()  # (n_isos,)
-            _row_sums = np.asarray(_counts.sum(1)).flatten()  # (n_spots,)
-            _total_sum = _sum_per_iso.sum()
-
-            pct_spot_on = (_row_sums > 0).mean()
-            count_avg = _row_sums.mean()
-            count_std = _row_sums.std()
-        else:
-            if not isinstance(_counts, np.ndarray):
-                _counts = np.asarray(_counts)
-
-            _sum_per_iso = _counts.sum(0)
-            _row_sums = _counts.sum(1)
-            _total_sum = _counts.sum()
-
-            pct_spot_on = (_row_sums > 0).mean()
-            count_avg = _row_sums.mean()
-            count_std = _row_sums.std()
-
-        # Avoid division by zero
-        if _total_sum == 0:
-            _ratios_avg = np.zeros_like(_sum_per_iso)
-        else:
-            _ratios_avg = _sum_per_iso / _total_sum  # (n_isos,)
-
-        # calculate and store gene-level statistics
-        # handle zeros in log
-        with np.errstate(divide="ignore", invalid="ignore"):
-            entropy = -(np.log(_ratios_avg) * _ratios_avg)
-            entropy = np.nan_to_num(entropy).sum()
-
-        df_list.append(
-            {
-                "gene": _gene,
-                "n_iso": _group.shape[0],
-                "pct_spot_on": pct_spot_on,
-                "count_avg": count_avg,
-                "count_std": count_std,
-                "perplexity": np.exp(entropy),
-                "major_ratio_avg": _ratios_avg.max() if _ratios_avg.size > 0 else 0.0,
-            }
-        )
-
-    df_gene_meta = pd.DataFrame(df_list).set_index("gene")
-
-    return df_gene_meta
+    warnings.warn(
+        "extract_gene_level_statistics is deprecated; use compute_feature_summaries() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    gene_names = list(
+        adata.var.groupby(group_iso_by, observed=True, sort=False).groups.keys()
+    )
+    gene_df, iso_df = compute_feature_summaries(
+        adata, gene_names, layer=layer, group_iso_by=group_iso_by, print_progress=True
+    )
+    # Remap column names for backward compatibility
+    gene_df = gene_df.rename(columns={"n_isos": "n_iso", "pct_bin_on": "pct_spot_on"})
+    return gene_df
 
 
 def run_sparkx(

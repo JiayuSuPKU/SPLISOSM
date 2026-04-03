@@ -36,7 +36,11 @@ from splisosm.kernel_gpr import (
     _DEFAULT_GPR_CONFIGS,
 )
 from splisosm.likelihood import liu_sf
-from splisosm.utils import counts_to_ratios, false_discovery_control
+from splisosm.utils import (
+    compute_feature_summaries,
+    counts_to_ratios,
+    false_discovery_control,
+)
 
 __all__ = ["FFTKernel", "FFTKernelOp", "FFTKernelGPR", "SplisosmFFT"]
 
@@ -1156,151 +1160,16 @@ class SplisosmFFT:
             raise RuntimeError("Data is not initialized. Call setup_data() first.")
         if self._gene_summary is not None and self._isoform_summary is not None:
             return
-
-        adata = self._adata
-        n_bins = int(adata.n_obs)
-        var_names_index = adata.var_names
-        iso_counts = adata.layers[self._counts_layer]
-        is_sparse = sp.issparse(iso_counts)
-
-        if is_sparse:
-            if not sp.isspmatrix_csc(iso_counts):
-                iso_counts = iso_counts.tocsc()
-        else:
-            iso_counts = np.asarray(iso_counts, dtype=float)
-
-        gene_rows: list[dict[str, Any]] = []
-        iso_rows: list[dict[str, Any]] = []
-        all_iso_names: list[str] = []
-
-        iterator = tqdm(
-            zip(self.gene_names, self._gene_iso_names),
-            desc="Genes",
-            total=len(self.gene_names),
-            disable=not print_progress,
+        # self._adata is the full unfiltered table; restrict to filtered isoforms
+        kept_isos = [iso for gene_isos in self._gene_iso_names for iso in gene_isos]
+        filtered_adata = self._adata[:, kept_isos]
+        self._gene_summary, self._isoform_summary = compute_feature_summaries(
+            filtered_adata,
+            self.gene_names,
+            layer=self._counts_layer,
+            group_iso_by=self._group_iso_by,
+            print_progress=print_progress,
         )
-
-        for gene_name, iso_names in iterator:
-            iso_idx = var_names_index.get_indexer(iso_names)
-            if np.any(iso_idx < 0):
-                raise ValueError(
-                    f"Failed to locate one or more filtered isoforms for gene '{gene_name}'."
-                )
-
-            if is_sparse:
-                gene_counts = iso_counts[:, iso_idx]
-                iso_total = np.asarray(gene_counts.sum(axis=0), dtype=float).ravel()
-                iso_sumsq = np.asarray(
-                    gene_counts.power(2).sum(axis=0), dtype=float
-                ).ravel()
-                iso_nnz = np.diff(gene_counts.indptr).astype(float)
-                row_sums = np.asarray(gene_counts.sum(axis=1), dtype=float).ravel()
-            else:
-                gene_counts = np.asarray(iso_counts[:, iso_idx], dtype=float)
-                iso_total = gene_counts.sum(axis=0)
-                iso_sumsq = np.square(gene_counts).sum(axis=0)
-                iso_nnz = np.count_nonzero(gene_counts, axis=0).astype(float)
-                row_sums = gene_counts.sum(axis=1)
-
-            gene_total = float(iso_total.sum())
-            valid_rows = np.flatnonzero(row_sums > 0.0)
-            n_valid = int(valid_rows.size)
-
-            iso_count_avg = iso_total / n_bins
-            iso_count_var = np.maximum(
-                (iso_sumsq / n_bins) - np.square(iso_count_avg), 0.0
-            )
-            iso_count_std = np.sqrt(iso_count_var)
-            iso_pct_bin_on = iso_nnz / n_bins
-
-            if gene_total > 0.0:
-                ratio_total = iso_total / gene_total
-            else:
-                ratio_total = np.zeros(len(iso_names), dtype=float)
-
-            if n_valid > 0:
-                if is_sparse:
-                    ratio_counts = gene_counts.tocsr()[valid_rows]
-                    ratio_counts = ratio_counts.multiply(
-                        (1.0 / row_sums[valid_rows])[:, None]
-                    )
-                    ratio_sum = np.asarray(
-                        ratio_counts.sum(axis=0), dtype=float
-                    ).ravel()
-                    ratio_sumsq = np.asarray(
-                        ratio_counts.power(2).sum(axis=0), dtype=float
-                    ).ravel()
-                else:
-                    ratio_counts = gene_counts[valid_rows] / row_sums[valid_rows, None]
-                    ratio_sum = ratio_counts.sum(axis=0)
-                    ratio_sumsq = np.square(ratio_counts).sum(axis=0)
-
-                ratio_avg = ratio_sum / n_valid
-                ratio_var = np.maximum(
-                    (ratio_sumsq / n_valid) - np.square(ratio_avg), 0.0
-                )
-                ratio_std = np.sqrt(ratio_var)
-            else:
-                ratio_avg = np.zeros(len(iso_names), dtype=float)
-                ratio_std = np.zeros(len(iso_names), dtype=float)
-
-            with np.errstate(divide="ignore", invalid="ignore"):
-                entropy = -(np.log(ratio_total) * ratio_total)
-                entropy = float(np.nan_to_num(entropy).sum())
-
-            gene_count_avg = float(gene_total / n_bins)
-            gene_count_sumsq = float(np.square(row_sums).sum())
-            gene_count_var = max((gene_count_sumsq / n_bins) - (gene_count_avg**2), 0.0)
-
-            gene_rows.append(
-                {
-                    "gene": gene_name,
-                    "n_isos": len(iso_names),
-                    "perplexity": float(np.exp(entropy)),
-                    "pct_bin_on": float(n_valid / n_bins),
-                    "count_avg": gene_count_avg,
-                    "count_std": float(np.sqrt(gene_count_var)),
-                }
-            )
-
-            all_iso_names.extend(iso_names)
-            for (
-                iso_name,
-                pct_bin_on,
-                count_total,
-                count_avg,
-                count_std,
-                iso_ratio_total,
-                iso_ratio_avg,
-                iso_ratio_std,
-            ) in zip(
-                iso_names,
-                iso_pct_bin_on,
-                iso_total,
-                iso_count_avg,
-                iso_count_std,
-                ratio_total,
-                ratio_avg,
-                ratio_std,
-            ):
-                iso_rows.append(
-                    {
-                        "isoform": iso_name,
-                        "pct_bin_on": float(pct_bin_on),
-                        "count_total": float(count_total),
-                        "count_avg": float(count_avg),
-                        "count_std": float(count_std),
-                        "ratio_total": float(iso_ratio_total),
-                        "ratio_avg": float(iso_ratio_avg),
-                        "ratio_std": float(iso_ratio_std),
-                    }
-                )
-
-        self._gene_summary = pd.DataFrame(gene_rows).set_index("gene")
-
-        var_df = adata.var.loc[all_iso_names].copy()
-        stats_df = pd.DataFrame(iso_rows).set_index("isoform")
-        self._isoform_summary = pd.concat([var_df, stats_df], axis=1)
 
     def extract_feature_summary(
         self,

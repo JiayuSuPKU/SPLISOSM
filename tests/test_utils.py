@@ -473,12 +473,11 @@ class TestUtils(unittest.TestCase):
         )
 
     def test_extract_gene_level_statistics_sparse_lil_and_zero_gene(self):
-        counts_lil = scipy.sparse.lil_matrix(self.counts_dense)
-        fake_adata = types.SimpleNamespace(
-            layers={"counts_lil": counts_lil},
-            var=self.adata.var,
-        )
-        stats = extract_gene_level_statistics(fake_adata, layer="counts_lil")
+        # LIL is converted to CSR for AnnData compatibility
+        counts_csr = scipy.sparse.lil_matrix(self.counts_dense).tocsr()
+        adata_sp = self.adata.copy()
+        adata_sp.layers["counts_sp"] = counts_csr
+        stats = extract_gene_level_statistics(adata_sp, layer="counts_sp")
         self.assertGreater(stats.shape[0], 0)
 
         zero_counts = np.zeros((5, 2), dtype=np.float32)
