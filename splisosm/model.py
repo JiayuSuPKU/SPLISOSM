@@ -1368,22 +1368,46 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             with torch.no_grad():
                 self.nu.copy_(torch.zeros(self.n_genes, self.n_spots, self.n_isos - 1))
 
-        # initial estimate of the variance components
-        sigma_init = (
-            (self.counts.var(1).mean(1) / self.counts.sum(2).mean(1))
-            .clamp(max=0.9)
-            .pow(0.5)
-        ).unsqueeze(-1)
+        # Initial estimate of the variance parameter sigma.
+        if self.init_ratio == "observed" and self.nu.abs().sum() > 0:
+            nu_var = self.nu.detach().var(dim=1)  # (n_genes, n_isos - 1)
+            if self.share_variance:
+                # Use the max variance across isoform contrasts (not the mean),
+                # because some isoforms may have near-zero variation and would
+                # pull the mean down, under-estimating sigma for the active ones.
+                sigma_init = (
+                    nu_var.max(dim=-1, keepdim=True).values.clamp(min=1e-4).pow(0.5)
+                )
+            else:
+                # per-isoform variance component
+                sigma_init = nu_var.clamp(min=1e-4).pow(0.5)
+        else:
+            # Fallback for init_ratio="uniform" (nu is all zeros).
+            # Use the Fano-factor heuristic on raw counts as a rough proxy.
+            sigma_init = (
+                (self.counts.var(1).mean(1) / self.counts.sum(2).mean(1).clamp(min=1))
+                .clamp(min=1e-4, max=0.9)
+                .pow(0.5)
+            ).unsqueeze(-1)
 
-        # initialize proportion of spatial variance to be ~0.05
+        # Initialise spatial variance proportion to ~5% (theta ≈ sigmoid(-3) ≈ 0.047).
+        _theta_init = 0.047  # consistent across both parameterisations
         if self.var_parameterization_sigma_theta:
             with torch.no_grad():
                 self.sigma.copy_(torch.ones_like(self.sigma) * sigma_init)
                 self.theta_logit.copy_(torch.ones_like(self.theta_logit) * -3.0)
         else:
+            # Decompose sigma_init into spatial / non-spatial components so that
+            # sigma_sp² + sigma_nsp² = sigma_init²  (consistent total variance).
             with torch.no_grad():
-                self.sigma_nsp.copy_(torch.ones_like(self.sigma_nsp) * sigma_init)
-                self.sigma_sp.copy_(torch.ones_like(self.sigma_sp) * 0.2 * sigma_init)
+                self.sigma_sp.copy_(
+                    torch.ones_like(self.sigma_sp) * sigma_init * _theta_init**0.5
+                )
+                self.sigma_nsp.copy_(
+                    torch.ones_like(self.sigma_nsp)
+                    * sigma_init
+                    * (1 - _theta_init) ** 0.5
+                )
 
     """Below are a bunch of helper functions to update intermediate variables after each optimization step.
     """

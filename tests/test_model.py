@@ -303,6 +303,43 @@ class TestMultinomGLMM(unittest.TestCase):
                 )
                 model.fit(verbose=False)
 
+    def test_sigma_init_from_logit_variance(self):
+        """sigma is initialised from empirical std of nu in logit space."""
+        model = MultinomGLMM(init_ratio="observed")
+        model.setup_data(self.counts, corr_sp=self.corr_sp)
+        # After setup_data, sigma should ≈ sqrt(max(nu.var(dim=1))) across isoform contrasts
+        expected = (
+            model.nu.detach()
+            .var(dim=1)
+            .max(dim=-1, keepdim=True)
+            .values.clamp(min=1e-4)
+            .pow(0.5)
+        )
+        torch.testing.assert_close(model.sigma.data, expected, atol=1e-6, rtol=1e-6)
+
+    def test_sigma_init_parameterization_consistency(self):
+        """sigma_sp² + sigma_nsp² ≈ sigma² for the same data."""
+        model_st = MultinomGLMM(
+            var_parameterization_sigma_theta=True, init_ratio="observed"
+        )
+        model_st.setup_data(self.counts, corr_sp=self.corr_sp)
+
+        model_sp = MultinomGLMM(
+            var_parameterization_sigma_theta=False, init_ratio="observed"
+        )
+        model_sp.setup_data(self.counts, corr_sp=self.corr_sp)
+
+        var_st = model_st.sigma.data**2
+        var_sp = model_sp.sigma_sp.data**2 + model_sp.sigma_nsp.data**2
+        torch.testing.assert_close(var_st, var_sp, atol=1e-5, rtol=1e-5)
+
+    def test_sigma_init_uniform_fallback(self):
+        """init_ratio='uniform' still produces a positive sigma (fallback path)."""
+        model = MultinomGLMM(init_ratio="uniform")
+        model.setup_data(self.counts, corr_sp=self.corr_sp)
+        self.assertTrue((model.sigma.data > 0).all())
+        self.assertTrue(torch.isfinite(model.sigma.data).all())
+
     # def test_update_gradient_descent(self):
     #     model = MultinomGLM(fitting_method="gd")
     #     model.setup_data(self.counts, design_mtx=self.design_mtx)
