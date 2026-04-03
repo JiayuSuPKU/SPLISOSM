@@ -1355,5 +1355,359 @@ class TestSplisosmNP(unittest.TestCase):
                 )
 
 
+class TestParallelNP(unittest.TestCase):
+    """Verify that joblib parallelism in SplisosmNP produces identical results to sequential."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Build a shared small dataset (5 genes, 10×10 grid, 2 covariates)."""
+        torch.manual_seed(123)
+        np.random.seed(123)
+        n_spots_per_dim = 10
+        n_genes, n_isos = 5, 3
+        mtc, var = 10, 0.3
+        n_spots = n_spots_per_dim**2
+        X_spot = torch.randn(n_spots, 2)
+        data = simulate_isoform_counts(
+            n_genes=n_genes,
+            grid_size=(n_spots_per_dim, n_spots_per_dim),
+            n_isos=n_isos,
+            total_counts_expected=mtc,
+            var_sp=var,
+            var_nsp=var,
+            rho=0.99,
+            design_mtx=X_spot,
+            beta_true=torch.ones(2, n_isos - 1),
+            return_params=False,
+        )
+        counts_list = [data["counts"][i] for i in range(n_genes)]
+        cls.adata = _make_small_adata(counts_list, data["coords"], X_spot)
+        cls.n_genes = n_genes
+
+        # Binary covariate for t-test methods
+        binary_design = torch.zeros(n_spots, 1)
+        binary_design[::2, 0] = 1
+        cls.adata_binary = _make_small_adata(counts_list, data["coords"], binary_design)
+
+    def _setup_model(self, adata, design_cols=None):
+        """Create and setup a fresh SplisosmNP model."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=design_cols,
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        return model
+
+    # ------------------------------------------------------------------
+    # Spatial variability: n_jobs=1 vs n_jobs=2
+    # ------------------------------------------------------------------
+
+    def test_sv_parallel_eig_hsic_ir(self):
+        """SV with hsic-ir + eig null: n_jobs=1 and n_jobs=2 give identical results."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            model.test_spatial_variability(
+                method="hsic-ir", null_method="eig", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model.sv_test_results
+            else:
+                np.testing.assert_allclose(
+                    model.sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="SV statistic differs between n_jobs=1 and n_jobs=2",
+                )
+                np.testing.assert_allclose(
+                    model.sv_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="SV pvalue differs between n_jobs=1 and n_jobs=2",
+                )
+
+    def test_sv_parallel_trace_null(self):
+        """SV with hsic-ir + trace null: parallel results are identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            model.test_spatial_variability(
+                method="hsic-ir",
+                null_method="trace",
+                n_jobs=n_jobs,
+                print_progress=False,
+            )
+            if n_jobs == 1:
+                ref = model.sv_test_results
+            else:
+                np.testing.assert_allclose(
+                    model.sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                )
+                np.testing.assert_allclose(
+                    model.sv_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                )
+
+    def test_sv_parallel_perm_null(self):
+        """SV with hsic-ir + perm null: parallel results are identical (fixed seed)."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            model.test_spatial_variability(
+                method="hsic-ir",
+                null_method="perm",
+                null_configs={"n_perms_per_gene": 30, "perm_batch_size": 10},
+                n_jobs=n_jobs,
+                print_progress=False,
+            )
+            if n_jobs == 1:
+                ref = model.sv_test_results
+            else:
+                # Perm stats should still match (deterministic per-gene body)
+                np.testing.assert_allclose(
+                    model.sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                )
+
+    def test_sv_parallel_hsic_ic(self):
+        """SV with hsic-ic method: parallel results are identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            model.test_spatial_variability(
+                method="hsic-ic", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model.sv_test_results
+            else:
+                np.testing.assert_allclose(
+                    model.sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                )
+                np.testing.assert_allclose(
+                    model.sv_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                )
+
+    def test_sv_parallel_hsic_gc(self):
+        """SV with hsic-gc method: parallel results are identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            model.test_spatial_variability(
+                method="hsic-gc", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model.sv_test_results
+            else:
+                np.testing.assert_allclose(
+                    model.sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                )
+                np.testing.assert_allclose(
+                    model.sv_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                )
+
+    def test_sv_parallel_nan_filling_none(self):
+        """SV with nan_filling='none' (per-gene kernel path): parallel identical."""
+        import warnings
+
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                model.test_spatial_variability(
+                    method="hsic-ir",
+                    nan_filling="none",
+                    n_jobs=n_jobs,
+                    print_progress=False,
+                )
+            if n_jobs == 1:
+                ref = model.sv_test_results
+            else:
+                np.testing.assert_allclose(
+                    model.sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                )
+                np.testing.assert_allclose(
+                    model.sv_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                )
+
+    # ------------------------------------------------------------------
+    # Differential usage: n_jobs=1 vs n_jobs=2
+    # ------------------------------------------------------------------
+
+    def test_du_parallel_hsic(self):
+        """DU with method='hsic': parallel results are identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata, design_cols=["cov_1", "cov_2"])
+            model.test_differential_usage(
+                method="hsic", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model.du_test_results
+            else:
+                np.testing.assert_allclose(
+                    model.du_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="DU hsic statistic differs",
+                )
+                np.testing.assert_allclose(
+                    model.du_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="DU hsic pvalue differs",
+                )
+
+    def test_du_parallel_hsic_gp(self):
+        """DU with method='hsic-gp' (sklearn backend): parallel results are identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata, design_cols=["cov_1", "cov_2"])
+            model.test_differential_usage(
+                method="hsic-gp",
+                gpr_backend="sklearn",
+                n_jobs=n_jobs,
+                print_progress=False,
+            )
+            if n_jobs == 1:
+                ref = model.du_test_results
+            else:
+                np.testing.assert_allclose(
+                    model.du_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="DU hsic-gp statistic differs",
+                )
+                np.testing.assert_allclose(
+                    model.du_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="DU hsic-gp pvalue differs",
+                )
+
+    def test_du_parallel_t_fisher(self):
+        """DU with method='t-fisher' (binary covariate): parallel identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata_binary, design_cols=["cov_1"])
+            model.test_differential_usage(
+                method="t-fisher", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model.du_test_results
+            else:
+                np.testing.assert_allclose(
+                    model.du_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="DU t-fisher statistic differs",
+                )
+                np.testing.assert_allclose(
+                    model.du_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="DU t-fisher pvalue differs",
+                )
+
+    def test_du_parallel_t_tippett(self):
+        """DU with method='t-tippett' (binary covariate): parallel identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata_binary, design_cols=["cov_1"])
+            model.test_differential_usage(
+                method="t-tippett", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model.du_test_results
+            else:
+                np.testing.assert_allclose(
+                    model.du_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="DU t-tippett statistic differs",
+                )
+                np.testing.assert_allclose(
+                    model.du_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="DU t-tippett pvalue differs",
+                )
+
+    # ------------------------------------------------------------------
+    # Result dict structure checks
+    # ------------------------------------------------------------------
+
+    def test_sv_result_dict_structure(self):
+        """SV result dict has correct keys and shapes after parallel run."""
+        model = self._setup_model(self.adata)
+        model.test_spatial_variability(method="hsic-ir", n_jobs=2, print_progress=False)
+        res = model.sv_test_results
+        self.assertIn("statistic", res)
+        self.assertIn("pvalue", res)
+        self.assertIn("pvalue_adj", res)
+        self.assertIn("method", res)
+        self.assertIn("null_method", res)
+        self.assertEqual(len(res["statistic"]), self.n_genes)
+        self.assertEqual(len(res["pvalue"]), self.n_genes)
+        self.assertEqual(len(res["pvalue_adj"]), self.n_genes)
+        self.assertTrue(np.all(res["pvalue"] >= 0))
+        self.assertTrue(np.all(res["pvalue"] <= 1))
+
+    def test_du_result_dict_structure(self):
+        """DU result dict has correct keys and shapes after parallel run."""
+        model = self._setup_model(self.adata, design_cols=["cov_1", "cov_2"])
+        model.test_differential_usage(method="hsic", n_jobs=2, print_progress=False)
+        res = model.du_test_results
+        self.assertIn("statistic", res)
+        self.assertIn("pvalue", res)
+        self.assertIn("pvalue_adj", res)
+        self.assertIn("method", res)
+        self.assertEqual(res["statistic"].shape, (self.n_genes, 2))
+        self.assertEqual(res["pvalue"].shape, (self.n_genes, 2))
+        self.assertTrue(np.all(res["pvalue"] >= 0))
+        self.assertTrue(np.all(res["pvalue"] <= 1))
+
+    def test_formatted_results_consistent_with_parallel(self):
+        """get_formatted_test_results works correctly after parallel SV and DU."""
+        model = self._setup_model(self.adata, design_cols=["cov_1", "cov_2"])
+        model.test_spatial_variability(method="hsic-ir", n_jobs=2, print_progress=False)
+        sv_df = model.get_formatted_test_results("sv")
+        self.assertEqual(len(sv_df), self.n_genes)
+        self.assertTrue({"statistic", "pvalue", "pvalue_adj"}.issubset(sv_df.columns))
+
+        model.test_differential_usage(method="hsic", n_jobs=2, print_progress=False)
+        du_df = model.get_formatted_test_results("du")
+        self.assertEqual(len(du_df), self.n_genes * 2)
+        self.assertTrue({"statistic", "pvalue", "pvalue_adj"}.issubset(du_df.columns))
+
+    # ------------------------------------------------------------------
+    # Edge case: n_jobs=1 should behave identically to the old sequential path
+    # ------------------------------------------------------------------
+
+    def test_sv_n_jobs_1_no_error(self):
+        """SV with n_jobs=1 completes without error (regression guard)."""
+        model = self._setup_model(self.adata)
+        model.test_spatial_variability(method="hsic-ir", n_jobs=1, print_progress=False)
+        self.assertIn("statistic", model.sv_test_results)
+
+    def test_du_n_jobs_1_no_error(self):
+        """DU with n_jobs=1 completes without error (regression guard)."""
+        model = self._setup_model(self.adata, design_cols=["cov_1", "cov_2"])
+        model.test_differential_usage(method="hsic-gp", n_jobs=1, print_progress=False)
+        self.assertIn("statistic", model.du_test_results)
+
+
 if __name__ == "__main__":
     unittest.main()

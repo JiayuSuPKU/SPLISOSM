@@ -1006,6 +1006,11 @@ class SplisosmFFT:
         if n_jobs == -1:
             n_jobs = os.cpu_count() or 1
 
+        # Auto-coordinate FFT workers with joblib n_jobs to prevent thread
+        # oversubscription: scipy.fft.fft2 spawns `workers` threads internally,
+        # so total threads = n_jobs × workers without this cap.
+        self.kernel.workers = max(1, (os.cpu_count() or 1) // n_jobs)
+
         iterator = tqdm(
             self._gene_iso_names,
             desc=f"SV [{method}]",
@@ -1215,6 +1220,15 @@ class SplisosmFFT:
 
         if n_jobs == -1:
             n_jobs = os.cpu_count() or 1
+
+        # Auto-coordinate FFT workers with joblib n_jobs to prevent thread
+        # oversubscription (same rationale as in test_spatial_variability).
+        _fft_workers = max(1, (os.cpu_count() or 1) // n_jobs)
+        self.kernel.workers = _fft_workers
+        if gpr_cov is not None:
+            gpr_cov._workers = _fft_workers
+        if gpr_iso_cfg is not None:
+            gpr_iso_cfg = {**gpr_iso_cfg, "workers": _fft_workers}
 
         n_genes = len(self._gene_iso_names)
         stats = np.zeros((n_genes, n_factors))

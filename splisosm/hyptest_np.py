@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import warnings
 import re
 from typing import Any, Optional, Union, Literal
+from joblib import Parallel, delayed
 from scipy.stats import ttest_ind, combine_pvalues, norm as _norm_dist
 import numpy as np
 import scipy.sparse
@@ -94,6 +96,199 @@ def _calc_ttest_differential_usage(
         stats, pval = combine_pvalues(pval, method=combine_method)
 
     return stats, pval
+
+
+def _sv_gene_worker_np(
+    counts: "torch.Tensor",
+    method: str,
+    ratio_transformation: str,
+    nan_filling: str,
+    null_method: str,
+    n_spots: int,
+    K_sp,
+    lambda_sp: "Optional[torch.Tensor]",
+    k_eff: int,
+    trK: "Optional[torch.Tensor]",
+    trK2: "Optional[torch.Tensor]",
+    n_nulls: int,
+    perm_batch_size: int,
+) -> "tuple[float, float]":
+    """Process a single gene for :meth:`SplisosmNP.test_spatial_variability`.
+
+    Shared objects (``K_sp``, ``lambda_sp``, ``trK``, ``trK2``) are
+    passed by reference and only read, making this safe for
+    ``joblib.Parallel(prefer="threads")``.
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(hsic_norm, pval)`` for this gene.
+    """
+    if counts.is_sparse:
+        counts = counts.to_dense()
+
+    lambda_sp_eff = lambda_sp
+    k_eff_eff = k_eff
+
+    if method == "hsic-ir" and nan_filling == "none":
+        # per-gene spatial kernel: drop NaN spots and recompute K
+        y = counts_to_ratios(
+            counts,
+            transformation=ratio_transformation,
+            nan_filling="none",
+            fill_before_transform=False,
+        )
+        is_nan = torch.isnan(y).any(1)
+        y = y[~is_nan]
+        n_spots_eff = y.shape[0]
+        K_sp_gene = K_sp.realization()[~is_nan, :][:, ~is_nan]
+        K_sp_gene = K_sp_gene - K_sp_gene.mean(dim=0, keepdim=True)
+        K_sp_gene = K_sp_gene - K_sp_gene.mean(dim=1, keepdim=True)
+
+        if null_method == "eig":
+            lambda_sp_eff = torch.linalg.eigvalsh(K_sp_gene)
+            lambda_sp_eff = lambda_sp_eff[lambda_sp_eff > 1e-5]
+            k_eff_eff = len(lambda_sp_eff)
+
+        hsic_scaled = torch.trace(y.T @ K_sp_gene @ y)
+
+    else:  # global spatial kernel shared across all genes
+        if method == "hsic-ic":
+            y = counts - counts.mean(0, keepdim=True)
+        elif method == "hsic-gc":
+            y = counts.sum(1, keepdim=True)
+            y = y - y.mean()
+        else:  # hsic-ir with mean nan_filling (global kernel case)
+            y = counts_to_ratios(
+                counts,
+                transformation=ratio_transformation,
+                nan_filling="mean",
+                fill_before_transform=False,
+            )
+            y = y - y.mean(0, keepdim=True)
+
+        n_spots_eff = n_spots
+
+        if null_method == "eig":
+            hsic_scaled = torch.trace(K_sp.xtKx_approx(y, k=k_eff_eff))
+        else:
+            hsic_scaled = torch.trace(K_sp.xtKx_exact(y))
+
+    hsic_norm = float(hsic_scaled / (n_spots_eff - 1) ** 2)
+
+    if null_method == "eig":
+        try:
+            lambda_y = torch.linalg.eigvalsh(y.T @ y)
+        except torch._C._LinAlgError:
+            lambda_y = torch.linalg.eigvalsh(y.T @ y + 1e-6 * torch.eye(y.shape[1]))
+        lambda_y = lambda_y[lambda_y > 1e-5]
+        lambda_spy = (lambda_sp_eff.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
+        pval = liu_sf((hsic_scaled * n_spots_eff).numpy(), lambda_spy.numpy())
+
+    elif null_method == "trace":
+        S = y.T @ y
+        trS = torch.trace(S).item()
+        trS2 = torch.trace(S @ S).item()
+        n1 = n_spots_eff - 1
+        mean_null = trK.item() * trS / n1
+        var_null = 2.0 * trK2.item() * trS2 / (n1**2)
+        z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
+        pval = float(_norm_dist.sf(z))
+
+    else:  # null_method == "perm"
+        p_isos = y.shape[1]
+        null_stats = []
+        for chunk_start in range(0, n_nulls, perm_batch_size):
+            B = min(perm_batch_size, n_nulls - chunk_start)
+            y_batch = torch.cat(
+                [y[torch.randperm(n_spots_eff)] for _ in range(B)], dim=1
+            )
+            if isinstance(K_sp, torch.Tensor):
+                R = y_batch.T @ K_sp @ y_batch
+            else:
+                R = K_sp.xtKx(y_batch)
+            null_stats.append(torch.diagonal(R).reshape(B, p_isos).sum(dim=1))
+        null_m = torch.cat(null_stats)
+        pval = float((null_m > hsic_scaled).sum() / n_nulls)
+
+    return hsic_norm, pval
+
+
+def _du_hsic_gene_worker_np(
+    counts: "torch.Tensor",
+    z_list: list,
+    ratio_transformation: str,
+    nan_filling: str,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Per-gene worker for SplisosmNP DU test (method='hsic')."""
+    if counts.is_sparse:
+        counts = counts.to_dense()
+    y = counts_to_ratios(
+        counts,
+        transformation=ratio_transformation,
+        nan_filling=nan_filling,
+        fill_before_transform=False,
+    )
+    n_factors = len(z_list)
+    hsic_row = torch.empty(n_factors)
+    pvals_row = torch.empty(n_factors)
+    for _f, z in enumerate(z_list):
+        hsic_row[_f], pvals_row[_f] = linear_hsic_test(z, y, centering=True)
+    return hsic_row, pvals_row
+
+
+def _du_hsic_gp_gene_worker_np(
+    counts: "torch.Tensor",
+    gpr_iso,
+    x: "torch.Tensor",
+    z_res_list: list,
+    ratio_transformation: str,
+    nan_filling: str,
+    residualize: str,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Per-gene worker for SplisosmNP DU test (method='hsic-gp')."""
+    if counts.is_sparse:
+        counts = counts.to_dense()
+    y = counts_to_ratios(
+        counts,
+        transformation=ratio_transformation,
+        nan_filling=nan_filling,
+        fill_before_transform=False,
+    )
+    if residualize == "both" and gpr_iso is not None:
+        y = gpr_iso.fit_residuals(x, y)
+    n_factors = len(z_res_list)
+    hsic_row = torch.empty(n_factors)
+    pvals_row = torch.empty(n_factors)
+    for _f, z_res in enumerate(z_res_list):
+        hsic_row[_f], pvals_row[_f] = linear_hsic_test(z_res, y, centering=True)
+    return hsic_row, pvals_row
+
+
+def _du_ttest_gene_worker_np(
+    counts: "torch.Tensor",
+    groups_list: list,
+    ratio_transformation: str,
+    nan_filling: str,
+    combine_method: str,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Per-gene worker for SplisosmNP DU test (method='t-fisher'/'t-tippett')."""
+    if counts.is_sparse:
+        counts = counts.to_dense()
+    ratios = counts_to_ratios(
+        counts,
+        transformation=ratio_transformation,
+        nan_filling=nan_filling,
+        fill_before_transform=False,
+    )
+    n_factors = len(groups_list)
+    stats_row = np.empty(n_factors)
+    pvals_row = np.empty(n_factors)
+    for _ind, groups in enumerate(groups_list):
+        stats_row[_ind], pvals_row[_ind] = _calc_ttest_differential_usage(
+            ratios, groups, combine_pval=True, combine_method=combine_method
+        )
+    return stats_row, pvals_row
 
 
 class SplisosmNP:
@@ -777,6 +972,7 @@ class SplisosmNP:
         nan_filling: Literal["mean", "none"] = "mean",
         null_method: Literal["eig", "trace", "perm"] = "eig",
         null_configs: Optional[dict[str, Any]] = None,
+        n_jobs: int = -1,
         return_results: bool = False,
         print_progress: bool = True,
     ) -> Optional[dict[str, Any]]:
@@ -820,6 +1016,11 @@ class SplisosmNP:
               lead to more memory usage) for batch-wise null statistic computation.
         null_configs : dict or None, optional
             Extra keyword arguments for the chosen ``null_method``.
+        n_jobs : int, optional
+            Number of parallel workers for the per-gene loop.  ``-1`` uses all
+            available CPUs.  Each worker densifies one sparse count tensor
+            (~4–40 MB at 100 K–1 M spots × 10 isoforms) so choose ``n_jobs``
+            to fit within available RAM.  Default ``-1``.
         return_results : bool, optional
             If ``True``, return the result dict.  Otherwise store results in
             :attr:`sv_test_results` and return ``None``.
@@ -861,6 +1062,16 @@ class SplisosmNP:
             nan_filling in valid_nan_filling
         ), f"Invalid NaN filling method. Must be one of {valid_nan_filling}."
 
+        if nan_filling == "none" and method == "hsic-ir":
+            warnings.warn(
+                "nan_filling='none' with method='hsic-ir' triggers a per-gene spatial "
+                "kernel materialization and eigendecomposition (O(n_spots³) per gene). "
+                "For large datasets this is very slow. "
+                "Consider nan_filling='mean' to reuse a single pre-computed kernel.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         if method == "spark-x":  # run the gene-level SPARK-X test
             # prepare the data in gene-level counts
             counts_g = torch.concat(
@@ -870,11 +1081,20 @@ class SplisosmNP:
                 counts_g.numpy(), self.coordinates.numpy()
             )
         else:
+            if n_jobs == -1:
+                n_jobs = os.cpu_count() or 1
+
             # use a global spatial kernel unless nan_filling is 'none'
             n_spots = self.n_spots
             K_sp = self.corr_sp  # the Kernel class object was already centered
 
             # pre-compute null distribution inputs (once, before per-gene loop)
+            lambda_sp = None
+            k_eff = 0
+            trK = None
+            trK2 = None
+            n_nulls = 0
+            _perm_batch_size = 1
             configs = null_configs or {}
             if null_method == "eig":
                 _rank = (
@@ -900,140 +1120,40 @@ class SplisosmNP:
                 n_nulls = int(configs.get("n_perms_per_gene", 1000))
                 _perm_batch_size = int(configs.get("perm_batch_size", 50))
 
-            # iterate over genes and calculate the HSIC statistic
-            hsic_list, pvals_list = [], []
-            for counts in tqdm(
-                self.data,
-                desc=f"SV [{method}]",
-                total=self.n_genes,
-                disable=not print_progress,
-            ):
-                if counts.is_sparse:
-                    counts = counts.to_dense()
+            # parallel per-gene SV test; shared objects are read-only
+            _sv_results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_sv_gene_worker_np)(
+                    counts,
+                    method,
+                    ratio_transformation,
+                    nan_filling,
+                    null_method,
+                    n_spots,
+                    K_sp,
+                    lambda_sp if null_method == "eig" else None,
+                    k_eff if null_method == "eig" else 0,
+                    trK if null_method == "trace" else None,
+                    trK2 if null_method == "trace" else None,
+                    n_nulls if null_method == "perm" else 0,
+                    _perm_batch_size if null_method == "perm" else 1,
+                )
+                for counts in tqdm(
+                    self.data,
+                    desc=f"SV [{method}]",
+                    total=self.n_genes,
+                    disable=not print_progress,
+                )
+            )
+            hsic_arr = np.array([r[0] for r in _sv_results], dtype=float)
+            pvals_arr = np.array([r[1] for r in _sv_results], dtype=float)
 
-                if method == "hsic-ir" and nan_filling == "none":
-                    # spetial treatment for the isoform ratio test when nan_filling is 'none'
-                    # need to adjust the effective spot number (non NaN spots) and spatial kernel
-                    y = counts_to_ratios(
-                        counts,
-                        transformation=ratio_transformation,
-                        nan_filling="none",
-                        fill_before_transform=False,
-                    )
-                    # remove spots with NaN values
-                    is_nan = torch.isnan(y).any(1)  # spots with NaN values
-                    y = y[~is_nan]  # (n_non_nan, n_isos)
-
-                    # adjust the effective number of spots and update the spatial kernel
-                    n_spots = y.shape[0]
-                    # H = torch.eye(n_spots) - 1/n_spots
-                    # K_sp = H @ self.corr_sp[~is_nan, :][:, ~is_nan] @ H # centered spatial kernel
-                    K_sp = self.corr_sp.realization()[~is_nan, :][:, ~is_nan]
-                    K_sp = K_sp - K_sp.mean(dim=0, keepdim=True)
-                    K_sp = K_sp - K_sp.mean(dim=1, keepdim=True)
-
-                    # calculate the eigenvalues of the new per-gene spatial kernel
-                    if null_method == "eig":
-                        lambda_sp = torch.linalg.eigvalsh(
-                            K_sp
-                        )  # eigenvalues of length n_spots
-                        lambda_sp = lambda_sp[
-                            lambda_sp > 1e-5
-                        ]  # remove small eigenvalues
-
-                    # compute the hsic statistic
-                    hsic_scaled = torch.trace(y.T @ K_sp @ y)
-
-                else:  # one global spatial kernel for all genes
-                    if method == "hsic-ic":  # use isoform-level count data
-                        y = counts - counts.mean(
-                            0, keepdim=True
-                        )  # centering per isoform
-                    elif method == "hsic-gc":  # use gene-level count data
-                        y = counts.sum(1, keepdim=True)
-                        y = y - y.mean()  # centering per isoform
-                    else:  # use isoform ratio
-                        # calculate the isoform ratio from counts
-                        y = counts_to_ratios(
-                            counts,
-                            transformation=ratio_transformation,
-                            nan_filling="mean",
-                            fill_before_transform=False,
-                        )
-                        y = y - y.mean(0, keepdim=True)  # centering per isoform
-
-                    # compute the hsic statistic
-                    if null_method == "eig":
-                        # use rank-k approx consistent with the Liu null eigenvalues
-                        hsic_scaled = torch.trace(K_sp.xtKx_approx(y, k=k_eff))
-                    else:
-                        # use the exact full kernel for trace/perm null methods
-                        hsic_scaled = torch.trace(K_sp.xtKx_exact(y))
-
-                hsic_list.append(hsic_scaled / (n_spots - 1) ** 2)
-
-                if null_method == "eig":  # asymptotic chi-square mixture (Liu's method)
-                    try:
-                        lambda_y = torch.linalg.eigvalsh(y.T @ y)  # length of n_isos
-                    except torch._C._LinAlgError:
-                        # Add a small jitter to the diagonal and retry
-                        lambda_y = torch.linalg.eigvalsh(
-                            y.T @ y + 1e-6 * torch.eye(y.shape[1])
-                        )
-
-                    lambda_y = lambda_y[lambda_y > 1e-5]  # remove small eigenvalues
-                    lambda_spy = (
-                        lambda_sp.unsqueeze(0) * lambda_y.unsqueeze(1)
-                    ).reshape(
-                        -1
-                    )  # n_spots * (n_isos or 1)
-                    pval = liu_sf((hsic_scaled * n_spots).numpy(), lambda_spy.numpy())
-
-                elif null_method == "trace":  # moment-matching normal approximation
-                    S = y.T @ y  # (n_isos, n_isos)
-                    trS = torch.trace(S).item()
-                    trS2 = torch.trace(S @ S).item()
-                    # Under the permutation null (centered K, centered y):
-                    # E[tr(y.T K y)] = tr(K) * tr(y.T y) / (n-1)
-                    # Var[tr(y.T K y)] ≈ 2 * tr(K^2) * tr((y.T y)^2) / (n-1)^2
-                    n1 = n_spots - 1
-                    mean_null = trK.item() * trS / n1
-                    var_null = 2.0 * trK2.item() * trS2 / (n1**2)
-                    z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
-                    pval = float(_norm_dist.sf(z))
-
-                elif null_method == "perm":  # permutation-based null distribution
-                    p_isos = y.shape[1]
-                    null_stats = []
-                    for chunk_start in range(0, n_nulls, _perm_batch_size):
-                        B = min(_perm_batch_size, n_nulls - chunk_start)
-                        # Concatenate B permuted copies of y along the feature axis → (n, B·p)
-                        y_batch = torch.cat(
-                            [y[torch.randperm(n_spots)] for _ in range(B)], dim=1
-                        )
-                        if isinstance(K_sp, torch.Tensor):
-                            # NaN path: K_sp is a dense per-gene submatrix tensor
-                            R = y_batch.T @ K_sp @ y_batch  # (B·p, B·p)
-                        else:
-                            # Global path: one LU solve for B·p right-hand sides
-                            R = K_sp.xtKx(y_batch)  # (B·p, B·p)
-                        # Recover per-permutation traces from diagonal blocks:
-                        # tr(y_i.T K y_i) = diagonal(R)[i·p:(i+1)·p].sum()
-                        null_stats.append(
-                            torch.diagonal(R).reshape(B, p_isos).sum(dim=1)
-                        )
-                    null_m = torch.cat(null_stats)  # (n_nulls,)
-                    pval = float((null_m > hsic_scaled).sum() / n_nulls)
-
-                pvals_list.append(pval)
-
-                # store the results
-                self.sv_test_results = {
-                    "statistic": torch.tensor(hsic_list).numpy(),
-                    "pvalue": torch.tensor(pvals_list).numpy(),
-                    "method": method,
-                    "null_method": null_method,
-                }
+            # store results after the loop (NP-12 fix: no longer rebuilt per gene)
+            self.sv_test_results = {
+                "statistic": hsic_arr,
+                "pvalue": pvals_arr,
+                "method": method,
+                "null_method": null_method,
+            }
 
             # calculate adjusted p-values
             self.sv_test_results["pvalue_adj"] = false_discovery_control(
@@ -1052,6 +1172,7 @@ class SplisosmNP:
         gpr_backend: Literal["sklearn", "gpytorch"] = "sklearn",
         gpr_configs: Optional[dict[str, Any]] = None,
         residualize: Literal["cov_only", "both"] = "cov_only",
+        n_jobs: int = -1,
         print_progress: bool = True,
         return_results: bool = False,
     ) -> Optional[dict[str, Any]]:
@@ -1141,6 +1262,12 @@ class SplisosmNP:
               HSIC(Z_res, Y_raw).  Fastest; calibration matches ``"both"``
               when covariate GPR captures most spatial confounding.
             * ``"both"``: residualize both covariates and isoform ratios.
+        n_jobs : int, optional
+            Number of parallel workers for the per-gene loop.  ``-1`` uses all
+            available CPUs.  Each worker densifies one sparse count tensor
+            (~4–40 MB at 100 K–1 M spots × 10 isoforms).  When
+            ``gpr_backend="gpytorch"`` and ``device != "cpu"``, the GPU is not
+            thread-safe; parallelism is automatically disabled.  Default ``-1``.
         print_progress : bool, optional
             Whether to show the progress bar. Default to True.
         return_results : bool, optional
@@ -1180,6 +1307,8 @@ class SplisosmNP:
         ), f"Invalid residualize. Must be one of {valid_residualize}."
 
         n_genes = self.n_genes
+        if n_jobs == -1:
+            n_jobs = os.cpu_count() or 1
 
         if method == "hsic":  # unconditional HSIC test (multivariate RV coefficient)
             # Pre-compute covariates: keep sparse when design_mtx is scipy sparse
@@ -1202,27 +1331,20 @@ class SplisosmNP:
             hsic_all = torch.empty(n_genes, n_factors)
             pvals_all = torch.empty(n_genes, n_factors)
 
-            # Outer loop: one gene at a time to avoid materialising all dense counts
-            for _g, counts in enumerate(
-                tqdm(
+            _du_results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_du_hsic_gene_worker_np)(
+                    counts, z_list, ratio_transformation, nan_filling
+                )
+                for counts in tqdm(
                     self.data,
                     desc=f"DU [{method}]",
                     total=self.n_genes,
                     disable=not print_progress,
                 )
-            ):
-                if counts.is_sparse:
-                    counts = counts.to_dense()
-                y = counts_to_ratios(
-                    counts,
-                    transformation=ratio_transformation,
-                    nan_filling=nan_filling,
-                    fill_before_transform=False,
-                )
-                for _f, z in enumerate(z_list):
-                    hsic_all[_g, _f], pvals_all[_g, _f] = linear_hsic_test(
-                        z, y, centering=True
-                    )
+            )
+            for _g, (h_row, p_row) in enumerate(_du_results):
+                hsic_all[_g] = h_row
+                pvals_all[_g] = p_row
 
             self.du_test_results = {
                 "statistic": hsic_all.numpy(),
@@ -1235,6 +1357,11 @@ class SplisosmNP:
             cov_config = {**_DEFAULT_GPR_CONFIGS["covariate"]}
             iso_config = {**_DEFAULT_GPR_CONFIGS["isoform"]}
             if gpr_configs is not None:
+                if gpr_configs.keys() - {"covariate", "isoform"}:
+                    raise ValueError(
+                        "gpr_configs must have a nested structure. Use keys "
+                        "'covariate' and/or 'isoform' for the respective GPR configurations."
+                    )
                 if "covariate" in gpr_configs:
                     cov_config.update(gpr_configs["covariate"])
                 if "isoform" in gpr_configs:
@@ -1264,6 +1391,7 @@ class SplisosmNP:
                 z_res_list.append(gpr_cov.fit_residuals(x, z.unsqueeze(1)))
 
             # Optionally fit GPR for isoform ratios to residualize spatial effects in the response as well.
+            gpr_iso = None
             if residualize == "both":
                 gpr_iso = make_kernel_gpr(gpr_backend, **iso_config)
                 # Warm up the shared eigendecomposition for backends that support it
@@ -1275,34 +1403,38 @@ class SplisosmNP:
                 ):
                     gpr_iso.precompute_shared_kernel(x)
 
+            # GPU guard: CUDA operations are not thread-safe across threads
+            _iso_device = iso_config.get("device", "cpu")
+            if gpr_backend == "gpytorch" and _iso_device != "cpu":
+                _effective_n_jobs = 1  # sequential fallback for GPU backend
+            else:
+                _effective_n_jobs = n_jobs
+
             # --- Main loop: densify and process one gene at a time ---
             hsic_all = torch.empty(n_genes, n_factors)
             pvals_all = torch.empty(n_genes, n_factors)
 
-            for _g, counts in enumerate(
-                tqdm(
+            _gpr_iso_for_worker = gpr_iso if residualize == "both" else None
+            _du_gp_results = Parallel(n_jobs=_effective_n_jobs, prefer="threads")(
+                delayed(_du_hsic_gp_gene_worker_np)(
+                    counts,
+                    _gpr_iso_for_worker,
+                    x,
+                    z_res_list,
+                    ratio_transformation,
+                    nan_filling,
+                    residualize,
+                )
+                for counts in tqdm(
                     self.data,
                     desc=f"DU [{method}]",
                     total=self.n_genes,
                     disable=not print_progress,
                 )
-            ):
-                if counts.is_sparse:
-                    counts = counts.to_dense()
-                y = counts_to_ratios(
-                    counts,
-                    transformation=ratio_transformation,
-                    nan_filling=nan_filling,
-                    fill_before_transform=False,
-                )
-
-                if residualize == "both":
-                    y = gpr_iso.fit_residuals(x, y)
-
-                for _f, z_res in enumerate(z_res_list):
-                    hsic_all[_g, _f], pvals_all[_g, _f] = linear_hsic_test(
-                        z_res, y, centering=True
-                    )
+            )
+            for _g, (h_row, p_row) in enumerate(_du_gp_results):
+                hsic_all[_g] = h_row
+                pvals_all[_g] = p_row
 
             self.du_test_results = {
                 "statistic": hsic_all.numpy(),
@@ -1329,32 +1461,25 @@ class SplisosmNP:
                 for _ind in range(n_factors)
             ]
 
-            # Outer loop: one gene at a time so each sparse tensor is densified once
-            for _g, counts in enumerate(
-                tqdm(
+            # Parallel per-gene t-test
+            _du_tt_results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_du_ttest_gene_worker_np)(
+                    counts,
+                    groups_list,
+                    ratio_transformation,
+                    nan_filling,
+                    combine_method,
+                )
+                for counts in tqdm(
                     self.data,
                     desc=f"DU [{method}]",
                     total=self.n_genes,
                     disable=not print_progress,
                 )
-            ):
-                if counts.is_sparse:
-                    counts = counts.to_dense()
-                ratios = counts_to_ratios(
-                    counts,
-                    transformation=ratio_transformation,
-                    nan_filling=nan_filling,
-                    fill_before_transform=False,
-                )
-                for _ind, groups in enumerate(groups_list):
-                    _stats, _pvals = _calc_ttest_differential_usage(
-                        ratios,
-                        groups,
-                        combine_pval=True,
-                        combine_method=combine_method,
-                    )
-                    stats_all[_g, _ind] = _stats
-                    pvals_all[_g, _ind] = _pvals
+            )
+            for _g, (s_row, p_row) in enumerate(_du_tt_results):
+                stats_all[_g] = s_row
+                pvals_all[_g] = p_row
 
             self.du_test_results = {
                 "statistic": stats_all,  # (n_genes, n_factors)
