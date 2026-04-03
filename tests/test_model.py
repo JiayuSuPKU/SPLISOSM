@@ -301,7 +301,7 @@ class TestMultinomGLMM(unittest.TestCase):
                 model.setup_data(
                     self.counts, design_mtx=self.design_mtx, corr_sp=self.corr_sp
                 )
-                model.fit(verbose=False, diagnose=False)
+                model.fit(verbose=False)
 
     # def test_update_gradient_descent(self):
     #     model = MultinomGLM(fitting_method="gd")
@@ -798,7 +798,7 @@ class TestMultinomGLMMLowRank(unittest.TestCase):
         model.setup_data(
             self.counts, corr_sp_eigvals=eigvals_k, corr_sp_eigvecs=eigvecs_k
         )
-        model.fit(verbose=False, quiet=True, diagnose=False)
+        model.fit(verbose=False, quiet=True)
         self.assertEqual(model.n_genes, self.N_GENES)
         self.assertTrue(torch.isfinite(model.sigma).all())
         self.assertTrue(torch.isfinite(model.nu).all())
@@ -816,13 +816,13 @@ class TestMultinomGLMMLowRank(unittest.TestCase):
             corr_sp_eigvals=self.eigvals_full,
             corr_sp_eigvecs=self.eigvecs_full,
         )
-        model_full.fit(verbose=False, quiet=True, diagnose=False)
+        model_full.fit(verbose=False, quiet=True)
 
         model_low = MultinomGLMM(fitting_method="joint_gd", fitting_configs=cfg)
         model_low.setup_data(
             self.counts, corr_sp_eigvals=eigvals_k, corr_sp_eigvecs=eigvecs_k
         )
-        model_low.fit(verbose=False, quiet=True, diagnose=False)
+        model_low.fit(verbose=False, quiet=True)
 
         ratio_full = model_full.get_isoform_ratio()  # (n_genes, n_spots, n_isos)
         ratio_low = model_low.get_isoform_ratio()
@@ -881,6 +881,151 @@ class TestMultinomGLMMLowRank(unittest.TestCase):
 
         lp = model._calc_log_prob_joint()
         self.assertTrue(torch.isfinite(lp).all())
+
+
+class TestNewAPIs(unittest.TestCase):
+    """Tests for new APIs introduced in the refactoring:
+    - loss_history always available (PatienceLogger)
+    - __str__ shows training summary after fit()
+    - strip_data() frees counts/X_spot buffers
+    - diagnose deprecation warning
+    - store_param_history still works
+    """
+
+    def setUp(self):
+        torch.manual_seed(42)
+        # Small: 2 genes, 10 spots, 3 isoforms, 2 covariates
+        self.counts = torch.randint(5, 30, (2, 10, 3)).float()
+        self.design_mtx = torch.randn(10, 2)
+
+    # ------------------------------------------------------------------
+    # PatienceLogger.loss_history
+    # ------------------------------------------------------------------
+
+    def test_glm_loss_history_always_available(self):
+        """loss_history is populated after fit() without store_param_history=True."""
+        model = MultinomGLM(fitting_configs={"max_epochs": 15})
+        model.setup_data(self.counts, design_mtx=self.design_mtx)
+        model.fit(verbose=False, quiet=True)
+        lh = model.logger.loss_history
+        self.assertEqual(lh.ndim, 2, "loss_history must be 2-D (epochs, batch_size)")
+        self.assertEqual(lh.shape[1], 2, "batch_size dim must equal n_genes=2")
+        self.assertGreater(lh.shape[0], 0, "At least one epoch must be recorded")
+        self.assertTrue(torch.isfinite(lh).all())
+
+    def test_glmm_loss_history_always_available(self):
+        """MultinomGLMM loss_history is populated without store_param_history."""
+        corr_sp = _make_spd_kernel(10)
+        model = MultinomGLMM(fitting_configs={"max_epochs": 10})
+        model.setup_data(self.counts, design_mtx=self.design_mtx, corr_sp=corr_sp)
+        model.fit(verbose=False, quiet=True)
+        lh = model.logger.loss_history
+        self.assertEqual(lh.ndim, 2)
+        self.assertGreater(lh.shape[0], 0)
+
+    def test_glm_loss_history_empty_before_fit(self):
+        """loss_history returns empty tensor (0 epochs) before fit() is called."""
+        model = MultinomGLM()
+        model.setup_data(self.counts)
+        # PatienceLogger is only created during fit(); accessing before raises AttributeError
+        # — that is acceptable, no requirement to have logger before fit.
+        # If logger exists, its loss_history should be empty.
+        if hasattr(model, "logger") and model.logger is not None:
+            lh = model.logger.loss_history
+            self.assertEqual(lh.shape[0], 0)
+
+    def test_store_param_history_still_works(self):
+        """store_param_history=True still populates params_iter."""
+        model = MultinomGLM(fitting_configs={"max_epochs": 5})
+        model.setup_data(self.counts[:1])  # single gene to keep it fast
+        model.fit(verbose=False, quiet=True, store_param_history=True)
+        pi = model.logger.get_params_iter()
+        self.assertIsNotNone(
+            pi, "params_iter must not be None when store_param_history=True"
+        )
+        self.assertIn("loss", pi)
+        self.assertIn("params", pi)
+
+    def test_diagnose_deprecation_warning(self):
+        """Passing diagnose=True to fit() emits a DeprecationWarning."""
+        import warnings
+
+        model = MultinomGLM(fitting_configs={"max_epochs": 3})
+        model.setup_data(self.counts[:1])
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            model.fit(verbose=False, quiet=True, diagnose=True)
+        dep_warns = [x for x in w if issubclass(x.category, DeprecationWarning)]
+        self.assertTrue(
+            len(dep_warns) > 0,
+            "Expected DeprecationWarning for diagnose=True, got none",
+        )
+        self.assertIn("diagnose", str(dep_warns[0].message).lower())
+
+    # ------------------------------------------------------------------
+    # MultinomGLM.__str__ / __repr__ training section
+    # ------------------------------------------------------------------
+
+    def test_glm_str_unfitted(self):
+        """GLM __str__ shows 'not yet fitted' before fit()."""
+        model = MultinomGLM()
+        model.setup_data(self.counts)
+        s = str(model)
+        self.assertIn("not yet fitted", s.lower())
+
+    def test_glm_str_fitted(self):
+        """GLM __str__ shows convergence info after fit()."""
+        model = MultinomGLM(fitting_configs={"max_epochs": 10})
+        model.setup_data(self.counts, design_mtx=self.design_mtx)
+        model.fit(verbose=False, quiet=True)
+        s = str(model)
+        self.assertIn("Converged", s)
+        self.assertIn("Best epoch", s)
+        self.assertIn("Best loss", s)
+        # repr should match str
+        self.assertEqual(repr(model), s)
+
+    def test_glmm_str_fitted(self):
+        """GLMM __str__ shows training summary after fit()."""
+        corr_sp = _make_spd_kernel(10)
+        model = MultinomGLMM(fitting_configs={"max_epochs": 5})
+        model.setup_data(self.counts, corr_sp=corr_sp)
+        model.fit(verbose=False, quiet=True)
+        s = str(model)
+        self.assertIn("Converged", s)
+        self.assertEqual(repr(model), s)
+
+    # ------------------------------------------------------------------
+    # MultinomGLM.strip_data()
+    # ------------------------------------------------------------------
+
+    def test_strip_data_frees_buffers(self):
+        """strip_data() sets counts and X_spot to None and removes them from _buffers."""
+        model = MultinomGLM()
+        model.setup_data(self.counts, design_mtx=self.design_mtx)
+        # Confirm buffers exist before strip
+        self.assertIsNotNone(model.counts)
+        self.assertIsNotNone(model.X_spot)
+        model.strip_data()
+        self.assertIsNone(model.counts)
+        self.assertIsNone(model.X_spot)
+        # Must not be in _buffers either
+        self.assertNotIn("counts", model._buffers)
+        self.assertNotIn("X_spot", model._buffers)
+
+    def test_strip_data_no_counts_no_error(self):
+        """strip_data() is safe to call when design_mtx=None (X_spot not registered)."""
+        model = MultinomGLM()
+        model.setup_data(self.counts, design_mtx=None)
+        model.strip_data()  # should not raise
+        self.assertIsNone(model.counts)
+
+    def test_strip_data_idempotent(self):
+        """Calling strip_data() twice should not raise."""
+        model = MultinomGLM()
+        model.setup_data(self.counts)
+        model.strip_data()
+        model.strip_data()  # second call must be safe
 
 
 if __name__ == "__main__":

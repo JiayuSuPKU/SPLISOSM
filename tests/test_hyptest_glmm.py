@@ -396,6 +396,307 @@ class TestSplisosmGLMM(unittest.TestCase):
         fitted_models = model.get_fitted_models()
         self.assertTrue(len(fitted_models) == 20)
 
+    def test_get_gene_model_and_getitem(self):
+        """get_gene_model / __getitem__ return the correct per-gene model."""
+        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 2})
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        # before fit → RuntimeError
+        with self.assertRaises(RuntimeError):
+            model.get_gene_model(model.gene_names[0])
+
+        model.fit(quiet=True)
+        first_gene = model.gene_names[0]
+        g_model = model.get_gene_model(first_gene)
+        self.assertIsNotNone(g_model)
+        # __getitem__ must be identical object
+        self.assertIs(model[first_gene], g_model)
+        # unknown gene → KeyError
+        with self.assertRaises(KeyError):
+            model.get_gene_model("__does_not_exist__")
+
+    def test_get_training_summary(self):
+        """get_training_summary returns a DataFrame with expected columns and index."""
+        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 2})
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        with self.assertRaises(RuntimeError):
+            model.get_training_summary()
+
+        model.fit(quiet=True)
+        summary = model.get_training_summary()
+        self.assertEqual(len(summary), model.n_genes)
+        self.assertIn("converged", summary.columns)
+        self.assertIn("best_loss", summary.columns)
+        self.assertIn("best_epoch", summary.columns)
+        self.assertIn("fitting_time_s", summary.columns)
+        self.assertEqual(summary.index.name, "gene")
+
+    def test_loss_history_always_available(self):
+        """PatienceLogger.loss_history is non-empty after fit without store_param_history."""
+        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        model.fit(quiet=True)
+        g_model = model[model.gene_names[0]]
+        lh = g_model.logger.loss_history
+        self.assertEqual(lh.ndim, 2)
+        self.assertGreater(lh.shape[0], 0)  # at least 1 epoch
+        self.assertEqual(lh.shape[1], 1)  # single gene per fitted model
+
+    def test_free_memory(self):
+        """free_memory() nulls corr_sp and strips counts buffers."""
+        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 2})
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        model.fit(quiet=True)
+        model.free_memory(strip_model_data=True, free_kernel=True)
+        self.assertIsNone(model.corr_sp)
+        for m in model.get_fitted_models():
+            self.assertIsNone(getattr(m, "counts", None))
+
+    def test_fitting_results_deprecation_warning(self):
+        """Accessing fitting_results directly emits a DeprecationWarning."""
+        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 2})
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        model.fit(quiet=True)
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            _ = model.fitting_results
+        dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        self.assertTrue(
+            len(dep) > 0, "Expected DeprecationWarning for fitting_results access"
+        )
+
+    # ------------------------------------------------------------------
+    # get_fitted_ratios_anndata
+    # ------------------------------------------------------------------
+
+    def _fitted_model(self, model_type="glmm-full", with_cov=False, max_epochs=3):
+        """Return a fitted SplisosmGLMM (small, fast)."""
+        kwargs = {
+            "model_type": model_type,
+            "fitting_configs": {"max_epochs": max_epochs},
+        }
+        m = SplisosmGLMM(**kwargs)
+        setup_kw = dict(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        if with_cov:
+            setup_kw["design_mtx"] = ["cov_1", "cov_2"]
+        m.setup_data(**setup_kw)
+        # with_design_mtx=True so that per-gene models carry covariate parameters
+        m.fit(quiet=True, print_progress=False, with_design_mtx=with_cov)
+        return m
+
+    def test_get_fitted_ratios_anndata_returns_copy_with_layer(self):
+        """get_fitted_ratios_anndata() returns a copy (not in-place mutation) with the new layer."""
+        model = self._fitted_model()
+        adata_out = model.get_fitted_ratios_anndata(layer_name="test_ratios")
+        # Must be a distinct object (copy), not the original _filtered_adata
+        self.assertIsNot(adata_out, model._filtered_adata)
+        # Layer present in the returned copy
+        self.assertIn("test_ratios", adata_out.layers)
+        # var metadata is the same as _filtered_adata
+        pd.testing.assert_frame_equal(adata_out.var, model._filtered_adata.var)
+
+    def test_get_fitted_ratios_anndata_shape(self):
+        """Ratio layer has shape (n_spots, n_filtered_vars)."""
+        model = self._fitted_model()
+        fadata = model.get_fitted_ratios_anndata()
+        layer = fadata.layers["fitted_ratios"]
+        self.assertEqual(layer.shape, (model.n_spots, model._filtered_adata.n_vars))
+
+    def test_get_fitted_ratios_anndata_sums_to_one(self):
+        """Fitted ratios sum to 1 across isoforms for each gene/spot."""
+        model = self._fitted_model()
+        fadata = model.get_fitted_ratios_anndata()
+        layer = fadata.layers["fitted_ratios"]
+        var_df = fadata.var
+        for gene in model.gene_names:
+            gene_cols = np.where((var_df[model._group_iso_by] == gene).values)[0]
+            gene_ratios = layer[:, gene_cols]
+            row_sums = gene_ratios.sum(axis=1)
+            np.testing.assert_allclose(
+                row_sums,
+                np.ones(model.n_spots),
+                atol=1e-4,
+                err_msg=f"Ratios for gene {gene!r} do not sum to 1",
+            )
+
+    def test_get_fitted_ratios_anndata_raises_before_fit(self):
+        """get_fitted_ratios_anndata() raises RuntimeError before fit()."""
+        model = SplisosmGLMM()
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        with self.assertRaises(RuntimeError):
+            model.get_fitted_ratios_anndata()
+
+    def test_get_fitted_ratios_anndata_values_finite(self):
+        """All ratio values in the layer are finite (no NaN/Inf for passing isos)."""
+        model = self._fitted_model()
+        fadata = model.get_fitted_ratios_anndata()
+        layer = fadata.layers["fitted_ratios"]
+        self.assertTrue(
+            np.isfinite(layer).all(),
+            "Ratio layer contains non-finite values",
+        )
+
+    def test_get_fitted_ratios_anndata_isoform_order(self):
+        """Isoform columns in the ratio layer match the filtered_adata.var row order.
+
+        For each gene we reconstruct the expected ratios by calling
+        model.get_isoform_ratio() directly and compare them against the
+        columns placed by get_fitted_ratios_anndata() using the same
+        filtered_adata column mask.  If there were any reordering in the
+        pipeline, the values would not align.
+        """
+        model = self._fitted_model()
+        fadata = model.get_fitted_ratios_anndata()
+        layer = fadata.layers["fitted_ratios"]
+        var_df = fadata.var
+
+        for gene, gene_model in zip(model.gene_names, model.get_fitted_models()):
+            # Column indices for this gene in the returned AnnData
+            gene_cols = np.where((var_df[model._group_iso_by] == gene).values)[0]
+
+            # Directly extract ratios from the per-gene model
+            expected = (
+                gene_model.get_isoform_ratio()
+                .detach()
+                .cpu()
+                .squeeze(0)
+                .numpy()
+            )  # (n_spots, n_isos)
+
+            actual = layer[:, gene_cols]  # (n_spots, n_isos)
+
+            np.testing.assert_allclose(
+                actual,
+                expected,
+                atol=1e-6,
+                err_msg=(
+                    f"Isoform order mismatch for gene {gene!r}: "
+                    f"ratio layer columns do not match model.get_isoform_ratio() output"
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # save / load
+    # ------------------------------------------------------------------
+
+    def test_save_load_roundtrip(self):
+        """save() / load() preserve model structure and fitted parameters."""
+        import tempfile
+        import os
+
+        model = self._fitted_model()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "model.pt")
+            model.save(path)
+            loaded = SplisosmGLMM.load(path)
+
+        # Basic metadata intact
+        self.assertEqual(loaded.n_genes, model.n_genes)
+        self.assertEqual(loaded.n_spots, model.n_spots)
+        self.assertEqual(loaded.gene_names, model.gene_names)
+        self.assertTrue(loaded._is_trained)
+
+        # Parameters preserved
+        for gene in model.gene_names:
+            orig = model[gene]
+            rest = loaded[gene]
+            torch.testing.assert_close(
+                orig.beta, rest.beta, msg=f"beta mismatch for gene {gene!r}"
+            )
+
+    def test_save_load_test_results_preserved(self):
+        """Test results (sv / du) survive save/load."""
+        import tempfile
+        import os
+
+        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+            group_gene_by_n_iso=True,
+        )
+        model.fit(quiet=True, print_progress=False, from_null=True)
+        model.test_spatial_variability(print_progress=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "model.pt")
+            model.save(path)
+            loaded = SplisosmGLMM.load(path)
+        self.assertGreater(len(loaded.sv_test_results), 0)
+
+    def test_load_map_location_cpu(self):
+        """load(map_location='cpu') works without error."""
+        import tempfile
+        import os
+
+        model = self._fitted_model()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "model.pt")
+            model.save(path)
+            loaded = SplisosmGLMM.load(path, map_location="cpu")
+        self.assertTrue(loaded._is_trained)
+
     def test_splisosm_glmm_test_spatial_variability(self):
         model = SplisosmGLMM(
             model_type="glmm-full", fitting_configs={"max_epochs": 100}
@@ -975,7 +1276,7 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             corr_sp_eigvals=self.corr_sp_eigvals,
             corr_sp_eigvecs=self.corr_sp_eigvecs,
         )
-        full_model.fit(quiet=True, verbose=False, diagnose=False, random_seed=0)
+        full_model.fit(quiet=True, verbose=False, random_seed=0)
 
         stat, df = _calc_score_differential_usage(full_model, self.design_mtx[:, 0])
         self.assertIsNotNone(stat)
@@ -1028,7 +1329,7 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             with_design_mtx=False,
             refit_null=False,
         )
-        model.fitting_results["sv_llr_perm_stats"] = torch.zeros(model.n_genes)
+        model._fitting_results["sv_llr_perm_stats"] = torch.zeros(model.n_genes)
 
         with patch("builtins.print") as print_mock:
             model.test_spatial_variability(

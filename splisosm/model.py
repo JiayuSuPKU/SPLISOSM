@@ -176,6 +176,7 @@ class MultinomGLM(BaseModel, nn.Module):
             - ``'lr'``: float, Learning rate for gradient descent or Newton's method.
             - ``'optim'``: str, Optimizer type, one of ``'adam'``, ``'sgd'``, or ``'lbfgs'``.
             - ``'tol'``: float, Tolerance for convergence.
+            - ``'tol_relative'``: bool, Whether to use relative tolerance for improvement.
             - ``'max_epochs'``: int, Maximum number of epochs for fitting.
             - ``'patience'``: int, Number of epochs to wait for improvement before stopping.
         """
@@ -194,6 +195,7 @@ class MultinomGLM(BaseModel, nn.Module):
             "lr": 1e-2,
             "optim": "adam",
             "tol": 1e-5,
+            "tol_relative": False,
             "max_epochs": 1000,
             "patience": 5 if fitting_method == "gd" else 2,
         }
@@ -206,7 +208,7 @@ class MultinomGLM(BaseModel, nn.Module):
         self.fitting_time = 0
 
     def __str__(self):
-        return (
+        base = (
             "A Multinomial Generalized Linear Model (GLM)\n"
             + f"- Number of genes in the batch: {self.n_genes}\n"
             + f"- Number of spots: {self.n_spots}\n"
@@ -214,6 +216,23 @@ class MultinomGLM(BaseModel, nn.Module):
             + f"- Number of covariates: {self.n_factors}\n"
             + f"- Fitting method: {self.fitting_method}"
         )
+        lg = getattr(self, "logger", None)
+        if lg is not None:
+            n_conv = int(lg.convergence.sum().item())
+            med_epoch = int(lg.best_epoch.median().item())
+            med_loss = float(lg.best_loss.median().item())
+            training = (
+                "\n=== Training summary (fitted)"
+                + f"\n- Fitting time: {self.fitting_time:.2f} s"
+                + f"\n- Converged: {n_conv} / {self.n_genes} genes"
+                + f"\n- Best epoch (median): {med_epoch}"
+                + f"\n- Best loss (median): {med_loss:.4f}"
+            )
+        else:
+            training = "\n=== Training summary (not yet fitted)"
+        return base + training
+
+    __repr__ = __str__
 
     def setup_data(
         self,
@@ -249,9 +268,6 @@ class MultinomGLM(BaseModel, nn.Module):
 
         if counts.ndim == 2:
             counts = counts.unsqueeze(0)  # (1, n_spots, n_isos)
-            print(
-                "Batched calculation has been implemented. Provide a batch of counts to speed up calculation."
-            )
 
         # convert sparse tensors to dense tensors
         if counts.is_sparse:
@@ -660,29 +676,43 @@ class MultinomGLM(BaseModel, nn.Module):
 
     def fit(
         self,
-        diagnose: bool = False,
+        store_param_history: bool = False,
         verbose: bool = False,
         quiet: bool = False,
         random_seed: Optional[int] = None,
+        diagnose: Optional[bool] = None,
     ) -> dict:
-        """Fit the model using all data
+        """Fit the model using all data.
 
         Parameters
         ----------
-        diagnose
-            Whether to store parameter changes during training (passed to PatienceLogger).
+        store_param_history
+            Whether to store per-epoch parameter snapshots during training.
+            Loss history is always recorded via ``model.logger.loss_history``
+            regardless of this flag.
         verbose
             Whether to print verbose information during fitting.
         quiet
             Whether to suppress output during fitting.
         random_seed
             Random seed for reproducibility.
+        diagnose
+            Deprecated alias for ``store_param_history``.
 
         Returns
         -------
         params_iter : dict or None
-            If `diagnose` is True, returns a dictionary of parameter changes during training. Otherwise returns None.
+            If ``store_param_history=True``, returns a dictionary of parameter
+            snapshots during training.  Otherwise returns ``None``.
         """
+        if diagnose is not None:
+            warnings.warn(
+                "The `diagnose` parameter is deprecated; use `store_param_history` instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            store_param_history = diagnose
+
         if random_seed is not None:  # set random seed for reproducibility
             torch.manual_seed(random_seed)
 
@@ -694,13 +724,19 @@ class MultinomGLM(BaseModel, nn.Module):
         max_epochs = self.fitting_configs["max_epochs"]
         patience = self.fitting_configs["patience"]
         tol = self.fitting_configs["tol"]
+        tol_relative = self.fitting_configs.get("tol_relative", False)
         max_epochs = 10000 if max_epochs == -1 else max_epochs
         patience = patience if patience > 0 else 1
 
-        # set iteration limits
         batch_size = self.n_genes
         t_start = timer()
-        logger = PatienceLogger(batch_size, patience, min_delta=tol, diagnose=diagnose)
+        logger = PatienceLogger(
+            batch_size,
+            patience,
+            min_delta=tol,
+            tol_relative=tol_relative,
+            store_param_history=store_param_history,
+        )
 
         while logger.epoch < max_epochs and not logger.convergence.all():
             # update the model parameters
@@ -711,24 +747,22 @@ class MultinomGLM(BaseModel, nn.Module):
             elif self.fitting_method == "iwls":
                 self._update_iwls()
 
-            # check convergence
+            # evaluate post-step loss for convergence checking
             with torch.no_grad():
-                # calculate the negative log-likelihood
                 neg_log_prob = -self().detach().cpu()
 
-                # d_loss = prev_loss - neg_log_prob.detach().item()
-
-                # # update the epoch and patience
-                # epoch += 1
-                # if d_loss < 0:  # if loss increases
-                #     patience -= 1
-
-                # # update the loss
-                # prev_loss = neg_log_prob.detach().item()
-
-            # if self.fitting_method == "gd":
-            # update learning rate
-            # self.scheduler.step(neg_log_prob[~self.convergence].mean())
+            # NaN/Inf guard — mark affected genes converged to avoid wasted iterations
+            if not torch.isfinite(neg_log_prob).all():
+                nan_genes = int((~torch.isfinite(neg_log_prob)).sum().item())
+                warnings.warn(
+                    f"{nan_genes} gene(s) produced non-finite loss at epoch "
+                    f"{logger.epoch}. Check for numerical issues (extreme counts, "
+                    "degenerate design matrix).",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.convergence |= ~torch.isfinite(neg_log_prob)
+                neg_log_prob = torch.nan_to_num(neg_log_prob, nan=float("inf"))
 
             logger.log(
                 neg_log_prob,
@@ -742,14 +776,14 @@ class MultinomGLM(BaseModel, nn.Module):
 
             if (verbose and not quiet) and logger.epoch % 10 == 0:
                 print(
-                    f"Epoch {logger.epoch}. Loss (neg_log_prob): {logger.best_loss.mean():.4f}. "
+                    f"Epoch {logger.epoch}. Loss (neg_log_prob): {logger.best_loss.mean():.4f}."
                 )
 
         # check model convergence
         num_not_converge = (~logger.convergence).sum()
         if num_not_converge:
             warnings.warn(
-                f"{num_not_converge} Genes did not converge after epoch {max_epochs}. "
+                f"{num_not_converge} gene(s) did not converge after epoch {max_epochs}. "
                 "Try larger max_epochs.",
                 UserWarning,
                 stacklevel=2,
@@ -765,7 +799,7 @@ class MultinomGLM(BaseModel, nn.Module):
                 f"(neg_log_prob): {neg_log_prob.mean():.3f}."
             )
 
-        # collect parameters corresponding to the best epoch for each sample in batch
+        # restore parameters from the best epoch for each sample in the batch
         if max_epochs > 0:
             for k, v in self.named_parameters():
                 if "_fake" not in k:
@@ -799,6 +833,18 @@ class MultinomGLM(BaseModel, nn.Module):
         new_params = self.state_dict()
         new_params.update(params)
         self.load_state_dict(new_params)
+
+    def strip_data(self) -> None:
+        """Free the ``counts`` and ``X_spot`` buffers to reduce memory after fitting.
+
+        After calling this method, any method that requires the original counts
+        (e.g. :meth:`get_isoform_ratio`, :meth:`forward`) will no longer work.
+        The fitted parameters (``beta``, ``bias_eta``, etc.) are preserved.
+        """
+        for buf_name in ("counts", "X_spot"):
+            if buf_name in self._buffers:
+                del self._buffers[buf_name]
+            setattr(self, buf_name, None)
 
 
 class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
@@ -1049,7 +1095,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         self.fitting_time = 0
 
     def __str__(self):
-        return (
+        base = (
             "A Multinomial Generalized Linear Mixed Model (GLMM)\n"
             + f"- Number of genes in the batch: {self.n_genes}\n"
             + f"- Number of spots: {self.n_spots}\n"
@@ -1063,6 +1109,23 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             + f"- Initialization method: {self.init_ratio}\n"
             + f"- Fitting method: {self.fitting_method}"
         )
+        lg = getattr(self, "logger", None)
+        if lg is not None:
+            n_conv = int(lg.convergence.sum().item())
+            med_epoch = int(lg.best_epoch.median().item())
+            med_loss = float(lg.best_loss.median().item())
+            training = (
+                "\n=== Training summary (fitted)"
+                + f"\n- Fitting time: {self.fitting_time:.2f} s"
+                + f"\n- Converged: {n_conv} / {self.n_genes} genes"
+                + f"\n- Best epoch (median): {med_epoch}"
+                + f"\n- Best loss (median): {med_loss:.4f}"
+            )
+        else:
+            training = "\n=== Training summary (not yet fitted)"
+        return base + training
+
+    __repr__ = __str__
 
     def setup_data(
         self,
@@ -1106,9 +1169,6 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         if counts.ndim == 2:
             counts = counts.unsqueeze(0)  # (1, n_spots, n_isos)
-            print(
-                "Batched calculation has been implemented. Provide a batch of counts to speed up calculation."
-            )
         else:
             if not counts.ndim == 3:
                 raise ValueError(
@@ -1766,16 +1826,17 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             hessian_beta_expand.shape[-1]
         ).unsqueeze(0).to(self.device)
 
-        # combine beta and bias_eta
-        # # (n_genes, n_factors + 1, n_isos - 1)
-        # gradient_beta_expand = torch.cat(
-        #     [self.beta.grad, self.bias_eta.grad.unsqueeze(1)], dim=1
-        # )
-        # (n_genes, n_factors + 1, n_isos - 1)
+        # combine beta and bias_eta into a single (n_genes, n_factors+1, n_isos-1) tensor
+        # gradient w.r.t. neg log-likelihood = -grad w.r.t. log-likelihood
+        gradient_beta_expand = -torch.cat(
+            [self.beta.grad, self.bias_eta.grad.unsqueeze(1)], dim=1
+        )  # (n_genes, n_factors + 1, n_isos - 1)
         beta_expand = torch.cat([self.beta, self.bias_eta.unsqueeze(1)], dim=1)
+        # Newton step: β_new = β − H⁻¹ ∇L(β)
+        # Equivalent form: H β_new = H β − ∇L  ⟹  right = H β − ∇L
         right = hessian_beta_expand.matmul(
             beta_expand.transpose(1, 2).reshape(n_genes, -1, 1)
-        ) - step * beta_expand.transpose(1, 2).reshape(
+        ) - step * gradient_beta_expand.transpose(1, 2).reshape(
             n_genes, -1, 1
         )  # (n_genes, (n_factors + 1) * (n_isos - 1), 1)
         beta_expand_new = (
@@ -1816,17 +1877,16 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         n_genes, n_spots, n_isos = self.n_genes, self.n_spots, self.n_isos
         step = 1  # step size
 
-        hessian_nu_inv = torch.cholesky_inverse(
-            chol
-        )  # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
+        # Use cholesky_solve to compute H⁻¹ g without materialising the full inverse.
+        # This avoids an O(n_genes × (n_spots*(n_isos-1))²) memory allocation.
         gradient_nu = self.nu.grad.transpose(1, 2).reshape(
             n_genes, -1, 1
         )  # (n_genes, n_spots * (n_isos - 1), 1)
-        nu_new = self.nu.transpose(1, 2).reshape(n_genes, -1, 1) - (
-            step * hessian_nu_inv
-        ).matmul(
-            gradient_nu
+        # delta_nu = H⁻¹ g, solved via the stored Cholesky factor
+        delta_nu = torch.cholesky_solve(
+            gradient_nu, chol
         )  # (n_genes, n_spots * (n_isos - 1), 1)
+        nu_new = self.nu.transpose(1, 2).reshape(n_genes, -1, 1) - step * delta_nu
         nu_new = nu_new.reshape(n_genes, n_isos - 1, n_spots).transpose(1, 2)
         # update the parameters and clear the gradients
         with torch.no_grad():
@@ -1838,7 +1898,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
     def _fit(
         self,
-        diagnose: bool = False,
+        store_param_history: bool = False,
         verbose: bool = False,
         quiet: bool = False,
         random_seed=None,
@@ -1850,20 +1910,22 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         max_epochs = self.fitting_configs["max_epochs"]
         patience = self.fitting_configs["patience"]
         tol = self.fitting_configs["tol"]
+        tol_relative = self.fitting_configs.get("tol_relative", False)
         max_epochs = 10000 if max_epochs == -1 else max_epochs
         patience = patience if patience > 0 else 1
 
         if random_seed is not None:  # set random seed for reproducibility
             torch.manual_seed(random_seed)
 
-        # set iteration limits
-        epoch = 0
-        batch_size = self.n_genes
-
-        # set iteration limits
         batch_size = self.n_genes
         t_start = timer()
-        logger = PatienceLogger(batch_size, patience, min_delta=tol, diagnose=diagnose)
+        logger = PatienceLogger(
+            batch_size,
+            patience,
+            min_delta=tol,
+            tol_relative=tol_relative,
+            store_param_history=store_param_history,
+        )
 
         # start training
         self.train()
@@ -1873,17 +1935,18 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
             # minimize the negative log-likelihood or the negative log-marginal-likelihood
             neg_log_prob = -self()  # (n_genes,)
-            neg_log_prob.mean().backward()  # backpropate gradients
+            neg_log_prob.mean().backward()  # backpropagate gradients
 
             if fitting_method == "joint_newton":
                 # update nu, beta, bias, and sigmas using Newton's method
                 self._update_joint_newton()
 
             elif fitting_method == "marginal_newton":
-                # update nu every k epochs
-                if epoch % self.fitting_configs["update_nu_every_k"] == 0:
+                # update nu every k epochs using Newton's method;
+                # use logger.epoch (canonical counter) — NOT a stale local variable
+                if logger.epoch % self.fitting_configs["update_nu_every_k"] == 0:
                     self._update_marginal_nu_newton()
-                # skip gradient descent update
+                # skip gradient descent update for nu
                 self.nu.grad.zero_()
 
             # gradient-based updates
@@ -1895,10 +1958,22 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
                 # update the remaining parameters with non-zero gradients using gradient descent
                 self.optimizer.step()
 
-            # check convergence
+            # evaluate post-step loss for convergence checking
             with torch.no_grad():
-                # calculate the negative log-likelihood
                 neg_log_prob = -self().detach().cpu()
+
+            # NaN/Inf guard — mark affected genes converged to avoid wasted iterations
+            if not torch.isfinite(neg_log_prob).all():
+                nan_genes = int((~torch.isfinite(neg_log_prob)).sum().item())
+                warnings.warn(
+                    f"{nan_genes} gene(s) produced non-finite loss at epoch "
+                    f"{logger.epoch}. Check for numerical issues (extreme counts, "
+                    "degenerate design matrix).",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                self.convergence |= ~torch.isfinite(neg_log_prob)
+                neg_log_prob = torch.nan_to_num(neg_log_prob, nan=float("inf"))
 
             logger.log(
                 neg_log_prob,
@@ -1912,7 +1987,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
             if (verbose and not quiet) and logger.epoch % 10 == 0:
                 print(
-                    f"Epoch {logger.epoch}. Loss (neg_log_prob): {logger.best_loss.mean():.4f}. "
+                    f"Epoch {logger.epoch}. Loss (neg_log_prob): {logger.best_loss.mean():.4f}."
                 )
 
         # make sure constraints are satisfied
@@ -1922,7 +1997,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         num_not_converge = (~logger.convergence).sum()
         if num_not_converge:
             warnings.warn(
-                f"{num_not_converge} Genes did not converge after epoch {max_epochs}. "
+                f"{num_not_converge} gene(s) did not converge after epoch {max_epochs}. "
                 "Try larger max_epochs.",
                 UserWarning,
                 stacklevel=2,
@@ -1938,7 +2013,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
                 f"(neg_log_prob): {neg_log_prob.mean():.3f}."
             )
 
-        # collect parameters corresponding to the best epoch for each sample in batch
+        # restore parameters from the best epoch for each sample in the batch
         if max_epochs > 0:
             for k, v in self.named_parameters():
                 if "_fake" not in k:
@@ -1960,34 +2035,51 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
     def fit(
         self,
-        diagnose: bool = False,
+        store_param_history: bool = False,
         verbose: bool = False,
         quiet: bool = False,
         random_seed: Optional[int] = None,
+        diagnose: Optional[bool] = None,
     ) -> Optional[dict]:
-        """Fit the model using all data
+        """Fit the model using all data.
 
         Parameters
         ----------
-        diagnose
-            Whether to store parameter changes during training (passed to PatienceLogger).
+        store_param_history
+            Whether to store per-epoch parameter snapshots during training.
+            Loss history is always recorded via ``model.logger.loss_history``
+            regardless of this flag.
         verbose
             Whether to print verbose information during fitting.
         quiet
             Whether to suppress output during fitting.
         random_seed
             Random seed for reproducibility.
+        diagnose
+            Deprecated alias for ``store_param_history``.
 
         Returns
         -------
         params_iter : dict or None
-            If `diagnose` is True, returns a dictionary of parameter changes during training. Otherwise returns None.
+            If ``store_param_history=True``, returns a dictionary of parameter
+            snapshots during training.  Otherwise returns ``None``.
         """
+        if diagnose is not None:
+            warnings.warn(
+                "The `diagnose` parameter is deprecated; use `store_param_history` instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            store_param_history = diagnose
+
         self._configure_optimizer(verbose=verbose)
         diag_outputs = self._fit(
-            diagnose=diagnose, verbose=verbose, quiet=quiet, random_seed=random_seed
+            store_param_history=store_param_history,
+            verbose=verbose,
+            quiet=quiet,
+            random_seed=random_seed,
         )
-        if diagnose:
+        if store_param_history:
             return diag_outputs
 
     def clone(self) -> "MultinomGLMM":

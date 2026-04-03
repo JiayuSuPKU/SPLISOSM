@@ -148,9 +148,10 @@ class SplisosmGLMM:
     ``var_fix_sigma``, ``var_prior_model``, ``var_prior_model_params``,
     ``init_ratio``, ``fitting_method``, and ``fitting_configs``."""
 
-    fitting_results: dict
-    """Dictionary to store lists of fitted models, with keys
-    ``'glmm-full'``, ``'glmm-null'``, ``'glm'``."""
+    _fitting_results: dict
+    """Internal store for fitted models, keyed by ``'models_glmm-full'``,
+    ``'models_glmm-null'``, and ``'models_glm'``.  Access via
+    :meth:`get_fitted_models` or :meth:`get_gene_model`."""
 
     def __init__(
         self,
@@ -277,7 +278,7 @@ class SplisosmGLMM:
 
         # to store the fitted models after running fit()
         self._is_trained = False
-        self.fitting_results = {
+        self._fitting_results = {
             "models_glmm-full": [],
             "models_glmm-null": [],
             "models_glm": [],
@@ -300,6 +301,21 @@ class SplisosmGLMM:
             if len(self.du_test_results) > 0
             else "NA"
         )
+        if self._is_trained:
+            try:
+                models = self.get_fitted_models()
+                n_conv = sum(
+                    bool(m.logger.convergence[0].item())
+                    for m in models
+                    if getattr(m, "logger", None) is not None
+                )
+                _fit_line = (
+                    f"- Trained: True (converged: {n_conv} / {self.n_genes} genes)\n"
+                )
+            except Exception:
+                _fit_line = "- Trained: True\n"
+        else:
+            _fit_line = "- Trained: False\n"
         return (
             "=== SplisosmGLMM\n"
             + f"- Number of genes: {self.n_genes}\n"
@@ -314,7 +330,7 @@ class SplisosmGLMM:
             + f"- Prior on total variance: {self.model_configs['var_prior_model']}\n"
             + f"- Initialization method: {self.model_configs['init_ratio']}\n"
             + "=== Fitting configurations\n"
-            + f"- Trained: {self._is_trained}\n"
+            + _fit_line
             + f"- Fitting method: {self.model_configs['fitting_method']}\n"
             + f"- Parameters: {self.model_configs['fitting_configs']}\n"
             + "=== Test results\n"
@@ -984,13 +1000,51 @@ class SplisosmGLMM:
             The path to save the fitted models.
         """
         for key in ["models_glmm-full", "models_glmm-null"]:
-            if key in self.fitting_results and len(self.fitting_results[key]) > 0:
+            if key in self._fitting_results and len(self._fitting_results[key]) > 0:
                 # update model.corr_sp as a reference to self.corr_sp
-                fitted_models = self.fitting_results[key]
+                fitted_models = self._fitting_results[key]
                 for model in fitted_models:
                     model.corr_sp = self.corr_sp
 
         torch.save(self, path)
+
+    @staticmethod
+    def load(path: str, map_location: Optional[str] = None) -> "SplisosmGLMM":
+        """Load a :class:`SplisosmGLMM` model previously saved with :meth:`save`.
+
+        Parameters
+        ----------
+        path
+            Path to the file written by :meth:`save`.
+        map_location
+            Optional device string (e.g. ``'cpu'``, ``'cuda:0'``) to remap
+            tensor storage when loading a model that was saved on a different
+            device.  Defaults to ``None`` (preserves original device mapping).
+
+        Returns
+        -------
+        SplisosmGLMM
+            The fully restored model, including fitted parameters, test results,
+            and all metadata.
+
+        Examples
+        --------
+        >>> model.save("model.pt")
+        >>> loaded = SplisosmGLMM.load("model.pt")
+        >>> loaded.get_training_summary()
+        """
+        return torch.load(path, map_location=map_location, weights_only=False)
+
+    @property
+    def fitting_results(self) -> dict:
+        """Deprecated — use :meth:`get_fitted_models` or :meth:`get_gene_model` instead."""
+        warnings.warn(
+            "Direct access to `fitting_results` is deprecated; use "
+            "get_fitted_models() or get_gene_model(gene_name) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._fitting_results
 
     def get_fitted_models(self) -> list[Any]:
         """Get the fitted models after running fit().
@@ -1003,13 +1057,201 @@ class SplisosmGLMM:
             - ``model_type='glm'``: list[splisosm.model.MultinomGLM]
         """
         if self.model_type == "glmm-full":
-            return self.fitting_results["models_glmm-full"]
+            return self._fitting_results["models_glmm-full"]
         elif self.model_type == "glmm-null":
-            return self.fitting_results["models_glmm-null"]
+            return self._fitting_results["models_glmm-null"]
         elif self.model_type == "glm":
-            return self.fitting_results["models_glm"]
+            return self._fitting_results["models_glm"]
         else:
             raise ValueError(f"Invalid model type {self.model_type}.")
+
+    def get_gene_model(self, gene_name: str) -> Any:
+        """Return the fitted model for a single gene by display name.
+
+        Parameters
+        ----------
+        gene_name
+            Display name of the gene (must appear in :attr:`gene_names`).
+
+        Returns
+        -------
+        Fitted ``MultinomGLM``, ``IsoFullModel``, or ``IsoNullNoSpVar`` instance
+        corresponding to ``gene_name``.
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`fit` has not been called yet.
+        KeyError
+            If ``gene_name`` is not found in :attr:`gene_names`.
+        """
+        if not self._is_trained:
+            raise RuntimeError("Call fit() first.")
+        try:
+            idx = self.gene_names.index(gene_name)
+        except ValueError:
+            preview = self.gene_names[:5]
+            raise KeyError(
+                f"Gene {gene_name!r} not found in gene_names. "
+                f"First 5 available: {preview}"
+            ) from None
+        return self.get_fitted_models()[idx]
+
+    def __getitem__(self, gene_name: str) -> Any:
+        """Shorthand for :meth:`get_gene_model`.
+
+        Example
+        -------
+        >>> model['GENE_NAME']  # returns the fitted model for GENE_NAME
+        """
+        return self.get_gene_model(gene_name)
+
+    def get_training_summary(self) -> pd.DataFrame:
+        """Return a per-gene training summary as a :class:`pandas.DataFrame`.
+
+        The DataFrame is indexed by gene name and contains the following columns:
+
+        - ``'model_type'``: str. Model type (``'glmm-full'``, ``'glmm-null'``, or ``'glm'``).
+        - ``'converged'``: bool. Whether the gene converged during training.
+        - ``'best_loss'``: float. Best (lowest) negative log-likelihood achieved.
+        - ``'best_epoch'``: int. Epoch at which the best loss was recorded.
+        - ``'fitting_time_s'``: float. Wall-clock seconds spent fitting this gene.
+
+        Only available after calling :meth:`fit`.
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`fit` has not been called yet.
+        """
+        if not self._is_trained:
+            raise RuntimeError("Call fit() first.")
+
+        rows = []
+        for gene, model in zip(self.gene_names, self.get_fitted_models()):
+            lg = getattr(model, "logger", None)
+            if lg is not None:
+                rows.append(
+                    {
+                        "gene": gene,
+                        "model_type": self.model_type,
+                        "converged": bool(lg.convergence[0].item()),
+                        "best_loss": float(lg.best_loss[0].item()),
+                        "best_epoch": int(lg.best_epoch[0].item()),
+                        "fitting_time_s": float(
+                            getattr(model, "fitting_time", float("nan"))
+                        ),
+                    }
+                )
+            else:
+                rows.append(
+                    {
+                        "gene": gene,
+                        "model_type": self.model_type,
+                        "converged": None,
+                        "best_loss": None,
+                        "best_epoch": None,
+                        "fitting_time_s": None,
+                    }
+                )
+        return pd.DataFrame(rows).set_index("gene")
+
+    def get_fitted_ratios_anndata(self, layer_name: str = "fitted_ratios") -> AnnData:
+        """Return a copy of the filtered AnnData with fitted isoform ratios as a new layer.
+
+        For each gene the per-spot softmax isoform ratios are taken from the
+        fitted model (``model.get_isoform_ratio()``) and placed into the
+        corresponding isoform columns of a ``(n_spots, n_filtered_isoforms)``
+        dense matrix, which is stored under ``layer_name``.
+
+        **Isoform ordering guarantee**: the columns of the new layer follow
+        the exact row order of ``self._filtered_adata.var``.  This holds
+        because :meth:`setup_data` builds per-gene count tensors by slicing
+        ``filtered_adata`` isoforms in their ``var`` row order (via
+        ``groupby(sort=False)``), and :meth:`~splisosm.model.MultinomGLM.get_isoform_ratio`
+        returns ratios in the same column order as the input counts.
+
+        Parameters
+        ----------
+        layer_name
+            Name of the new layer.  Defaults to ``'fitted_ratios'``.
+
+        Returns
+        -------
+        AnnData
+            A *copy* of ``self._filtered_adata`` (shape
+            ``(n_spots, n_filtered_isoforms)``) with ``layer_name`` added.
+            The ``var`` DataFrame is identical to ``self._filtered_adata.var``,
+            so isoform metadata (e.g. the gene-grouping column) is intact.
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`fit` has not been called, or if :meth:`setup_data` was
+            not called with an :class:`~anndata.AnnData` object (i.e. raw
+            tensors were provided instead).
+
+        Notes
+        -----
+        Requires that the per-gene model parameters (``beta``, ``bias_eta``,
+        ``nu``) are still accessible.  If :meth:`free_memory` was previously
+        called with ``strip_model_data=True``, models fitted with covariates
+        (``n_factors > 0``) will raise an error inside
+        ``get_isoform_ratio()`` because ``X_spot`` has been freed.
+        """
+        if not self._is_trained:
+            raise RuntimeError("Call fit() first.")
+        if self._filtered_adata is None:
+            raise RuntimeError(
+                "No filtered AnnData is available. Call setup_data() with an "
+                "AnnData object (not raw tensors) before calling "
+                "get_fitted_ratios_anndata()."
+            )
+
+        ad_out = self._filtered_adata.copy()
+        n_fvars = ad_out.n_vars
+        ratio_mat = np.full((self.n_spots, n_fvars), np.nan, dtype=np.float32)
+
+        for gene, model in zip(self.gene_names, self.get_fitted_models()):
+            # column indices for this gene in _filtered_adata.var
+            gene_mask = (ad_out.var[self._group_iso_by] == gene).values
+            col_idx = np.where(gene_mask)[0]
+
+            # (1, n_spots, n_isos) → (n_spots, n_isos)
+            ratio = model.get_isoform_ratio().detach().cpu().squeeze(0).numpy()
+            ratio_mat[:, col_idx] = ratio
+
+        ad_out.layers[layer_name] = ratio_mat
+
+        return ad_out
+
+    def free_memory(
+        self, strip_model_data: bool = True, free_kernel: bool = True
+    ) -> None:
+        """Release large tensors that are no longer needed after fitting.
+
+        Parameters
+        ----------
+        strip_model_data
+            If ``True``, call :meth:`splisosm.model.MultinomGLM.strip_data` on
+            every fitted model, removing per-gene ``counts`` and ``X_spot``
+            buffers.  This saves approximately
+            ``n_genes × n_spots × max(n_isos) × 4`` bytes but will break any
+            subsequent call to :meth:`splisosm.model.MultinomGLM.get_isoform_ratio`
+            or :meth:`splisosm.model.MultinomGLM.forward`.
+        free_kernel
+            If ``True``, set ``self.corr_sp = None``.  The dense
+            ``(n_spots × n_spots)`` spatial kernel is only retained when a
+            full-rank eigendecomposition was used; eigenpairs
+            (``_corr_sp_eigvals``, ``_corr_sp_eigvecs``) are always preserved
+            and are sufficient for all downstream operations.
+        """
+        if strip_model_data:
+            for model in self.get_fitted_models():
+                if hasattr(model, "strip_data"):
+                    model.strip_data()
+        if free_kernel:
+            self.corr_sp = None
 
     def _ungroup_fitted_models(
         self, fitted_models: list[Any], batch_size: int, with_design_mtx: bool
@@ -1100,8 +1342,9 @@ class SplisosmGLMM:
                 model.update_params_from_dict(_g_pars)
                 fitted_models_ungrouped.append(model)
 
-        # reorder the fitted models by gene names
-        _order = [gene_names_ungroupped.index(_g) for _g in self.gene_names]
+        # reorder the fitted models by gene names — O(N) dict lookup instead of O(N²) list.index
+        _name_to_idx = {name: i for i, name in enumerate(gene_names_ungroupped)}
+        _order = [_name_to_idx[g] for g in self.gene_names]
         fitted_models_ungrouped = [fitted_models_ungrouped[i] for i in _order]
 
         return fitted_models_ungrouped
@@ -1192,9 +1435,7 @@ class SplisosmGLMM:
                     )
 
                 # fit the model
-                model.fit(
-                    quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed
-                )
+                model.fit(quiet=quiet, verbose=False, random_seed=random_seed)
                 fitted_models.append(model)
         else:
             if print_progress:
@@ -1272,11 +1513,11 @@ class SplisosmGLMM:
 
         # store the fitted models
         if self.model_type == "glmm-full":
-            self.fitting_results["models_glmm-full"] = fitted_models
+            self._fitting_results["models_glmm-full"] = fitted_models
         elif self.model_type == "glmm-null":
-            self.fitting_results["models_glmm-null"] = fitted_models
+            self._fitting_results["models_glmm-null"] = fitted_models
         elif self.model_type == "glm":
-            self.fitting_results["models_glm"] = fitted_models
+            self._fitting_results["models_glm"] = fitted_models
         else:
             raise ValueError(f"Invalid model type {self.model_type}.")
 
@@ -1360,15 +1601,11 @@ class SplisosmGLMM:
                     corr_sp_eigvecs=self._corr_sp_eigvecs,
                     device=self._device,
                 )
-                null.fit(
-                    quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed
-                )
+                null.fit(quiet=quiet, verbose=False, random_seed=random_seed)
 
                 # fit the full model from the null
                 full = IsoFullModel.from_trained_null_no_sp_var_model(null)
-                full.fit(
-                    quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed
-                )
+                full.fit(quiet=quiet, verbose=False, random_seed=random_seed)
 
                 # refit the null model if needed
                 if refit_null:
@@ -1376,7 +1613,6 @@ class SplisosmGLMM:
                     null_refit.fit(
                         quiet=quiet,
                         verbose=False,
-                        diagnose=False,
                         random_seed=random_seed,
                     )
 
@@ -1394,7 +1630,6 @@ class SplisosmGLMM:
                         full_refit.fit(
                             quiet=quiet,
                             verbose=False,
-                            diagnose=False,
                             random_seed=random_seed,
                         )
                         if full_refit().mean() > full().mean():
@@ -1473,8 +1708,8 @@ class SplisosmGLMM:
             )
 
         # store the fitted models
-        self.fitting_results["models_glmm-null"] = fitted_null_models_sv
-        self.fitting_results["models_glmm-full"] = fitted_full_models
+        self._fitting_results["models_glmm-null"] = fitted_null_models_sv
+        self._fitting_results["models_glmm-full"] = fitted_full_models
 
         # stop timer
         t_end = timer()
@@ -1583,8 +1818,8 @@ class SplisosmGLMM:
                 # calculate the likelihood ratio statistic
                 _sv_llr_stats = []
                 for full_m, null_m in zip(
-                    new_model.fitting_results["models_glmm-full"],
-                    new_model.fitting_results["models_glmm-null"],
+                    new_model._fitting_results["models_glmm-full"],
+                    new_model._fitting_results["models_glmm-null"],
                 ):
                     # use marginal likelihood for stability
                     llr, _ = _calc_llr_spatial_variability(null_m, full_m)
@@ -1594,7 +1829,7 @@ class SplisosmGLMM:
                 _sv_llr_perm_stats.append(_sv_llr_stats)
 
             # save the llr statistics from permutated data
-            self.fitting_results["sv_llr_perm_stats"] = torch.concat(
+            self._fitting_results["sv_llr_perm_stats"] = torch.concat(
                 _sv_llr_perm_stats, dim=0
             )
 
@@ -1640,7 +1875,7 @@ class SplisosmGLMM:
                 )
             )
 
-            self.fitting_results["sv_llr_perm_stats"] = torch.concat(
+            self._fitting_results["sv_llr_perm_stats"] = torch.concat(
                 _sv_llr_perm_stats, dim=0
             )
 
@@ -1704,7 +1939,7 @@ class SplisosmGLMM:
         ), f"Invalid method. Must be one of {valid_methods}."
 
         # Parametric likelihood ratio test for spatial variability. Need to fit the null and full models.
-        if len(self.fitting_results["models_glmm-null"]) == 0:
+        if len(self._fitting_results["models_glmm-null"]) == 0:
             raise ValueError(
                 "Null models not found. Please run fit() with from_null = True first."
             )
@@ -1712,8 +1947,8 @@ class SplisosmGLMM:
         _sv_llr_stats, _sv_llr_dfs = [], []
         # iterate over genes and calculate the likelihood ratio statistic
         for full_m, null_m in zip(
-            self.fitting_results["models_glmm-full"],
-            self.fitting_results["models_glmm-null"],
+            self._fitting_results["models_glmm-full"],
+            self._fitting_results["models_glmm-null"],
         ):
             # use marginal likelihood for stability
             llr, df = _calc_llr_spatial_variability(null_m, full_m)
@@ -1725,7 +1960,7 @@ class SplisosmGLMM:
 
         if use_perm_null:
             # use permutation to calculate the p-value.
-            if "sv_llr_perm_stats" not in self.fitting_results.keys():
+            if "sv_llr_perm_stats" not in self._fitting_results:
                 self._fit_sv_llr_perm(
                     n_perms=n_perms_per_gene if n_perms_per_gene is not None else 20,
                     print_progress=print_progress,
@@ -1734,7 +1969,7 @@ class SplisosmGLMM:
             else:  # use the cached results if available
                 print("Using cached permutation results...")
 
-            _sv_llr_perm = self.fitting_results["sv_llr_perm_stats"]
+            _sv_llr_perm = self._fitting_results["sv_llr_perm_stats"]
             _sv_llr_pvals = 1 - (_sv_llr_stats[:, None] > _sv_llr_perm[None, :]).sum(
                 1
             ) / len(_sv_llr_perm)

@@ -223,7 +223,7 @@ def _fit_model_one_gene(
         ]
 
     # fit the model
-    model.fit(quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed)
+    model.fit(quiet=quiet, verbose=False, random_seed=random_seed)
 
     # extract and return the fitted parameters
     pars = {
@@ -284,18 +284,16 @@ def _fit_null_full_sv_one_gene(
         corr_sp_eigvecs=corr_sp_eigvecs,
         device=device,
     )
-    null.fit(quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed)
+    null.fit(quiet=quiet, verbose=False, random_seed=random_seed)
 
     # fit the full model from the null
     full = IsoFullModel.from_trained_null_no_sp_var_model(null)
-    full.fit(quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed)
+    full.fit(quiet=quiet, verbose=False, random_seed=random_seed)
 
     # refit the null model if needed
     if refit_null:
         null_refit = IsoNullNoSpVar.from_trained_full_model(full)
-        null_refit.fit(
-            quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed
-        )
+        null_refit.fit(quiet=quiet, verbose=False, random_seed=random_seed)
 
         # update the null if larger log-likelihood
         if null_refit().mean() > null().mean():  # null() returns shape of (n_genes,)
@@ -304,9 +302,7 @@ def _fit_null_full_sv_one_gene(
         # refit the full model from the null if likelihood decreases
         if null().mean() > full().mean():
             full_refit = IsoFullModel.from_trained_null_no_sp_var_model(null)
-            full_refit.fit(
-                quiet=quiet, verbose=False, diagnose=False, random_seed=random_seed
-            )
+            full_refit.fit(quiet=quiet, verbose=False, random_seed=random_seed)
             if full_refit().mean() > full().mean():
                 full = full_refit
 
@@ -385,18 +381,16 @@ def _fit_perm_one_gene(
         corr_sp_eigvecs=corr_sp_eigvecs,
         device=device,
     )
-    null.fit(quiet=True, verbose=False, diagnose=False, random_seed=random_seed)
+    null.fit(quiet=True, verbose=False, random_seed=random_seed)
 
     # fit the full model from the null
     full = IsoFullModel.from_trained_null_no_sp_var_model(null)
-    full.fit(quiet=True, verbose=False, diagnose=False, random_seed=random_seed)
+    full.fit(quiet=True, verbose=False, random_seed=random_seed)
 
     # refit the null model if needed
     if refit_null:
         null_refit = IsoNullNoSpVar.from_trained_full_model(full)
-        null_refit.fit(
-            quiet=True, verbose=False, diagnose=False, random_seed=random_seed
-        )
+        null_refit.fit(quiet=True, verbose=False, random_seed=random_seed)
 
         # update the null if larger log-likelihood
         if null_refit().mean() > null().mean():  # null() returns shape of (n_genes,)
@@ -405,9 +399,7 @@ def _fit_perm_one_gene(
         # refit the full model from the null if likelihood decreases
         if null().mean() > full().mean():
             full_refit = IsoFullModel.from_trained_null_no_sp_var_model(null)
-            full_refit.fit(
-                quiet=True, verbose=False, diagnose=False, random_seed=random_seed
-            )
+            full_refit.fit(quiet=True, verbose=False, random_seed=random_seed)
             if full_refit().mean() > full().mean():
                 full = full_refit
 
