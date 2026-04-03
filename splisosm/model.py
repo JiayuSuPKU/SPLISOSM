@@ -462,23 +462,31 @@ class MultinomGLM(BaseModel, nn.Module):
 
         return score
 
-    def _get_log_lik_hessian_eta(self):
-        """Get the Hessian matrix of the log joint probability wrt eta."""
+    def _get_multinom_hessian_raw(self):
+        """Get the per-spot multinomial Hessian blocks (compact form, before melting).
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_spots, n_isos - 1, n_isos - 1)``.
+            Entry ``[b, s, j, k]`` is the (j,k) element of the Hessian block at spot s
+            for gene b.
+        """
         n_isos = self.n_isos
         props = self._alpha()  # (n_genes, n_spots, n_isos)
-
-        # multinom_hessian[s] = - sum(counts[s,:]) * {diag(p) - p@p.T}
-        # (n_genes, n_spots, n_isos - 1, n_isos - 1)
-        multinom_hessian = -self.counts.sum(-1).view(self.n_genes, -1, 1, 1) * (
+        # multinom_hessian[b,s,j,k] = -counts_total[b,s] * (δ_jk * p_j - p_j * p_k)
+        return -self.counts.sum(-1).view(self.n_genes, -1, 1, 1) * (
             props[..., :-1].unsqueeze(-1).expand(-1, -1, -1, n_isos - 1)
             * torch.eye(n_isos - 1, device=self.device)
             - torch.einsum("bsi,bsj->bsij", (props[..., :-1], props[..., :-1]))
         )
 
+    def _get_log_lik_hessian_eta(self):
+        """Get the Hessian matrix of the log joint probability wrt eta."""
         # reshape the hessian into (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
         # (1) zeros for spots i != j
         # (2) at spot i, isoform j and k are connected via multinom_hessian[i, j, k]
-        return _melt_tensor_along_first_dim(multinom_hessian)
+        return _melt_tensor_along_first_dim(self._get_multinom_hessian_raw())
 
     def _get_log_lik_hessian_beta_bias(self):
         """Get the Hessian matrix of the log joint probability wrt the fixed effects.
@@ -1181,6 +1189,24 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         # set model dimensions based on the input shape
         self.n_genes, self.n_spots, self.n_isos = counts.shape
 
+        # Warn early when marginal mode is used with a large spot count.
+        # The Hessian has shape (n_spots × (n_isos-1))², leading to an O(n³)
+        # Cholesky decomposition per epoch.  For n_spots=500, n_isos=3 this is
+        # a 1000×1000 Cholesky — already ~1 Gflop per gene-epoch.
+        if (
+            self.fitting_method in ("marginal_gd", "marginal_newton")
+            and self.n_spots > 300
+        ):
+            warnings.warn(
+                f"fitting_method='{self.fitting_method}' with n_spots={self.n_spots} > 300. "
+                "Marginal mode requires a Cholesky decomposition of the full "
+                f"({self.n_spots} × (n_isos-1))² Hessian per epoch (O(n³) cost), "
+                "which becomes prohibitively slow for large datasets. "
+                "Consider 'joint_gd' or 'joint_newton' instead.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         # switch to float type
         if not counts.dtype.is_floating_point:
             counts = counts.float()
@@ -1594,24 +1620,41 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
     def _get_log_lik_hessian_nu(self):
         """Get the Hessian matrix of the log joint probability wrt the random effect nu."""
-        n_genes, n_isos = self.n_genes, self.n_isos
-        # full_hessian = multinom_hessian + mvn_hessian # n_spots * (n_isos - 1) x n_spots * (n_isos - 1)
-        # mvn_hessian: (n_isos - 1) x n_spots x n_spots
-        # mvn_hessian[q] = - cov[q]^-1 # n_spots * n_spots
-        mvn_hessian = -self._inv_cov()  # (n_genes, n_var_components, n_spots, n_spots)
-        if self.share_variance:  # the same variance across isoforms
-            # (n_genes, n_isos - 1, n_spots, n_spots)
-            mvn_hessian = mvn_hessian.expand(n_genes, n_isos - 1, -1, -1)
-        # reshape the hessian into (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
-        full_hessian = torch.stack(
-            [torch.block_diag(*[_m for _m in m_gene]) for m_gene in mvn_hessian], dim=0
+        n_genes, n_isos, n_spots = self.n_genes, self.n_isos, self.n_spots
+        n_p = n_spots * (n_isos - 1)
+
+        # Single allocation: pre-allocate the output tensor once to avoid a second
+        # (n_genes, n_p, n_p) allocation from _get_log_lik_hessian_eta / _melt_tensor.
+        full_hessian = torch.zeros(
+            n_genes, n_p, n_p, device=self.device, dtype=self.nu.dtype
         )
 
-        # multinom_hessian[s] = - sum(counts[s,:]) * {diag(p) - p@p.T}
-        # self._get_log_lik_hessian_eta() already reshapes the hessian into
-        # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
-        multinom_hessian = self._get_log_lik_hessian_eta()
-        full_hessian += multinom_hessian
+        # Fill MVN blocks in-place.
+        # full_hessian = multinom_hessian + mvn_hessian
+        # mvn_hessian[q] = -cov[q]^{-1}, shape (n_genes, n_spots, n_spots)
+        # In the isoform-major index ordering, isoform q occupies
+        # rows/cols [q*n_spots : (q+1)*n_spots].
+        mvn_hessian = -self._inv_cov()  # (n_genes, n_var_components, n_spots, n_spots)
+        if self.share_variance:
+            mvn_hessian = mvn_hessian.expand(n_genes, n_isos - 1, -1, -1)
+        for q in range(n_isos - 1):
+            full_hessian[
+                :, q * n_spots : (q + 1) * n_spots, q * n_spots : (q + 1) * n_spots
+            ].add_(mvn_hessian[:, q])
+
+        # Fill multinomial blocks in-place via scatter (compact form avoids second
+        # large allocation; uses the same index arithmetic as _melt_tensor_along_first_dim).
+        # raw: (n_genes, n_spots, n_isos-1, n_isos-1)
+        raw = self._get_multinom_hessian_raw()
+        i_idx, j_idx, k_idx = torch.meshgrid(
+            torch.arange(n_spots, device=self.device),
+            torch.arange(n_isos - 1, device=self.device),
+            torch.arange(n_isos - 1, device=self.device),
+            indexing="ij",
+        )
+        row_idx = (i_idx + j_idx * n_spots).view(-1)
+        col_idx = (i_idx + k_idx * n_spots).view(-1)
+        full_hessian[:, row_idx, col_idx] += raw.flatten(1)
 
         return full_hessian
 
@@ -1676,6 +1719,208 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         # sum over the batch dim to get shape of (n_var_components, 2)
         return torch.autograd.grad(log_prob, sigma_expand, create_graph=True)[0].sum(0)
 
+    def _get_log_lik_hessian_sigma_expand_analytic(self):
+        """Analytic Hessian of log(MVN prior + sigma prior) wrt variance parameters.
+
+        Drop-in replacement for :meth:`_get_log_lik_hessian_sigma_expand` that avoids
+        the expensive ``torch.autograd.functional.jacobian`` call by computing all
+        second derivatives in closed form.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_comps * 2, n_var_comps * 2)``.  Each gene-slice
+            is ``(1/n_genes) * d²log_prob_g / d(sigma_params)²``, matching the scale
+            of the autograd version.
+        """
+        n_genes, n_isos, n_spots = self.n_genes, self.n_isos, self.n_spots
+        rank = self._rank
+        n_var_comps = (
+            self.sigma.shape[1]
+            if self.var_parameterization_sigma_theta
+            else self.sigma_sp.shape[1]
+        )
+        dtype = self.nu.dtype
+
+        V_k = self.corr_sp_eigvecs  # (n_spots, rank)
+        lam = self.corr_sp_eigvals  # (rank,)
+
+        # Data projections: z[b,q,k] = (V_k^T nu_q)[b,q,k]
+        data = self.nu.transpose(1, 2)  # (n_genes, n_isos-1, n_spots)
+        z = torch.einsum("bqs,sk->bqk", data, V_k)  # (n_genes, n_isos-1, rank)
+        if self._is_low_rank:
+            # ||x_perp_q||^2 = ||nu_q||^2 - ||z_q||^2  (n_genes, n_isos-1)
+            x_perp_sq = (data**2).sum(-1) - (z**2).sum(-1)
+
+        # Variance params (n_genes, n_var_comps)
+        if self.var_parameterization_sigma_theta:
+            sigma = self.sigma
+            theta = torch.sigmoid(self.theta_logit)
+            D = theta * (1 - theta)  # sigmoid derivative, (n_genes, n_var_comps)
+        else:
+            sigma_sp = self.sigma_sp
+            sigma_nsp = self.sigma_nsp
+
+        # Accumulate per-class MVN Hessian contributions into (n_genes, n_var_comps, 2, 2)
+        H_diag = torch.zeros(
+            n_genes, n_var_comps, 2, 2, device=self.device, dtype=dtype
+        )
+
+        for q in range(n_isos - 1):
+            vc = 0 if self.share_variance else q
+            zq = z[:, q, :]  # (n_genes, rank)
+
+            # Covariance eigenvalues c_k and residual d for this class
+            # NOTE: in _calc_log_prob_mvn_wrt_sigma, σ enters LINEARLY:
+            #   c_k = σ · (θ·λ_k + (1-θ)),  d = σ · (1-θ)
+            if self.var_parameterization_sigma_theta:
+                s = sigma[:, vc]  # (n_genes,)
+                th = theta[:, vc]
+                Dq = D[:, vc]
+                c_q = s.unsqueeze(-1) * (
+                    th.unsqueeze(-1) * (lam - 1) + 1
+                )  # (n_genes, rank)
+                d_q = (1 - th) * s  # (n_genes,)
+            else:
+                sp = sigma_sp[:, vc]
+                sn = sigma_nsp[:, vc]
+                c_q = (
+                    sp.unsqueeze(-1) ** 2 * lam + sn.unsqueeze(-1) ** 2
+                )  # (n_genes, rank)
+                d_q = sn**2  # (n_genes,)
+
+            # First/second derivs of l_{g,q} wrt c_k (n_genes, rank) and d (n_genes,)
+            dl_dc = -0.5 / c_q + 0.5 * zq**2 / c_q**2
+            d2l_dc2 = 0.5 / c_q**2 - zq**2 / c_q**3
+
+            if self._is_low_rank:
+                xp = x_perp_sq[:, q]  # (n_genes,)
+                dl_dd = -0.5 * (n_spots - rank) / d_q + 0.5 * xp / d_q**2
+                d2l_dd2 = 0.5 * (n_spots - rank) / d_q**2 - xp / d_q**3
+
+            # Jacobians: ∂c_k/∂p1, ∂c_k/∂p2, ∂d/∂p1, ∂d/∂p2, and their second derivatives
+            if self.var_parameterization_sigma_theta:
+                # p1=sigma, p2=theta_logit,  θ=sigmoid(p2),  D=θ(1-θ)
+                # c_k = σ·(θ(λ_k-1)+1),  d = σ·(1-θ)  (LINEAR in σ)
+                dc_dp1 = c_q / s.unsqueeze(-1)  # = θ(λ_k-1)+1
+                dc_dp2 = s.unsqueeze(-1) * (lam - 1) * Dq.unsqueeze(-1)
+                d2c_dp11 = torch.zeros_like(c_q)
+                d2c_dp22 = (
+                    s.unsqueeze(-1)
+                    * (lam - 1)
+                    * Dq.unsqueeze(-1)
+                    * (1 - 2 * th).unsqueeze(-1)
+                )
+                d2c_dp12 = (lam - 1) * Dq.unsqueeze(-1).expand_as(c_q)
+                dd_dp1 = d_q / s  # = (1-θ)
+                dd_dp2 = -s * Dq
+                d2d_dp11 = torch.zeros_like(s)
+                d2d_dp22 = -s * Dq * (1 - 2 * th)
+                d2d_dp12 = -Dq
+            else:
+                # p1=sigma_sp, p2=sigma_nsp
+                dc_dp1 = 2 * sp.unsqueeze(-1) * lam
+                dc_dp2 = 2 * sn.unsqueeze(-1).expand_as(c_q)
+                d2c_dp11 = 2 * lam.unsqueeze(0).expand(n_genes, -1)
+                d2c_dp22 = torch.full_like(c_q, 2.0)
+                d2c_dp12 = torch.zeros_like(c_q)
+                dd_dp1 = torch.zeros(n_genes, device=self.device, dtype=dtype)
+                dd_dp2 = 2 * sn
+                d2d_dp11 = torch.zeros(n_genes, device=self.device, dtype=dtype)
+                d2d_dp22 = torch.full((n_genes,), 2.0, device=self.device, dtype=dtype)
+                d2d_dp12 = torch.zeros(n_genes, device=self.device, dtype=dtype)
+
+            def _hc(dc_pi, dc_pj, d2c_ij):
+                return (d2l_dc2 * dc_pi * dc_pj + dl_dc * d2c_ij).sum(
+                    -1
+                )  # sum over rank
+
+            def _hd(dd_pi, dd_pj, d2d_ij):
+                if self._is_low_rank:
+                    return d2l_dd2 * dd_pi * dd_pj + dl_dd * d2d_ij
+                return torch.zeros(n_genes, device=self.device, dtype=dtype)
+
+            H_diag[:, vc, 0, 0] += _hc(dc_dp1, dc_dp1, d2c_dp11) + _hd(
+                dd_dp1, dd_dp1, d2d_dp11
+            )
+            H_diag[:, vc, 0, 1] += _hc(dc_dp1, dc_dp2, d2c_dp12) + _hd(
+                dd_dp1, dd_dp2, d2d_dp12
+            )
+            H_diag[:, vc, 1, 0] += _hc(dc_dp2, dc_dp1, d2c_dp12) + _hd(
+                dd_dp2, dd_dp1, d2d_dp12
+            )
+            H_diag[:, vc, 1, 1] += _hc(dc_dp2, dc_dp2, d2c_dp22) + _hd(
+                dd_dp2, dd_dp2, d2d_dp22
+            )
+
+        # Prior contributions (per var_comp; scale by n_isos-1 for share_variance)
+        prior_scale = (n_isos - 1) if self.share_variance else 1
+        if self.var_prior_model != "none":
+            alpha = self.var_prior_model_params["alpha"]
+            beta = self.var_prior_model_params["beta"]
+            if self.var_parameterization_sigma_theta:
+                # Prior on sigma_total = sigma; theta_logit has no effect on prior
+                s_all = self.sigma  # (n_genes, n_var_comps)
+                if self.var_prior_model == "inv_gamma":
+                    # InverseGamma on u=sigma^2: d²logp/dσ² = 2(α+1)/σ² - 6β/σ⁴
+                    u = s_all**2
+                    d2logp_du2 = (alpha + 1) / u**2 - 2 * beta / u**3
+                    dlogp_du = -(alpha + 1) / u + beta / u**2
+                    d2prior_dp1 = d2logp_du2 * (2 * s_all) ** 2 + dlogp_du * 2
+                else:  # gamma on sigma
+                    v = s_all.abs()
+                    d2prior_dp1 = -(alpha - 1) / v**2
+                H_diag[:, :, 0, 0] += prior_scale * d2prior_dp1
+                # [0,1], [1,0], [1,1] entries: 0 (prior doesn't depend on theta_logit)
+            else:
+                # Prior on sigma_total = sqrt(sigma_sp^2 + sigma_nsp^2)
+                sp_all = self.sigma_sp  # (n_genes, n_var_comps)
+                sn_all = self.sigma_nsp
+                v2 = sp_all**2 + sn_all**2  # sigma_total^2
+                if self.var_prior_model == "inv_gamma":
+                    # InverseGamma on u=sigma_total^2
+                    u = v2
+                    d2logp_du2 = (alpha + 1) / u**2 - 2 * beta / u**3
+                    dlogp_du = -(alpha + 1) / u + beta / u**2
+                    d2p_dsp2 = d2logp_du2 * 4 * sp_all**2 + dlogp_du * 2
+                    d2p_dsn2 = d2logp_du2 * 4 * sn_all**2 + dlogp_du * 2
+                    d2p_cross = d2logp_du2 * 4 * sp_all * sn_all
+                else:  # gamma on sigma_total
+                    v = torch.sqrt(v2)
+                    dlogp_dv = (alpha - 1) / v - beta
+                    d2logp_dv2 = -(alpha - 1) / v**2
+                    d2p_dsp2 = (
+                        d2logp_dv2 * (sp_all / v) ** 2 + dlogp_dv * sn_all**2 / v**3
+                    )
+                    d2p_dsn2 = (
+                        d2logp_dv2 * (sn_all / v) ** 2 + dlogp_dv * sp_all**2 / v**3
+                    )
+                    d2p_cross = d2logp_dv2 * (sp_all / v) * (sn_all / v) + dlogp_dv * (
+                        -sp_all * sn_all / v**3
+                    )
+                H_diag[:, :, 0, 0] += prior_scale * d2p_dsp2
+                H_diag[:, :, 0, 1] += prior_scale * d2p_cross
+                H_diag[:, :, 1, 0] += prior_scale * d2p_cross
+                H_diag[:, :, 1, 1] += prior_scale * d2p_dsn2
+
+        # Build block-diagonal output (n_genes, n_var_comps*2, n_var_comps*2)
+        if n_var_comps == 1:
+            H_full = H_diag[:, 0, :, :]  # (n_genes, 2, 2)
+        else:
+            H_full = torch.zeros(
+                n_genes,
+                n_var_comps * 2,
+                n_var_comps * 2,
+                device=self.device,
+                dtype=dtype,
+            )
+            for vc in range(n_var_comps):
+                H_full[:, vc * 2 : vc * 2 + 2, vc * 2 : vc * 2 + 2] = H_diag[
+                    :, vc, :, :
+                ]
+
+        return H_full / n_genes
+
     def _get_log_lik_hessian_sigma_expand(self):
         """Get the Hessian matrix of the log mvn wrt the variance components."""
         if self.var_parameterization_sigma_theta:
@@ -1733,9 +1978,8 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
                 [self.sigma_sp.grad, self.sigma_nsp.grad], dim=-1
             )  # (n_genes, n_var_components, 2)
 
-        # TODO: analytical solutions when var_prior_model in ['none', 'inv_gamma']?
         hessian_sigma_expand = (
-            -self._get_log_lik_hessian_sigma_expand()
+            -self._get_log_lik_hessian_sigma_expand_analytic()
         )  # (n_genes, n_var_components * 2, n_var_components * 2)
         hessian_sigma_expand += 1e-5 * torch.eye(
             hessian_sigma_expand.shape[-1]

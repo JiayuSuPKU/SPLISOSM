@@ -613,11 +613,7 @@ class TestSplisosmGLMM(unittest.TestCase):
 
             # Directly extract ratios from the per-gene model
             expected = (
-                gene_model.get_isoform_ratio()
-                .detach()
-                .cpu()
-                .squeeze(0)
-                .numpy()
+                gene_model.get_isoform_ratio().detach().cpu().squeeze(0).numpy()
             )  # (n_spots, n_isos)
 
             actual = layer[:, gene_cols]  # (n_spots, n_isos)

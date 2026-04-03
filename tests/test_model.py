@@ -1028,5 +1028,126 @@ class TestNewAPIs(unittest.TestCase):
         model.strip_data()  # second call must be safe
 
 
+def _setup_glmm_for_sigma_hessian(
+    n_genes=2,
+    n_spots=10,
+    n_isos=3,
+    rank=4,
+    var_parameterization_sigma_theta=True,
+    share_variance=True,
+    var_prior_model="none",
+    var_prior_model_params=None,
+    seed=42,
+):
+    """Helper: create a MultinomGLMM with known low-rank kernel for sigma Hessian tests."""
+    torch.manual_seed(seed)
+    counts = torch.randint(5, 30, (n_genes, n_spots, n_isos)).float()
+    corr_sp = _make_spd_kernel(n_spots, seed=seed)
+    eigvals_full, eigvecs_full = _eigenpairs_from_corr_sp(corr_sp)
+    eigvals_lr = eigvals_full[:rank]
+    eigvecs_lr = eigvecs_full[:, :rank]
+    model = MultinomGLMM(
+        var_parameterization_sigma_theta=var_parameterization_sigma_theta,
+        share_variance=share_variance,
+        var_prior_model=var_prior_model,
+        var_prior_model_params=var_prior_model_params or {},
+    )
+    model.setup_data(
+        counts,
+        corr_sp_eigvals=eigvals_lr,
+        corr_sp_eigvecs=eigvecs_lr,
+    )
+    # Perturb parameters away from defaults so gradients are non-trivial
+    with torch.no_grad():
+        if var_parameterization_sigma_theta:
+            model.sigma.add_(torch.randn_like(model.sigma) * 0.1)
+            model.sigma.abs_()
+            model.theta_logit.add_(torch.randn_like(model.theta_logit) * 0.5)
+        else:
+            model.sigma_sp.add_(torch.randn_like(model.sigma_sp) * 0.1)
+            model.sigma_sp.abs_()
+            model.sigma_nsp.add_(torch.randn_like(model.sigma_nsp) * 0.1)
+            model.sigma_nsp.abs_()
+    return model
+
+
+class TestSigmaHessianAnalytic(unittest.TestCase):
+    """Unit tests comparing _get_log_lik_hessian_sigma_expand_analytic vs autograd."""
+
+    ATOL = 1e-4  # tolerance for analytic vs autograd comparison
+
+    def _assert_hessians_close(self, model):
+        analytic = model._get_log_lik_hessian_sigma_expand_analytic()
+        autograd = model._get_log_lik_hessian_sigma_expand()
+        self.assertEqual(analytic.shape, autograd.shape)
+        max_diff = (analytic - autograd).abs().max().item()
+        self.assertLess(
+            max_diff,
+            self.ATOL,
+            f"Max abs diff {max_diff:.2e} exceeds tolerance {self.ATOL:.2e}.\n"
+            f"analytic=\n{analytic}\nautograd=\n{autograd}",
+        )
+
+    def test_sigma_theta_low_rank_no_prior(self):
+        """sigma/theta_logit, low-rank kernel, no prior."""
+        model = _setup_glmm_for_sigma_hessian(
+            var_parameterization_sigma_theta=True, var_prior_model="none"
+        )
+        self.assertTrue(model._is_low_rank)
+        self._assert_hessians_close(model)
+
+    def test_sigma_sp_nsp_low_rank_no_prior(self):
+        """sigma_sp/sigma_nsp, low-rank kernel, no prior."""
+        model = _setup_glmm_for_sigma_hessian(
+            var_parameterization_sigma_theta=False, var_prior_model="none"
+        )
+        self.assertTrue(model._is_low_rank)
+        self._assert_hessians_close(model)
+
+    def test_sigma_theta_low_rank_inv_gamma_prior(self):
+        """sigma/theta_logit, low-rank kernel, inv_gamma prior."""
+        model = _setup_glmm_for_sigma_hessian(
+            var_parameterization_sigma_theta=True, var_prior_model="inv_gamma"
+        )
+        self._assert_hessians_close(model)
+
+    def test_sigma_sp_nsp_low_rank_gamma_prior(self):
+        """sigma_sp/sigma_nsp, low-rank kernel, gamma prior."""
+        model = _setup_glmm_for_sigma_hessian(
+            var_parameterization_sigma_theta=False, var_prior_model="gamma"
+        )
+        self._assert_hessians_close(model)
+
+    def test_sigma_theta_full_rank_no_prior(self):
+        """sigma/theta_logit, full-rank kernel (_is_low_rank=False), no prior."""
+        torch.manual_seed(0)
+        n_spots, n_genes, n_isos = 10, 2, 3
+        counts = torch.randint(5, 30, (n_genes, n_spots, n_isos)).float()
+        corr_sp = _make_spd_kernel(n_spots, seed=0)
+        eigvals, eigvecs = _eigenpairs_from_corr_sp(corr_sp)
+        model = MultinomGLMM(var_parameterization_sigma_theta=True)
+        model.setup_data(counts, corr_sp_eigvals=eigvals, corr_sp_eigvecs=eigvecs)
+        self.assertFalse(model._is_low_rank)
+        self._assert_hessians_close(model)
+
+    def test_sigma_theta_low_rank_share_variance_false(self):
+        """sigma/theta_logit, low-rank, share_variance=False (per-isoform params)."""
+        model = _setup_glmm_for_sigma_hessian(
+            var_parameterization_sigma_theta=True,
+            share_variance=False,
+            var_prior_model="none",
+        )
+        self._assert_hessians_close(model)
+
+    def test_sigma_sp_nsp_low_rank_share_variance_false(self):
+        """sigma_sp/sigma_nsp, low-rank, share_variance=False, inv_gamma prior."""
+        model = _setup_glmm_for_sigma_hessian(
+            var_parameterization_sigma_theta=False,
+            share_variance=False,
+            var_prior_model="inv_gamma",
+        )
+        self._assert_hessians_close(model)
+
+
 if __name__ == "__main__":
     unittest.main()
