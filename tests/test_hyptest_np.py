@@ -262,7 +262,7 @@ class TestSplisosmNP(unittest.TestCase):
         )
 
         self.assertEqual(model.n_genes, 1)
-        self.assertEqual(model.n_isos, [2])
+        self.assertEqual(model.n_isos_per_gene, [2])
         self.assertEqual(model.gene_names, ["Gene 1"])
 
     def test_setup_data_from_anndata_with_single_covariate_name(self):
@@ -385,15 +385,15 @@ class TestSplisosmNP(unittest.TestCase):
 
         # Test spatial variability - HSIC-GC (gene counts)
         model.test_spatial_variability(method="hsic-gc", print_progress=False)
-        self.assertTrue(len(model.sv_test_results) > 0)
+        self.assertTrue(len(model._sv_test_results) > 0)
 
         # Test spatial variability - HSIC-IR (isoform ratios, requires densification)
         model.test_spatial_variability(method="hsic-ir", print_progress=False)
-        self.assertTrue(len(model.sv_test_results) > 0)
+        self.assertTrue(len(model._sv_test_results) > 0)
 
         # Test differential usage - HSIC (isoform ratios, requires densification)
         model.test_differential_usage(method="hsic", print_progress=False)
-        self.assertTrue(len(model.du_test_results) > 0)
+        self.assertTrue(len(model._du_test_results) > 0)
 
     def test_hsic_gc(self):
         """Make sure the standalone hsic-gc function works as expected."""
@@ -421,11 +421,11 @@ class TestSplisosmNP(unittest.TestCase):
                     if _counts.is_sparse
                     else _counts.sum(1, keepdim=True)
                 )
-                for _counts in model.data
+                for _counts in model._data
             ],
             axis=1,
         )  # tensor(n_spots, n_genes)
-        sv_results2 = run_hsic_gc(counts_gene=counts_g, coordinates=model.coordinates)
+        sv_results2 = run_hsic_gc(counts_gene=counts_g, coordinates=model._coordinates)
         # compare the statistics and p-values
         stats1 = sv_results1["statistic"].values
         stats2 = sv_results2["statistic"]
@@ -489,7 +489,7 @@ class TestSplisosmNP(unittest.TestCase):
             filter_single_iso_genes=False,
         )
         df = model.extract_feature_summary(level="isoform", print_progress=False)
-        self.assertEqual(len(df), sum(model.n_isos))
+        self.assertEqual(len(df), sum(model.n_isos_per_gene))
         for col in ("gene_symbol", "ratio_avg", "ratio_std", "ratio_total"):
             self.assertIn(col, df.columns)
         self.assertTrue(np.isfinite(df["ratio_avg"].to_numpy()).all())
@@ -517,7 +517,7 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertIn("pvalue", results)
         # Should match stored results
         np.testing.assert_array_equal(
-            results["statistic"], model.sv_test_results["statistic"]
+            results["statistic"], model._sv_test_results["statistic"]
         )
 
     def test_str_reflects_test_status(self):
@@ -614,7 +614,7 @@ class TestSplisosmNP(unittest.TestCase):
                     null_configs=configs,
                     print_progress=False,
                 )
-                res = model.sv_test_results
+                res = model._sv_test_results
                 self.assertEqual(res["null_method"], null_method)
                 self.assertEqual(len(res["pvalue"]), self.n_genes)
                 self.assertTrue(np.all(res["pvalue"] >= 0))
@@ -641,7 +641,7 @@ class TestSplisosmNP(unittest.TestCase):
             null_configs={"n_perms_per_gene": 30, "perm_batch_size": 10},
             print_progress=False,
         )
-        res = model.sv_test_results
+        res = model._sv_test_results
         self.assertEqual(len(res["pvalue"]), self.n_genes)
         self.assertTrue(np.all(res["pvalue"] >= 0))
         self.assertTrue(np.all(res["pvalue"] <= 1))
@@ -671,7 +671,7 @@ class TestSplisosmNP(unittest.TestCase):
                     },
                     print_progress=False,
                 )
-                res = model.sv_test_results
+                res = model._sv_test_results
                 self.assertEqual(len(res["pvalue"]), self.n_genes)
                 self.assertTrue(np.all(res["pvalue"] >= 0))
                 self.assertTrue(np.all(res["pvalue"] <= 1))
@@ -1156,14 +1156,14 @@ class TestSplisosmNP(unittest.TestCase):
     def test_init_kernel_hyperparams(self):
         """k_neighbors, rho, standardize_cov passed to __init__ should be used in setup_data."""
         model_custom = SplisosmNP(k_neighbors=6, rho=0.5, standardize_cov=False)
-        self.assertEqual(model_custom.k_neighbors, 6)
-        self.assertAlmostEqual(model_custom.rho, 0.5)
-        self.assertFalse(model_custom.standardize_cov)
+        self.assertEqual(model_custom._k_neighbors, 6)
+        self.assertAlmostEqual(model_custom._rho, 0.5)
+        self.assertFalse(model_custom._standardize_cov)
 
         model_default = SplisosmNP()
-        self.assertEqual(model_default.k_neighbors, 4)
-        self.assertAlmostEqual(model_default.rho, 0.99)
-        self.assertTrue(model_default.standardize_cov)
+        self.assertEqual(model_default._k_neighbors, 4)
+        self.assertAlmostEqual(model_default._rho, 0.99)
+        self.assertTrue(model_default._standardize_cov)
 
         # After setup_data both models work end-to-end
         model_custom.setup_data(
@@ -1188,8 +1188,8 @@ class TestSplisosmNP(unittest.TestCase):
         # Custom vs default kernel should differ (rho=0.5 vs 0.99 changes eigenvalue spread)
         import torch
 
-        trace_custom = torch.trace(model_custom.corr_sp.realization()).item()
-        trace_default = torch.trace(model_default.corr_sp.realization()).item()
+        trace_custom = torch.trace(model_custom.sp_kernel.realization()).item()
+        trace_default = torch.trace(model_default.sp_kernel.realization()).item()
         self.assertNotAlmostEqual(
             trace_custom,
             trace_default,
@@ -1225,8 +1225,8 @@ class TestSplisosmNP(unittest.TestCase):
         warning_text = str(user_warns[0].message)
         self.assertIn(str(n_isolated), warning_text)
         self.assertEqual(model.n_spots, n_total - n_isolated)
-        self.assertEqual(model.coordinates.shape[0], n_total - n_isolated)
-        for g in model.data:
+        self.assertEqual(model._coordinates.shape[0], n_total - n_isolated)
+        for g in model._data:
             self.assertEqual(g.shape[0], n_total - n_isolated)
 
     def test_min_component_size_design_mtx_filtered(self):
@@ -1385,7 +1385,7 @@ class TestSplisosmNP(unittest.TestCase):
                 # Force design_mtx to scipy sparse CSR to exercise the sparse path
                 model.design_mtx = scipy.sparse.csr_matrix(model.design_mtx.numpy())
             model.test_differential_usage(method=method, print_progress=False)
-            return model.du_test_results
+            return model._du_test_results
 
         n_genes = self.n_genes
         n_factors = 1  # single binary covariate
@@ -1484,16 +1484,16 @@ class TestParallelNP(unittest.TestCase):
                 method="hsic-ir", null_method="eig", n_jobs=n_jobs, print_progress=False
             )
             if n_jobs == 1:
-                ref = model.sv_test_results
+                ref = model._sv_test_results
             else:
                 np.testing.assert_allclose(
-                    model.sv_test_results["statistic"],
+                    model._sv_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                     err_msg="SV statistic differs between n_jobs=1 and n_jobs=2",
                 )
                 np.testing.assert_allclose(
-                    model.sv_test_results["pvalue"],
+                    model._sv_test_results["pvalue"],
                     ref["pvalue"],
                     atol=1e-6,
                     err_msg="SV pvalue differs between n_jobs=1 and n_jobs=2",
@@ -1510,15 +1510,15 @@ class TestParallelNP(unittest.TestCase):
                 print_progress=False,
             )
             if n_jobs == 1:
-                ref = model.sv_test_results
+                ref = model._sv_test_results
             else:
                 np.testing.assert_allclose(
-                    model.sv_test_results["statistic"],
+                    model._sv_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                 )
                 np.testing.assert_allclose(
-                    model.sv_test_results["pvalue"],
+                    model._sv_test_results["pvalue"],
                     ref["pvalue"],
                     atol=1e-6,
                 )
@@ -1535,11 +1535,11 @@ class TestParallelNP(unittest.TestCase):
                 print_progress=False,
             )
             if n_jobs == 1:
-                ref = model.sv_test_results
+                ref = model._sv_test_results
             else:
                 # Perm stats should still match (deterministic per-gene body)
                 np.testing.assert_allclose(
-                    model.sv_test_results["statistic"],
+                    model._sv_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                 )
@@ -1552,15 +1552,15 @@ class TestParallelNP(unittest.TestCase):
                 method="hsic-ic", n_jobs=n_jobs, print_progress=False
             )
             if n_jobs == 1:
-                ref = model.sv_test_results
+                ref = model._sv_test_results
             else:
                 np.testing.assert_allclose(
-                    model.sv_test_results["statistic"],
+                    model._sv_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                 )
                 np.testing.assert_allclose(
-                    model.sv_test_results["pvalue"],
+                    model._sv_test_results["pvalue"],
                     ref["pvalue"],
                     atol=1e-6,
                 )
@@ -1573,15 +1573,15 @@ class TestParallelNP(unittest.TestCase):
                 method="hsic-gc", n_jobs=n_jobs, print_progress=False
             )
             if n_jobs == 1:
-                ref = model.sv_test_results
+                ref = model._sv_test_results
             else:
                 np.testing.assert_allclose(
-                    model.sv_test_results["statistic"],
+                    model._sv_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                 )
                 np.testing.assert_allclose(
-                    model.sv_test_results["pvalue"],
+                    model._sv_test_results["pvalue"],
                     ref["pvalue"],
                     atol=1e-6,
                 )
@@ -1601,15 +1601,15 @@ class TestParallelNP(unittest.TestCase):
                     print_progress=False,
                 )
             if n_jobs == 1:
-                ref = model.sv_test_results
+                ref = model._sv_test_results
             else:
                 np.testing.assert_allclose(
-                    model.sv_test_results["statistic"],
+                    model._sv_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                 )
                 np.testing.assert_allclose(
-                    model.sv_test_results["pvalue"],
+                    model._sv_test_results["pvalue"],
                     ref["pvalue"],
                     atol=1e-6,
                 )
@@ -1626,16 +1626,16 @@ class TestParallelNP(unittest.TestCase):
                 method="hsic", n_jobs=n_jobs, print_progress=False
             )
             if n_jobs == 1:
-                ref = model.du_test_results
+                ref = model._du_test_results
             else:
                 np.testing.assert_allclose(
-                    model.du_test_results["statistic"],
+                    model._du_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                     err_msg="DU hsic statistic differs",
                 )
                 np.testing.assert_allclose(
-                    model.du_test_results["pvalue"],
+                    model._du_test_results["pvalue"],
                     ref["pvalue"],
                     atol=1e-6,
                     err_msg="DU hsic pvalue differs",
@@ -1652,16 +1652,16 @@ class TestParallelNP(unittest.TestCase):
                 print_progress=False,
             )
             if n_jobs == 1:
-                ref = model.du_test_results
+                ref = model._du_test_results
             else:
                 np.testing.assert_allclose(
-                    model.du_test_results["statistic"],
+                    model._du_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                     err_msg="DU hsic-gp statistic differs",
                 )
                 np.testing.assert_allclose(
-                    model.du_test_results["pvalue"],
+                    model._du_test_results["pvalue"],
                     ref["pvalue"],
                     atol=1e-6,
                     err_msg="DU hsic-gp pvalue differs",
@@ -1675,16 +1675,16 @@ class TestParallelNP(unittest.TestCase):
                 method="t-fisher", n_jobs=n_jobs, print_progress=False
             )
             if n_jobs == 1:
-                ref = model.du_test_results
+                ref = model._du_test_results
             else:
                 np.testing.assert_allclose(
-                    model.du_test_results["statistic"],
+                    model._du_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                     err_msg="DU t-fisher statistic differs",
                 )
                 np.testing.assert_allclose(
-                    model.du_test_results["pvalue"],
+                    model._du_test_results["pvalue"],
                     ref["pvalue"],
                     atol=1e-6,
                     err_msg="DU t-fisher pvalue differs",
@@ -1698,16 +1698,16 @@ class TestParallelNP(unittest.TestCase):
                 method="t-tippett", n_jobs=n_jobs, print_progress=False
             )
             if n_jobs == 1:
-                ref = model.du_test_results
+                ref = model._du_test_results
             else:
                 np.testing.assert_allclose(
-                    model.du_test_results["statistic"],
+                    model._du_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                     err_msg="DU t-tippett statistic differs",
                 )
                 np.testing.assert_allclose(
-                    model.du_test_results["pvalue"],
+                    model._du_test_results["pvalue"],
                     ref["pvalue"],
                     atol=1e-6,
                     err_msg="DU t-tippett pvalue differs",

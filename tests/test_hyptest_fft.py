@@ -428,7 +428,7 @@ class TestSplisosmFFT(unittest.TestCase):
         summary2 = model.extract_feature_summary(level="isoform")
 
         self.assertIs(summary1, summary2)
-        self.assertEqual(len(summary1), sum(model.n_isos))
+        self.assertEqual(len(summary1), sum(model.n_isos_per_gene))
         self.assertTrue(
             {
                 "pct_bin_on",
@@ -489,16 +489,16 @@ class TestSplisosmFFT(unittest.TestCase):
                 method="hsic-ir", n_jobs=n_jobs, print_progress=False
             )
             if n_jobs == 1:
-                ref = model.sv_test_results
+                ref = model._sv_test_results
             else:
                 np.testing.assert_allclose(
-                    model.sv_test_results["statistic"],
+                    model._sv_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                     err_msg="FFT SV statistic differs between n_jobs=1 and n_jobs=2",
                 )
                 np.testing.assert_allclose(
-                    model.sv_test_results["pvalue"],
+                    model._sv_test_results["pvalue"],
                     ref["pvalue"],
                     atol=1e-6,
                     err_msg="FFT SV pvalue differs between n_jobs=1 and n_jobs=2",
@@ -515,16 +515,16 @@ class TestSplisosmFFT(unittest.TestCase):
                 method="hsic", n_jobs=n_jobs, return_results=False, print_progress=False
             )
             if n_jobs == 1:
-                ref = model.du_test_results
+                ref = model._du_test_results
             else:
                 np.testing.assert_allclose(
-                    model.du_test_results["statistic"],
+                    model._du_test_results["statistic"],
                     ref["statistic"],
                     atol=1e-6,
                     err_msg="FFT DU statistic differs between n_jobs=1 and n_jobs=2",
                 )
                 np.testing.assert_allclose(
-                    model.du_test_results["pvalue"],
+                    model._du_test_results["pvalue"],
                     ref["pvalue"],
                     atol=1e-6,
                     err_msg="FFT DU pvalue differs between n_jobs=1 and n_jobs=2",

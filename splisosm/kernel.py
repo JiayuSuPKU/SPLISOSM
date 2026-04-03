@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import warnings
 import numpy as np
+import scipy.fft
 import scipy.sparse
 import scipy.sparse.linalg
 import torch
@@ -11,7 +12,7 @@ from abc import ABC, abstractmethod
 from scipy.sparse.linalg import splu
 from sklearn.neighbors import NearestNeighbors
 
-__all__ = ["IdentityKernel", "SpatialCovKernel"]
+__all__ = ["IdentityKernel", "SpatialCovKernel", "FFTKernel"]
 
 
 class Kernel(ABC):
@@ -817,3 +818,237 @@ class SpatialCovKernel(Kernel):
         if self.K_sp is not None:
             return self.K_sp.pow(2).sum()
         return torch.tensor(self._hutchinson_trace(squared=True), dtype=torch.float32)
+
+
+class FFTKernel(Kernel):
+    """FFT-based spatial kernel on a periodic 2D raster grid.
+
+    This implementation supports a CAR-style spatial kernel equivalent to a
+    periodic, neighbourhood-graph-based autoregressive model.  All operations
+    are :math:`O(N \\log N)` via the 2-D Fast Fourier Transform.
+
+    Parameters
+    ----------
+    shape
+        Grid shape ``(ny, nx)``.
+    spacing
+        Physical spacing ``(dy, dx)`` between neighbouring raster cells.
+    rho
+        Spatial autocorrelation coefficient in CAR kernel.
+    neighbor_degree
+        Neighbour ring degree for graph construction.
+        ``1`` uses nearest neighbours in the periodic metric.
+    workers
+        Number of workers used by ``scipy.fft.fft2``.
+    """
+
+    def __init__(
+        self,
+        shape: tuple[int, int],
+        spacing: tuple[float, float] = (1.0, 1.0),
+        rho: float = 0.99,
+        neighbor_degree: int = 1,
+        workers: int | None = None,
+    ) -> None:
+        if len(shape) != 2:
+            raise ValueError("`shape` must be a tuple of length 2: (ny, nx).")
+        if shape[0] <= 0 or shape[1] <= 0:
+            raise ValueError("Grid dimensions must be positive.")
+        if neighbor_degree < 1:
+            raise ValueError("`neighbor_degree` must be >= 1.")
+
+        self.ny, self.nx = int(shape[0]), int(shape[1])
+        self.dy, self.dx = float(spacing[0]), float(spacing[1])
+        self.n_grid = self.ny * self.nx
+        self.neighbor_degree = int(neighbor_degree)
+        self.rho = min(float(rho), 0.99)
+        self.workers = workers
+
+        self._min_dist_sq = self._precompute_square_torus_distances()
+        self._spectrum_2d = self._compute_car_spectrum()
+        self.spectrum = self._spectrum_2d.ravel()
+
+    # ------------------------------------------------------------------
+    # Internal construction helpers
+    # ------------------------------------------------------------------
+
+    def _precompute_square_torus_distances(self) -> np.ndarray:
+        """Compute squared torus distances from origin for periodic grid."""
+        y = np.arange(self.ny, dtype=float) * self.dy
+        x = np.arange(self.nx, dtype=float) * self.dx
+        y = np.minimum(y, (self.ny * self.dy) - y)
+        x = np.minimum(x, (self.nx * self.dx) - x)
+        yy, xx = np.meshgrid(y, x, indexing="ij")
+        return yy**2 + xx**2
+
+    def _compute_car_spectrum(self) -> np.ndarray:
+        """Compute eigenvalues of the periodic CAR kernel via FFT."""
+        unique_d2 = np.unique(self._min_dist_sq)
+        if self.neighbor_degree < len(unique_d2):
+            cutoff_sq = unique_d2[self.neighbor_degree]
+        else:
+            cutoff_sq = unique_d2[-1]
+
+        w_img = (self._min_dist_sq <= cutoff_sq).astype(float)
+        w_img[0, 0] = 0.0
+        degree = float(np.sum(w_img))
+
+        if degree <= 0.0:
+            return np.ones((self.ny, self.nx), dtype=float)
+
+        lam_w = np.real(scipy.fft.fft2(w_img, workers=self.workers)) / degree
+        return 1.0 / (1.0 - self.rho * lam_w)
+
+    # ------------------------------------------------------------------
+    # Kernel ABC implementation
+    # ------------------------------------------------------------------
+
+    def realization(self) -> torch.Tensor:
+        """Return the dense kernel matrix (not recommended for large grids)."""
+        raise NotImplementedError(
+            "FFTKernel does not support dense realisation; use xtKx() or eigenvalues()."
+        )
+
+    def xtKx(self, x: np.ndarray) -> float | np.ndarray:
+        """Compute ``x^T K x`` in ``O(N log N)`` via FFT.
+
+        Parameters
+        ----------
+        x
+            Input with shape ``(ny, nx)`` or ``(ny, nx, m)``.
+
+        Returns
+        -------
+        float or np.ndarray
+            Scalar for 2D input, or shape ``(m,)`` for 3D input.
+        """
+        x = np.asarray(x, dtype=float)
+        if x.ndim == 2:
+            x = x[..., None]
+        if x.ndim != 3:
+            raise ValueError("`x` must have shape (ny, nx) or (ny, nx, m).")
+
+        ny, nx, _ = x.shape
+        if ny != self.ny or nx != self.nx:
+            raise ValueError(
+                f"Input shape ({ny}, {nx}) does not match kernel shape "
+                f"({self.ny}, {self.nx})."
+            )
+
+        x_hat = scipy.fft.fft2(x, axes=(0, 1), workers=self.workers)
+        power = np.abs(x_hat) ** 2
+        weighted = np.sum(power * self._spectrum_2d[:, :, None], axis=(0, 1))
+        q = weighted / (self.n_grid)
+        return float(q[0]) if q.size == 1 else q
+
+    def xtKx_approx(self, x, k: int | None = None):
+        """Same as :meth:`xtKx` (FFT is already exact for periodic grids)."""
+        return self.xtKx(x)
+
+    def eigenvalues(self, k: int | None = None) -> np.ndarray:
+        """Return kernel eigenvalues in descending order.
+
+        Parameters
+        ----------
+        k
+            Number of leading eigenvalues to return.  ``None`` returns all.
+
+        Returns
+        -------
+        np.ndarray
+            Eigenvalues in descending order.
+        """
+        evals = np.sort(self.spectrum)[::-1]
+        if k is None:
+            return evals
+        return evals[:k]
+
+    def trace(self) -> float:
+        """Return ``tr(K)``."""
+        return float(np.sum(self.spectrum))
+
+    def square_trace(self) -> float:
+        """Return ``tr(K^2)``."""
+        return float(np.sum(self.spectrum**2))
+
+    # ------------------------------------------------------------------
+    # FFT-specific methods (not in Kernel ABC)
+    # ------------------------------------------------------------------
+
+    def power_spectral_density_1d(
+        self, bins: int = 50
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute the 1D power spectral density (radial profile).
+
+        Parameters
+        ----------
+        bins
+            Number of bins for the 1D radial frequency.
+
+        Returns
+        -------
+        freq_bins : np.ndarray
+            The centre frequencies of the valid bins.
+        psd_1d : np.ndarray
+            The average power (eigenvalue) in each frequency bin.
+        """
+        if bins < 1:
+            raise ValueError("`bins` must be >= 1.")
+
+        fy = scipy.fft.fftfreq(self.ny, d=self.dy)
+        fx = scipy.fft.fftfreq(self.nx, d=self.dx)
+        FY, FX = np.meshgrid(fy, fx, indexing="ij")
+        F_r = np.sqrt(FY**2 + FX**2)
+        f_r_flat = F_r.ravel()
+        spectrum_flat = self._spectrum_2d.ravel()
+
+        bin_edges = np.linspace(0, f_r_flat.max(), bins + 1)
+        psd_sum, _ = np.histogram(f_r_flat, bins=bin_edges, weights=spectrum_flat)
+        counts, _ = np.histogram(f_r_flat, bins=bin_edges)
+
+        valid = counts > 0
+        psd_1d = np.zeros(bins)
+        psd_1d[valid] = psd_sum[valid] / counts[valid]
+
+        freq_bins = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+        return freq_bins[valid], psd_1d[valid]
+
+    def apply_residual_op(self, x: np.ndarray, epsilon: float) -> np.ndarray:
+        """Apply the kernel regression residual operator.
+
+        Computed in O(N log N) via FFT as::
+
+            R @ v = IFFT2( epsilon / (lambda + epsilon) * FFT2(v) )
+
+        Parameters
+        ----------
+        x
+            Input with shape ``(ny, nx)`` or ``(ny, nx, m)``.
+        epsilon
+            Regularisation / noise level.
+
+        Returns
+        -------
+        np.ndarray
+            Residuals of the same shape as ``x``.
+        """
+        x = np.asarray(x, dtype=float)
+        scalar = x.ndim == 2
+        if scalar:
+            x = x[..., None]
+        if x.ndim != 3:
+            raise ValueError("`x` must have shape (ny, nx) or (ny, nx, m).")
+
+        ny, nx, _ = x.shape
+        if ny != self.ny or nx != self.nx:
+            raise ValueError(
+                f"Input shape ({ny}, {nx}) does not match kernel shape "
+                f"({self.ny}, {self.nx})."
+            )
+
+        x_hat = scipy.fft.fft2(x, axes=(0, 1), workers=self.workers)
+        scale = epsilon / (self._spectrum_2d[:, :, None] + epsilon)
+        result = np.real(
+            scipy.fft.ifft2(scale * x_hat, axes=(0, 1), workers=self.workers)
+        )
+        return result[..., 0] if scalar else result

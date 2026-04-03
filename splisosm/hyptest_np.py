@@ -324,72 +324,35 @@ class SplisosmNP:
     >>> print(du_results.head())
     """
 
-    k_neighbors: int
-    """Number of nearest neighbours for the CAR spatial kernel (set in :meth:`__init__`)."""
-
-    rho: float
-    """Spatial autocorrelation strength for the CAR kernel (set in :meth:`__init__`)."""
-
-    standardize_cov: bool
-    """Whether to standardise the spatial covariance matrix (set in :meth:`__init__`)."""
+    # -- Public attributes (populated by :meth:`setup_data`) ------------------
 
     n_genes: int
-    """Number of genes."""
+    """Number of genes after filtering."""
 
     n_spots: int
-    """Number of spots."""
+    """Number of spatial spots/cells."""
 
-    n_isos: list[int]
-    """List of numbers of isoforms per gene."""
+    n_isos_per_gene: list[int]
+    """Number of isoforms per gene (list of length :attr:`n_genes`)."""
 
     n_factors: int
-    """Number of covariates to test for differential usage."""
+    """Number of covariates for differential usage testing."""
 
     gene_names: list[str]
-    """List of gene names corresponding to the genes in the model."""
+    """Gene display names (length :attr:`n_genes`)."""
 
     covariate_names: list[str]
-    """List of covariate names corresponding to columns of the design matrix."""
+    """Covariate display names (length :attr:`n_factors`)."""
 
     adata: Optional[AnnData]
-    """Source :class:`anndata.AnnData` object when using AnnData input mode;
-    ``None`` in legacy (list-of-tensors) mode."""
+    """Source :class:`~anndata.AnnData` object; ``None`` before :meth:`setup_data`."""
 
-    data: list[torch.Tensor]
-    """List of isoform count tensors, one per gene, each of shape
-    ``(n_spots, n_isos)``.  Set by :meth:`setup_data`."""
-
-    coordinates: torch.Tensor
-    """Spatial coordinates of shape ``(n_spots, n_dims)``.
-    Set by :meth:`setup_data`."""
-
-    corr_sp: Any
-    """Spatial covariance kernel (:class:`~splisosm.kernel.SpatialCovKernel`)
-    constructed from :attr:`coordinates`.  Set by :meth:`setup_data`."""
+    sp_kernel: Any
+    """Spatial kernel (:class:`~splisosm.kernel.SpatialCovKernel` or
+    :class:`~splisosm.kernel.IdentityKernel`).  Set by :meth:`setup_data`."""
 
     design_mtx: Optional[torch.Tensor]
-    """Design matrix of shape ``(n_spots, n_factors)``; ``None`` if no
-    covariates were provided to :meth:`setup_data`."""
-
-    sv_test_results: dict
-    """Dictionary to store the spatial variability test results after running test_spatial_variability().
-    It contains the following keys:
-
-    - ``'method'``: str, the method used for the test.
-    - ``'statistic'``: numpy.ndarray of shape (n_genes,), the test statistic for each gene.
-    - ``'pvalue'``: numpy.ndarray of shape (n_genes,), the p-value for each gene.
-    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes,), the BH adjusted p-value for each gene.
-    """
-
-    du_test_results: dict
-    """Dictionary to store the differential usage test results after running test_differential_usage().
-    It contains the following keys:
-
-    - ``'method'``: str, the method used for the test.
-    - ``'statistic'``: numpy.ndarray of shape (n_genes, n_factors), the test statistic for each gene and covariate.
-    - ``'pvalue'``: numpy.ndarray of shape (n_genes, n_factors), the p-value for each gene and covariate.
-    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes, n_factors), the BH adjusted p-value for each gene and covariate. Each column/covariate is adjusted separately.
-    """
+    """Design matrix ``(n_spots, n_factors)``; ``None`` if no covariates."""
 
     def __init__(
         self,
@@ -411,54 +374,79 @@ class SplisosmNP:
             Whether to standardise the spatial covariance matrix so that its
             diagonal entries are 1 (default ``True``).
         """
-        # spatial kernel hyperparameters (used in setup_data)
-        self.k_neighbors = k_neighbors
-        self.rho = rho
-        self.standardize_cov = standardize_cov
+        # Spatial kernel hyperparameters (private config — shown in __str__)
+        self._k_neighbors: int = k_neighbors
+        self._rho: float = rho
+        self._standardize_cov: bool = standardize_cov
 
-        # to be set after running setup_data()
-        self.n_genes = None  # number of genes
-        self.n_spots = None  # number of spots
-        self.n_isos = None  # list of number of isoforms for each gene
-        self.n_factors = None  # number of covariates to test for differential usage
-        self.adata = None  # optional anndata source for the new setup path
-        self._setup_input_mode = None  # "legacy" or "anndata"
+        # Populated by setup_data()
+        self.n_genes: int | None = None
+        self.n_spots: int | None = None
+        self.n_isos_per_gene: list[int] | None = None
+        self.n_factors: int | None = None
+        self.adata: AnnData | None = None
+        self._setup_input_mode: str | None = None
+        self._skip_kernel_construction: bool = False
 
-        # feature summary cache (populated by _compute_feature_summaries)
-        self._filtered_adata = None
-        self._gene_summary = None
-        self._isoform_summary = None
+        # Feature summary cache (populated by _compute_feature_summaries)
+        self._filtered_adata: AnnData | None = None
+        self._gene_summary: pd.DataFrame | None = None
+        self._isoform_summary: pd.DataFrame | None = None
 
-        # to store the spatial variability test results after running test_spatial_variability()
-        self.sv_test_results = {}
-
-        # to store the differential usage test results after running test_differential_usage()
-        self.du_test_results = {}
+        # Test results (private — access via get_formatted_test_results)
+        self._sv_test_results: dict = {}
+        self._du_test_results: dict = {}
 
     def __str__(self) -> str:
         """Return string representation of the model."""
         _sv_status = (
-            f"Completed ({self.sv_test_results['method']})"
-            if len(self.sv_test_results) > 0
+            f"Completed ({self._sv_test_results['method']})"
+            if len(self._sv_test_results) > 0
             else "NA"
         )
         _du_status = (
-            f"Completed ({self.du_test_results['method']})"
-            if len(self.du_test_results) > 0
+            f"Completed ({self._du_test_results['method']})"
+            if len(self._du_test_results) > 0
             else "NA"
+        )
+        _avg_iso = (
+            f"{np.mean(self.n_isos_per_gene):.1f}"
+            if self.n_isos_per_gene is not None
+            else "N/A"
         )
         return (
             "=== SplisosmNP\n"
             + f"- Number of genes: {self.n_genes}\n"
             + f"- Number of spots: {self.n_spots}\n"
             + f"- Number of covariates: {self.n_factors}\n"
-            + f"- Average isoforms per gene: {np.mean(self.n_isos) if self.n_isos is not None else None}\n"
+            + f"- Average isoforms per gene: {_avg_iso}\n"
+            + "=== Model configurations\n"
+            + f"- Mutual neighbors K: {self._k_neighbors}\n"
+            + f"- Spatial autocorrelation rho: {self._rho}\n"
+            + f"- Standardize kernel variance: {self._standardize_cov}\n"
+            + f"- Skip kernel construction: {self._skip_kernel_construction}\n"
             + "=== Test results\n"
             + f"- Spatial variability: {_sv_status}\n"
             + f"- Differential usage: {_du_status}"
         )
 
     __repr__ = __str__
+
+    @property
+    def filtered_adata(self) -> AnnData:
+        """The filtered AnnData of shape (:attr:`n_spots`, sum(:attr:`n_isos_per_gene`)).
+
+        This is the data used internally after :meth:`setup_data`. 
+        It is a copy of the input :attr:`adata`, subsetted to the retained spots and isoforms after filtering.
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`setup_data` has not been called.
+        """
+        if self._filtered_adata is None:
+            raise RuntimeError("Data not initialised. Call setup_data() first.")
+        return self._filtered_adata
 
     def setup_data(
         self,
@@ -548,9 +536,9 @@ class SplisosmNP:
         skip_spatial_kernel : bool, optional
             If ``True``, skip construction of the CAR spatial kernel and
             store an :class:`~splisosm.kernel.IdentityKernel` placeholder as
-            ``self.corr_sp`` instead.  Use this when only
-            :meth:`test_differential_usage` is needed — that method uses GPR
-            to handle spatial autocorrelation and does not read ``corr_sp``.
+            ``self.sp_kernel`` instead.  Use this when only
+            :meth:`test_differential_usage` is needed (it fits custom GPR
+            to handle spatial autocorrelation).
             Calling :meth:`test_spatial_variability` on a model set up with
             ``skip_spatial_kernel=True`` will raise a ``RuntimeError``.
             Default ``False``.
@@ -584,7 +572,7 @@ class SplisosmNP:
             covariate_names=covariate_names,
             min_component_size=min_component_size,
             adj_key=adj_key,
-            k_neighbors=self.k_neighbors,
+            k_neighbors=self._k_neighbors,
             return_filtered_anndata=True,
         )
 
@@ -598,34 +586,35 @@ class SplisosmNP:
 
         self.n_genes = len(data)
         self.n_spots = coordinates.shape[0]
-        self.n_isos = [g.shape[1] for g in data]
+        self.n_isos_per_gene = [g.shape[1] for g in data]
         self.gene_names = resolved_gene_names
 
         # Convert to float tensors
-        self.data = [g.float() for g in data]
-        self.coordinates = coordinates
+        self._data = [g.float() for g in data]
+        self._coordinates = coordinates
 
         # Build spatial kernel from the adjacency returned by prepare_inputs_from_anndata.
         # adj_matrix is not None when:
         # (1) min_component_size > 1, or,
         # (2) adj_key is provided
+        self._skip_kernel_construction = skip_spatial_kernel
         if skip_spatial_kernel:
-            self.corr_sp = IdentityKernel(self.n_spots)
+            self.sp_kernel = IdentityKernel(self.n_spots)
         elif adj_matrix is not None:
-            self.corr_sp = SpatialCovKernel(
+            self.sp_kernel = SpatialCovKernel(
                 coords=None,
                 adj_matrix=adj_matrix,
-                rho=self.rho,
-                standardize_cov=self.standardize_cov,
+                rho=self._rho,
+                standardize_cov=self._standardize_cov,
                 centering=True,
             )
         else:
-            self.corr_sp = SpatialCovKernel(
+            self.sp_kernel = SpatialCovKernel(
                 coords=coordinates,
                 adj_matrix=None,
-                k_neighbors=self.k_neighbors,
-                rho=self.rho,
-                standardize_cov=self.standardize_cov,
+                k_neighbors=self._k_neighbors,
+                rho=self._rho,
+                standardize_cov=self._standardize_cov,
                 centering=True,
             )
 
@@ -918,7 +907,9 @@ class SplisosmNP:
         return self._isoform_summary
 
     def get_formatted_test_results(
-        self, test_type: Literal["sv", "du"]
+        self,
+        test_type: Literal["sv", "du"],
+        with_gene_summary: bool = False,
     ) -> pd.DataFrame:
         """Get formatted test results as a pandas DataFrame.
 
@@ -927,6 +918,10 @@ class SplisosmNP:
         test_type : {"sv", "du"}
             Which results to retrieve: ``"sv"`` for spatial variability or
             ``"du"`` for differential usage.
+        with_gene_summary : bool, optional
+            If ``True``, append gene-level summary statistics from
+            :meth:`extract_feature_summary` (columns: ``n_isos``,
+            ``perplexity``, ``pct_bin_on``, ``count_avg``, ``count_std``).
 
         Returns
         -------
@@ -936,34 +931,41 @@ class SplisosmNP:
         if test_type not in {"sv", "du"}:
             raise ValueError("test_type must be 'sv' or 'du'.")
         if test_type == "sv":
-            if len(self.sv_test_results) == 0:
+            if len(self._sv_test_results) == 0:
                 raise ValueError(
                     "No spatial variability results. Run test_spatial_variability() first."
                 )
-            return pd.DataFrame(
+            df = pd.DataFrame(
                 {
                     "gene": self.gene_names,
-                    "statistic": self.sv_test_results["statistic"],
-                    "pvalue": self.sv_test_results["pvalue"],
-                    "pvalue_adj": self.sv_test_results["pvalue_adj"],
+                    "statistic": self._sv_test_results["statistic"],
+                    "pvalue": self._sv_test_results["pvalue"],
+                    "pvalue_adj": self._sv_test_results["pvalue_adj"],
                 }
             )
-        if len(self.du_test_results) == 0:
-            raise ValueError(
-                "No differential usage results. Run test_differential_usage() first."
+        else:
+            if len(self._du_test_results) == 0:
+                raise ValueError(
+                    "No differential usage results. Run test_differential_usage() first."
+                )
+            covariate_names = self.covariate_names or [
+                f"factor_{i}" for i in range(self.n_factors)
+            ]
+            df = pd.DataFrame(
+                {
+                    "gene": np.repeat(self.gene_names, self.n_factors),
+                    "covariate": np.tile(covariate_names, self.n_genes),
+                    "statistic": self._du_test_results["statistic"].reshape(-1),
+                    "pvalue": self._du_test_results["pvalue"].reshape(-1),
+                    "pvalue_adj": self._du_test_results["pvalue_adj"].reshape(-1),
+                }
             )
-        covariate_names = self.covariate_names or [
-            f"factor_{i}" for i in range(self.n_factors)
-        ]
-        return pd.DataFrame(
-            {
-                "gene": np.repeat(self.gene_names, self.n_factors),
-                "covariate": np.tile(covariate_names, self.n_genes),
-                "statistic": self.du_test_results["statistic"].reshape(-1),
-                "pvalue": self.du_test_results["pvalue"].reshape(-1),
-                "pvalue_adj": self.du_test_results["pvalue_adj"].reshape(-1),
-            }
-        )
+
+        if with_gene_summary:
+            gene_df = self.extract_feature_summary(level="gene", print_progress=False)
+            df = df.merge(gene_df, left_on="gene", right_index=True, how="left")
+
+        return df
 
     def test_spatial_variability(
         self,
@@ -1031,14 +1033,14 @@ class SplisosmNP:
         -------
         dict or None
             If `return_results` is True, returns dict with test statistics and p-values.
-            Otherwise, returns None and stores results in self.sv_test_results.
+            Otherwise, returns None and stores results in self._sv_test_results.
 
         Notes
         -----
         To run the SPARK-X test, the R-package `SPARK` must be installed and accessible from Python via `rpy2`.
         """
 
-        if isinstance(self.corr_sp, IdentityKernel):
+        if self._skip_kernel_construction:
             raise RuntimeError(
                 "setup_data was called with skip_spatial_kernel=True; the spatial "
                 "kernel is a placeholder IdentityKernel. Re-run setup_data with "
@@ -1075,10 +1077,10 @@ class SplisosmNP:
         if method == "spark-x":  # run the gene-level SPARK-X test
             # prepare the data in gene-level counts
             counts_g = torch.concat(
-                [_counts.sum(1, keepdim=True) for _counts in self.data], axis=1
+                [_counts.sum(1, keepdim=True) for _counts in self._data], axis=1
             )  # tensor(n_spots, n_genes)
-            self.sv_test_results = run_sparkx(
-                counts_g.numpy(), self.coordinates.numpy()
+            self._sv_test_results = run_sparkx(
+                counts_g.numpy(), self._coordinates.numpy()
             )
         else:
             if n_jobs == -1:
@@ -1086,7 +1088,7 @@ class SplisosmNP:
 
             # use a global spatial kernel unless nan_filling is 'none'
             n_spots = self.n_spots
-            K_sp = self.corr_sp  # the Kernel class object was already centered
+            K_sp = self.sp_kernel  # the Kernel class object was already centered
 
             # pre-compute null distribution inputs (once, before per-gene loop)
             lambda_sp = None
@@ -1110,12 +1112,12 @@ class SplisosmNP:
                         UserWarning,
                         stacklevel=2,
                     )
-                lambda_sp = self.corr_sp.eigenvalues(k=approx_rank)
+                lambda_sp = self.sp_kernel.eigenvalues(k=approx_rank)
                 lambda_sp = lambda_sp[lambda_sp > 1e-5]
                 k_eff = len(lambda_sp)
             elif null_method == "trace":
-                trK = self.corr_sp.trace()
-                trK2 = self.corr_sp.square_trace()
+                trK = self.sp_kernel.trace()
+                trK2 = self.sp_kernel.square_trace()
             elif null_method == "perm":
                 n_nulls = int(configs.get("n_perms_per_gene", 1000))
                 _perm_batch_size = int(configs.get("perm_batch_size", 50))
@@ -1138,7 +1140,7 @@ class SplisosmNP:
                     _perm_batch_size if null_method == "perm" else 1,
                 )
                 for counts in tqdm(
-                    self.data,
+                    self._data,
                     desc=f"SV [{method}]",
                     total=self.n_genes,
                     disable=not print_progress,
@@ -1148,7 +1150,7 @@ class SplisosmNP:
             pvals_arr = np.array([r[1] for r in _sv_results], dtype=float)
 
             # store results after the loop (NP-12 fix: no longer rebuilt per gene)
-            self.sv_test_results = {
+            self._sv_test_results = {
                 "statistic": hsic_arr,
                 "pvalue": pvals_arr,
                 "method": method,
@@ -1156,13 +1158,13 @@ class SplisosmNP:
             }
 
             # calculate adjusted p-values
-            self.sv_test_results["pvalue_adj"] = false_discovery_control(
-                self.sv_test_results["pvalue"]
+            self._sv_test_results["pvalue_adj"] = false_discovery_control(
+                self._sv_test_results["pvalue"]
             )
 
         # return results
         if return_results:
-            return self.sv_test_results
+            return self._sv_test_results
 
     def test_differential_usage(
         self,
@@ -1272,14 +1274,14 @@ class SplisosmNP:
             Whether to show the progress bar. Default to True.
         return_results : bool, optional
             Whether to return the test statistics and p-values.
-            If False, the results are stored in ``self.du_test_results``.
+            If False, the results are stored in ``self._du_test_results``.
 
         Returns
         -------
         results : dict or None
             If ``return_results`` is True, returns dict with test statistics and
             p-values. Otherwise, returns None and stores results in
-            ``self.du_test_results``.
+            ``self._du_test_results``.
         """
         if self.design_mtx is None:
             raise ValueError(
@@ -1336,7 +1338,7 @@ class SplisosmNP:
                     counts, z_list, ratio_transformation, nan_filling
                 )
                 for counts in tqdm(
-                    self.data,
+                    self._data,
                     desc=f"DU [{method}]",
                     total=self.n_genes,
                     disable=not print_progress,
@@ -1346,7 +1348,7 @@ class SplisosmNP:
                 hsic_all[_g] = h_row
                 pvals_all[_g] = p_row
 
-            self.du_test_results = {
+            self._du_test_results = {
                 "statistic": hsic_all.numpy(),
                 "pvalue": pvals_all.numpy(),
                 "method": method,
@@ -1369,7 +1371,7 @@ class SplisosmNP:
 
             # Normalize spatial coordinates once
             x = torch.as_tensor(
-                self.coordinates, dtype=torch.float64
+                self._coordinates, dtype=torch.float64
             ).clone()  # (n_spots, n_dims)
             x = (x - x.mean(0)) / x.std(0)
             x[torch.isinf(x)] = 0  # guard against constant coordinate axes
@@ -1426,7 +1428,7 @@ class SplisosmNP:
                     residualize,
                 )
                 for counts in tqdm(
-                    self.data,
+                    self._data,
                     desc=f"DU [{method}]",
                     total=self.n_genes,
                     disable=not print_progress,
@@ -1436,7 +1438,7 @@ class SplisosmNP:
                 hsic_all[_g] = h_row
                 pvals_all[_g] = p_row
 
-            self.du_test_results = {
+            self._du_test_results = {
                 "statistic": hsic_all.numpy(),
                 "pvalue": pvals_all.numpy(),
                 "method": method,
@@ -1471,7 +1473,7 @@ class SplisosmNP:
                     combine_method,
                 )
                 for counts in tqdm(
-                    self.data,
+                    self._data,
                     desc=f"DU [{method}]",
                     total=self.n_genes,
                     disable=not print_progress,
@@ -1481,17 +1483,17 @@ class SplisosmNP:
                 stats_all[_g] = s_row
                 pvals_all[_g] = p_row
 
-            self.du_test_results = {
+            self._du_test_results = {
                 "statistic": stats_all,  # (n_genes, n_factors)
                 "pvalue": pvals_all,  # (n_genes, n_factors)
                 "method": method,
             }
 
         # calculate adjusted p-values (independently for each factor)
-        self.du_test_results["pvalue_adj"] = false_discovery_control(
-            self.du_test_results["pvalue"], axis=0
+        self._du_test_results["pvalue_adj"] = false_discovery_control(
+            self._du_test_results["pvalue"], axis=0
         )
 
         # return the results if needed
         if return_results:
-            return self.du_test_results
+            return self._du_test_results
