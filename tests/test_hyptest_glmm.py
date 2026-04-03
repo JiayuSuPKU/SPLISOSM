@@ -303,7 +303,7 @@ class TestSplisosmGLMM(unittest.TestCase):
             group_gene_by_n_iso=True,
         )
         self.assertIsNotNone(model.design_mtx)
-        self.assertIsNotNone(model.coordinates)
+        self.assertIsNotNone(model._coordinates)
 
     def test_splisosm_glmm_setup_data_from_anndata(self):
         model = SplisosmGLMM()
@@ -416,8 +416,9 @@ class TestSplisosmGLMM(unittest.TestCase):
         first_gene = model.gene_names[0]
         g_model = model.get_gene_model(first_gene)
         self.assertIsNotNone(g_model)
-        # __getitem__ must be identical object
-        self.assertIs(model[first_gene], g_model)
+        # __getitem__ reconstructs an equivalent model (same parameters)
+        g_model2 = model[first_gene]
+        torch.testing.assert_close(g_model.beta, g_model2.beta)
         # unknown gene → KeyError
         with self.assertRaises(KeyError):
             model.get_gene_model("__does_not_exist__")
@@ -446,8 +447,8 @@ class TestSplisosmGLMM(unittest.TestCase):
         self.assertIn("fitting_time_s", summary.columns)
         self.assertEqual(summary.index.name, "gene")
 
-    def test_loss_history_always_available(self):
-        """PatienceLogger.loss_history is non-empty after fit without store_param_history."""
+    def test_training_summary_after_fit(self):
+        """Training summary has convergence info after fit."""
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
         model.setup_data(
             adata=self.adata,
@@ -459,14 +460,16 @@ class TestSplisosmGLMM(unittest.TestCase):
             filter_single_iso_genes=False,
         )
         model.fit(quiet=True)
-        g_model = model[model.gene_names[0]]
-        lh = g_model.logger.loss_history
-        self.assertEqual(lh.ndim, 2)
-        self.assertGreater(lh.shape[0], 0)  # at least 1 epoch
-        self.assertEqual(lh.shape[1], 1)  # single gene per fitted model
+        # After lean refactoring, per-gene state stores convergence metadata
+        key = model._model_key_for_type()
+        state = model._fitted_states[key][0]
+        self.assertIsInstance(state.best_loss, float)
+        self.assertIsInstance(state.best_epoch, int)
+        self.assertIsInstance(state.convergence, bool)
+        self.assertIsInstance(state.fitting_time, float)
 
     def test_free_memory(self):
-        """free_memory() nulls corr_sp and strips counts buffers."""
+        """free_memory() nulls the kernel object."""
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 2})
         model.setup_data(
             adata=self.adata,
@@ -479,32 +482,10 @@ class TestSplisosmGLMM(unittest.TestCase):
         )
         model.fit(quiet=True)
         model.free_memory(strip_model_data=True, free_kernel=True)
-        self.assertIsNone(model.corr_sp)
-        for m in model.get_fitted_models():
-            self.assertIsNone(getattr(m, "counts", None))
-
-    def test_fitting_results_deprecation_warning(self):
-        """Accessing fitting_results directly emits a DeprecationWarning."""
-        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 2})
-        model.setup_data(
-            adata=self.adata,
-            layer="counts",
-            spatial_key="spatial",
-            group_iso_by="gene_symbol",
-            min_counts=0,
-            min_bin_pct=0.0,
-            filter_single_iso_genes=False,
-        )
-        model.fit(quiet=True)
-        import warnings as _warnings
-
-        with _warnings.catch_warnings(record=True) as caught:
-            _warnings.simplefilter("always")
-            _ = model.fitting_results
-        dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-        self.assertTrue(
-            len(dep) > 0, "Expected DeprecationWarning for fitting_results access"
-        )
+        self.assertIsNone(model.sp_kernel)
+        # Lean storage: no full model objects kept, only _FittedGeneState
+        key = model._model_key_for_type()
+        self.assertGreater(len(model._fitted_states[key]), 0)
 
     # ------------------------------------------------------------------
     # get_fitted_ratios_anndata
@@ -679,7 +660,7 @@ class TestSplisosmGLMM(unittest.TestCase):
             path = os.path.join(tmpdir, "model.pt")
             model.save(path)
             loaded = SplisosmGLMM.load(path)
-        self.assertGreater(len(loaded.sv_test_results), 0)
+        self.assertGreater(len(loaded._sv_test_results), 0)
 
     def test_load_map_location_cpu(self):
         """load(map_location='cpu') works without error."""
@@ -1325,7 +1306,7 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             with_design_mtx=False,
             refit_null=False,
         )
-        model._fitting_results["sv_llr_perm_stats"] = torch.zeros(model.n_genes)
+        model._sv_llr_perm_stats = torch.zeros(model.n_genes)
 
         with patch("builtins.print") as print_mock:
             model.test_spatial_variability(
@@ -1528,7 +1509,11 @@ class TestSplisosmGLMMNewFeatures(unittest.TestCase):
         model_k4 = self._make_model(k_neighbors=4)
         model_k6 = self._make_model(k_neighbors=6)
         # Matrices should differ (k=4 vs k=6 adjacency)
-        self.assertFalse(torch.allclose(model_k4.corr_sp, model_k6.corr_sp))
+        self.assertFalse(
+            torch.allclose(
+                model_k4.sp_kernel.realization(), model_k6.sp_kernel.realization()
+            )
+        )
 
     def test_eigvals_eigvecs_populated_after_setup(self):
         """setup_data populates _corr_sp_eigvals and _corr_sp_eigvecs."""
@@ -1538,14 +1523,14 @@ class TestSplisosmGLMMNewFeatures(unittest.TestCase):
         self.assertEqual(model._corr_sp_eigvecs.shape, (n, n))
 
     def test_eigvals_consistent_with_corr_sp(self):
-        """Eigendecomposition reconstructs corr_sp correctly."""
+        """Eigendecomposition reconstructs sp_kernel correctly."""
         model = self._make_model()
         V = model._corr_sp_eigvecs
         L = model._corr_sp_eigvals
         recon = V @ torch.diag(L) @ V.t()
         self.assertTrue(
-            torch.allclose(recon, model.corr_sp, atol=1e-4),
-            "Reconstructed corr_sp does not match stored corr_sp.",
+            torch.allclose(recon, model.sp_kernel.realization(), atol=1e-4),
+            "Reconstructed corr_sp does not match sp_kernel.realization().",
         )
 
     # ------------------------------------------------------------------
@@ -1559,7 +1544,7 @@ class TestSplisosmGLMMNewFeatures(unittest.TestCase):
         # Auto-selection: full rank for n <= 5000
         self.assertEqual(model._corr_sp_eigvals.shape[0], n)
         self.assertEqual(model._corr_sp_eigvecs.shape, (n, n))
-        self.assertIsNotNone(model.corr_sp)
+        self.assertIsNotNone(model.sp_kernel)
 
     def test_approx_rank_explicit_int(self):
         """Passing approx_rank=k truncates eigenvectors to k columns."""
@@ -1567,8 +1552,8 @@ class TestSplisosmGLMMNewFeatures(unittest.TestCase):
         n = model.n_spots
         self.assertEqual(model._corr_sp_eigvals.shape[0], 5)
         self.assertEqual(model._corr_sp_eigvecs.shape, (n, 5))
-        # corr_sp is None for truncated decomposition
-        self.assertIsNone(model.corr_sp)
+        # sp_kernel is still a SpatialCovKernel even for truncated decomposition
+        self.assertIsNotNone(model.sp_kernel)
 
     def test_approx_rank_none_is_full_rank(self):
         """Explicit approx_rank=None forces full-rank decomposition."""

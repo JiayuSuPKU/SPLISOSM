@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass
 from timeit import default_timer as timer
 from typing import Any, Optional, Union, Literal
 
@@ -21,7 +22,7 @@ from splisosm.utils import (
     prepare_inputs_from_anndata,
 )
 from splisosm.dataset import IsoDataset
-from splisosm.kernel import SpatialCovKernel
+from splisosm.kernel import IdentityKernel, SpatialCovKernel
 from splisosm.model import MultinomGLM
 from splisosm._glmm_workers import (
     IsoFullModel,
@@ -39,6 +40,18 @@ __all__ = ["SplisosmGLMM"]
 # Sentinel object that signals "auto-select approx_rank at setup_data time".
 # Distinct from ``None``, which means "force full rank regardless of n_spots".
 _APPROX_RANK_AUTO = object()
+
+
+@dataclass
+class _FittedGeneState:
+    """Minimal per-gene state extracted after fitting."""
+
+    state_dict: dict[str, torch.Tensor]
+    convergence: bool
+    best_loss: float
+    best_epoch: int
+    fitting_time: float
+    n_isos: int
 
 
 class SplisosmGLMM:
@@ -83,75 +96,36 @@ class SplisosmGLMM:
     >>> print(du_results.head())
     """
 
+    # -- Public attributes (populated by :meth:`setup_data`) ------------------
+
     n_genes: int
-    """Number of genes."""
+    """Number of genes after filtering."""
 
     n_spots: int
-    """Number of spots."""
+    """Number of spatial spots."""
 
     n_isos_per_gene: list[int]
-    """List of numbers of isoforms per gene (equivalent to ``n_isos`` in :class:`SplisosmNP` and :class:`SplisosmFFT`)."""
+    """Number of isoforms per gene (list of length :attr:`n_genes`)."""
 
     n_factors: int
-    """Number of covariates to test for differential usage."""
+    """Number of covariates for differential usage testing."""
 
     gene_names: list[str]
-    """List of gene names corresponding to the genes in the model."""
+    """Gene display names (length :attr:`n_genes`)."""
 
     covariate_names: list[str]
-    """List of covariate names corresponding to columns of the design matrix."""
+    """Covariate display names (length :attr:`n_factors`)."""
 
     adata: Optional[AnnData]
-    """Source :class:`anndata.AnnData` object when using AnnData input mode;
-    ``None`` in legacy (list-of-tensors) mode."""
+    """Source :class:`~anndata.AnnData` object; ``None`` before :meth:`setup_data`."""
 
-    coordinates: torch.Tensor
-    """Spatial coordinates of shape ``(n_spots, 2)``.
+    sp_kernel: Any
+    """Spatial kernel (:class:`~splisosm.kernel.SpatialCovKernel` for ``'glmm-full'``,
+    :class:`~splisosm.kernel.IdentityKernel` for ``'glmm-null'``, ``None`` for ``'glm'``).
     Set by :meth:`setup_data`."""
 
-    corr_sp: torch.Tensor
-    """Spatial covariance matrix of shape ``(n_spots, n_spots)``.
-    Constructed from :attr:`coordinates` by :meth:`setup_data`."""
-
     design_mtx: Optional[torch.Tensor]
-    """Design matrix of shape ``(n_spots, n_factors)``; ``None`` if no
-    covariates were provided to :meth:`setup_data`."""
-
-    sv_test_results: dict
-    """Dictionary to store the spatial variability test results after running test_spatial_variability().
-    It contains the following keys:
-
-    - ``'method'``: str, the method used for the test.
-    - ``'statistic'``: numpy.ndarray of shape (n_genes,), the log likelihood ratio test statistic for each gene.
-    - ``'df'``: int, the degrees of freedom for the test statistic.
-    - ``'use_perm_null'``: bool, whether the null distribution is estimated using permutation.
-    - ``'pvalue'``: numpy.ndarray of shape (n_genes,), the p-value for each gene.
-    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes,), the BH adjusted p-value for each gene.
-    """
-
-    du_test_results: dict
-    """Dictionary to store the differential usage test results after running test_differential_usage().
-    It contains the following keys:
-
-    - ``'method'``: str, the method used for the test.
-    - ``'statistic'``: numpy.ndarray of shape (n_genes, n_factors), the test statistic for each gene and covariate.
-    - ``'pvalue'``: numpy.ndarray of shape (n_genes, n_factors), the p-value for each gene and covariate.
-    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes, n_factors), the BH adjusted p-value for each gene and covariate. Each column/covariate is adjusted separately.
-    """
-
-    model_type: Literal["glmm-full", "glmm-null", "glm"]
-    """The type of GLM or GLMM model."""
-
-    model_configs: dict
-    """Dictionary of model configurations, with keys
-    ``share_variance``, ``var_parameterization_sigma_theta``,
-    ``var_fix_sigma``, ``var_prior_model``, ``var_prior_model_params``,
-    ``init_ratio``, ``fitting_method``, and ``fitting_configs``."""
-
-    _fitting_results: dict
-    """Internal store for fitted models, keyed by ``'models_glmm-full'``,
-    ``'models_glmm-null'``, and ``'models_glm'``.  Access via
-    :meth:`get_fitted_models` or :meth:`get_gene_model`."""
+    """Design matrix ``(n_spots, n_factors)``; ``None`` if no covariates."""
 
     def __init__(
         self,
@@ -241,9 +215,9 @@ class SplisosmGLMM:
         """
         # specify the model type to fit
         assert model_type in ["glmm-full", "glmm-null", "glm"]
-        self.model_type = model_type
+        self._model_type = model_type
 
-        self.model_configs = {
+        self._model_configs = {
             "share_variance": share_variance,
             "var_parameterization_sigma_theta": var_parameterization_sigma_theta,
             "var_fix_sigma": var_fix_sigma,
@@ -278,37 +252,36 @@ class SplisosmGLMM:
 
         # to store the fitted models after running fit()
         self._is_trained = False
-        self._fitting_results = {
-            "models_glmm-full": [],
-            "models_glmm-null": [],
-            "models_glm": [],
+        self._fitted_states: dict[str, list[_FittedGeneState]] = {
+            "glmm-full": [],
+            "glmm-null": [],
+            "glm": [],
         }
 
+        # to store permutation LLR statistics (populated by _fit_sv_llr_perm)
+        self._sv_llr_perm_stats: Optional[torch.Tensor] = None
+
         # to store the spatial variability test results after running test_spatial_variability()
-        self.sv_test_results = {}
+        self._sv_test_results = {}
 
         # to store the differential usage test results after running test_differential_usage()
-        self.du_test_results = {}
+        self._du_test_results = {}
 
     def __str__(self):
         _sv_status = (
-            f"Completed ({self.sv_test_results['method']})"
-            if len(self.sv_test_results) > 0
+            f"Completed ({self._sv_test_results['method']})"
+            if len(self._sv_test_results) > 0
             else "NA"
         )
         _du_status = (
-            f"Completed ({self.du_test_results['method']})"
-            if len(self.du_test_results) > 0
+            f"Completed ({self._du_test_results['method']})"
+            if len(self._du_test_results) > 0
             else "NA"
         )
         if self._is_trained:
             try:
-                models = self.get_fitted_models()
-                n_conv = sum(
-                    bool(m.logger.convergence[0].item())
-                    for m in models
-                    if getattr(m, "logger", None) is not None
-                )
+                key = self._model_key_for_type()
+                n_conv = sum(s.convergence for s in self._fitted_states[key])
                 _fit_line = (
                     f"- Trained: True (converged: {n_conv} / {self.n_genes} genes)\n"
                 )
@@ -316,6 +289,21 @@ class SplisosmGLMM:
                 _fit_line = "- Trained: True\n"
         else:
             _fit_line = "- Trained: False\n"
+
+        _config_desc = ""
+        if self._model_type in ["glmm-full", "glmm-null"]:
+            if self._model_type == "glmm-full":
+                _config_desc = (
+                    f"- Mutual neighbors K: {self._kernel_k_neighbors}\n"
+                    f"- Spatial autocorrelation rho: {self._kernel_rho}\n"
+                    f"- Variance parameterized with theta_logit: {self._model_configs['var_parameterization_sigma_theta']}\n"
+                )
+            _config_desc += (
+                f"- Learnable variance: {not self._model_configs['var_fix_sigma']}\n"
+                f"- Same variance across classes: {self._model_configs['share_variance']}\n"
+                f"- Prior on total variance: {self._model_configs['var_prior_model']}\n"
+                f"- Initialization method: {self._model_configs['init_ratio']}\n"
+            )
         return (
             "=== SplisosmGLMM\n"
             + f"- Number of genes: {self.n_genes}\n"
@@ -323,16 +311,12 @@ class SplisosmGLMM:
             + f"- Number of covariates: {self.n_factors}\n"
             + f"- Average isoforms per gene: {np.mean(self.n_isos_per_gene) if self.n_isos_per_gene is not None else None}\n"
             + "=== Model configurations\n"
-            + f"- Model type: {self.model_type}\n"
-            + f"- Parameterized using sigma and theta: {self.model_configs['var_parameterization_sigma_theta']}\n"
-            + f"- Learnable variance: {not self.model_configs['var_fix_sigma']}\n"
-            + f"- Same variance across classes: {self.model_configs['share_variance']}\n"
-            + f"- Prior on total variance: {self.model_configs['var_prior_model']}\n"
-            + f"- Initialization method: {self.model_configs['init_ratio']}\n"
+            + f"- Model type: {self._model_type}\n"
+            + _config_desc
             + "=== Fitting configurations\n"
             + _fit_line
-            + f"- Fitting method: {self.model_configs['fitting_method']}\n"
-            + f"- Parameters: {self.model_configs['fitting_configs']}\n"
+            + f"- Fitting method: {self._model_configs['fitting_method']}\n"
+            + f"- Parameters: {self._model_configs['fitting_configs']}\n"
             + "=== Test results\n"
             + f"- Spatial variability: {_sv_status}\n"
             + f"- Differential usage: {_du_status}"
@@ -341,13 +325,20 @@ class SplisosmGLMM:
     __repr__ = __str__
 
     @property
-    def n_isos(self) -> list[int]:
-        """List of numbers of isoforms per gene.
+    def filtered_adata(self) -> AnnData:
+        """The filtered AnnData of shape (:attr:`n_spots`, sum(:attr:`n_isos_per_gene`)).
 
-        Alias for :attr:`n_isos_per_gene` for API consistency with
-        :class:`SplisosmNP` and :class:`SplisosmFFT`.
+        This is the data used internally after :meth:`setup_data`.
+        It is a copy of the input :attr:`adata`, subsetted to the retained spots and isoforms after filtering.
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`setup_data` has not been called.
         """
-        return self.n_isos_per_gene
+        if self._filtered_adata is None:
+            raise RuntimeError("Data not initialised. Call setup_data() first.")
+        return self._filtered_adata
 
     def setup_data(
         self,
@@ -470,7 +461,7 @@ class SplisosmGLMM:
         self.gene_names = _dataset.gene_names
         self._dataset = _dataset
         self._group_gene_by_n_iso = group_gene_by_n_iso
-        self.coordinates = coordinates
+        self._coordinates = coordinates
 
         # Build spatial kernel only when the model actually uses spatial random effects.
         # For 'glm' there are no random effects at all.
@@ -480,19 +471,17 @@ class SplisosmGLMM:
         # covariance C = σ²I via the low-rank Woodbury formula.
         n_spots = self.n_spots
 
-        if self.model_type == "glm":
+        if self._model_type == "glm":
             # No spatial random effects — eigvals/eigvecs are not used.
-            self.corr_sp = None
+            self.sp_kernel = None
             self._corr_sp_eigvals = None
             self._corr_sp_eigvecs = None
 
-        elif self.model_type == "glmm-null":
-            # Spatial variance is always zero in the null model.
-            # Rank-1 dummy: V = (1/√n) 1_n, λ = 1.  With theta=0:
-            #   _cov_eigvals  = σ²(0·1 + 1) = σ²
-            #   residual_eigval = σ²(1-0) = σ²
-            #   correction = 1/σ² - 1/σ² = 0  →  C⁻¹ = (1/σ²)I  ✓
-            self.corr_sp = None
+        elif self._model_type == "glmm-null":
+            # Spatial variance is always zero in the null model (theta → 0).
+            # Use IdentityKernel; extract rank-1 dummy eigenpairs for the
+            # Woodbury formula: C = σ²I regardless of eigenvectors.
+            self.sp_kernel = IdentityKernel(n_spots)
             self._corr_sp_eigvals = torch.ones(1)  # (1,)
             self._corr_sp_eigvecs = torch.full(
                 (n_spots, 1), 1.0 / np.sqrt(n_spots)
@@ -543,18 +532,13 @@ class SplisosmGLMM:
                 k = min(int(self._approx_rank), n_spots)
 
             # Trigger eigendecomposition via SpatialCovKernel (numpy eigh / eigsh).
-            # For dense mode (n ≤ DENSE_THRESHOLD), K_eigvecs always has n_spots columns
-            # regardless of k, so we slice explicitly when k is given.
-            _kernel.eigenvalues(
-                k=k
-            )  # populates K_eigvals, K_eigvecs (and K_sp for dense)
-            self.corr_sp = _kernel.realization() if k is None else None
+            _kernel.eigenvalues(k=k)
+            # Store the kernel object (for inspection / save-load)
+            self.sp_kernel = _kernel
             if k is None:
-                # Full decomp: use all cached eigenpairs
                 self._corr_sp_eigvals = _kernel.K_eigvals  # (n_spots,)
                 self._corr_sp_eigvecs = _kernel.K_eigvecs  # (n_spots, n_spots)
             else:
-                # Truncated: dense mode may have cached all n_spots; implicit stores exactly k.
                 self._corr_sp_eigvals = _kernel.K_eigvals[:k]  # (k,)
                 self._corr_sp_eigvecs = _kernel.K_eigvecs[:, :k]  # (n_spots, k)
 
@@ -617,7 +601,7 @@ class SplisosmGLMM:
         self,
         data: list,
         coordinates: torch.Tensor,
-        corr_sp: torch.Tensor,
+        sp_kernel,
         corr_sp_eigvals: torch.Tensor,
         corr_sp_eigvecs: torch.Tensor,
         design_mtx: Optional[torch.Tensor],
@@ -637,8 +621,8 @@ class SplisosmGLMM:
         self.gene_names = _dataset.gene_names
         self._dataset = _dataset
         self._group_gene_by_n_iso = group_gene_by_n_iso
-        self.coordinates = coordinates
-        self.corr_sp = corr_sp
+        self._coordinates = coordinates
+        self.sp_kernel = sp_kernel
         self._corr_sp_eigvals = corr_sp_eigvals
         self._corr_sp_eigvecs = corr_sp_eigvecs
         self.design_mtx = design_mtx
@@ -646,6 +630,75 @@ class SplisosmGLMM:
         self.covariate_names = covariate_names
         self.adata = None
         self._setup_input_mode = "prebuilt"
+
+    # ------------------------------------------------------------------
+    # Lean per-gene state extraction / reconstruction helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_gene_state(model) -> _FittedGeneState:
+        """Extract a lightweight :class:`_FittedGeneState` from a fitted model."""
+        sd = {
+            k: v.detach().cpu()
+            for k, v in model.state_dict().items()
+            if k in model._parameters
+        }
+        lg = getattr(model, "logger", None)
+        return _FittedGeneState(
+            state_dict=sd,
+            convergence=bool(lg.convergence[0].item()) if lg is not None else False,
+            best_loss=float(lg.best_loss[0].item()) if lg is not None else float("nan"),
+            best_epoch=int(lg.best_epoch[0].item()) if lg is not None else 0,
+            fitting_time=float(getattr(model, "fitting_time", 0.0)),
+            n_isos=model.n_isos,
+        )
+
+    def _get_gene_counts(self, gene_idx: int) -> torch.Tensor:
+        """Return counts for gene *gene_idx* as ``(1, n_spots, n_isos)``."""
+        return self._dataset.data[gene_idx].unsqueeze(0)
+
+    def _reconstruct_gene_model(self, gene_idx: int, model_key: str = "glmm-full"):
+        """Reconstruct a functional per-gene model from stored state."""
+        state = self._fitted_states[model_key][gene_idx]
+        counts = self._get_gene_counts(gene_idx)
+
+        with_design_mtx = self._model_configs.get("fitting_configs", {}).get(
+            "with_design_mtx", False
+        )
+        design = self.design_mtx if with_design_mtx else None
+
+        if model_key == "glm":
+            model = MultinomGLM()
+            model.setup_data(counts, design_mtx=design, device=self._device)
+        else:
+            if model_key == "glmm-full":
+                model = IsoFullModel(**self._model_configs)
+            elif model_key == "glmm-null":
+                model = IsoNullNoSpVar(**self._model_configs)
+            else:
+                raise ValueError(f"Invalid model key {model_key!r}.")
+            model.setup_data(
+                counts,
+                design_mtx=design,
+                corr_sp_eigvals=self._corr_sp_eigvals,
+                corr_sp_eigvecs=self._corr_sp_eigvecs,
+                device=self._device,
+            )
+
+        # Load fitted parameters (strict=False because buffers are not in state_dict)
+        model.load_state_dict(state.state_dict, strict=False)
+        return model
+
+    def _model_key_for_type(self, model_type: Optional[str] = None) -> str:
+        """Map a model_type string to its ``_fitted_states`` key."""
+        mt = model_type or self._model_type
+        if mt == "glmm-full":
+            return "glmm-full"
+        elif mt == "glmm-null":
+            return "glmm-null"
+        elif mt == "glm":
+            return "glm"
+        raise ValueError(f"Invalid model type {mt!r}.")
 
     # ------------------------------------------------------------------
     # Feature summaries
@@ -858,14 +911,19 @@ class SplisosmGLMM:
         return self._isoform_summary
 
     def get_formatted_test_results(
-        self, test_type: Literal["sv", "du"]
+        self,
+        test_type: Literal["sv", "du"],
+        with_gene_summary: bool = False,
     ) -> pd.DataFrame:
         """Get the formatted test results as data frame.
 
         Parameters
         ----------
         test_type : {"sv", "du"}
-            Type of test results to retrieve. Can be one of ``'sv'`` (spatial variability) or ``'du'`` (differential usage).
+            Type of test results to retrieve.
+        with_gene_summary : bool, optional
+            If ``True``, append gene-level summary statistics from
+            :meth:`extract_feature_summary`.
 
         Returns
         -------
@@ -875,34 +933,41 @@ class SplisosmGLMM:
         if test_type not in {"sv", "du"}:
             raise ValueError("test_type must be 'sv' or 'du'.")
         if test_type == "sv":
-            if len(self.sv_test_results) == 0:
+            if len(self._sv_test_results) == 0:
                 raise ValueError(
                     "No spatial variability results. Run test_spatial_variability() first."
                 )
-            return pd.DataFrame(
+            df = pd.DataFrame(
                 {
                     "gene": self.gene_names,
-                    "statistic": self.sv_test_results["statistic"],
-                    "pvalue": self.sv_test_results["pvalue"],
-                    "pvalue_adj": self.sv_test_results["pvalue_adj"],
+                    "statistic": self._sv_test_results["statistic"],
+                    "pvalue": self._sv_test_results["pvalue"],
+                    "pvalue_adj": self._sv_test_results["pvalue_adj"],
                 }
             )
-        if len(self.du_test_results) == 0:
-            raise ValueError(
-                "No differential usage results. Run test_differential_usage() first."
+        else:
+            if len(self._du_test_results) == 0:
+                raise ValueError(
+                    "No differential usage results. Run test_differential_usage() first."
+                )
+            covariate_names = self.covariate_names or [
+                f"factor_{i}" for i in range(self.n_factors)
+            ]
+            df = pd.DataFrame(
+                {
+                    "gene": np.repeat(self.gene_names, self.n_factors),
+                    "covariate": np.tile(covariate_names, self.n_genes),
+                    "statistic": self._du_test_results["statistic"].reshape(-1),
+                    "pvalue": self._du_test_results["pvalue"].reshape(-1),
+                    "pvalue_adj": self._du_test_results["pvalue_adj"].reshape(-1),
+                }
             )
-        covariate_names = self.covariate_names or [
-            f"factor_{i}" for i in range(self.n_factors)
-        ]
-        return pd.DataFrame(
-            {
-                "gene": np.repeat(self.gene_names, self.n_factors),
-                "covariate": np.tile(covariate_names, self.n_genes),
-                "statistic": self.du_test_results["statistic"].reshape(-1),
-                "pvalue": self.du_test_results["pvalue"].reshape(-1),
-                "pvalue_adj": self.du_test_results["pvalue_adj"].reshape(-1),
-            }
-        )
+
+        if with_gene_summary:
+            gene_df = self.extract_feature_summary(level="gene", print_progress=False)
+            df = df.merge(gene_df, left_on="gene", right_index=True, how="left")
+
+        return df
 
     def fit(
         self,
@@ -975,7 +1040,7 @@ class SplisosmGLMM:
             )
 
         # store the fitting configurations
-        self.model_configs["fitting_configs"].update(
+        self._model_configs["fitting_configs"].update(
             {
                 "with_design_mtx": with_design_mtx,
                 "from_null": from_null,
@@ -987,26 +1052,33 @@ class SplisosmGLMM:
         self._is_trained = True
 
     def save(self, path: str) -> None:
-        """Save the fitted models to a file.
+        """Save the fitted model to a file.
 
-        This function is designed to overcome a limitation of ``torch.save()``,
-        which naively saves `n_genes` copies of the spatial kernel matrix ``self.corr_sp``.
-        The kernel matrix is reconstructed per fitted model using ``self._corr_sp_eigvals``
-        and ``self._corr_sp_eigvecs``.
+        Only lightweight per-gene :class:`_FittedGeneState` objects (fitted
+        parameters + convergence metadata) are stored -- no full ``nn.Module``
+        objects.  The raw ``.adata`` is **not** saved; only
+        ``_filtered_adata`` is persisted.  After loading, ``.adata`` will be
+        ``None``.
 
         Parameters
         ----------
         path
             The path to save the fitted models.
         """
-        for key in ["models_glmm-full", "models_glmm-null"]:
-            if key in self._fitting_results and len(self._fitting_results[key]) > 0:
-                # update model.corr_sp as a reference to self.corr_sp
-                fitted_models = self._fitting_results[key]
-                for model in fitted_models:
-                    model.corr_sp = self.corr_sp
+        # Don't persist raw adata (only _filtered_adata is kept)
+        adata_backup = self.adata
+        self.adata = None
 
-        torch.save(self, path)
+        # Don't persist the kernel object (eigenpairs suffice for reconstruction)
+        kernel_backup = self.sp_kernel
+        if self._corr_sp_eigvals is not None:
+            self.sp_kernel = None
+
+        try:
+            torch.save(self, path)
+        finally:
+            self.sp_kernel = kernel_backup
+            self.adata = adata_backup
 
     @staticmethod
     def load(path: str, map_location: Optional[str] = None) -> "SplisosmGLMM":
@@ -1033,21 +1105,15 @@ class SplisosmGLMM:
         >>> loaded = SplisosmGLMM.load("model.pt")
         >>> loaded.get_training_summary()
         """
-        return torch.load(path, map_location=map_location, weights_only=False)
-
-    @property
-    def fitting_results(self) -> dict:
-        """Deprecated — use :meth:`get_fitted_models` or :meth:`get_gene_model` instead."""
-        warnings.warn(
-            "Direct access to `fitting_results` is deprecated; use "
-            "get_fitted_models() or get_gene_model(gene_name) instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._fitting_results
+        obj = torch.load(path, map_location=map_location, weights_only=False)
+        return obj
 
     def get_fitted_models(self) -> list[Any]:
         """Get the fitted models after running fit().
+
+        Each call reconstructs the full model objects from the stored
+        lightweight state.  The returned list is a fresh reconstruction;
+        mutations to the returned models are *not* persisted.
 
         Returns
         -------
@@ -1056,17 +1122,16 @@ class SplisosmGLMM:
             - ``model_type='glmm-null'``: list[splisosm.hyptest_glmm.IsoNullNoSpVar]
             - ``model_type='glm'``: list[splisosm.model.MultinomGLM]
         """
-        if self.model_type == "glmm-full":
-            return self._fitting_results["models_glmm-full"]
-        elif self.model_type == "glmm-null":
-            return self._fitting_results["models_glmm-null"]
-        elif self.model_type == "glm":
-            return self._fitting_results["models_glm"]
-        else:
-            raise ValueError(f"Invalid model type {self.model_type}.")
+        key = self._model_key_for_type()
+        return [
+            self._reconstruct_gene_model(i, key)
+            for i in range(len(self._fitted_states[key]))
+        ]
 
     def get_gene_model(self, gene_name: str) -> Any:
         """Return the fitted model for a single gene by display name.
+
+        Each call reconstructs a fresh model from stored state.
 
         Parameters
         ----------
@@ -1095,7 +1160,8 @@ class SplisosmGLMM:
                 f"Gene {gene_name!r} not found in gene_names. "
                 f"First 5 available: {preview}"
             ) from None
-        return self.get_fitted_models()[idx]
+        key = self._model_key_for_type()
+        return self._reconstruct_gene_model(idx, key)
 
     def __getitem__(self, gene_name: str) -> Any:
         """Shorthand for :meth:`get_gene_model`.
@@ -1127,33 +1193,19 @@ class SplisosmGLMM:
         if not self._is_trained:
             raise RuntimeError("Call fit() first.")
 
+        key = self._model_key_for_type()
         rows = []
-        for gene, model in zip(self.gene_names, self.get_fitted_models()):
-            lg = getattr(model, "logger", None)
-            if lg is not None:
-                rows.append(
-                    {
-                        "gene": gene,
-                        "model_type": self.model_type,
-                        "converged": bool(lg.convergence[0].item()),
-                        "best_loss": float(lg.best_loss[0].item()),
-                        "best_epoch": int(lg.best_epoch[0].item()),
-                        "fitting_time_s": float(
-                            getattr(model, "fitting_time", float("nan"))
-                        ),
-                    }
-                )
-            else:
-                rows.append(
-                    {
-                        "gene": gene,
-                        "model_type": self.model_type,
-                        "converged": None,
-                        "best_loss": None,
-                        "best_epoch": None,
-                        "fitting_time_s": None,
-                    }
-                )
+        for gene, state in zip(self.gene_names, self._fitted_states[key]):
+            rows.append(
+                {
+                    "gene": gene,
+                    "model_type": self._model_type,
+                    "converged": state.convergence,
+                    "best_loss": state.best_loss,
+                    "best_epoch": state.best_epoch,
+                    "fitting_time_s": state.fitting_time,
+                }
+            )
         return pd.DataFrame(rows).set_index("gene")
 
     def get_fitted_ratios_anndata(self, layer_name: str = "fitted_ratios") -> AnnData:
@@ -1233,25 +1285,19 @@ class SplisosmGLMM:
         Parameters
         ----------
         strip_model_data
-            If ``True``, call :meth:`splisosm.model.MultinomGLM.strip_data` on
-            every fitted model, removing per-gene ``counts`` and ``X_spot``
-            buffers.  This saves approximately
-            ``n_genes × n_spots × max(n_isos) × 4`` bytes but will break any
-            subsequent call to :meth:`splisosm.model.MultinomGLM.get_isoform_ratio`
-            or :meth:`splisosm.model.MultinomGLM.forward`.
+            Accepted for backward compatibility but has no effect.
+            Per-gene models are no longer stored as full ``nn.Module``
+            objects; only lightweight :class:`_FittedGeneState` dataclasses
+            are kept after fitting.
         free_kernel
-            If ``True``, set ``self.corr_sp = None``.  The dense
+            If ``True``, set ``self.sp_kernel = None``.  The dense
             ``(n_spots × n_spots)`` spatial kernel is only retained when a
             full-rank eigendecomposition was used; eigenpairs
             (``_corr_sp_eigvals``, ``_corr_sp_eigvecs``) are always preserved
             and are sufficient for all downstream operations.
         """
-        if strip_model_data:
-            for model in self.get_fitted_models():
-                if hasattr(model, "strip_data"):
-                    model.strip_data()
         if free_kernel:
-            self.corr_sp = None
+            self.sp_kernel = None
 
     def _ungroup_fitted_models(
         self, fitted_models: list[Any], batch_size: int, with_design_mtx: bool
@@ -1315,7 +1361,7 @@ class SplisosmGLMM:
                 _g_pars = {k: v[_g : (_g + 1), ...] for k, v in pars.items()}
 
                 # initialize and setup the model
-                if self.model_type == "glm":
+                if self._model_type == "glm":
                     model = MultinomGLM()
                     model.setup_data(
                         _g_counts,
@@ -1323,12 +1369,12 @@ class SplisosmGLMM:
                         device=self._device,
                     )
                 else:
-                    if self.model_type == "glmm-full":
-                        model = IsoFullModel(**self.model_configs)
-                    elif self.model_type == "glmm-null":
-                        model = IsoNullNoSpVar(**self.model_configs)
+                    if self._model_type == "glmm-full":
+                        model = IsoFullModel(**self._model_configs)
+                    elif self._model_type == "glmm-null":
+                        model = IsoNullNoSpVar(**self._model_configs)
                     else:
-                        raise ValueError(f"Invalid model type {self.model_type}.")
+                        raise ValueError(f"Invalid model type {self._model_type}.")
 
                     model.setup_data(
                         _g_counts,
@@ -1408,11 +1454,8 @@ class SplisosmGLMM:
             ):
                 _, b_counts, _ = (batch["n_isos"], batch["x"], batch["gene_name"])
 
-                if b_counts.is_sparse:
-                    b_counts = b_counts.to_dense()
-
                 # initialize and setup the model
-                if self.model_type == "glm":
+                if self._model_type == "glm":
                     model = MultinomGLM()
                     model.setup_data(
                         b_counts,
@@ -1420,12 +1463,12 @@ class SplisosmGLMM:
                         device=self._device,
                     )
                 else:
-                    if self.model_type == "glmm-full":
-                        model = IsoFullModel(**self.model_configs)
-                    elif self.model_type == "glmm-null":
-                        model = IsoNullNoSpVar(**self.model_configs)
+                    if self._model_type == "glmm-full":
+                        model = IsoFullModel(**self._model_configs)
+                    elif self._model_type == "glmm-null":
+                        model = IsoNullNoSpVar(**self._model_configs)
                     else:
-                        raise ValueError(f"Invalid model type {self.model_type}.")
+                        raise ValueError(f"Invalid model type {self._model_type}.")
                     model.setup_data(
                         b_counts,
                         design_mtx=self.design_mtx if with_design_mtx else None,
@@ -1449,8 +1492,8 @@ class SplisosmGLMM:
             # Prepare tasks with delayed to ensure they're ready for parallel execution
             tasks_gen = (
                 delayed(_fit_model_one_gene)(
-                    self.model_configs,
-                    self.model_type,
+                    self._model_configs,
+                    self._model_type,
                     batch["x"],
                     self._corr_sp_eigvals,
                     self._corr_sp_eigvecs,
@@ -1479,7 +1522,7 @@ class SplisosmGLMM:
                 b_counts = batch["x"]
 
                 # initialize and setup the model
-                if self.model_type == "glm":
+                if self._model_type == "glm":
                     model = MultinomGLM()
                     model.setup_data(
                         b_counts,
@@ -1487,12 +1530,12 @@ class SplisosmGLMM:
                         device=self._device,
                     )
                 else:
-                    if self.model_type == "glmm-full":
-                        model = IsoFullModel(**self.model_configs)
-                    elif self.model_type == "glmm-null":
-                        model = IsoNullNoSpVar(**self.model_configs)
+                    if self._model_type == "glmm-full":
+                        model = IsoFullModel(**self._model_configs)
+                    elif self._model_type == "glmm-null":
+                        model = IsoNullNoSpVar(**self._model_configs)
                     else:
-                        raise ValueError(f"Invalid model type {self.model_type}.")
+                        raise ValueError(f"Invalid model type {self._model_type}.")
                     model.setup_data(
                         b_counts,
                         design_mtx=self.design_mtx if with_design_mtx else None,
@@ -1511,15 +1554,10 @@ class SplisosmGLMM:
                 fitted_models, batch_size, with_design_mtx
             )
 
-        # store the fitted models
-        if self.model_type == "glmm-full":
-            self._fitting_results["models_glmm-full"] = fitted_models
-        elif self.model_type == "glmm-null":
-            self._fitting_results["models_glmm-null"] = fitted_models
-        elif self.model_type == "glm":
-            self._fitting_results["models_glm"] = fitted_models
-        else:
-            raise ValueError(f"Invalid model type {self.model_type}.")
+        # extract lightweight state and discard full model objects
+        key = self._model_key_for_type()
+        self._fitted_states[key] = [self._extract_gene_state(m) for m in fitted_models]
+        del fitted_models
 
         # stop timer
         t_end = timer()
@@ -1593,7 +1631,7 @@ class SplisosmGLMM:
                 _, b_counts, _ = (batch["n_isos"], batch["x"], batch["gene_name"])
 
                 # fit the null model
-                null = IsoNullNoSpVar(**self.model_configs)
+                null = IsoNullNoSpVar(**self._model_configs)
                 null.setup_data(
                     b_counts,
                     design_mtx=self.design_mtx if with_design_mtx else None,
@@ -1650,7 +1688,7 @@ class SplisosmGLMM:
             # Prepare tasks with delayed to ensure they're ready for parallel execution
             tasks_gen = (
                 delayed(_fit_null_full_sv_one_gene)(
-                    self.model_configs,
+                    self._model_configs,
                     batch["x"],
                     self._corr_sp_eigvals,
                     self._corr_sp_eigvecs,
@@ -1680,7 +1718,7 @@ class SplisosmGLMM:
                 b_counts = batch["x"]
 
                 # null models
-                null = IsoNullNoSpVar(**self.model_configs)
+                null = IsoNullNoSpVar(**self._model_configs)
                 null.setup_data(
                     b_counts,
                     design_mtx=self.design_mtx if with_design_mtx else None,
@@ -1707,9 +1745,14 @@ class SplisosmGLMM:
                 fitted_full_models, batch_size, with_design_mtx
             )
 
-        # store the fitted models
-        self._fitting_results["models_glmm-null"] = fitted_null_models_sv
-        self._fitting_results["models_glmm-full"] = fitted_full_models
+        # extract lightweight state and discard full model objects
+        self._fitted_states["glmm-null"] = [
+            self._extract_gene_state(m) for m in fitted_null_models_sv
+        ]
+        self._fitted_states["glmm-full"] = [
+            self._extract_gene_state(m) for m in fitted_full_models
+        ]
+        del fitted_null_models_sv, fitted_full_models
 
         # stop timer
         t_end = timer()
@@ -1738,7 +1781,7 @@ class SplisosmGLMM:
             The random seed for reproducibility. Default to None.
         """
         # fit permutated data using the same null model
-        fitting_configs = self.model_configs["fitting_configs"]
+        fitting_configs = self._model_configs["fitting_configs"]
 
         try:
             with_design_mtx = fitting_configs["with_design_mtx"]
@@ -1787,7 +1830,7 @@ class SplisosmGLMM:
                 perm_idx = torch.randperm(self.n_spots)
 
                 # fit a new SplisosmGLMM model using pre-built tensors (fast path)
-                new_model = SplisosmGLMM(**self.model_configs, device=self._device)
+                new_model = SplisosmGLMM(**self._model_configs, device=self._device)
                 new_design_mtx = (
                     self.design_mtx[perm_idx, :]
                     if (self.design_mtx is not None and with_design_mtx)
@@ -1796,8 +1839,8 @@ class SplisosmGLMM:
                 new_data = [_d[perm_idx, :] for _d in self._dataset.data]
                 new_model._setup_from_prebuilt(
                     data=new_data,
-                    coordinates=self.coordinates,
-                    corr_sp=self.corr_sp,
+                    coordinates=self._coordinates,
+                    sp_kernel=self.sp_kernel,
                     corr_sp_eigvals=self._corr_sp_eigvals,
                     corr_sp_eigvecs=self._corr_sp_eigvecs,
                     design_mtx=new_design_mtx,
@@ -1817,10 +1860,9 @@ class SplisosmGLMM:
 
                 # calculate the likelihood ratio statistic
                 _sv_llr_stats = []
-                for full_m, null_m in zip(
-                    new_model._fitting_results["models_glmm-full"],
-                    new_model._fitting_results["models_glmm-null"],
-                ):
+                for g_idx in range(new_model.n_genes):
+                    full_m = new_model._reconstruct_gene_model(g_idx, "glmm-full")
+                    null_m = new_model._reconstruct_gene_model(g_idx, "glmm-null")
                     # use marginal likelihood for stability
                     llr, _ = _calc_llr_spatial_variability(null_m, full_m)
                     _sv_llr_stats.append(llr)
@@ -1829,9 +1871,7 @@ class SplisosmGLMM:
                 _sv_llr_perm_stats.append(_sv_llr_stats)
 
             # save the llr statistics from permutated data
-            self._fitting_results["sv_llr_perm_stats"] = torch.concat(
-                _sv_llr_perm_stats, dim=0
-            )
+            self._sv_llr_perm_stats = torch.concat(_sv_llr_perm_stats, dim=0)
 
         else:  # use multiprocessing
             if print_progress:
@@ -1853,7 +1893,7 @@ class SplisosmGLMM:
             tasks_gen = (
                 delayed(_fit_perm_one_gene)(
                     torch.randperm(self.n_spots),
-                    self.model_configs,
+                    self._model_configs,
                     batch["x"],
                     self._corr_sp_eigvals,
                     self._corr_sp_eigvecs,
@@ -1875,9 +1915,7 @@ class SplisosmGLMM:
                 )
             )
 
-            self._fitting_results["sv_llr_perm_stats"] = torch.concat(
-                _sv_llr_perm_stats, dim=0
-            )
+            self._sv_llr_perm_stats = torch.concat(_sv_llr_perm_stats, dim=0)
 
         # stop timer
         t_end = timer()
@@ -1914,7 +1952,7 @@ class SplisosmGLMM:
             If False, use the chi-square with df = n_var_components as the null.
         return_results : bool, optional
             Whether to return the test statistics and p-values.
-            If False, the results will be stored in ``self.sv_test_results``.
+            If False, the results will be stored in ``self._sv_test_results``.
         print_progress : bool, optional
             Whether to show the progress bar for permutation. Default to True.
         n_perms_per_gene : int or None, optional
@@ -1939,17 +1977,16 @@ class SplisosmGLMM:
         ), f"Invalid method. Must be one of {valid_methods}."
 
         # Parametric likelihood ratio test for spatial variability. Need to fit the null and full models.
-        if len(self._fitting_results["models_glmm-null"]) == 0:
+        if len(self._fitted_states["glmm-null"]) == 0:
             raise ValueError(
                 "Null models not found. Please run fit() with from_null = True first."
             )
 
         _sv_llr_stats, _sv_llr_dfs = [], []
         # iterate over genes and calculate the likelihood ratio statistic
-        for full_m, null_m in zip(
-            self._fitting_results["models_glmm-full"],
-            self._fitting_results["models_glmm-null"],
-        ):
+        for g_idx in range(self.n_genes):
+            full_m = self._reconstruct_gene_model(g_idx, "glmm-full")
+            null_m = self._reconstruct_gene_model(g_idx, "glmm-null")
             # use marginal likelihood for stability
             llr, df = _calc_llr_spatial_variability(null_m, full_m)
             _sv_llr_stats.append(llr)
@@ -1960,7 +1997,7 @@ class SplisosmGLMM:
 
         if use_perm_null:
             # use permutation to calculate the p-value.
-            if "sv_llr_perm_stats" not in self._fitting_results:
+            if self._sv_llr_perm_stats is None:
                 self._fit_sv_llr_perm(
                     n_perms=n_perms_per_gene if n_perms_per_gene is not None else 20,
                     print_progress=print_progress,
@@ -1969,7 +2006,7 @@ class SplisosmGLMM:
             else:  # use the cached results if available
                 print("Using cached permutation results...")
 
-            _sv_llr_perm = self._fitting_results["sv_llr_perm_stats"]
+            _sv_llr_perm = self._sv_llr_perm_stats
             _sv_llr_pvals = 1 - (_sv_llr_stats[:, None] > _sv_llr_perm[None, :]).sum(
                 1
             ) / len(_sv_llr_perm)
@@ -1980,7 +2017,7 @@ class SplisosmGLMM:
             _sv_llr_pvals = torch.tensor(_sv_llr_pvals)
 
         # store the results (always on CPU for downstream pandas/numpy usage)
-        self.sv_test_results = {
+        self._sv_test_results = {
             "statistic": _sv_llr_stats.cpu().numpy(),
             "pvalue": _sv_llr_pvals.cpu().numpy(),
             "df": _sv_llr_dfs.cpu().numpy(),
@@ -1989,13 +2026,13 @@ class SplisosmGLMM:
         }
 
         # calculate adjusted p-values
-        self.sv_test_results["pvalue_adj"] = false_discovery_control(
-            self.sv_test_results["pvalue"]
+        self._sv_test_results["pvalue_adj"] = false_discovery_control(
+            self._sv_test_results["pvalue"]
         )
 
         # return results
         if return_results:
-            return self.sv_test_results
+            return self._sv_test_results
 
     def test_differential_usage(
         self,
@@ -2032,13 +2069,13 @@ class SplisosmGLMM:
             Whether to show the progress bar. Default to True.
         return_results : bool, optional
             Whether to return the test statistics and p-values.
-            If False, the results are stored in ``self.du_test_results``.
+            If False, the results are stored in ``self._du_test_results``.
 
         Returns
         -------
         dict or None
             If `return_results` is True, returns dict with test statistics and p-values.
-            Otherwise, returns None and stores results in self.du_test_results.
+            Otherwise, returns None and stores results in self._du_test_results.
         """
         if self.design_mtx is None:
             raise ValueError("No design matrix is provided. Run setup_data() first.")
@@ -2058,7 +2095,7 @@ class SplisosmGLMM:
                 raise ValueError(
                     "Fitted full models not found. Run fit(..., with_design_mtx = False) first."
                 )
-            if self.model_configs["fitting_configs"]["with_design_mtx"]:
+            if self._model_configs["fitting_configs"]["with_design_mtx"]:
                 raise ValueError(
                     "Design matrix is included in the fitted models. "
                     "Perhaps you want to use the wald test. Otherwise please run fit() with with_design_mtx = False."
@@ -2093,7 +2130,7 @@ class SplisosmGLMM:
             _du_score_pvals = torch.tensor(_du_score_pvals)
 
             # store the results (always on CPU for downstream pandas/numpy usage)
-            self.du_test_results = {
+            self._du_test_results = {
                 "statistic": _du_score_stats.cpu(),  # (n_genes, n_factors)
                 "pvalue": _du_score_pvals.cpu(),  # (n_genes, n_factors)
                 "method": method,
@@ -2104,7 +2141,7 @@ class SplisosmGLMM:
             fitted_models = self.get_fitted_models()
             if len(fitted_models) == 0:
                 raise ValueError("Fitted full models not found. Run fit() first.")
-            if not self.model_configs["fitting_configs"]["with_design_mtx"]:
+            if not self._model_configs["fitting_configs"]["with_design_mtx"]:
                 raise ValueError(
                     "Design matrix is not included in the fitted models. "
                     "Perhaps you want to use the score test. Otherwise please run fit() with with_design_mtx = True."
@@ -2135,17 +2172,17 @@ class SplisosmGLMM:
             _du_wald_pvals = torch.tensor(_du_wald_pvals)
 
             # store the results (always on CPU for downstream pandas/numpy usage)
-            self.du_test_results = {
+            self._du_test_results = {
                 "statistic": _du_wald_stats.cpu(),  # (n_genes, n_factors)
                 "pvalue": _du_wald_pvals.cpu(),  # (n_genes, n_factors)
                 "method": method,
             }
 
         # calculate adjusted p-values (independently for each factor)
-        self.du_test_results["pvalue_adj"] = false_discovery_control(
-            self.du_test_results["pvalue"], axis=0
+        self._du_test_results["pvalue_adj"] = false_discovery_control(
+            self._du_test_results["pvalue"], axis=0
         )
 
         # return the results if needed
         if return_results:
-            return self.du_test_results
+            return self._du_test_results
