@@ -842,18 +842,6 @@ class MultinomGLM(BaseModel, nn.Module):
         new_params.update(params)
         self.load_state_dict(new_params)
 
-    def strip_data(self) -> None:
-        """Free the ``counts`` and ``X_spot`` buffers to reduce memory after fitting.
-
-        After calling this method, any method that requires the original counts
-        (e.g. :meth:`get_isoform_ratio`, :meth:`forward`) will no longer work.
-        The fitted parameters (``beta``, ``bias_eta``, etc.) are preserved.
-        """
-        for buf_name in ("counts", "X_spot"):
-            if buf_name in self._buffers:
-                del self._buffers[buf_name]
-            setattr(self, buf_name, None)
-
 
 class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     """The Multinomial Generalized Linear Mixed Model for spatial isoform expression.
@@ -1521,6 +1509,16 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         )  # (n_spots, n_spots)
         return d * eye + V.matmul(torch.diag_embed(delta).matmul(V.transpose(-1, -2)))
 
+    @property
+    def _is_identity_cov(self) -> bool:
+        """True when the spatial variance proportion is zero (C = σ²I).
+
+        This holds for null models where ``theta_logit = -inf`` or
+        ``sigma_sp = 0``, making the spatial kernel contribute nothing.
+        """
+        sp = self.var_sp_prop()  # (n_genes, n_var_comp)
+        return bool((sp.detach().abs() < 1e-10).all())
+
     def _inv_cov(self):
         """Reconstruct the inverse covariance of the random effect.
 
@@ -1531,11 +1529,20 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         Notes
         -----
+        **Identity fast path** (when ``theta = 0``):
+        ``C = σ²I`` so ``C^{-1} = (1/σ²) I``.
+
         **Full-rank**: ``C^{-1} = V diag(1/c) V^T``
 
         **Low-rank** (Woodbury identity):
         ``C^{-1} = (1/d) I + V_k diag(1/c_k − 1/d) V_k^T``
         """
+        # Fast path: when theta = 0, covariance is sigma^2 * I
+        if self._is_identity_cov:
+            inv_var = (1.0 / self.var_total()).unsqueeze(-1).unsqueeze(-1)
+            eye = torch.eye(self.n_spots, device=self.device, dtype=self.nu.dtype)
+            return inv_var * eye  # (n_genes, n_var_comp, n_spots, n_spots)
+
         V = self.corr_sp_eigvecs[None, None, ...]  # (1, 1, n_spots, rank)
         c = self._cov_eigvals()  # (n_genes, n_var_comp, rank)
         if not self._is_low_rank:
@@ -1575,28 +1582,51 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         # add mvn prob of nu ~ MVN(0, S)
         data = self.nu.transpose(1, 2)  # (n_genes, n_isos - 1, n_spots)
-        # expand shared-variance dimension (1 → n_isos-1) if needed; keep rank dim
-        cov_eigvals = self._cov_eigvals().expand(
-            self.n_genes, data.shape[1], -1
-        )  # (n_genes, n_isos-1, rank)
-        cov_eigvecs = self.corr_sp_eigvecs.expand(
-            1, data.shape[1], self.n_spots, self._rank
-        )  # (1, n_isos-1, n_spots, rank)
 
-        residual_eigval = None
-        if self._is_low_rank:
-            # (n_genes, n_isos-1, 1) — broadcast across spots in fastmvn
-            residual_eigval = self._residual_cov_eigval().expand(
-                self.n_genes, data.shape[1], 1
+        if self._is_identity_cov:
+            # Fast path: C = σ²I.  MVN log-prob =
+            #   -0.5 * (n*p*log(2π) + n*p*log(σ²) + ||ν||² / σ²)
+            n_p = data.shape[1]  # n_isos - 1
+            var_total = self.var_total()  # (n_genes, n_var_comp)
+            if self.share_variance:
+                var_total = var_total.expand(self.n_genes, n_p)
+            import math
+
+            log_2pi = torch.log(
+                torch.tensor(2.0 * math.pi, device=self.device, dtype=data.dtype)
             )
+            # sum over isoform classes and spots
+            nu_sq = (data**2).sum(-1)  # (n_genes, n_isos-1)
+            log_prob += (
+                -0.5
+                * (
+                    self.n_spots * log_2pi
+                    + self.n_spots * var_total.log()
+                    + nu_sq / var_total
+                )
+            ).sum(-1)
+        else:
+            # General eigenspace path
+            cov_eigvals = self._cov_eigvals().expand(
+                self.n_genes, data.shape[1], -1
+            )  # (n_genes, n_isos-1, rank)
+            cov_eigvecs = self.corr_sp_eigvecs.expand(
+                1, data.shape[1], self.n_spots, self._rank
+            )  # (1, n_isos-1, n_spots, rank)
 
-        log_prob += log_prob_fastmvn_batched(
-            locs=torch.zeros_like(data),
-            cov_eigvals=cov_eigvals,
-            cov_eigvecs=cov_eigvecs,
-            data=data,
-            residual_eigval=residual_eigval,
-        )
+            residual_eigval = None
+            if self._is_low_rank:
+                residual_eigval = self._residual_cov_eigval().expand(
+                    self.n_genes, data.shape[1], 1
+                )
+
+            log_prob += log_prob_fastmvn_batched(
+                locs=torch.zeros_like(data),
+                cov_eigvals=cov_eigvals,
+                cov_eigvecs=cov_eigvecs,
+                data=data,
+                residual_eigval=residual_eigval,
+            )
 
         # add Multinomial likelihood of the counts
         log_prob += log_prob_fastmult_batched(
@@ -1654,17 +1684,28 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         )
 
         # Fill MVN blocks in-place.
-        # full_hessian = multinom_hessian + mvn_hessian
         # mvn_hessian[q] = -cov[q]^{-1}, shape (n_genes, n_spots, n_spots)
         # In the isoform-major index ordering, isoform q occupies
         # rows/cols [q*n_spots : (q+1)*n_spots].
-        mvn_hessian = -self._inv_cov()  # (n_genes, n_var_components, n_spots, n_spots)
-        if self.share_variance:
-            mvn_hessian = mvn_hessian.expand(n_genes, n_isos - 1, -1, -1)
-        for q in range(n_isos - 1):
-            full_hessian[
-                :, q * n_spots : (q + 1) * n_spots, q * n_spots : (q + 1) * n_spots
-            ].add_(mvn_hessian[:, q])
+        if self._is_identity_cov:
+            # Fast path: C = σ²I → C^{-1} = (1/σ²)I, so MVN Hessian = -(1/σ²)I
+            # Fill the diagonal directly — O(n_spots) per isoform, no dense matrix.
+            inv_var = 1.0 / self.var_total()  # (n_genes, n_var_comp)
+            if self.share_variance:
+                inv_var = inv_var.expand(n_genes, n_isos - 1)
+            diag_idx = torch.arange(n_spots, device=self.device)
+            for q in range(n_isos - 1):
+                full_hessian[
+                    :, q * n_spots + diag_idx, q * n_spots + diag_idx
+                ] -= inv_var[:, q].unsqueeze(-1)
+        else:
+            mvn_hessian = -self._inv_cov()  # (n_genes, n_var_comp, n_spots, n_spots)
+            if self.share_variance:
+                mvn_hessian = mvn_hessian.expand(n_genes, n_isos - 1, -1, -1)
+            for q in range(n_isos - 1):
+                full_hessian[
+                    :, q * n_spots : (q + 1) * n_spots, q * n_spots : (q + 1) * n_spots
+                ].add_(mvn_hessian[:, q])
 
         # Fill multinomial blocks in-place via scatter (compact form avoids second
         # large allocation; uses the same index arithmetic as _melt_tensor_along_first_dim).

@@ -468,25 +468,6 @@ class TestSplisosmGLMM(unittest.TestCase):
         self.assertIsInstance(state.convergence, bool)
         self.assertIsInstance(state.fitting_time, float)
 
-    def test_free_memory(self):
-        """free_memory() nulls the kernel object."""
-        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 2})
-        model.setup_data(
-            adata=self.adata,
-            layer="counts",
-            spatial_key="spatial",
-            group_iso_by="gene_symbol",
-            min_counts=0,
-            min_bin_pct=0.0,
-            filter_single_iso_genes=False,
-        )
-        model.fit(quiet=True)
-        model.free_memory(strip_model_data=True, free_kernel=True)
-        self.assertIsNone(model.sp_kernel)
-        # Lean storage: no full model objects kept, only _FittedGeneState
-        key = model._model_key_for_type()
-        self.assertGreater(len(model._fitted_states[key]), 0)
-
     # ------------------------------------------------------------------
     # get_fitted_ratios_anndata
     # ------------------------------------------------------------------

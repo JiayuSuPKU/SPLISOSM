@@ -485,7 +485,7 @@ class SplisosmGLMM:
             self._corr_sp_eigvals = torch.ones(1)  # (1,)
             self._corr_sp_eigvecs = torch.full(
                 (n_spots, 1), 1.0 / np.sqrt(n_spots)
-            )  # (n_spots, 1)
+            )  # dummy vector of (n_spots, 1), not really used
 
         else:
             # model_type == "glmm-full" — build the real spatial kernel.
@@ -1122,13 +1122,6 @@ class SplisosmGLMM:
             not called with an :class:`~anndata.AnnData` object (i.e. raw
             tensors were provided instead).
 
-        Notes
-        -----
-        Requires that the per-gene model parameters (``beta``, ``bias_eta``,
-        ``nu``) are still accessible.  If :meth:`free_memory` was previously
-        called with ``strip_model_data=True``, models fitted with covariates
-        (``n_factors > 0``) will raise an error inside
-        ``get_isoform_ratio()`` because ``X_spot`` has been freed.
         """
         if not self._is_trained:
             raise RuntimeError("Call fit() first.")
@@ -1155,28 +1148,6 @@ class SplisosmGLMM:
         ad_out.layers[layer_name] = ratio_mat
 
         return ad_out
-
-    def free_memory(
-        self, strip_model_data: bool = True, free_kernel: bool = True
-    ) -> None:
-        """Release large tensors that are no longer needed after fitting.
-
-        Parameters
-        ----------
-        strip_model_data
-            Accepted for backward compatibility but has no effect.
-            Per-gene models are no longer stored as full ``nn.Module``
-            objects; only lightweight :class:`_FittedGeneState` dataclasses
-            are kept after fitting.
-        free_kernel
-            If ``True``, set ``self.sp_kernel = None``.  The dense
-            ``(n_spots × n_spots)`` spatial kernel is only retained when a
-            full-rank eigendecomposition was used; eigenpairs
-            (``_corr_sp_eigvals``, ``_corr_sp_eigvecs``) are always preserved
-            and are sufficient for all downstream operations.
-        """
-        if free_kernel:
-            self.sp_kernel = None
 
     def _ungroup_fitted_models(
         self, fitted_models: list[Any], batch_size: int, with_design_mtx: bool

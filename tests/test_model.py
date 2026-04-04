@@ -924,7 +924,6 @@ class TestNewAPIs(unittest.TestCase):
     """Tests for new APIs introduced in the refactoring:
     - loss_history always available (PatienceLogger)
     - __str__ shows training summary after fit()
-    - strip_data() frees counts/X_spot buffers
     - diagnose deprecation warning
     - store_param_history still works
     """
@@ -1031,38 +1030,6 @@ class TestNewAPIs(unittest.TestCase):
         s = str(model)
         self.assertIn("Converged", s)
         self.assertEqual(repr(model), s)
-
-    # ------------------------------------------------------------------
-    # MultinomGLM.strip_data()
-    # ------------------------------------------------------------------
-
-    def test_strip_data_frees_buffers(self):
-        """strip_data() sets counts and X_spot to None and removes them from _buffers."""
-        model = MultinomGLM()
-        model.setup_data(self.counts, design_mtx=self.design_mtx)
-        # Confirm buffers exist before strip
-        self.assertIsNotNone(model.counts)
-        self.assertIsNotNone(model.X_spot)
-        model.strip_data()
-        self.assertIsNone(model.counts)
-        self.assertIsNone(model.X_spot)
-        # Must not be in _buffers either
-        self.assertNotIn("counts", model._buffers)
-        self.assertNotIn("X_spot", model._buffers)
-
-    def test_strip_data_no_counts_no_error(self):
-        """strip_data() is safe to call when design_mtx=None (X_spot not registered)."""
-        model = MultinomGLM()
-        model.setup_data(self.counts, design_mtx=None)
-        model.strip_data()  # should not raise
-        self.assertIsNone(model.counts)
-
-    def test_strip_data_idempotent(self):
-        """Calling strip_data() twice should not raise."""
-        model = MultinomGLM()
-        model.setup_data(self.counts)
-        model.strip_data()
-        model.strip_data()  # second call must be safe
 
 
 def _setup_glmm_for_sigma_hessian(
