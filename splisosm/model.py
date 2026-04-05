@@ -789,7 +789,7 @@ class MultinomGLM(BaseModel, nn.Module):
 
         # check model convergence
         num_not_converge = (~logger.convergence).sum()
-        if num_not_converge:
+        if num_not_converge and not quiet:
             warnings.warn(
                 f"{num_not_converge} gene(s) did not converge after epoch {max_epochs}. "
                 "Try larger max_epochs.",
@@ -850,8 +850,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         Y ~ Multinomial(alpha, Y.sum(1))
         eta = multinomial-logit(alpha) = X @ beta + bias_eta + nu
-        nu ~ MVN(0, sigma^2 * (theta * V_sp + (1-theta) * I) =
-             MVN(0, sigma_sp^2 * V_sp + sigma_nsp^2 * I)
+        nu ~ MVN(0, sigma^2 * (theta * V_sp + (1-theta) * I))
 
     Given isoform counts of a gene ``Y`` (n_spots, n_isos), design matrix ``X`` (n_spots, n_factors),
     and spatial covariance matrix ``V_sp`` (n_spots, n_spots), the model estimates the isoform usage
@@ -861,11 +860,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     - ``beta``: (n_factors, n_isos - 1) covariate coefficients of the fixed effect term.
     - ``bias_eta``: (n_isos - 1) intercepts of the fixed effect term.
     - ``nu``: (n_spots, n_isos - 1) the random effect term.
-    - variance components: each of length n_isos - 1 (or 1 if `share_variance` is True).
-      If `var_parameterization_sigma_theta` is True, they are (``sigma``, ``theta_logit``),
-      representing total variance and logit of spatial variance proportion ``theta``.
-      Otherwise they are (``sigma_sp``, ``sigma_nsp``), representing spatial and non-spatial
-      variance components.
+    - variance components: (``sigma``, ``theta_logit``), each of length n_isos - 1
+      (or 1 if `share_variance` is True), representing total variance and logit of
+      spatial variance proportion ``theta``.
 
     Inference algorithms can be categorized into two types based on the optimization objective:
 
@@ -915,11 +912,15 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     share_variance: bool
     """Whether to use the same variance across isoforms."""
 
-    var_parameterization_sigma_theta: bool
-    """Whether variance components are parameterized as (``sigma``, ``theta_logit``) or (``sigma_sp``, ``sigma_nsp``)."""
-
     var_fix_sigma: bool
-    """Whether to fix the total variance (``sigma``) or not."""
+    """Whether to fix the total variance (``sigma``) to its initial value.
+
+    When ``True`` (default), sigma is frozen at the Fano-factor estimate
+    and only ``theta_logit`` (spatial variance proportion) is learned.
+    This yields conservative but well-calibrated SV and DU tests:
+    near-zero false positive rates with strong power on true signals.
+    Set to ``False`` to learn sigma jointly, which may increase power
+    at the cost of inflated false positive rates."""
 
     var_prior_model: Literal["none", "gamma", "inv_gamma"]
     """The prior model on the total variance ``sigma``."""
@@ -944,11 +945,10 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     def __init__(
         self,
         share_variance: bool = True,
-        var_parameterization_sigma_theta: bool = True,
         var_fix_sigma: bool = True,
         var_prior_model: Literal["none", "gamma", "inv_gamma"] = "none",
         var_prior_model_params: dict = {},
-        init_ratio: Literal["observed", "uniform"] = "observed",
+        init_ratio: Literal["observed", "uniform"] = "uniform",
         fitting_method: Literal[
             "joint_gd", "joint_newton", "marginal_gd", "marginal_newton"
         ] = "joint_gd",
@@ -960,16 +960,13 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         share_variance
             Whether to use the same variance across isoforms. If True, the variance components
             will be of length 1. If False, the variance components will be of length n_isos - 1.
-        var_parameterization_sigma_theta
-            Whether to parameterize the variance components as (``sigma``, ``theta_logit``) or (``sigma_sp``, ``sigma_nsp``).
-            If True, the variance components will be (``sigma``, ``theta_logit``), where ``sigma`` is the total variance and
-            ``theta_logit`` is the logit of the spatial variance proportion.
-            If False, the variance components will be (``sigma_sp``, ``sigma_nsp``), where ``sigma_sp`` is the spatial
-            variance and ``sigma_nsp`` is the non-spatial variance.
         var_fix_sigma
-            Whether to fix the total variance (``sigma``) or not. If True, the total variance will be fixed to the initial value,
-            which is the average per-spot variance of isoform counts normalized by its mean expression.
-            See `MultinomGLMM._initialize_params` for details.
+            Whether to fix the total variance (``sigma``) to the Fano-factor
+            initial estimate.  When ``True`` (default), only ``theta_logit``
+            is learned, producing conservative but well-calibrated hypothesis
+            tests.  Set to ``False`` to learn sigma jointly with other
+            parameters; this may yield higher power for the SV test but can
+            inflate false positive rates for both SV and DU tests.
         var_prior_model
             The prior model on the total variance ``sigma``. Default is ``'none'`` with no prior.
             Other options are ``'gamma'`` (Gamma prior) and ``'inv_gamma'`` (Inverse Gamma prior).
@@ -997,23 +994,19 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         """
         super().__init__()
 
-        # specify the parameterization of variance components
-        # if True:
+        # variance parameterization:
         # 	var(sigma, theta) = sigma^2 (theta * V_sp + (1-theta) * I)
-        # else:
-        # 	var(sigma_sp, sigma_nsp) = sigma_sp^2 * V_sp + sigma_nsp^2 * I
-        self.var_parameterization_sigma_theta = var_parameterization_sigma_theta
         self.share_variance = (
             share_variance  # whether to share variance across isoforms
         )
         self.var_fix_sigma = var_fix_sigma  # whether to fix sigma
 
-        # specify the prior model on sigma^2 (or sigma_sp^2 + sigma_nsp^2))
+        # specify the prior model on sigma^2
         assert var_prior_model in ["none", "gamma", "inv_gamma"]
         self.var_prior_model = var_prior_model  # prior on the variance size sigma
         if self.var_prior_model == "gamma":
             # Chung, Yeojin, et al. Psychometrika 78.4 (2013): 685-709.
-            # this prior is applied on sigma (or sqrt(sigma_sp^2 + sigma_nsp^2))
+            # this prior is applied on sigma
             # Gamma(2, 0.3): prior mode of sigma ~= 3
             self.var_prior_model_params = {
                 "alpha": 2.0,
@@ -1026,11 +1019,11 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             )
         elif self.var_prior_model == "inv_gamma":
             # conjugacy prior
-            # this prior is applied on sigma^2 (or sigma_sp^2 + sigma_nsp^2)
-            # InverseGamma(3, 0.5): prior mode of sigma^2 ~= 0.25
+            # this prior is applied on sigma^2
+            # InverseGamma(2, 0.1): weakly informative, mode at beta/(alpha+1) = 0.033
             self.var_prior_model_params = {
-                "alpha": 3,
-                "beta": 0.5,
+                "alpha": 2,
+                "beta": 0.1,
             }
             self.var_prior_model_params.update(var_prior_model_params)
             self.var_prior_model_dist = InverseGamma(
@@ -1098,7 +1091,6 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             + f"- Number of isoforms per gene: {self.n_isos}\n"
             + f"- Number of covariates: {self.n_factors}\n"
             + "- Variance formulation:\n"
-            + f"\t* Parameterized using sigma and theta: {self.var_parameterization_sigma_theta}\n"
             + f"\t* Learnable variance: {not self.var_fix_sigma}\n"
             + f"\t* Same variance across isoforms: {self.share_variance}\n"
             + f"\t* Prior on total variance: {self.var_prior_model}\n"
@@ -1298,7 +1290,26 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         # send to device before initialising params so that parameters and
         # counts are on the same device (avoids cross-device ops for non-CPU)
         self.to(self.device)
+        self._move_prior_to_device()
         self._initialize_params()
+
+    def _move_prior_to_device(self):
+        """Recreate the variance prior distribution on the model's device."""
+        if self.var_prior_model_dist is not None:
+            alpha = torch.tensor(
+                self.var_prior_model_params["alpha"],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            beta = torch.tensor(
+                self.var_prior_model_params["beta"],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            if self.var_prior_model == "gamma":
+                self.var_prior_model_dist = Gamma(alpha, beta)
+            elif self.var_prior_model == "inv_gamma":
+                self.var_prior_model_dist = InverseGamma(alpha, beta)
 
     def _configure_learnable_variables(self):
         """Set up learnable parameters according to the model architecture."""
@@ -1318,24 +1329,14 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         # the variance components
         n_var_components = 1 if self.share_variance else self.n_isos - 1
-        if self.var_parameterization_sigma_theta:
-            # cov = sigma^2 (theta * V_sp + (1-theta) * I)
-            sigma = torch.ones(self.n_genes, n_var_components)
-            theta_logit = torch.zeros(self.n_genes, n_var_components)
-            self.register_parameter("sigma", nn.Parameter(sigma))
-            self.register_parameter("theta_logit", nn.Parameter(theta_logit))
+        # cov = sigma^2 (theta * V_sp + (1-theta) * I)
+        sigma = torch.ones(self.n_genes, n_var_components)
+        theta_logit = torch.zeros(self.n_genes, n_var_components)
+        self.register_parameter("sigma", nn.Parameter(sigma))
+        self.register_parameter("theta_logit", nn.Parameter(theta_logit))
 
-            if self.var_fix_sigma:
-                self.sigma.requires_grad = False
-        else:
-            # cov = sigma_sp^2 * V_sp + sigma_nsp^2 * I
-            sigma_sp = torch.ones(self.n_genes, n_var_components)
-            sigma_nsp = torch.ones(self.n_genes, n_var_components)
-            self.register_parameter("sigma_sp", nn.Parameter(sigma_sp))
-            self.register_parameter("sigma_nsp", nn.Parameter(sigma_nsp))
-
-            if self.var_fix_sigma:
-                self.sigma_nsp.requires_grad = False
+        if self.var_fix_sigma:
+            self.sigma.requires_grad = False
 
     def _initialize_params(self):
         """Initialize model parameters."""
@@ -1356,46 +1357,17 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             with torch.no_grad():
                 self.nu.copy_(torch.zeros(self.n_genes, self.n_spots, self.n_isos - 1))
 
-        # Initial estimate of the variance parameter sigma.
-        if self.init_ratio == "observed" and self.nu.abs().sum() > 0:
-            nu_var = self.nu.detach().var(dim=1)  # (n_genes, n_isos - 1)
-            if self.share_variance:
-                # Use the max variance across isoform contrasts (not the mean),
-                # because some isoforms may have near-zero variation and would
-                # pull the mean down, under-estimating sigma for the active ones.
-                sigma_init = (
-                    nu_var.max(dim=-1, keepdim=True).values.clamp(min=1e-4).pow(0.5)
-                )
-            else:
-                # per-isoform variance component
-                sigma_init = nu_var.clamp(min=1e-4).pow(0.5)
-        else:
-            # Fallback for init_ratio="uniform" (nu is all zeros).
-            # Use the Fano-factor heuristic on raw counts as a rough proxy.
-            sigma_init = (
-                (self.counts.var(1).mean(1) / self.counts.sum(2).mean(1).clamp(min=1))
-                .clamp(min=1e-4, max=0.9)
-                .pow(0.5)
-            ).unsqueeze(-1)
+        # initial estimate of the variance parameter sigma using the Fano-factor heuristic
+        sigma_init = (
+            (self.counts.var(1).mean(1) / self.counts.sum(2).mean(1).clamp(min=1))
+            .clamp(min=1e-4, max=0.9)
+            .pow(0.5)
+        ).unsqueeze(-1)
 
-        # Initialise spatial variance proportion to ~5% (theta ≈ sigmoid(-3) ≈ 0.047).
-        _theta_init = 0.047  # consistent across both parameterisations
-        if self.var_parameterization_sigma_theta:
-            with torch.no_grad():
-                self.sigma.copy_(torch.ones_like(self.sigma) * sigma_init)
-                self.theta_logit.copy_(torch.ones_like(self.theta_logit) * -3.0)
-        else:
-            # Decompose sigma_init into spatial / non-spatial components so that
-            # sigma_sp² + sigma_nsp² = sigma_init²  (consistent total variance).
-            with torch.no_grad():
-                self.sigma_sp.copy_(
-                    torch.ones_like(self.sigma_sp) * sigma_init * _theta_init**0.5
-                )
-                self.sigma_nsp.copy_(
-                    torch.ones_like(self.sigma_nsp)
-                    * sigma_init
-                    * (1 - _theta_init) ** 0.5
-                )
+        # initialise spatial variance proportion to ~5% (theta ≈ sigmoid(-3) ≈ 0.047).
+        with torch.no_grad():
+            self.sigma.copy_(torch.ones_like(self.sigma) * sigma_init)
+            self.theta_logit.copy_(torch.ones_like(self.theta_logit) * -3.0)
 
     """Below are a bunch of helper functions to update intermediate variables after each optimization step.
     """
@@ -1408,10 +1380,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         var_total : torch.Tensor
             The total variance ``sigma`` of shape (n_genes, n_var_components).
         """
-        if self.var_parameterization_sigma_theta:
-            var_total = self.sigma**2
-        else:
-            var_total = self.sigma_sp**2 + self.sigma_nsp**2
+        var_total = self.sigma**2
 
         if var_total.min() < 1e-2:
             warnings.warn(
@@ -1431,10 +1400,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             The proportion ``theta`` of spatial variance of shape (n_genes, n_var_components).
         """
         # return: (n_genes, n_var_components)
-        if self.var_parameterization_sigma_theta:
-            return torch.sigmoid(self.theta_logit)
-        else:
-            return self.sigma_sp**2 / self.var_total()
+        return torch.sigmoid(self.theta_logit)
 
     def _corr_eigvals(self):
         """Output the leading eigenvalues of the correlation matrix.
@@ -1473,10 +1439,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             residual covariance eigenvalue ``d`` for the corresponding gene and
             variance component.
         """
-        # (1 - θ) * σ² — valid for both parameterisations because:
-        #   sigma/theta:   var_total = σ², var_sp_prop = θ   → d = σ²(1-θ)
-        #   sigma_sp/nsp:  var_total = sqrt(σ_sp²+σ_nsp²),
-        #                  var_sp_prop = σ_sp²/var_total²     → d = σ_nsp²  ✓
+        # (1 - θ) * σ²:  var_total = σ², var_sp_prop = θ   → d = σ²(1-θ)
         var_sp_prop = self.var_sp_prop().unsqueeze(-1)  # (n_genes, n_var_comp, 1)
         return (1.0 - var_sp_prop) * self.var_total().unsqueeze(-1)
 
@@ -1513,8 +1476,8 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     def _is_identity_cov(self) -> bool:
         """True when the spatial variance proportion is zero (C = σ²I).
 
-        This holds for null models where ``theta_logit = -inf`` or
-        ``sigma_sp = 0``, making the spatial kernel contribute nothing.
+        This holds for null models where ``theta_logit = -inf``,
+        making the spatial kernel contribute nothing.
         """
         sp = self.var_sp_prop()  # (n_genes, n_var_comp)
         return bool((sp.detach().abs() < 1e-10).all())
@@ -1729,33 +1692,23 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         Parameters
         ----------
         sigma_expand : torch.Tensor
-            Shape (n_genes, n_var_components, 2). The two variance parameters,
-            either (sigma, theta) or (sigma_sp, sigma_nsp), are stacked along the last dimension.
+            Shape (n_genes, n_var_components, 2). The two variance parameters
+            (sigma, theta_logit) are stacked along the last dimension.
         """
         if self.share_variance:  # the same variance components across isoforms
             sigma_expand = sigma_expand.expand(self.n_genes, self.n_isos - 1, -1)
 
-        if self.var_parameterization_sigma_theta:
-            sigma, theta_logit = sigma_expand[..., 0], sigma_expand[..., 1]
-            var_sp_prop = torch.sigmoid(theta_logit).unsqueeze(
-                -1
-            )  # (n_genes, n_iso - 1, 1)
-            sigma_total = sigma  # (n_genes, n_iso - 1)
-            # (n_genes, n_iso - 1, rank)
-            cov_eigvals = (
-                var_sp_prop * self.corr_sp_eigvals.unsqueeze(0) + (1 - var_sp_prop)
-            ) * sigma_total.unsqueeze(-1)
-            # residual = σ²(1-θ), shape (n_genes, n_iso-1, 1)
-            residual_eigval = (1.0 - var_sp_prop) * sigma_total.unsqueeze(-1)
-        else:
-            sigma_sp, sigma_nsp = sigma_expand[..., 0], sigma_expand[..., 1]
-            sigma_total = torch.sqrt(sigma_sp**2 + sigma_nsp**2)  # (n_genes, n_iso-1)
-            # (n_genes, n_iso-1, rank)
-            cov_eigvals = sigma_sp.unsqueeze(-1).pow(
-                2
-            ) * self.corr_sp_eigvals.unsqueeze(0) + sigma_nsp.unsqueeze(-1).pow(2)
-            # residual = σ_nsp², shape (n_genes, n_iso-1, 1)
-            residual_eigval = sigma_nsp.unsqueeze(-1).pow(2)
+        sigma, theta_logit = sigma_expand[..., 0], sigma_expand[..., 1]
+        var_sp_prop = torch.sigmoid(theta_logit).unsqueeze(
+            -1
+        )  # (n_genes, n_iso - 1, 1)
+        sigma_total = sigma  # (n_genes, n_iso - 1)
+        # (n_genes, n_iso - 1, rank)
+        cov_eigvals = (
+            var_sp_prop * self.corr_sp_eigvals.unsqueeze(0) + (1 - var_sp_prop)
+        ) * sigma_total.unsqueeze(-1)
+        # residual = σ²(1-θ), shape (n_genes, n_iso-1, 1)
+        residual_eigval = (1.0 - var_sp_prop) * sigma_total.unsqueeze(-1)
 
         # MVN prior likelihood as a function of the input eta
         data = self.nu.transpose(1, 2)  # (n_genes, n_isos - 1, n_spots)
@@ -1800,11 +1753,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         """
         n_genes, n_isos, n_spots = self.n_genes, self.n_isos, self.n_spots
         rank = self._rank
-        n_var_comps = (
-            self.sigma.shape[1]
-            if self.var_parameterization_sigma_theta
-            else self.sigma_sp.shape[1]
-        )
+        n_var_comps = self.sigma.shape[1]
         dtype = self.nu.dtype
 
         V_k = self.corr_sp_eigvecs  # (n_spots, rank)
@@ -1818,13 +1767,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             x_perp_sq = (data**2).sum(-1) - (z**2).sum(-1)
 
         # Variance params (n_genes, n_var_comps)
-        if self.var_parameterization_sigma_theta:
-            sigma = self.sigma
-            theta = torch.sigmoid(self.theta_logit)
-            D = theta * (1 - theta)  # sigmoid derivative, (n_genes, n_var_comps)
-        else:
-            sigma_sp = self.sigma_sp
-            sigma_nsp = self.sigma_nsp
+        sigma = self.sigma
+        theta = torch.sigmoid(self.theta_logit)
+        D = theta * (1 - theta)  # sigmoid derivative, (n_genes, n_var_comps)
 
         # Accumulate per-class MVN Hessian contributions into (n_genes, n_var_comps, 2, 2)
         H_diag = torch.zeros(
@@ -1838,21 +1783,13 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             # Covariance eigenvalues c_k and residual d for this class
             # NOTE: in _calc_log_prob_mvn_wrt_sigma, σ enters LINEARLY:
             #   c_k = σ · (θ·λ_k + (1-θ)),  d = σ · (1-θ)
-            if self.var_parameterization_sigma_theta:
-                s = sigma[:, vc]  # (n_genes,)
-                th = theta[:, vc]
-                Dq = D[:, vc]
-                c_q = s.unsqueeze(-1) * (
-                    th.unsqueeze(-1) * (lam - 1) + 1
-                )  # (n_genes, rank)
-                d_q = (1 - th) * s  # (n_genes,)
-            else:
-                sp = sigma_sp[:, vc]
-                sn = sigma_nsp[:, vc]
-                c_q = (
-                    sp.unsqueeze(-1) ** 2 * lam + sn.unsqueeze(-1) ** 2
-                )  # (n_genes, rank)
-                d_q = sn**2  # (n_genes,)
+            s = sigma[:, vc]  # (n_genes,)
+            th = theta[:, vc]
+            Dq = D[:, vc]
+            c_q = s.unsqueeze(-1) * (
+                th.unsqueeze(-1) * (lam - 1) + 1
+            )  # (n_genes, rank)
+            d_q = (1 - th) * s  # (n_genes,)
 
             # First/second derivs of l_{g,q} wrt c_k (n_genes, rank) and d (n_genes,)
             dl_dc = -0.5 / c_q + 0.5 * zq**2 / c_q**2
@@ -1864,36 +1801,23 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
                 d2l_dd2 = 0.5 * (n_spots - rank) / d_q**2 - xp / d_q**3
 
             # Jacobians: ∂c_k/∂p1, ∂c_k/∂p2, ∂d/∂p1, ∂d/∂p2, and their second derivatives
-            if self.var_parameterization_sigma_theta:
-                # p1=sigma, p2=theta_logit,  θ=sigmoid(p2),  D=θ(1-θ)
-                # c_k = σ·(θ(λ_k-1)+1),  d = σ·(1-θ)  (LINEAR in σ)
-                dc_dp1 = c_q / s.unsqueeze(-1)  # = θ(λ_k-1)+1
-                dc_dp2 = s.unsqueeze(-1) * (lam - 1) * Dq.unsqueeze(-1)
-                d2c_dp11 = torch.zeros_like(c_q)
-                d2c_dp22 = (
-                    s.unsqueeze(-1)
-                    * (lam - 1)
-                    * Dq.unsqueeze(-1)
-                    * (1 - 2 * th).unsqueeze(-1)
-                )
-                d2c_dp12 = (lam - 1) * Dq.unsqueeze(-1).expand_as(c_q)
-                dd_dp1 = d_q / s  # = (1-θ)
-                dd_dp2 = -s * Dq
-                d2d_dp11 = torch.zeros_like(s)
-                d2d_dp22 = -s * Dq * (1 - 2 * th)
-                d2d_dp12 = -Dq
-            else:
-                # p1=sigma_sp, p2=sigma_nsp
-                dc_dp1 = 2 * sp.unsqueeze(-1) * lam
-                dc_dp2 = 2 * sn.unsqueeze(-1).expand_as(c_q)
-                d2c_dp11 = 2 * lam.unsqueeze(0).expand(n_genes, -1)
-                d2c_dp22 = torch.full_like(c_q, 2.0)
-                d2c_dp12 = torch.zeros_like(c_q)
-                dd_dp1 = torch.zeros(n_genes, device=self.device, dtype=dtype)
-                dd_dp2 = 2 * sn
-                d2d_dp11 = torch.zeros(n_genes, device=self.device, dtype=dtype)
-                d2d_dp22 = torch.full((n_genes,), 2.0, device=self.device, dtype=dtype)
-                d2d_dp12 = torch.zeros(n_genes, device=self.device, dtype=dtype)
+            # p1=sigma, p2=theta_logit,  θ=sigmoid(p2),  D=θ(1-θ)
+            # c_k = σ·(θ(λ_k-1)+1),  d = σ·(1-θ)  (LINEAR in σ)
+            dc_dp1 = c_q / s.unsqueeze(-1)  # = θ(λ_k-1)+1
+            dc_dp2 = s.unsqueeze(-1) * (lam - 1) * Dq.unsqueeze(-1)
+            d2c_dp11 = torch.zeros_like(c_q)
+            d2c_dp22 = (
+                s.unsqueeze(-1)
+                * (lam - 1)
+                * Dq.unsqueeze(-1)
+                * (1 - 2 * th).unsqueeze(-1)
+            )
+            d2c_dp12 = (lam - 1) * Dq.unsqueeze(-1).expand_as(c_q)
+            dd_dp1 = d_q / s  # = (1-θ)
+            dd_dp2 = -s * Dq
+            d2d_dp11 = torch.zeros_like(s)
+            d2d_dp22 = -s * Dq * (1 - 2 * th)
+            d2d_dp12 = -Dq
 
             def _hc(dc_pi, dc_pj, d2c_ij):
                 return (d2l_dc2 * dc_pi * dc_pj + dl_dc * d2c_ij).sum(
@@ -1923,50 +1847,19 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         if self.var_prior_model != "none":
             alpha = self.var_prior_model_params["alpha"]
             beta = self.var_prior_model_params["beta"]
-            if self.var_parameterization_sigma_theta:
-                # Prior on sigma_total = sigma; theta_logit has no effect on prior
-                s_all = self.sigma  # (n_genes, n_var_comps)
-                if self.var_prior_model == "inv_gamma":
-                    # InverseGamma on u=sigma^2: d²logp/dσ² = 2(α+1)/σ² - 6β/σ⁴
-                    u = s_all**2
-                    d2logp_du2 = (alpha + 1) / u**2 - 2 * beta / u**3
-                    dlogp_du = -(alpha + 1) / u + beta / u**2
-                    d2prior_dp1 = d2logp_du2 * (2 * s_all) ** 2 + dlogp_du * 2
-                else:  # gamma on sigma
-                    v = s_all.abs()
-                    d2prior_dp1 = -(alpha - 1) / v**2
-                H_diag[:, :, 0, 0] += prior_scale * d2prior_dp1
-                # [0,1], [1,0], [1,1] entries: 0 (prior doesn't depend on theta_logit)
-            else:
-                # Prior on sigma_total = sqrt(sigma_sp^2 + sigma_nsp^2)
-                sp_all = self.sigma_sp  # (n_genes, n_var_comps)
-                sn_all = self.sigma_nsp
-                v2 = sp_all**2 + sn_all**2  # sigma_total^2
-                if self.var_prior_model == "inv_gamma":
-                    # InverseGamma on u=sigma_total^2
-                    u = v2
-                    d2logp_du2 = (alpha + 1) / u**2 - 2 * beta / u**3
-                    dlogp_du = -(alpha + 1) / u + beta / u**2
-                    d2p_dsp2 = d2logp_du2 * 4 * sp_all**2 + dlogp_du * 2
-                    d2p_dsn2 = d2logp_du2 * 4 * sn_all**2 + dlogp_du * 2
-                    d2p_cross = d2logp_du2 * 4 * sp_all * sn_all
-                else:  # gamma on sigma_total
-                    v = torch.sqrt(v2)
-                    dlogp_dv = (alpha - 1) / v - beta
-                    d2logp_dv2 = -(alpha - 1) / v**2
-                    d2p_dsp2 = (
-                        d2logp_dv2 * (sp_all / v) ** 2 + dlogp_dv * sn_all**2 / v**3
-                    )
-                    d2p_dsn2 = (
-                        d2logp_dv2 * (sn_all / v) ** 2 + dlogp_dv * sp_all**2 / v**3
-                    )
-                    d2p_cross = d2logp_dv2 * (sp_all / v) * (sn_all / v) + dlogp_dv * (
-                        -sp_all * sn_all / v**3
-                    )
-                H_diag[:, :, 0, 0] += prior_scale * d2p_dsp2
-                H_diag[:, :, 0, 1] += prior_scale * d2p_cross
-                H_diag[:, :, 1, 0] += prior_scale * d2p_cross
-                H_diag[:, :, 1, 1] += prior_scale * d2p_dsn2
+            # Prior on sigma_total = sigma; theta_logit has no effect on prior
+            s_all = self.sigma  # (n_genes, n_var_comps)
+            if self.var_prior_model == "inv_gamma":
+                # InverseGamma on u=sigma^2: d²logp/dσ² = 2(α+1)/σ² - 6β/σ⁴
+                u = s_all**2
+                d2logp_du2 = (alpha + 1) / u**2 - 2 * beta / u**3
+                dlogp_du = -(alpha + 1) / u + beta / u**2
+                d2prior_dp1 = d2logp_du2 * (2 * s_all) ** 2 + dlogp_du * 2
+            else:  # gamma on sigma
+                v = s_all.abs()
+                d2prior_dp1 = -(alpha - 1) / v**2
+            H_diag[:, :, 0, 0] += prior_scale * d2prior_dp1
+            # [0,1], [1,0], [1,1] entries: 0 (prior doesn't depend on theta_logit)
 
         # Build block-diagonal output (n_genes, n_var_comps*2, n_var_comps*2)
         if n_var_comps == 1:
@@ -1988,14 +1881,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
     def _get_log_lik_hessian_sigma_expand(self):
         """Get the Hessian matrix of the log mvn wrt the variance components."""
-        if self.var_parameterization_sigma_theta:
-            sigma_expand = torch.stack(
-                [self.sigma, self.theta_logit], dim=-1
-            )  # (n_genes, n_var_components, 2)
-        else:
-            sigma_expand = torch.stack(
-                [self.sigma_sp, self.sigma_nsp], dim=-1
-            )  # (n_genes, n_var_components, 2)
+        sigma_expand = torch.stack(
+            [self.sigma, self.theta_logit], dim=-1
+        )  # (n_genes, n_var_components, 2)
 
         # calculate the hessian using pytorch's functional
         # x = sigma_expand.clone().detach().requires_grad_(True)
@@ -2028,20 +1916,12 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         n_genes = self.n_genes
 
         # calculate the updates for variance parameters
-        if self.var_parameterization_sigma_theta:
-            sigma_expand = torch.stack(
-                [self.sigma, self.theta_logit], dim=-1
-            )  # (n_genes, n_var_components, 2)
-            sigma_expand_grad = torch.stack(
-                [self.sigma.grad, self.theta_logit.grad], dim=-1
-            )  # (n_genes, n_var_components, 2)
-        else:
-            sigma_expand = torch.stack(
-                [self.sigma_sp, self.sigma_nsp], dim=-1
-            )  # (n_genes, n_var_components, 2)
-            sigma_expand_grad = torch.stack(
-                [self.sigma_sp.grad, self.sigma_nsp.grad], dim=-1
-            )  # (n_genes, n_var_components, 2)
+        sigma_expand = torch.stack(
+            [self.sigma, self.theta_logit], dim=-1
+        )  # (n_genes, n_var_components, 2)
+        sigma_expand_grad = torch.stack(
+            [self.sigma.grad, self.theta_logit.grad], dim=-1
+        )  # (n_genes, n_var_components, 2)
 
         hessian_sigma_expand = (
             -self._get_log_lik_hessian_sigma_expand_analytic()
@@ -2065,16 +1945,10 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         # update the parameters and clear the gradients
         with torch.no_grad():
-            if self.var_parameterization_sigma_theta:
-                self.sigma.copy_(sigma_expand_new[..., 0])
-                self.theta_logit.copy_(sigma_expand_new[..., 1])
-                self.sigma.grad.zero_()
-                self.theta_logit.grad.zero_()
-            else:
-                self.sigma_sp.copy_(sigma_expand_new[..., 0])
-                self.sigma_nsp.copy_(sigma_expand_new[..., 1])
-                self.sigma_sp.grad.zero_()
-                self.sigma_nsp.grad.zero_()
+            self.sigma.copy_(sigma_expand_new[..., 0])
+            self.theta_logit.copy_(sigma_expand_new[..., 1])
+            self.sigma.grad.zero_()
+            self.theta_logit.grad.zero_()
 
         if return_variables:
             return sigma_expand_new
@@ -2304,7 +2178,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         # check model convergence
         num_not_converge = (~logger.convergence).sum()
-        if num_not_converge:
+        if num_not_converge and not quiet:
             warnings.warn(
                 f"{num_not_converge} gene(s) did not converge after epoch {max_epochs}. "
                 "Try larger max_epochs.",
@@ -2336,11 +2210,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     def _final_sanity_check(self):
         """Make sure constraints are satisfied."""
         # ensure positive parameters
-        if self.var_parameterization_sigma_theta:
-            self.sigma.abs_()
-        else:
-            self.sigma_sp.abs_()
-            self.sigma_nsp.abs_()
+        self.sigma.abs_()
 
     def fit(
         self,
@@ -2395,7 +2265,6 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         """Clone a Multinomial GLMM model with the same set of parameters."""
         new_model = type(self)(
             share_variance=self.share_variance,
-            var_parameterization_sigma_theta=self.var_parameterization_sigma_theta,
             var_fix_sigma=self.var_fix_sigma,
             var_prior_model=self.var_prior_model,
             var_prior_model_params=self.var_prior_model_params,

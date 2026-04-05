@@ -53,7 +53,7 @@ Summary of class features:
      - fastest
      - N/A (FFT-based; no eigendecomposition)
    * - :class:`~splisosm.SplisosmGLMM`
-     - ✗
+     - ⚠️
      - ✓
      - AnnData
      - any
@@ -416,12 +416,17 @@ Same test as :class:`~splisosm.SplisosmNP` but with FFT-accelerated GPR for regu
 **SplisosmGLMM** (parametric, GLM/GLMM-based)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Fits a multinomial GLMM with a Gaussian random field spatial random effect. The marginal likelihood is approximated via Laplace at the mode.
+Fits a multinomial GLMM with a Gaussian random field spatial random effect.
+Set ``var_fix_sigma=False`` to learn the total variance jointly.
+With the default settings (``var_fix_sigma=True``, ``max_epochs=500``), SV and DU
+hypothesis tests are **conservative** (better false positive control but
+reduced power).
 
 .. code-block:: python
 
    from splisosm import SplisosmGLMM
 
+   # DU testing (score test conditioned on spatial random effects)
    model = SplisosmGLMM(model_type="glmm-full")
    model.setup_data(
        adata_svp, spatial_key="spatial",
@@ -443,7 +448,10 @@ Fits a multinomial GLMM with a Gaussian random field spatial random effect. The 
 
    model = SplisosmGLMM(
        model_type="glmm-full",      # 'glmm-full' | 'glmm-null' | 'glm'
+       var_fix_sigma=True,          # True → conservative tests; False → more power but may inflate FPR
+       init_ratio="uniform",        # 'uniform' | 'observed'
        fitting_method="joint_gd",   # 'joint_gd' | 'joint_newton' | 'marginal_gd' | 'marginal_newton'
+       fitting_configs={"max_epochs": 500},
        device="cpu",                # 'cpu' | 'cuda' (NVIDIA) | 'mps' (Apple Silicon)
        approx_rank="auto",          # 'auto' (default) | None (full rank) | int (fixed low-rank)
    )
@@ -658,10 +666,19 @@ adjust them only when you hit performance or accuracy limits.
      - ``True`` (one shared σ)
      - ``False`` fits one variance component per isoform — more flexible
        but slower and prone to overfitting for genes with many isoforms.
-   * - **Other GLMM configuration**
-     - ``SplisosmGLMM(...)``
-     - See :class:`SplisosmGLMM <splisosm.hyptest_glmm.SplisosmGLMM>` docstring for details
-     - Adjust ``var_fix_sigma`` to disable total variance estimation and fix σ to a constant value.
+   * - **Fix total variance**
+     - ``SplisosmGLMM(var_fix_sigma=...)``
+     - ``True`` (σ frozen at Fano-factor estimate)
+     - When ``True``, only the spatial proportion θ is learned, producing
+       conservative tests (near-zero FPR).  Set to ``False`` to learn σ
+       jointly — may increase SV power but inflates FPR for both SV and
+       DU tests.
+   * - **Isoform ratio initialization**
+     - ``SplisosmGLMM(init_ratio=...)``
+     - ``"uniform"``
+     - ``"uniform"`` initialises isoform ratios to equal proportions — fast
+       convergence.  ``"observed"`` initialises from raw count ratios — slower
+       but may improve ratio estimates for high-count data.
 
 .. raw:: html
 

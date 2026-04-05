@@ -59,13 +59,18 @@ class IsoFullModel(MultinomGLMM):
         elif new_model.fitting_method == "marginal_newton":
             new_model.fitting_method = "marginal_gd"
 
-        new_model.fitting_configs.update({"lr": 1e-3, "optim": "adam", "patience": 3})
+        new_model.fitting_configs.update({"lr": 1e-2, "optim": "adam", "patience": 5})
+
+        # Re-initialize sigma from the fitted nu magnitude (prevents sigma collapse)
+        nu_std = new_model.nu.detach().std(dim=1)  # (n_genes, n_isos-1)
+        if new_model.share_variance:
+            sigma_reinit = nu_std.max(dim=-1, keepdim=True).values.clamp(min=0.1)
+        else:
+            sigma_reinit = nu_std.clamp(min=0.1)
+        new_model.sigma.detach_().copy_(sigma_reinit)
 
         # turn the gradient of the spatial variance term back on
-        if new_model.var_parameterization_sigma_theta:
-            new_model.theta_logit.detach_().fill_(-5.0).requires_grad_(True)
-        else:
-            new_model.sigma_sp.requires_grad_(True)
+        new_model.theta_logit.detach_().fill_(-3.0).requires_grad_(True)
 
         return new_model
 
@@ -111,10 +116,7 @@ class IsoNullNoSpVar(MultinomGLMM):
 
     def _turn_off_spatial_variance(self):
         """Set spatial variance to zero and don't update it."""
-        if self.var_parameterization_sigma_theta:
-            self.theta_logit.detach_().fill_(-torch.inf).requires_grad_(False)
-        else:
-            self.sigma_sp.detach_().fill_(0.0).requires_grad_(False)
+        self.theta_logit.detach_().fill_(-torch.inf).requires_grad_(False)
 
     @classmethod
     def from_trained_full_model(cls, full_model: MultinomGLMM) -> "IsoNullNoSpVar":
@@ -135,7 +137,7 @@ class IsoNullNoSpVar(MultinomGLMM):
         elif new_model.fitting_method == "marginal_newton":
             new_model.fitting_method = "marginal_gd"
 
-        new_model.fitting_configs.update({"lr": 1e-3, "optim": "adam", "patience": 3})
+        new_model.fitting_configs.update({"lr": 1e-2, "optim": "adam", "patience": 5})
 
         # remove spatial variance
         new_model._turn_off_spatial_variance()
@@ -218,8 +220,6 @@ def _fit_model_one_gene(
             "bias_eta",
             "sigma",
             "theta_logit",
-            "sigma_sp",
-            "sigma_nsp",
         ]
 
     # fit the model
@@ -312,8 +312,6 @@ def _fit_null_full_sv_one_gene(
         "bias_eta",
         "sigma",
         "theta_logit",
-        "sigma_sp",
-        "sigma_nsp",
     ]
     null_pars = {
         k: v.detach() for k, v in null.state_dict().items() if k in return_par_names
@@ -421,9 +419,9 @@ def _calc_llr_spatial_variability(null_model: IsoNullNoSpVar, full_model: IsoFul
     Parameters
     ----------
     null_model : IsoNullNoSpVar
-        The fitted null model of one gene (sigma_sp = 0).
+        The fitted null model of one gene (theta = 0, i.e. no spatial variance).
     full_model : IsoFullModel
-        The fitted full model of one gene (sigma_sp != 0).
+        The fitted full model of one gene (theta != 0).
 
     Returns
     -------

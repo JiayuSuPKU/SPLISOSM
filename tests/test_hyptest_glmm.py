@@ -912,11 +912,8 @@ class TestIsoModelEdgeCases(unittest.TestCase):
             corr_sp_eigvals=self.corr_sp_eigvals,
             corr_sp_eigvecs=self.corr_sp_eigvecs,
         )
-        # Check that either theta_logit or sigma_sp has no gradient
-        if hasattr(null_model, "theta_logit"):
-            self.assertFalse(null_model.theta_logit.requires_grad)
-        elif hasattr(null_model, "sigma_sp"):
-            self.assertFalse(null_model.sigma_sp.requires_grad)
+        # Check that theta_logit has no gradient (spatial variance turned off)
+        self.assertFalse(null_model.theta_logit.requires_grad)
 
     def test_fit_model_one_gene_glm_different_types(self):
         """Test _fit_model_one_gene with different model types."""
@@ -1366,10 +1363,9 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
         with self.assertRaises(ValueError):
             model_wald.test_differential_usage(method="wald", print_progress=False)
 
-    def test_iso_conversion_branches_with_sigma_sp_parameterization(self):
+    def test_iso_conversion_branches(self):
         base_joint = MultinomGLMM(
             fitting_method="joint_newton",
-            var_parameterization_sigma_theta=False,
             var_fix_sigma=False,
             fitting_configs={"max_epochs": 1},
         )
@@ -1381,11 +1377,10 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
         )
         full_from_joint = IsoFullModel.from_trained_null_no_sp_var_model(base_joint)
         self.assertEqual(full_from_joint.fitting_method, "joint_gd")
-        self.assertTrue(full_from_joint.sigma_sp.requires_grad)
+        self.assertTrue(full_from_joint.theta_logit.requires_grad)
 
         base_marg = MultinomGLMM(
             fitting_method="marginal_newton",
-            var_parameterization_sigma_theta=False,
             fitting_configs={"max_epochs": 1},
         )
         base_marg.setup_data(
@@ -1396,16 +1391,10 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
         )
         null_from_marg = IsoNullNoSpVar.from_trained_full_model(base_marg)
         self.assertEqual(null_from_marg.fitting_method, "marginal_gd")
-        self.assertFalse(null_from_marg.sigma_sp.requires_grad)
-        self.assertTrue(
-            torch.allclose(
-                null_from_marg.sigma_sp, torch.zeros_like(null_from_marg.sigma_sp)
-            )
-        )
+        self.assertFalse(null_from_marg.theta_logit.requires_grad)
 
         base_joint_for_null = MultinomGLMM(
             fitting_method="joint_newton",
-            var_parameterization_sigma_theta=False,
             var_fix_sigma=False,
             fitting_configs={"max_epochs": 1},
         )

@@ -131,13 +131,12 @@ class SplisosmGLMM:
         self,
         model_type: Literal["glmm-full", "glmm-null", "glm"] = "glmm-full",
         share_variance: bool = True,
-        var_parameterization_sigma_theta: bool = True,
-        var_fix_sigma: bool = False,
+        var_fix_sigma: bool = True,
         var_prior_model: str = "none",
         var_prior_model_params: dict = {},
-        init_ratio: str = "observed",
+        init_ratio: str = "uniform",
         fitting_method: str = "joint_gd",
-        fitting_configs: dict = {"max_epochs": -1},
+        fitting_configs: dict = {"max_epochs": 500},
         k_neighbors: int = 4,
         rho: float = 0.99,
         approx_rank=_APPROX_RANK_AUTO,
@@ -151,16 +150,13 @@ class SplisosmGLMM:
             ``'glmm-null'`` (Multinomial GLMM with white noise), ``'glm'`` (Multinomial GLM).
         share_variance
             Whether to share the variance component across isoforms.
-        var_parameterization_sigma_theta
-            Whether to parameterize the variance components as (``sigma``, ``theta_logit``) or (``sigma_sp``, ``sigma_nsp``).
-            If True, the variance components will be (``sigma``, ``theta_logit``), where ``sigma`` is the total variance and
-            ``theta_logit`` is the logit of the spatial variance proportion.
-            If False, the variance components will be (``sigma_sp``, ``sigma_nsp``), where ``sigma_sp`` is the spatial
-            variance and ``sigma_nsp`` is the non-spatial variance.
         var_fix_sigma
-            Whether to fix the total variance (``sigma``) or not. If True, the total variance will be fixed to the initial value,
-            which is the average per-spot variance of isoform counts normalized by its mean expression.
-            See `MultinomGLMM._initialize_params` for details.
+            Whether to fix the total variance (``sigma``) to the Fano-factor
+            initial estimate.  When ``True`` (default), only ``theta_logit``
+            is learned, producing conservative but well-calibrated hypothesis
+            tests.  Set to ``False`` to learn sigma jointly with other
+            parameters; this may yield higher power for the SV test but can
+            inflate false positive rates for both SV and DU tests.
         var_prior_model
             The prior model on the total variance ``sigma``. Default is ``'none'`` with no prior.
             Other options are ``'gamma'`` (Gamma prior) and ``'inv_gamma'`` (Inverse Gamma prior).
@@ -219,7 +215,6 @@ class SplisosmGLMM:
 
         self._model_configs = {
             "share_variance": share_variance,
-            "var_parameterization_sigma_theta": var_parameterization_sigma_theta,
             "var_fix_sigma": var_fix_sigma,
             "var_prior_model": var_prior_model,
             "var_prior_model_params": var_prior_model_params,
@@ -296,7 +291,6 @@ class SplisosmGLMM:
                 _config_desc = (
                     f"- Mutual neighbors K: {self._kernel_k_neighbors}\n"
                     f"- Spatial autocorrelation rho: {self._kernel_rho}\n"
-                    f"- Variance parameterized with theta_logit: {self._model_configs['var_parameterization_sigma_theta']}\n"
                 )
             _config_desc += (
                 f"- Learnable variance: {not self._model_configs['var_fix_sigma']}\n"
@@ -1193,8 +1187,6 @@ class SplisosmGLMM:
                 "bias_eta",
                 "sigma",
                 "theta_logit",
-                "sigma_sp",
-                "sigma_nsp",
             ]
             pars = {
                 k: v.detach()
@@ -1796,7 +1788,7 @@ class SplisosmGLMM:
         ----------
         method : {"llr"}, optional
             The test method.
-            Currently only support ``"llr"``, the likelihood ratio test (H_0: ``sigma_sp`` = 0).
+            Currently only support ``"llr"``, the likelihood ratio test (H_0: ``theta`` = 0, i.e. no spatial variance).
         use_perm_null : bool, optional
             Whether to generate the null distribution from permutation.
             If False, use the chi-square with df = n_var_components as the null.
