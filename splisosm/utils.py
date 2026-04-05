@@ -1166,6 +1166,15 @@ def compute_feature_summaries(
 
     iso_groups = list(adata.var.groupby(group_iso_by, observed=True, sort=False))
 
+    # Sanity check: groupby order must match gene_names
+    group_keys = [k for k, _ in iso_groups]
+    if group_keys != list(gene_names):
+        raise ValueError(
+            "gene_names order does not match adata.var groupby order. "
+            f"First mismatch: gene_names has '{gene_names[0]}' but "
+            f"groupby has '{group_keys[0]}'."
+        )
+
     gene_rows: list[dict] = []
     iso_rows: list[dict] = []
     all_iso_names: list[str] = []

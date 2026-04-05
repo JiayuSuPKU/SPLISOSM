@@ -350,7 +350,6 @@ class SplisosmGLMM:
         covariate_names: Optional[list[str]] = None,
         min_counts: int = 10,
         min_bin_pct: float = 0.0,
-        filter_single_iso_genes: bool = True,
         min_component_size: int = 1,
     ) -> None:
         """Setup the data for the GLMM model.
@@ -396,9 +395,6 @@ class SplisosmGLMM:
         min_bin_pct : float, optional
             Minimum fraction/percentage of spots where an isoform must be
             expressed (default 0.0).
-        filter_single_iso_genes : bool, optional
-            Whether to remove genes with fewer than two retained isoforms
-            (default ``True``).
         min_component_size : int, optional
             Minimum number of spots a connected component must contain to
             be retained.  Spots in smaller components are removed from all
@@ -429,7 +425,7 @@ class SplisosmGLMM:
             spatial_key=spatial_key,
             min_counts=min_counts,
             min_bin_pct=min_bin_pct,
-            filter_single_iso_genes=filter_single_iso_genes,
+            filter_single_iso_genes=True,  # GLMM requires ≥2 isoforms per gene
             gene_names=gene_names,
             design_mtx=design_mtx,
             covariate_names=covariate_names,
@@ -649,6 +645,11 @@ class SplisosmGLMM:
 
     def _get_gene_counts(self, gene_idx: int) -> torch.Tensor:
         """Return counts for gene *gene_idx* as ``(1, n_spots, n_isos)``."""
+        if self._dataset is None:
+            raise RuntimeError(
+                "Count data is not available. Call setup_data() first, or re-attach "
+                "the dataset after loading a saved model."
+            )
         return self._dataset.data[gene_idx].unsqueeze(0)
 
     def _reconstruct_gene_model(self, gene_idx: int, model_key: str = "glmm-full"):
@@ -1827,6 +1828,11 @@ class SplisosmGLMM:
         _sv_llr_stats, _sv_llr_dfs = [], []
         # iterate over genes and calculate the likelihood ratio statistic
         for g_idx in range(self.n_genes):
+            # Single-isoform genes cannot be tested (no usage variation)
+            if self.n_isos_per_gene[g_idx] <= 1:
+                _sv_llr_stats.append(torch.tensor(0.0))
+                _sv_llr_dfs.append(torch.tensor(1))
+                continue
             full_m = self._reconstruct_gene_model(g_idx, "glmm-full")
             null_m = self._reconstruct_gene_model(g_idx, "glmm-null")
             # use marginal likelihood for stability
@@ -1857,6 +1863,12 @@ class SplisosmGLMM:
             # move to CPU before scipy (scipy does not support non-CPU tensors)
             _sv_llr_pvals = 1 - chi2.cdf(_sv_llr_stats.cpu(), df=_sv_llr_dfs.cpu())
             _sv_llr_pvals = torch.tensor(_sv_llr_pvals)
+
+        # Single-isoform genes: force pval=1 (no usage variation to detect)
+        single_iso_mask = torch.tensor(
+            [n <= 1 for n in self.n_isos_per_gene], dtype=torch.bool
+        )
+        _sv_llr_pvals[single_iso_mask] = 1.0
 
         # store the results (always on CPU for downstream pandas/numpy usage)
         self._sv_test_results = {
@@ -1945,12 +1957,19 @@ class SplisosmGLMM:
 
             _du_score_stats, _du_score_dfs = [], []
             # iterate over genes and calculate the score statistic
-            for m in tqdm(
-                fitted_models,
-                desc=f"DU [{method}]",
-                total=len(fitted_models),
-                disable=not print_progress,
+            for g_idx, m in enumerate(
+                tqdm(
+                    fitted_models,
+                    desc=f"DU [{method}]",
+                    total=len(fitted_models),
+                    disable=not print_progress,
+                )
             ):
+                # Single-isoform genes: no differential usage possible
+                if self.n_isos_per_gene[g_idx] <= 1:
+                    _du_score_stats.append(torch.zeros(n_factors))
+                    _du_score_dfs.append(0)
+                    continue
                 score_stat, score_df = _calc_score_differential_usage(
                     m, self.design_mtx
                 )
@@ -1970,6 +1989,9 @@ class SplisosmGLMM:
                 _du_score_stats.cpu(), df=_du_score_dfs.cpu()
             )
             _du_score_pvals = torch.tensor(_du_score_pvals)
+            # Single-isoform genes (df=0): force pval=1 (no usage variation)
+            single_iso_mask = _du_score_dfs[:, 0] == 0
+            _du_score_pvals[single_iso_mask] = 1.0
 
             # store the results (always on CPU for downstream pandas/numpy usage)
             self._du_test_results = {
@@ -1991,12 +2013,18 @@ class SplisosmGLMM:
 
             _du_wald_stats, _du_wald_dfs = [], []
             # iterate over genes and calculate the Wald statistic
-            for m in tqdm(
-                fitted_models,
-                desc=f"DU [{method}]",
-                total=len(fitted_models),
-                disable=not print_progress,
+            for g_idx, m in enumerate(
+                tqdm(
+                    fitted_models,
+                    desc=f"DU [{method}]",
+                    total=len(fitted_models),
+                    disable=not print_progress,
+                )
             ):
+                if self.n_isos_per_gene[g_idx] <= 1:
+                    _du_wald_stats.append(torch.zeros(n_factors))
+                    _du_wald_dfs.append(0)
+                    continue
                 wald_stat, wald_df = _calc_wald_differential_usage(m)
                 _du_wald_stats.append(wald_stat)
                 _du_wald_dfs.append(wald_df)
@@ -2012,6 +2040,8 @@ class SplisosmGLMM:
             # move to CPU before scipy (scipy does not support non-CPU tensors)
             _du_wald_pvals = 1 - chi2.cdf(_du_wald_stats.cpu(), df=_du_wald_dfs.cpu())
             _du_wald_pvals = torch.tensor(_du_wald_pvals)
+            single_iso_mask = _du_wald_dfs[:, 0] == 0
+            _du_wald_pvals[single_iso_mask] = 1.0
 
             # store the results (always on CPU for downstream pandas/numpy usage)
             self._du_test_results = {

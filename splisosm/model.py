@@ -1513,7 +1513,8 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         # Low-rank Woodbury: C^{-1} = (1/d)I + V_k diag(1/c_k - 1/d) V_k^T
         d = self._residual_cov_eigval().unsqueeze(-1)  # (n_genes, n_var_comp, 1, 1)
-        inv_correction = 1.0 / c - 1.0 / d.squeeze(-1)  # (n_genes, n_var_comp, rank)
+        # Clamp to prevent catastrophic cancellation when c ≈ d (theta near 0)
+        inv_correction = (1.0 / c - 1.0 / d.squeeze(-1)).clamp(-1e6, 1e6)
         eye = torch.eye(
             self.n_spots, device=V.device, dtype=V.dtype
         )  # (n_spots, n_spots)
@@ -1792,13 +1793,16 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             d_q = (1 - th) * s  # (n_genes,)
 
             # First/second derivs of l_{g,q} wrt c_k (n_genes, rank) and d (n_genes,)
-            dl_dc = -0.5 / c_q + 0.5 * zq**2 / c_q**2
-            d2l_dc2 = 0.5 / c_q**2 - zq**2 / c_q**3
+            # Clamp c_q and d_q to prevent overflow in reciprocal powers
+            c_q_safe = c_q.clamp(min=1e-6)
+            dl_dc = -0.5 / c_q_safe + 0.5 * zq**2 / c_q_safe**2
+            d2l_dc2 = 0.5 / c_q_safe**2 - zq**2 / c_q_safe**3
 
             if self._is_low_rank:
                 xp = x_perp_sq[:, q]  # (n_genes,)
-                dl_dd = -0.5 * (n_spots - rank) / d_q + 0.5 * xp / d_q**2
-                d2l_dd2 = 0.5 * (n_spots - rank) / d_q**2 - xp / d_q**3
+                d_q_safe = d_q.clamp(min=1e-6)
+                dl_dd = -0.5 * (n_spots - rank) / d_q_safe + 0.5 * xp / d_q_safe**2
+                d2l_dd2 = 0.5 * (n_spots - rank) / d_q_safe**2 - xp / d_q_safe**3
 
             # Jacobians: ∂c_k/∂p1, ∂c_k/∂p2, ∂d/∂p1, ∂d/∂p2, and their second derivatives
             # p1=sigma, p2=theta_logit,  θ=sigmoid(p2),  D=θ(1-θ)

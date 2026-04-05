@@ -218,7 +218,6 @@ class TestHypTestGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
         )
 
         # Fit the model
@@ -299,7 +298,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         self.assertIsNotNone(model.design_mtx)
@@ -342,7 +340,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(
@@ -372,7 +369,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             gene_names="gene_label",
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(quiet=True, batch_size=5)
@@ -389,7 +385,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(quiet=True, batch_size=5)
@@ -406,7 +401,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             group_iso_by="gene_symbol",
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
         )
         # before fit → RuntimeError
         with self.assertRaises(RuntimeError):
@@ -433,7 +427,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             group_iso_by="gene_symbol",
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
         )
         with self.assertRaises(RuntimeError):
             model.get_training_summary()
@@ -457,7 +450,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             group_iso_by="gene_symbol",
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
         )
         model.fit(quiet=True)
         # After lean refactoring, per-gene state stores convergence metadata
@@ -486,7 +478,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             group_iso_by="gene_symbol",
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
         )
         if with_cov:
             setup_kw["design_mtx"] = ["cov_1", "cov_2"]
@@ -540,7 +531,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             group_iso_by="gene_symbol",
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
         )
         with self.assertRaises(RuntimeError):
             model.get_fitted_ratios_anndata()
@@ -632,7 +622,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             group_iso_by="gene_symbol",
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(quiet=True, print_progress=False, from_null=True)
@@ -667,7 +656,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=False, from_null=True, quiet=True)
@@ -690,7 +678,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=False, quiet=True)
@@ -714,7 +701,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=True, quiet=True)
@@ -733,7 +719,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=False, from_null=True, quiet=True)
@@ -754,7 +739,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=False, from_null=True, quiet=True)
@@ -773,7 +757,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=False, quiet=True)
@@ -792,7 +775,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=None,
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
         )
         self.assertIsNone(model.design_mtx)
 
@@ -807,7 +789,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(with_design_mtx=True, quiet=True)
@@ -824,7 +805,6 @@ class TestSplisosmGLMM(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(quiet=True, batch_size=10)
@@ -1088,7 +1068,6 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
                 covariate_names=["const"],
                 min_counts=0,
                 min_bin_pct=0.0,
-                filter_single_iso_genes=False,
             )
 
         self.assertEqual(model.design_mtx.shape[1], 1)
@@ -1122,7 +1101,6 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
                 design_mtx=["cov_1", "cov_2"],
                 min_counts=0,
                 min_bin_pct=0.0,
-                filter_single_iso_genes=False,
             )
 
         self.assertTrue(torch.is_floating_point(model._corr_sp_eigvals))
@@ -1139,7 +1117,6 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=False,
         )
 
@@ -1164,7 +1141,6 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(quiet=True, print_progress=False, with_design_mtx=False, batch_size=1)
@@ -1253,7 +1229,6 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(
@@ -1274,7 +1249,6 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         model.fit(
@@ -1307,7 +1281,6 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             design_mtx=None,
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         with self.assertRaises(ValueError):
@@ -1324,7 +1297,6 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         with self.assertRaises(ValueError):
@@ -1348,7 +1320,6 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
             group_gene_by_n_iso=True,
         )
         with self.assertRaises(ValueError):
@@ -1448,7 +1419,6 @@ class TestSplisosmGLMMNewFeatures(unittest.TestCase):
             group_iso_by="gene_symbol",
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
         )
         return model
 
@@ -1661,7 +1631,6 @@ class TestSplisosmGLMMDevice(unittest.TestCase):
             design_mtx=["cov_1", "cov_2"],
             min_counts=0,
             min_bin_pct=0.0,
-            filter_single_iso_genes=False,
         )
         return model
 

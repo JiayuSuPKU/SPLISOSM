@@ -102,6 +102,10 @@ def _du_worker_fft(
     stats = np.zeros(n_factors)
     pvals = np.ones(n_factors)
 
+    # Single-isoform gene: no differential usage is possible.
+    if len(iso_names) <= 1:
+        return stats, pvals
+
     # ── Load isoform ratios on-the-fly ────────────────────────────────────
     data = raster_layer.sel(c=iso_names).values  # (n_iso, ny, nx)
     counts_cube = np.moveaxis(np.asarray(data, dtype=float), 0, -1)  # (ny, nx, n_iso)
@@ -204,6 +208,11 @@ def _sv_worker_fft(
     """Compute one gene-level FFT-HSIC statistic and p-value from rasterized channels."""
     data = raster_layer.sel(c=iso_names).values  # (c, ny, nx)
     counts_cube = np.moveaxis(np.asarray(data, dtype=float), 0, -1)
+
+    # Single-isoform gene: HSIC-IR has no ratio variation → pval=1.
+    # HSIC-IC and HSIC-GC test count-level SV and proceed normally.
+    if method == "hsic-ir" and counts_cube.shape[2] <= 1:
+        return 0.0, 1.0
 
     if method == "hsic-ic":
         y_cube = counts_cube

@@ -464,6 +464,9 @@ reduced power).
        group_gene_by_n_iso=True,       # required for batch_size > 1
        design_mtx=covariates,
        covariate_names=covariate_names,
+       min_counts=10,            # min total counts per isoform to keep
+       min_bin_pct=0.0,          # min fraction of spots expressing the isoform
+       min_component_size=1,     # set > 1 to drop small tissue fragments
    )
    model.fit(
        n_jobs=1,               # parallel gene fitting (CPU only; auto-disabled on GPU)

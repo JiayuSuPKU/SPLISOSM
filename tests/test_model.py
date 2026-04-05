@@ -322,6 +322,41 @@ class TestMultinomGLMM(unittest.TestCase):
         self.assertTrue((model.sigma.data > 0).all())
         self.assertTrue(torch.isfinite(model.sigma.data).all())
 
+    def test_identity_cov_log_prob_matches_general(self):
+        """Identity fast path gives same log-prob as general path."""
+        model = MultinomGLMM()
+        model.setup_data(self.counts, corr_sp=self.corr_sp)
+        # Force theta → 0 (identity covariance)
+        with torch.no_grad():
+            model.theta_logit.fill_(-50.0)
+        self.assertTrue(model._is_identity_cov)
+        lp_fast = model._calc_log_prob_joint().detach()
+
+        # Force theta slightly above 0 so general path is used
+        with torch.no_grad():
+            model.theta_logit.fill_(-5.0)  # theta ≈ 0.007
+        self.assertFalse(model._is_identity_cov)
+        lp_general = model._calc_log_prob_joint().detach()
+
+        # Should be close (not exact due to small theta contribution)
+        torch.testing.assert_close(lp_fast, lp_general, atol=0.1, rtol=0.01)
+
+    def test_identity_cov_hessian_matches_general(self):
+        """Identity fast path Hessian matches general path."""
+        model = MultinomGLMM(fitting_method="marginal_gd")
+        model.setup_data(self.counts, corr_sp=self.corr_sp)
+        with torch.no_grad():
+            model.theta_logit.fill_(-50.0)
+        self.assertTrue(model._is_identity_cov)
+        H_fast = model._get_log_lik_hessian_nu().detach()
+
+        with torch.no_grad():
+            model.theta_logit.fill_(-5.0)
+        self.assertFalse(model._is_identity_cov)
+        H_general = model._get_log_lik_hessian_nu().detach()
+
+        torch.testing.assert_close(H_fast, H_general, atol=0.5, rtol=0.05)
+
     # def test_update_gradient_descent(self):
     #     model = MultinomGLM(fitting_method="gd")
     #     model.setup_data(self.counts, design_mtx=self.design_mtx)

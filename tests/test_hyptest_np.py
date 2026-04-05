@@ -520,6 +520,41 @@ class TestSplisosmNP(unittest.TestCase):
             results["statistic"], model._sv_test_results["statistic"]
         )
 
+    def test_with_gene_summary_sv(self):
+        """get_formatted_test_results(with_gene_summary=True) appends gene stats."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        model.test_spatial_variability(method="hsic-ir", print_progress=False)
+        df = model.get_formatted_test_results("sv", with_gene_summary=True)
+        self.assertIn("perplexity", df.columns)
+        self.assertIn("count_avg", df.columns)
+        self.assertEqual(len(df), model.n_genes)
+
+    def test_filtered_adata_property(self):
+        """filtered_adata raises before setup_data, returns AnnData after."""
+        model = SplisosmNP()
+        with self.assertRaises(RuntimeError):
+            _ = model.filtered_adata
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        fa = model.filtered_adata
+        self.assertIsInstance(fa, AnnData)
+
     def test_str_reflects_test_status(self):
         """__str__ includes method name after running SV and DU."""
         model = SplisosmNP()

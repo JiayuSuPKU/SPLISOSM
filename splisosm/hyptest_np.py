@@ -128,6 +128,13 @@ def _sv_gene_worker_np(
     if counts.is_sparse:
         counts = counts.to_dense()
 
+    # Single-isoform gene with HSIC-IR: ratios are constant (all 1.0), so there is
+    # no usage variation to detect.  Return stat=0, pval=1.
+    # HSIC-IC and HSIC-GC still produce meaningful results for single-isoform genes
+    # (they test count-level spatial variability, equivalent to gene-level SV).
+    if method == "hsic-ir" and counts.shape[1] <= 1:
+        return (0.0, 1.0)
+
     lambda_sp_eff = lambda_sp
     k_eff_eff = k_eff
 
@@ -224,6 +231,10 @@ def _du_hsic_gene_worker_np(
     """Per-gene worker for SplisosmNP DU test (method='hsic')."""
     if counts.is_sparse:
         counts = counts.to_dense()
+    # Single-isoform gene: no differential usage is possible.
+    if counts.shape[1] <= 1:
+        n_factors = len(z_list)
+        return torch.zeros(n_factors), torch.ones(n_factors)
     y = counts_to_ratios(
         counts,
         transformation=ratio_transformation,
@@ -250,6 +261,9 @@ def _du_hsic_gp_gene_worker_np(
     """Per-gene worker for SplisosmNP DU test (method='hsic-gp')."""
     if counts.is_sparse:
         counts = counts.to_dense()
+    if counts.shape[1] <= 1:
+        n_factors = len(z_res_list)
+        return torch.zeros(n_factors), torch.ones(n_factors)
     y = counts_to_ratios(
         counts,
         transformation=ratio_transformation,
@@ -276,6 +290,9 @@ def _du_ttest_gene_worker_np(
     """Per-gene worker for SplisosmNP DU test (method='t-fisher'/'t-tippett')."""
     if counts.is_sparse:
         counts = counts.to_dense()
+    if counts.shape[1] <= 1:
+        n_factors = len(groups_list)
+        return np.zeros(n_factors), np.ones(n_factors)
     ratios = counts_to_ratios(
         counts,
         transformation=ratio_transformation,
