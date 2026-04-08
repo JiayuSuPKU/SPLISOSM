@@ -4,7 +4,7 @@ import numpy as np
 import scipy.sparse
 import pandas as pd
 from anndata import AnnData
-from splisosm.utils import run_hsic_gc, extract_counts_n_ratios
+from splisosm.utils import run_hsic_gc
 from splisosm.hyptest_np import (
     SplisosmNP,
     _calc_ttest_differential_usage,
@@ -36,6 +36,41 @@ def get_simulation_data(n_genes=2, n_isos=3, n_spots_per_dim=20):
     )
 
     return data
+
+
+def _make_small_adata(counts_list, coords, design_mtx=None):
+    """Build a minimal AnnData from per-gene (n_spots, n_isos) count tensors."""
+    coords_np = coords.numpy() if hasattr(coords, "numpy") else np.asarray(coords)
+    n_spots = coords_np.shape[0]
+    all_c, gene_ids, iso_names = [], [], []
+    for i, c in enumerate(counts_list):
+        c_np = (
+            c.detach().numpy().astype(np.float32)
+            if hasattr(c, "numpy")
+            else np.asarray(c, dtype=np.float32)
+        )
+        all_c.append(c_np)
+        for j in range(c_np.shape[1]):
+            gene_ids.append(f"gene_{i}")
+            iso_names.append(f"gene_{i}_iso_{j}")
+    X = np.concatenate(all_c, axis=1)
+    var = pd.DataFrame({"gene_symbol": gene_ids}, index=iso_names)
+    if design_mtx is not None:
+        dm = (
+            design_mtx.detach().numpy()
+            if hasattr(design_mtx, "numpy")
+            else np.asarray(design_mtx, dtype=np.float32)
+        )
+        obs = pd.DataFrame(
+            {f"cov_{i+1}": dm[:, i] for i in range(dm.shape[1])},
+            index=[str(i) for i in range(n_spots)],
+        )
+    else:
+        obs = pd.DataFrame(index=[str(i) for i in range(n_spots)])
+    adata = AnnData(X=X, obs=obs, var=var)
+    adata.layers["counts"] = X
+    adata.obsm["spatial"] = coords_np.astype(np.float32)
+    return adata
 
 
 class TestSplisosmNP(unittest.TestCase):
@@ -84,13 +119,20 @@ class TestSplisosmNP(unittest.TestCase):
             {
                 "cov_1": design_np[:, 0],
                 "cov_2": design_np[:, 1],
-            }
+            },
+            index=[str(i) for i in range(design_np.shape[0])],
         )
         self.adata = AnnData(X=adata_counts, obs=adata_obs, var=adata_var)
         self.adata.layers["counts"] = adata_counts
         self.adata.obsm["spatial"] = np.asarray(self.coords).astype(np.float32)
 
         self._is_sparkx_installed = self._test_sparkx_installed()
+
+        # Subsets for tests that only need a few genes
+        g5 = [f"gene_{i}" for i in range(5)]
+        g10 = [f"gene_{i}" for i in range(10)]
+        self.adata_5g = self.adata[:, self.adata.var["gene_symbol"].isin(g5)].copy()
+        self.adata_10g = self.adata[:, self.adata.var["gene_symbol"].isin(g10)].copy()
 
     def _test_sparkx_installed(self):
         try:
@@ -106,16 +148,53 @@ class TestSplisosmNP(unittest.TestCase):
         except Exception:
             return False
 
+    def _make_fragmented_data(self):
+        """Return (data, coords, design_mtx) where the last 2 spots are isolated.
+
+        Main cluster: 8 spots in a tight 0.25-step grid so k-NN (k=4) connects them.
+        Isolated pair: 2 spots placed far away (at coordinate 100, 100 ± 0.01),
+        which will form their own tiny component.
+        """
+        np.random.seed(7)
+        # 8 connected spots on a 0–0.75 grid (0.25 spacing → k-NN links them)
+        grid = np.array(
+            [[i * 0.25, j * 0.25] for i in range(4) for j in range(2)], dtype=np.float32
+        )
+        # 2 isolated spots far away
+        isolated = np.array([[100.0, 100.0], [100.0, 100.01]], dtype=np.float32)
+        coords = np.vstack([grid, isolated])  # (10, 2)
+
+        n_spots = coords.shape[0]
+        n_genes = 5
+        data = [torch.rand(n_spots, 3) for _ in range(n_genes)]
+
+        design_mtx = np.random.randn(n_spots, 2).astype(np.float32)
+        return data, coords, design_mtx
+
+    def _make_fragmented_adata(self):
+        """Return (adata, n_total) built from _make_fragmented_data."""
+        data, coords, design_mtx = self._make_fragmented_data()
+        n_total = coords.shape[0]
+        adata = _make_small_adata(
+            data, torch.from_numpy(coords), torch.from_numpy(design_mtx)
+        )
+        return adata, n_total
+
     def test_setup_data(self):
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         model_str = str(model)
-        self.assertIn("Non-parametric SPLISOSM", model_str)
+        self.assertIn("SplisosmNP", model_str)
 
     def test_calc_ttest_differential_usage(self):
         data = torch.rand(self.n_spots, 2)
@@ -183,7 +262,7 @@ class TestSplisosmNP(unittest.TestCase):
         )
 
         self.assertEqual(model.n_genes, 1)
-        self.assertEqual(model.n_isos, [2])
+        self.assertEqual(model.n_isos_per_gene, [2])
         self.assertEqual(model.gene_names, ["Gene 1"])
 
     def test_setup_data_from_anndata_with_single_covariate_name(self):
@@ -199,14 +278,22 @@ class TestSplisosmNP(unittest.TestCase):
             min_bin_pct=0.0,
         )
 
-        self.assertEqual(model.setup_input_mode, "anndata")
+        self.assertEqual(model._setup_input_mode, "anndata")
         self.assertIs(model.adata, self.adata)
         self.assertEqual(model.n_factors, 1)
         self.assertEqual(model.covariate_names, ["cov_1"])
 
     def test_docstring_example_spatial_variability_workflow(self):
         model = SplisosmNP()
-        model.setup_data(data=self.counts, coordinates=self.coords)
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
         model.test_spatial_variability(method="hsic-ir", print_progress=False)
         sv_results = model.get_formatted_test_results("sv")
 
@@ -218,14 +305,19 @@ class TestSplisosmNP(unittest.TestCase):
     def test_docstring_example_differential_usage_workflow(self):
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         model.test_differential_usage(method="hsic", print_progress=False)
         du_results = model.get_formatted_test_results("du")
 
-        self.assertEqual(len(du_results), self.n_genes * self.design_mtx.shape[1])
+        self.assertEqual(len(du_results), self.n_genes * 2)
         self.assertTrue(
             {"statistic", "pvalue", "pvalue_adj"}.issubset(du_results.columns)
         )
@@ -233,10 +325,15 @@ class TestSplisosmNP(unittest.TestCase):
     def test_spatial_variability(self):
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         for method in ["hsic-gc", "hsic-ir", "hsic-ic", "spark-x"]:
             if method == "spark-x" and not self._is_sparkx_installed:
@@ -249,68 +346,68 @@ class TestSplisosmNP(unittest.TestCase):
                 self.assertIn(method, str(model))
 
     def test_sparse_data_handling(self):
-        # 1. Prepare sparse data using AnnData and extract_counts_n_ratios
         n_spots = self.n_spots
         n_isos_per_gene = [3, 2]
         total_isos = sum(n_isos_per_gene)
 
-        # Create random counts with some zeros
         counts_dense = np.random.randint(0, 5, size=(n_spots, total_isos)).astype(
             np.float32
         )
         counts_dense[counts_dense < 2] = 0
-        # Make it sparse
         counts_sparse = scipy.sparse.csr_matrix(counts_dense)
 
-        # Create var dataframe
         gene_ids = []
         for i, n in enumerate(n_isos_per_gene):
             gene_ids.extend([f"gene_sparse_{i}"] * n)
-        var = pd.DataFrame(
+        var_df = pd.DataFrame(
             {"gene_symbol": gene_ids}, index=[f"iso_{i}" for i in range(total_isos)]
         )
 
-        adata = AnnData(X=counts_sparse, var=var)
-        adata.layers["counts"] = counts_sparse
-
-        # Extract sparse tensors (should return list of sparse torch tensors)
-        data_sparse, _, gene_names, _ = extract_counts_n_ratios(
-            adata, "counts", "gene_symbol", return_sparse=True
-        )
-
-        # Verify inputs are sparse
-        for tensor in data_sparse:
-            self.assertTrue(tensor.is_sparse)
-
-        # 2. Test SplisosmNP with sparse data
+        # Test SplisosmNP with sparse data
         model = SplisosmNP()
+        _adata_sparse = AnnData(
+            X=counts_sparse,
+            obs=self.adata.obs.copy(),
+            var=var_df,
+        )
+        _adata_sparse.layers["counts"] = counts_sparse
+        _adata_sparse.obsm["spatial"] = self.adata.obsm["spatial"].copy()
         model.setup_data(
-            data=data_sparse,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=gene_names,
+            adata=_adata_sparse,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
 
         # Test spatial variability - HSIC-GC (gene counts)
         model.test_spatial_variability(method="hsic-gc", print_progress=False)
-        self.assertTrue(len(model.sv_test_results) > 0)
+        self.assertTrue(len(model._sv_test_results) > 0)
 
         # Test spatial variability - HSIC-IR (isoform ratios, requires densification)
         model.test_spatial_variability(method="hsic-ir", print_progress=False)
-        self.assertTrue(len(model.sv_test_results) > 0)
+        self.assertTrue(len(model._sv_test_results) > 0)
 
         # Test differential usage - HSIC (isoform ratios, requires densification)
         model.test_differential_usage(method="hsic", print_progress=False)
-        self.assertTrue(len(model.du_test_results) > 0)
+        self.assertTrue(len(model._du_test_results) > 0)
 
     def test_hsic_gc(self):
         """Make sure the standalone hsic-gc function works as expected."""
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         # run hsic-gc using the class method
         model.test_spatial_variability(method="hsic-gc")
@@ -318,9 +415,17 @@ class TestSplisosmNP(unittest.TestCase):
 
         # run hsic-gc using the standalone utility function
         counts_g = torch.concat(
-            [_counts.sum(1, keepdim=True) for _counts in self.counts], axis=1
+            [
+                (
+                    _counts.to_dense().sum(1, keepdim=True)
+                    if _counts.is_sparse
+                    else _counts.sum(1, keepdim=True)
+                )
+                for _counts in model._data
+            ],
+            axis=1,
         )  # tensor(n_spots, n_genes)
-        sv_results2 = run_hsic_gc(counts_gene=counts_g, coordinates=model.coordinates)
+        sv_results2 = run_hsic_gc(counts_gene=counts_g, coordinates=model._coordinates)
         # compare the statistics and p-values
         stats1 = sv_results1["statistic"].values
         stats2 = sv_results2["statistic"]
@@ -333,10 +438,15 @@ class TestSplisosmNP(unittest.TestCase):
     def test_differential_usage(self):
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         for method in ["hsic", "hsic-gp"]:
             with self.subTest(method=method):
@@ -345,30 +455,143 @@ class TestSplisosmNP(unittest.TestCase):
                 self.assertGreater(len(du_results), 0)
                 self.assertIn(method, str(model))
 
-    def test_spatial_variability_with_none_transformation(self):
-        """Test spatial variability with no transformation."""
+    def test_extract_feature_summary_gene(self):
+        """extract_feature_summary(level='gene') returns expected shape and columns."""
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
-        model.test_spatial_variability(
-            method="hsic-ir", ratio_transformation="none", print_progress=False
+        df = model.extract_feature_summary(level="gene", print_progress=False)
+        self.assertEqual(len(df), model.n_genes)
+        for col in ("n_isos", "perplexity", "pct_bin_on", "count_avg", "count_std"):
+            self.assertIn(col, df.columns)
+        self.assertTrue((df["count_avg"] >= 0).all())
+        # caching: second call returns same object
+        df2 = model.extract_feature_summary(level="gene", print_progress=False)
+        self.assertIs(df, df2)
+
+    def test_extract_feature_summary_isoform(self):
+        """extract_feature_summary(level='isoform') returns expected shape and columns."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
-        sv_results = model.get_formatted_test_results("sv")
-        self.assertEqual(len(sv_results), self.n_genes)
-        self.assertIn("pvalue", sv_results.columns)
+        df = model.extract_feature_summary(level="isoform", print_progress=False)
+        self.assertEqual(len(df), sum(model.n_isos_per_gene))
+        for col in ("gene_symbol", "ratio_avg", "ratio_std", "ratio_total"):
+            self.assertIn(col, df.columns)
+        self.assertTrue(np.isfinite(df["ratio_avg"].to_numpy()).all())
+        # caching
+        df2 = model.extract_feature_summary(level="isoform", print_progress=False)
+        self.assertIs(df, df2)
+
+    def test_sv_return_results_true(self):
+        """test_spatial_variability(return_results=True) returns the result dict."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        results = model.test_spatial_variability(
+            method="hsic-ir", return_results=True, print_progress=False
+        )
+        self.assertIsNotNone(results)
+        self.assertIn("statistic", results)
+        self.assertIn("pvalue", results)
+        # Should match stored results
+        np.testing.assert_array_equal(
+            results["statistic"], model._sv_test_results["statistic"]
+        )
+
+    def test_with_gene_summary_sv(self):
+        """get_formatted_test_results(with_gene_summary=True) appends gene stats."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        model.test_spatial_variability(method="hsic-ir", print_progress=False)
+        df = model.get_formatted_test_results("sv", with_gene_summary=True)
+        self.assertIn("perplexity", df.columns)
+        self.assertIn("count_avg", df.columns)
+        self.assertEqual(len(df), model.n_genes)
+
+    def test_filtered_adata_property(self):
+        """filtered_adata raises before setup_data, returns AnnData after."""
+        model = SplisosmNP()
+        with self.assertRaises(RuntimeError):
+            _ = model.filtered_adata
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        fa = model.filtered_adata
+        self.assertIsInstance(fa, AnnData)
+
+    def test_str_reflects_test_status(self):
+        """__str__ includes method name after running SV and DU."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        s_before = str(model)
+        self.assertIn("SplisosmNP", s_before)
+
+        model.test_spatial_variability(method="hsic-ir", print_progress=False)
+        s_sv = str(model)
+        self.assertIn("hsic-ir", s_sv)
+
+        model.test_differential_usage(method="hsic", print_progress=False)
+        s_du = str(model)
+        self.assertIn("hsic", s_du)
 
     def test_spatial_variability_with_radial_transformation(self):
         """Test spatial variability with radial ratio transformation."""
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         model.test_spatial_variability(
             method="hsic-ir", ratio_transformation="radial", print_progress=False
@@ -380,10 +603,15 @@ class TestSplisosmNP(unittest.TestCase):
         """Test spatial variability with nan_filling='none' and no transformation."""
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         model.test_spatial_variability(
             method="hsic-ir",
@@ -394,6 +622,95 @@ class TestSplisosmNP(unittest.TestCase):
         sv_results = model.get_formatted_test_results("sv")
         self.assertEqual(len(sv_results), self.n_genes)
 
+    def test_sv_null_methods(self):
+        """All three null methods should run and return valid p-values."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        for null_method in ["eig", "trace", "perm"]:
+            with self.subTest(null_method=null_method):
+                configs = (
+                    {"n_perms_per_gene": 50, "perm_batch_size": 10}
+                    if null_method == "perm"
+                    else {}
+                )
+                model.test_spatial_variability(
+                    method="hsic-ir",
+                    null_method=null_method,
+                    null_configs=configs,
+                    print_progress=False,
+                )
+                res = model._sv_test_results
+                self.assertEqual(res["null_method"], null_method)
+                self.assertEqual(len(res["pvalue"]), self.n_genes)
+                self.assertTrue(np.all(res["pvalue"] >= 0))
+                self.assertTrue(np.all(res["pvalue"] <= 1))
+
+    def test_sv_perm_nan_filling_none(self):
+        """Perm null with nan_filling='none' should use the dense per-gene submatrix path."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        model.test_spatial_variability(
+            method="hsic-ir",
+            nan_filling="none",
+            null_method="perm",
+            null_configs={"n_perms_per_gene": 30, "perm_batch_size": 10},
+            print_progress=False,
+        )
+        res = model._sv_test_results
+        self.assertEqual(len(res["pvalue"]), self.n_genes)
+        self.assertTrue(np.all(res["pvalue"] >= 0))
+        self.assertTrue(np.all(res["pvalue"] <= 1))
+
+    def test_sv_perm_batch_size_config(self):
+        """perm_batch_size in null_configs should be respected."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        for batch_size in [1, 50]:
+            with self.subTest(perm_batch_size=batch_size):
+                model.test_spatial_variability(
+                    method="hsic-gc",
+                    null_method="perm",
+                    null_configs={
+                        "n_perms_per_gene": 50,
+                        "perm_batch_size": batch_size,
+                    },
+                    print_progress=False,
+                )
+                res = model._sv_test_results
+                self.assertEqual(len(res["pvalue"]), self.n_genes)
+                self.assertTrue(np.all(res["pvalue"] >= 0))
+                self.assertTrue(np.all(res["pvalue"] <= 1))
+
     def test_differential_usage_t_fisher(self):
         """Test differential usage with t-fisher method using binary factor."""
         model = SplisosmNP()
@@ -402,10 +719,14 @@ class TestSplisosmNP(unittest.TestCase):
         binary_design[::2, 0] = 1  # Alternate between 0 and 1
 
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
             design_mtx=binary_design,
-            gene_names=self.gene_names,
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         model.test_differential_usage(method="t-fisher", print_progress=False)
         du_results = model.get_formatted_test_results("du")
@@ -420,10 +741,14 @@ class TestSplisosmNP(unittest.TestCase):
         binary_design[::2, 0] = 1  # Alternate between 0 and 1
 
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
             design_mtx=binary_design,
-            gene_names=self.gene_names,
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         model.test_differential_usage(method="t-tippett", print_progress=False)
         du_results = model.get_formatted_test_results("du")
@@ -433,23 +758,33 @@ class TestSplisosmNP(unittest.TestCase):
         """Test unconditional HSIC (method='hsic', no spatial conditioning)."""
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         model.test_differential_usage(method="hsic", print_progress=False)
         du_results = model.get_formatted_test_results("du")
-        self.assertEqual(len(du_results), self.n_genes * self.design_mtx.shape[1])
+        self.assertEqual(len(du_results), self.n_genes * 2)
 
     def test_differential_usage_with_no_transformation(self):
         """Test differential usage without transformation."""
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         model.test_differential_usage(
             method="hsic-gp", ratio_transformation="none", print_progress=False
@@ -461,10 +796,15 @@ class TestSplisosmNP(unittest.TestCase):
         """Test differential usage with return_results=True."""
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
-            gene_names=self.gene_names,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         results = model.test_differential_usage(
             method="hsic", return_results=True, print_progress=False
@@ -477,13 +817,17 @@ class TestSplisosmNP(unittest.TestCase):
         """Test that DataFrame column names are inferred for covariate_names."""
         model = SplisosmNP()
         design_df = pd.DataFrame(
-            self.design_mtx.numpy(), columns=["treatment", "batch"]
+            np.asarray(self.design_mtx), columns=["treatment", "batch"]
         )
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
             design_mtx=design_df,
-            # covariate_names=None (not provided, should be inferred)
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
 
         # Verify covariate names were inferred from DataFrame columns
@@ -498,10 +842,15 @@ class TestSplisosmNP(unittest.TestCase):
         )
         custom_names = ["my_treatment", "my_batch"]
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
             design_mtx=design_df,
             covariate_names=custom_names,
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
 
         # Verify explicit names take priority
@@ -517,41 +866,52 @@ class TestSplisosmNP(unittest.TestCase):
         # Number of covariate names doesn't match design matrix columns
         with self.assertRaises(ValueError) as context:
             model.setup_data(
-                data=self.counts,
-                coordinates=self.coords,
+                adata=self.adata,
+                layer="counts",
+                spatial_key="spatial",
+                group_iso_by="gene_symbol",
                 design_mtx=design_df,
                 covariate_names=["only_one"],
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
             )
 
         self.assertIn("must match", str(context.exception))
 
     def test_design_mtx_sparse_array_conversion(self):
-        """Test that sparse matrices are properly converted to dense."""
+        """Sparse design matrices are stored as scipy CSR (not densified at setup_data time)."""
         import scipy.sparse as sp
 
         model = SplisosmNP()
-        # Convert design matrix to sparse scipy format
-        design_sparse = sp.csr_matrix(self.design_mtx.numpy())
-
+        design_sparse = sp.csr_matrix(np.asarray(self.design_mtx))
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
             design_mtx=design_sparse,
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
-
-        # Verify sparse matrix was converted to torch tensor
-        self.assertIsInstance(model.design_mtx, torch.Tensor)
+        # Sparse design matrices are stored as scipy CSR
+        self.assertTrue(sp.issparse(model.design_mtx))
         self.assertEqual(model.design_mtx.shape, (self.n_spots, 2))
 
     def test_design_mtx_numpy_array_conversion(self):
         """Test numpy array conversion and covariate name generation."""
         model = SplisosmNP()
-        design_np = self.design_mtx.numpy()
 
         model.setup_data(
-            data=self.counts,
-            coordinates=self.coords,
-            design_mtx=design_np,
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=np.asarray(self.design_mtx),
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
 
         # Verify conversion and default name generation
@@ -625,10 +985,15 @@ class TestSplisosmNP(unittest.TestCase):
         """residualize='both' should run without error and return valid p-values."""
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts[:5],
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=np.asarray(self.design_mtx),
             covariate_names=["C1", "C2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         model.test_differential_usage(
             method="hsic-gp",
@@ -650,10 +1015,15 @@ class TestSplisosmNP(unittest.TestCase):
         """gpr_backend='gpytorch' should return valid p-values."""
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts[:5],
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=np.asarray(self.design_mtx),
             covariate_names=["C1", "C2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         model.test_differential_usage(
             method="hsic-gp",
@@ -677,10 +1047,15 @@ class TestSplisosmNP(unittest.TestCase):
 
         model = SplisosmNP()
         model.setup_data(
-            data=self.counts[:10],
-            coordinates=self.coords,
-            design_mtx=self.design_mtx,
+            adata=self.adata_10g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=np.asarray(self.design_mtx),
             covariate_names=["C1", "C2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
         )
         model.test_differential_usage(
             method="hsic-gp",
@@ -702,6 +1077,676 @@ class TestSplisosmNP(unittest.TestCase):
             -np.log10(np.clip(pv_sk, 1e-300, 1)), -np.log10(np.clip(pv_pt, 1e-300, 1))
         )
         self.assertGreater(rho, 0.9, f"Spearman rank correlation={rho:.3f} too low")
+
+    def test_null_methods_agreement(self):
+        """eig, trace and perm null methods should yield broadly similar p-value ranks.
+
+        We run all three methods on the same data and check pairwise Spearman rank
+        correlations on –log10(p).  The two asymptotic methods (eig/trace) should
+        agree tightly (ρ > 0.9); each asymptotic method vs. the permutation null
+        should agree moderately (ρ > 0.6), allowing for the discrete, noisy nature
+        of a permutation p-value with a finite number of permutations.
+        """
+        from scipy.stats import spearmanr
+
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+
+        pvals = {}
+        for null_method in ("eig", "trace", "perm"):
+            null_configs = (
+                {"n_perms_per_gene": 2000, "perm_batch_size": 100}
+                if null_method == "perm"
+                else {}
+            )
+            res = model.test_spatial_variability(
+                method="hsic-ir",
+                null_method=null_method,
+                null_configs=null_configs,
+                print_progress=False,
+                return_results=True,
+            )
+            pvals[null_method] = -np.log10(
+                np.clip(res["pvalue"].astype(np.float64), 1e-300, 1)
+            )
+
+        # Thresholds: asymptotic methods should agree tightly; perm is noisier.
+        thresholds = {
+            ("eig", "trace"): 0.90,
+            ("eig", "perm"): 0.70,
+            ("trace", "perm"): 0.70,
+        }
+        for (m1, m2), thr in thresholds.items():
+            rho, _ = spearmanr(pvals[m1], pvals[m2])
+            with self.subTest(pair=f"{m1}_vs_{m2}"):
+                self.assertGreater(
+                    rho,
+                    thr,
+                    f"Spearman ρ({m1}, {m2}) = {rho:.3f} < {thr} — null methods disagree too much",
+                )
+
+    def test_eig_lowrank_vs_fullrank_agreement(self):
+        """Low-rank eig (approx_rank=20) should give p-value ranks consistent with full-rank eig.
+
+        This is a regression test for the scale-mismatch bug where approx_rank < n_spots
+        caused the test stat (full kernel) and the Liu null (rank-k eigenvalues) to be on
+        incompatible scales, pushing all p-values to 0.
+        """
+        from scipy.stats import spearmanr
+
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+
+        res_full = model.test_spatial_variability(
+            method="hsic-ir",
+            null_method="eig",
+            null_configs={},
+            print_progress=False,
+            return_results=True,
+        )
+        res_lowrank = model.test_spatial_variability(
+            method="hsic-ir",
+            null_method="eig",
+            null_configs={"approx_rank": 20},
+            print_progress=False,
+            return_results=True,
+        )
+
+        pv_full = res_full["pvalue"]
+        pv_lowrank = res_lowrank["pvalue"]
+
+        # Regression: low-rank must NOT produce all-zero p-values
+        self.assertFalse(
+            np.all(pv_lowrank == 0.0),
+            "Low-rank eig produced all p-values == 0 (scale-mismatch bug regression)",
+        )
+
+        # Rank correlation should be high
+        rho, _ = spearmanr(
+            -np.log10(np.clip(pv_full, 1e-300, 1)),
+            -np.log10(np.clip(pv_lowrank, 1e-300, 1)),
+        )
+        self.assertGreater(
+            rho,
+            0.85,
+            f"Spearman ρ(full-rank, low-rank eig) = {rho:.3f} — approximation too inaccurate",
+        )
+
+    def test_init_kernel_hyperparams(self):
+        """k_neighbors, rho, standardize_cov passed to __init__ should be used in setup_data."""
+        model_custom = SplisosmNP(k_neighbors=6, rho=0.5, standardize_cov=False)
+        self.assertEqual(model_custom._k_neighbors, 6)
+        self.assertAlmostEqual(model_custom._rho, 0.5)
+        self.assertFalse(model_custom._standardize_cov)
+
+        model_default = SplisosmNP()
+        self.assertEqual(model_default._k_neighbors, 4)
+        self.assertAlmostEqual(model_default._rho, 0.99)
+        self.assertTrue(model_default._standardize_cov)
+
+        # After setup_data both models work end-to-end
+        model_custom.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        model_default.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+
+        # Custom vs default kernel should differ (rho=0.5 vs 0.99 changes eigenvalue spread)
+        import torch
+
+        trace_custom = torch.trace(model_custom.sp_kernel.realization()).item()
+        trace_default = torch.trace(model_default.sp_kernel.realization()).item()
+        self.assertNotAlmostEqual(
+            trace_custom,
+            trace_default,
+            places=3,
+            msg="Custom kernel hyperparams had no effect — not wired through",
+        )
+
+    # ── min_component_size tests ──────────────────────────────────────────────
+
+    def test_min_component_size_warning_and_filtering(self):
+        """Spots in small components are removed and a UserWarning is issued."""
+        import warnings as _warnings
+
+        frag_adata, n_total = self._make_fragmented_adata()
+        n_isolated = 2
+
+        model = SplisosmNP()
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            model.setup_data(
+                adata=frag_adata,
+                layer="counts",
+                spatial_key="spatial",
+                group_iso_by="gene_symbol",
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
+                min_component_size=3,
+            )
+
+        user_warns = [w for w in caught if issubclass(w.category, UserWarning)]
+        self.assertTrue(len(user_warns) > 0, "Expected at least one UserWarning")
+        warning_text = str(user_warns[0].message)
+        self.assertIn(str(n_isolated), warning_text)
+        self.assertEqual(model.n_spots, n_total - n_isolated)
+        self.assertEqual(model._coordinates.shape[0], n_total - n_isolated)
+        for g in model._data:
+            self.assertEqual(g.shape[0], n_total - n_isolated)
+
+    def test_min_component_size_design_mtx_filtered(self):
+        """design_mtx rows are filtered together with spots."""
+        import warnings as _warnings
+
+        frag_adata, n_total = self._make_fragmented_adata()
+        n_kept = n_total - 2
+
+        model = SplisosmNP()
+        with _warnings.catch_warnings(record=True):
+            _warnings.simplefilter("always")
+            model.setup_data(
+                adata=frag_adata,
+                layer="counts",
+                spatial_key="spatial",
+                group_iso_by="gene_symbol",
+                design_mtx=["cov_1", "cov_2"],
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
+                min_component_size=3,
+            )
+        self.assertEqual(model.design_mtx.shape[0], n_kept)
+
+    def test_min_component_size_1_is_noop(self):
+        """min_component_size=1 (default) keeps all spots, no warning."""
+        import warnings as _warnings
+
+        frag_adata, n_total = self._make_fragmented_adata()
+
+        model = SplisosmNP()
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", UserWarning)
+            try:
+                model.setup_data(
+                    adata=frag_adata,
+                    layer="counts",
+                    spatial_key="spatial",
+                    group_iso_by="gene_symbol",
+                    min_counts=0,
+                    min_bin_pct=0.0,
+                    filter_single_iso_genes=False,
+                    min_component_size=1,
+                )
+            except UserWarning:
+                self.fail("min_component_size=1 should not issue a UserWarning")
+        self.assertEqual(model.n_spots, n_total)
+
+    def test_min_component_size_all_removed_raises(self):
+        """Raise ValueError when every spot is in a too-small component."""
+        coords = np.array([[0.0, 0.0], [100.0, 100.0]], dtype=np.float32)
+        X = np.ones((2, 2), dtype=np.float32)
+        var = pd.DataFrame({"gene_symbol": ["g", "g"]}, index=["g_0", "g_1"])
+        obs = pd.DataFrame(index=["s0", "s1"])
+        tiny_adata = AnnData(X=X, obs=obs, var=var)
+        tiny_adata.layers["counts"] = X
+        tiny_adata.obsm["spatial"] = coords
+        model = SplisosmNP()
+        with self.assertRaises(ValueError):
+            model.setup_data(
+                adata=tiny_adata,
+                layer="counts",
+                spatial_key="spatial",
+                group_iso_by="gene_symbol",
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
+                min_component_size=2,
+            )
+
+    def test_calc_ttest_sparse_groups_matches_dense(self):
+        """Sparse groups column produces identical results to the dense path."""
+        np.random.seed(7)
+        n_spots = 80
+        n_isos = 3
+        data = torch.from_numpy(np.random.rand(n_spots, n_isos).astype(np.float32))
+        # Binary 0/1 group vector: first half = 0, second half = 1
+        groups_dense = torch.tensor([0] * (n_spots // 2) + [1] * (n_spots // 2))
+        # Sparse equivalent: (n, 1) CSR with nonzeros at group-1 positions
+        g1_indices = np.where(groups_dense.numpy() == 1)[0]
+        groups_sparse = scipy.sparse.csr_matrix(
+            (
+                np.ones(len(g1_indices), dtype=np.float32),
+                (g1_indices, np.zeros(len(g1_indices), dtype=int)),
+            ),
+            shape=(n_spots, 1),
+        )
+
+        stats_dense, pval_dense = _calc_ttest_differential_usage(data, groups_dense)
+        stats_sparse, pval_sparse = _calc_ttest_differential_usage(data, groups_sparse)
+
+        self.assertAlmostEqual(float(stats_dense), float(stats_sparse), places=5)
+        self.assertAlmostEqual(float(pval_dense), float(pval_sparse), places=5)
+
+    def test_linear_hsic_sparse_X_matches_dense(self):
+        """linear_hsic_test with sparse X gives same result as dense X."""
+        from splisosm.kernel_gpr import linear_hsic_test
+
+        np.random.seed(42)
+        n, p, q = 100, 2, 4
+        # Dense continuous X
+        X_np = np.random.randn(n, p).astype(np.float32)
+        Y = torch.from_numpy(np.random.randn(n, q).astype(np.float32))
+        X_dense = torch.from_numpy(X_np)
+        # Sparse version of the same X
+        X_sparse = scipy.sparse.csr_matrix(X_np)
+
+        hsic_dense, pval_dense = linear_hsic_test(X_dense, Y, centering=True)
+        hsic_sparse, pval_sparse = linear_hsic_test(X_sparse, Y, centering=True)
+
+        self.assertAlmostEqual(hsic_dense, hsic_sparse, places=4)
+        self.assertAlmostEqual(pval_dense, pval_sparse, places=4)
+
+    def test_differential_usage_sparse_design_matrix(self):
+        """All four DU methods work with a sparse design matrix.
+
+        Uses a binary 0/1 numeric covariate (n_factors=1) so the t-test
+        methods have exactly two groups and the result shapes are predictable.
+
+        For the three deterministic methods (t-fisher, t-tippett, hsic) sparse
+        and dense design matrices must produce identical p-values.  hsic-gp
+        always densifies the design column internally via _get_design_col
+        (GPR residuals are always dense), so only a validity check is done
+        for that method.
+        """
+        adata = AnnData(
+            X=self.adata.X,
+            obs=self.adata.obs.copy(),
+            var=self.adata.var,
+        )
+        adata.layers["counts"] = self.adata.layers["counts"].copy()
+        adata.obsm["spatial"] = self.adata.obsm["spatial"].copy()
+        # Numeric binary covariate (not categorical) → single design column → n_factors=1.
+        # Alternating 0/1 gives balanced groups for the t-test.
+        n_obs = len(adata.obs)
+        adata.obs["group"] = np.tile([0.0, 1.0], n_obs // 2 + 1)[:n_obs].astype(
+            np.float32
+        )
+
+        def _run(method, sparse_mtx):
+            np.random.seed(0)
+            torch.manual_seed(0)
+            model = SplisosmNP()
+            model.setup_data(
+                adata=adata,
+                spatial_key="spatial",
+                layer="counts",
+                group_iso_by="gene_symbol",
+                design_mtx=["group"],
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
+            )
+            if sparse_mtx:
+                # Force design_mtx to scipy sparse CSR to exercise the sparse path
+                model.design_mtx = scipy.sparse.csr_matrix(model.design_mtx.numpy())
+            model.test_differential_usage(method=method, print_progress=False)
+            return model._du_test_results
+
+        n_genes = self.n_genes
+        n_factors = 1  # single binary covariate
+
+        # ── validity: all four methods run without error and return legal p-values ──
+        for method in ["t-fisher", "t-tippett", "hsic", "hsic-gp"]:
+            with self.subTest(method=method, check="validity"):
+                res = _run(method, sparse_mtx=True)
+                self.assertIn("pvalue", res)
+                pvals = res["pvalue"]
+                self.assertEqual(
+                    pvals.shape,
+                    (n_genes, n_factors),
+                    f"{method} sparse: unexpected p-value shape",
+                )
+                self.assertTrue(
+                    np.all((pvals >= 0) & (pvals <= 1)),
+                    f"{method} sparse: p-values outside [0, 1]",
+                )
+
+        # ── consistency: deterministic methods must match their dense counterpart ──
+        # hsic-gp is excluded: _get_design_col densifies the design column before
+        # GPR fitting, so the sparse vs dense comparison is trivially identical;
+        # checking it would only add expensive GPR fitting time.
+        for method in ["t-fisher", "t-tippett", "hsic"]:
+            with self.subTest(method=method, check="sparse==dense"):
+                res_dense = _run(method, sparse_mtx=False)
+                res_sparse = _run(method, sparse_mtx=True)
+                np.testing.assert_allclose(
+                    res_dense["pvalue"],
+                    res_sparse["pvalue"],
+                    rtol=1e-4,
+                    atol=1e-6,
+                    err_msg=f"{method}: dense vs sparse p-values differ",
+                )
+
+
+class TestParallelNP(unittest.TestCase):
+    """Verify that joblib parallelism in SplisosmNP produces identical results to sequential."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Build a shared small dataset (5 genes, 10×10 grid, 2 covariates)."""
+        torch.manual_seed(123)
+        np.random.seed(123)
+        n_spots_per_dim = 10
+        n_genes, n_isos = 5, 3
+        mtc, var = 10, 0.3
+        n_spots = n_spots_per_dim**2
+        X_spot = torch.randn(n_spots, 2)
+        data = simulate_isoform_counts(
+            n_genes=n_genes,
+            grid_size=(n_spots_per_dim, n_spots_per_dim),
+            n_isos=n_isos,
+            total_counts_expected=mtc,
+            var_sp=var,
+            var_nsp=var,
+            rho=0.99,
+            design_mtx=X_spot,
+            beta_true=torch.ones(2, n_isos - 1),
+            return_params=False,
+        )
+        counts_list = [data["counts"][i] for i in range(n_genes)]
+        cls.adata = _make_small_adata(counts_list, data["coords"], X_spot)
+        cls.n_genes = n_genes
+
+        # Binary covariate for t-test methods
+        binary_design = torch.zeros(n_spots, 1)
+        binary_design[::2, 0] = 1
+        cls.adata_binary = _make_small_adata(counts_list, data["coords"], binary_design)
+
+    def _setup_model(self, adata, design_cols=None):
+        """Create and setup a fresh SplisosmNP model."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            design_mtx=design_cols,
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        return model
+
+    # ------------------------------------------------------------------
+    # Spatial variability: n_jobs=1 vs n_jobs=2
+    # ------------------------------------------------------------------
+
+    def test_sv_parallel_eig_hsic_ir(self):
+        """SV with hsic-ir + eig null: n_jobs=1 and n_jobs=2 give identical results."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            model.test_spatial_variability(
+                method="hsic-ir", null_method="eig", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model._sv_test_results
+            else:
+                np.testing.assert_allclose(
+                    model._sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="SV statistic differs between n_jobs=1 and n_jobs=2",
+                )
+                np.testing.assert_allclose(
+                    model._sv_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="SV pvalue differs between n_jobs=1 and n_jobs=2",
+                )
+
+    def test_sv_parallel_trace_null(self):
+        """SV with hsic-ir + trace null: parallel results are identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            model.test_spatial_variability(
+                method="hsic-ir",
+                null_method="trace",
+                n_jobs=n_jobs,
+                print_progress=False,
+            )
+            if n_jobs == 1:
+                ref = model._sv_test_results
+            else:
+                np.testing.assert_allclose(
+                    model._sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                )
+                np.testing.assert_allclose(
+                    model._sv_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                )
+
+    def test_sv_parallel_perm_null(self):
+        """SV with hsic-ir + perm null: parallel results are identical (fixed seed)."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            model.test_spatial_variability(
+                method="hsic-ir",
+                null_method="perm",
+                null_configs={"n_perms_per_gene": 30, "perm_batch_size": 10},
+                n_jobs=n_jobs,
+                print_progress=False,
+            )
+            if n_jobs == 1:
+                ref = model._sv_test_results
+            else:
+                # Perm stats should still match (deterministic per-gene body)
+                np.testing.assert_allclose(
+                    model._sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                )
+
+    def test_sv_parallel_hsic_ic(self):
+        """SV with hsic-ic method: parallel results are identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            model.test_spatial_variability(
+                method="hsic-ic", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model._sv_test_results
+            else:
+                np.testing.assert_allclose(
+                    model._sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                )
+                np.testing.assert_allclose(
+                    model._sv_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                )
+
+    def test_sv_parallel_hsic_gc(self):
+        """SV with hsic-gc method: parallel results are identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            model.test_spatial_variability(
+                method="hsic-gc", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model._sv_test_results
+            else:
+                np.testing.assert_allclose(
+                    model._sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                )
+                np.testing.assert_allclose(
+                    model._sv_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                )
+
+    def test_sv_parallel_nan_filling_none(self):
+        """SV with nan_filling='none' (per-gene kernel path): parallel identical."""
+        import warnings
+
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                model.test_spatial_variability(
+                    method="hsic-ir",
+                    nan_filling="none",
+                    n_jobs=n_jobs,
+                    print_progress=False,
+                )
+            if n_jobs == 1:
+                ref = model._sv_test_results
+            else:
+                np.testing.assert_allclose(
+                    model._sv_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                )
+                np.testing.assert_allclose(
+                    model._sv_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                )
+
+    # ------------------------------------------------------------------
+    # Differential usage: n_jobs=1 vs n_jobs=2
+    # ------------------------------------------------------------------
+
+    def test_du_parallel_hsic(self):
+        """DU with method='hsic': parallel results are identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata, design_cols=["cov_1", "cov_2"])
+            model.test_differential_usage(
+                method="hsic", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model._du_test_results
+            else:
+                np.testing.assert_allclose(
+                    model._du_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="DU hsic statistic differs",
+                )
+                np.testing.assert_allclose(
+                    model._du_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="DU hsic pvalue differs",
+                )
+
+    def test_du_parallel_hsic_gp(self):
+        """DU with method='hsic-gp' (sklearn backend): parallel results are identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata, design_cols=["cov_1", "cov_2"])
+            model.test_differential_usage(
+                method="hsic-gp",
+                gpr_backend="sklearn",
+                n_jobs=n_jobs,
+                print_progress=False,
+            )
+            if n_jobs == 1:
+                ref = model._du_test_results
+            else:
+                np.testing.assert_allclose(
+                    model._du_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="DU hsic-gp statistic differs",
+                )
+                np.testing.assert_allclose(
+                    model._du_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="DU hsic-gp pvalue differs",
+                )
+
+    def test_du_parallel_t_fisher(self):
+        """DU with method='t-fisher' (binary covariate): parallel identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata_binary, design_cols=["cov_1"])
+            model.test_differential_usage(
+                method="t-fisher", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model._du_test_results
+            else:
+                np.testing.assert_allclose(
+                    model._du_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="DU t-fisher statistic differs",
+                )
+                np.testing.assert_allclose(
+                    model._du_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="DU t-fisher pvalue differs",
+                )
+
+    def test_du_parallel_t_tippett(self):
+        """DU with method='t-tippett' (binary covariate): parallel identical."""
+        for n_jobs in [1, 2]:
+            model = self._setup_model(self.adata_binary, design_cols=["cov_1"])
+            model.test_differential_usage(
+                method="t-tippett", n_jobs=n_jobs, print_progress=False
+            )
+            if n_jobs == 1:
+                ref = model._du_test_results
+            else:
+                np.testing.assert_allclose(
+                    model._du_test_results["statistic"],
+                    ref["statistic"],
+                    atol=1e-6,
+                    err_msg="DU t-tippett statistic differs",
+                )
+                np.testing.assert_allclose(
+                    model._du_test_results["pvalue"],
+                    ref["pvalue"],
+                    atol=1e-6,
+                    err_msg="DU t-tippett pvalue differs",
+                )
 
 
 if __name__ == "__main__":

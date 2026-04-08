@@ -10,6 +10,7 @@ Welcome
    installation
    quickstart
    txquant
+   methods
    faq
 
 .. toctree::
@@ -28,7 +29,7 @@ Welcome
    refs
 
 `SPLISOSM (SPatiaL ISOform Statistical Modeling) <https://github.com/JiayuSuPKU/splisosm>`_ is a Python package
-for analyzing RNA isoform patterns in spatial transcriptomics (ST) data. It employs multivariate kernel association tests to detect (i) *spatial variability* in
+for analyzing RNA processing patterns in spatial transcriptomics (ST) data. It employs multivariate kernel association tests to detect (i) *spatial variability* in
 isoform usage across spatial locations, and (ii) *differential association* between isoform usage and spatial covariates such as region annotation and RNA binding protein (RBP) expression.
 
 .. image:: ../img/splisosm_overview.png
@@ -43,7 +44,7 @@ contain sufficient isoform-level information for spatial pattern discovery. Thes
 
 - Full-length isoform from long-read data
 - Transcript 3' end diversity (TREND) event from short-read data
-- Exon/junction probe (codeword) usage from imaging-based in situ data
+- Exon/junction probe usage from targeted sequencing and/or imaging-based in situ data
 
 .. list-table::
    :header-rows: 1
@@ -71,7 +72,7 @@ contain sufficient isoform-level information for spatial pattern discovery. Thes
   SPLISOSM does not perform isoform quantification itself. See the :doc:`Feature Quantification page <txquant>` for guidance on preparing input data for different platforms.
 
 Unlike conventional gene-centric spatial analysis, SPLISOSM focuses on patterns of RNA processing (e.g., alternative splicing, alternative polyadenylation) manifested at the isoform level.
-Given isoform quantifications, SPLISOSM supports two types of statistical analyses:
+Given feature quantification, SPLISOSM supports two types of statistical analyses:
 
 - **Spatial variability (SV)**: Detect spatially variable transcript usage (*HSIC-IR*), transcript expression (*HSIC-IC*) or gene expression (*HSIC-GC*). Genes are termed *spatially variably processed (SVP)* if their HSIC-IR test results are significant; Genes are termed *spatially variably expressed (SVE)* if their HSIC-GC test results are significant.
 - **Differential isoform usage (DU)**: Test the *conditional* association between transcript usage and spatial covariates, such as spatial domains and expression of potential regulators like RBPs.
@@ -83,11 +84,12 @@ Given isoform quantifications, SPLISOSM supports two types of statistical analys
 
 Building on the `Hilbert-Schmidt Independence Criterion (HSIC) <https://www.gatsby.ucl.ac.uk/~gretton/papers/GreBouSmoSch05.pdf>`_ framework for kernel-based association testing, 
 SPLISOSM achieves provably higher statistical power in sparse data while delivering well-calibrated, permutation-free p-values. 
-For methodological details, please refer to the self-contained Supplementary Notes of the `SPLISOSM paper <https://www.nature.com/articles/s41587-025-02965-6>`_.
 
 .. image:: ../img/splisosm_method.jpg
    :alt: Method
    :width: 800
+
+For methodological details, please check out the :doc:`Methods page <methods>` and/or the self-contained Supplementary Notes of the `SPLISOSM paper <https://www.nature.com/articles/s41587-025-02965-6>`_.
 
 Reference
 ---------

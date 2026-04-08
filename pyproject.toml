@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "splisosm"
-version = "1.0.4"
+version = "1.1.0"
 description = "Spatial isoform statistical modeling (SPLISOSM)"
 authors = [
   {name = "Jiayu Su"}
@@ -20,7 +20,7 @@ dependencies = [
     "torch",
     "scipy",
     "tqdm",
-    "smoother-omics>=1.1.0",
+    "scikit-learn",
     "matplotlib",
     "anndata"
 ]
@@ -30,10 +30,14 @@ dev = [
     "scanpy[leiden]",
     "plotnine", # for plotting
     "pyro-ppl", # for Dirichlet Multinomial likelihood
-    "scikit-bio >= 0.5.9", # for ratio transformation. might have compatibility issues with numpy, installing using conda?
+    "scikit-bio >= 0.6", # for ratio transformation.
     "jupyterlab",
+    "ipykernel",
+    "ipywidgets",
     "pytest",
     "pytest-cov",
+    "black",
+    "ruff",
 ]
 sdata = [
     "spatialdata",
@@ -43,6 +47,15 @@ sdata = [
 gp = [
     "gpytorch",
     "linear-operator"
+]
+docs = [
+    "sphinx",
+    "jupyterlab",
+    "sphinx-book-theme",
+    "sphinxcontrib-bibtex",
+    "sphinx-autoapi",
+    "myst-nb",
+    "myst-sphinx-gallery"
 ]
 
 [project.urls]

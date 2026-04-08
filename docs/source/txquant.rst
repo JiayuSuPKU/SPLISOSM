@@ -39,23 +39,29 @@ Expected data format
 
 SPLISOSM expects isoform-level data in an ``AnnData`` of shape ``(n_spots, n_isoforms)``:
 
-- ``adata.layers['counts']``: raw isoform counts.
-- ``adata.var``: isoform metadata with at least:
-
-  - ``gene_symbol/gene_id``: gene assignment for each isoform.
-  - A unique feature identifier in ``adata.var_names`` (e.g., transcript ID, peak ID, codeword ID).
+- ``.layers[<layer>]``: raw isoform counts.
+- ``.var``: isoform metadata with at least a ``<group_iso_by>`` column for gene assignment.
 
 - Spatial coordinates in one of:
 
-  - ``adata.obsm['spatial']``: preferred; a ``(n_spots, 2)`` array with ``[x (col), y (row)]`` columns, compatible with Scanpy/Squidpy conventions.
-  - ``adata.obs[['array_row', 'array_col']]``: legacy pixel-coordinate format.
+  - ``.obsm[<spatial_key>]``: a ``(n_spots, n_dim)`` array with 2/3/more columns. Scanpy/Squidpy conventions are ``'spatial'``.
+  - ``.obsp[<adj_key>]``: a custom ``(n_spots, n_spots)`` adjacency matrix (e.g., ``'connectivities'`` from calling ``scanpy.pp.neighbors``).
 
   See :func:`splisosm.utils.prepare_inputs_from_anndata` for parsing details.
 
 The spot-by-isoform ``AnnData`` can also be a table of a ``SpatialData`` object, which is the required input format for :class:`splisosm.SplisosmFFT` (FFT-accelerated tests). 
 In such cases, we rely on `spatialdata.rasterize_bins <https://spatialdata.scverse.org/en/latest/api/operations.html#spatialdata.rasterize_bins>`_ to 
 rasterize counts into square bins (i.e., padding unobserved spots with zeros) to improve memory efficiency and computation speed. 
-See :func:`splisosm.SplisosmFFT.setup_data` for details.
+The minimum required structure of the ``SpatialData`` object is as follows:
+
+- ``sdata.shapes[<bins>]``: a ``GeoDataFrame`` of ``n_bins`` elements containing the geometry of each bin (e.g., square polygons).
+- ``sdata.tables[<table_name>]``: an ``AnnData`` of shape ``(n_bins, n_isoforms)`` with 
+
+  - ``.layers[<layer>]``: raw isoform counts
+  - ``.var``: isoform metadata with at least a ``<group_iso_by>`` column for gene assignment.
+  - ``.obs``: bin metadata with ``[<row_key>, <col_key>]`` for row and column indices (e.g., ``'array_row'``, ``'array_col'``) used during rasterization.
+  - ``.uns['spatialdata_attrs']``: a dictionary with keys ``spatial_key``, ``row_key``, and ``col_key`` indicating the spatial mapping information of bins. See the `SpatialData documentation <https://spatialdata.scverse.org/en/stable/tutorials/notebooks/notebooks/examples/tables.html#table-metadata-annotation-targets>`_.
+
 
 Long-read ST data
 -----------------
@@ -70,14 +76,14 @@ Tested platforms:
 - 10x Visium + ONT (SiT :cite:`lebrigand2023spatial`)
 - 10x Visium HD + ONT (the EPI2ME dataset)
 
-:doc:`Visium HD ONT tutorial <tutorials/visiumhd_ont>` shows an example workflow of loading preprocessed ONT + Visium HD data and running SPLISOSM. 
+:doc:`The Visium HD ONT tutorial <tutorials/visiumhd_ont>` shows how to load a preprocessed ONT + Visium HD dataset and run SPLISOSM. 
 The dataset is publicly accessible and can be downloaded from `EPI2ME <https://epi2me.nanoporetech.com/visium_hd_2025.06/>`_. 
 Transcript assignment and quantification were performed using ``minimap2``, ``Stringtie``, and ``FLAMES``. See the `EPI2ME workflow documentation <https://epi2me.nanoporetech.com/epi2me-docs/workflows/wf-single-cell/#transcript-assignment>`_ for details.
 The generated ``SpatialData`` object has the following structure (example):
 
 .. code-block:: text
 
-  SpatialData object, with associated Zarr store: /Users/jysumac/Projects/SPLISOSM_paper/data/visiumhd_ont_mouse_cbs/sdata_tx.filtered.zarr
+  SpatialData object
   ├── Images
   │     ├── '_hires_image': DataArray[cyx] (3, 3000, 3200)
   │     └── '_lowres_image': DataArray[cyx] (3, 563, 600)
@@ -101,11 +107,12 @@ The generated ``SpatialData`` object has the following structure (example):
 Short-read 3' end ST data
 --------------------------
 
-Use `Sierra <https://github.com/VCCRI/Sierra/>`__ to call 3' end diversity (TREND) events *de novo* from Space Ranger BAM files. See the `Sierra vignette <https://github.com/VCCRI/Sierra/wiki/Sierra-Vignette>`_ for installation and usage details.
+We recommend using `Sierra <https://github.com/VCCRI/Sierra/>`__ to call 3' end diversity (TREND) events *de novo* from Space Ranger BAM files. 
+See the `Sierra vignette <https://github.com/VCCRI/Sierra/wiki/Sierra-Vignette>`_ for installation and usage details.
 
 Tested platforms: 
 
-- 10x Visium (fresh-frozen)
+- 10x Visium 3' (fresh-frozen)
 - Slide-seqV2
 - 10x Visium HD 3' (fresh-frozen)
 
@@ -113,13 +120,20 @@ Tested platforms:
    When processing multiple samples, avoid Sierra's ``MergePeakCoordinates`` function — it can produce overlapping peak definitions.
 
 .. note::
-  There is a known issue with running Sierra's ``CountPeaks`` on Visium HD 3\' data. See the workaround workflow below and under 
-  `scripts/visiumhd_3p_trend_quant.sh <https://github.com/JiayuSuPKU/SPLISOSM/blob/main/scripts/visiumhd_3p_trend_quant.sh>`_ for details.
+  If you encounter issues when running Sierra's ``CountPeaks``, the following workaround quantification workflow may be helpful:
 
 Visium HD 3' data (custom quantification)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-For 10x Visium HD 3' data, we recommend running a hybrid workflow:
+For 10x Visium HD 3' data, we have prepared a hybrid quantification workflow where Sierra is used for peak calling but not counting.
+See the attached bash script (`scripts/visiumhd_3p_trend_quant.sh <https://github.com/JiayuSuPKU/SPLISOSM/blob/main/scripts/visiumhd_3p_trend_quant.sh>`_).
+
+.. raw:: html
+
+   <details>
+   <summary><strong>Step-by-step workflow explained (click to expand)</strong></summary>
+   <br>
+
 
 0. Run ``spaceranger count`` (>=v4.0) with ``create-bam=true`` to get the BAM file.
 1. Run Sierra ``FindPeaks`` (plus ``AnnotatePeaksFromGTF``) on the Space Ranger BAM.
@@ -128,12 +142,15 @@ For 10x Visium HD 3' data, we recommend running a hybrid workflow:
 4. Build a 10x-compatible feature-barcode matrix and save as ``raw_probe_bc_matrix.h5`` under the output directory ``outs/binned_outputs/square_002um``.
 5. Load peak-level data into ``SpatialData`` with :func:`splisosm.io.load_visiumhd_probe`.
 
-An end-to-end implementation of the above quantification workflow is available in ``scripts/visiumhd_3p_trend_quant.bash`` under the 
-`scripts directory <https://github.com/JiayuSuPKU/SPLISOSM/tree/main/scripts>`_. The generated ``SpatialData`` object has the following structure (example):
+.. raw:: html
+
+   </details>
+
+The generated ``SpatialData`` object has the following structure (example):
 
 .. code-block:: text
 
-  SpatialData object, with associated Zarr store: /Users/jysumac/Projects/SPLISOSM_paper/data/visiumhd_3p_mouse_cbs/sdata_peak.filtered.zarr
+  SpatialData object
   ├── Images
   │     ├── '_hires_image': DataArray[cyx] (3, 5492, 6000)
   │     └── '_lowres_image': DataArray[cyx] (3, 549, 600)
@@ -157,8 +174,14 @@ An end-to-end implementation of the above quantification workflow is available i
 
 For downstream analysis of TREND spatial patterns, see the :doc:`Visium HD 3' tutorial <tutorials/visiumhd_3prime>`.
 
-Running Sierra on Space Ranger BAM (10x Visium etc.)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Visium/Slide-seqV2 3' data (Sierra quantification)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. raw:: html
+
+   <details>
+   <summary><strong>Running Sierra on Space Ranger BAM (click to expand)</strong></summary>
+   <br>
 
 .. code-block:: r
 
@@ -183,15 +206,22 @@ Running Sierra on Space Ranger BAM (10x Visium etc.)
      output.dir = '${output_dir}',
    )
 
+.. raw:: html
 
-Converting Sierra output to AnnData
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   </details>
+
+
+.. raw:: html
+
+   <details>
+   <summary><strong>Converting Sierra output to AnnData (click to expand)</strong></summary>
+   <br>
 
 .. code-block:: python
 
     import scanpy as sc
     import pandas as pd
-    from splisosm.utils import load_visium_sp_meta
+    from splisosm.io import load_visium_sp_meta
 
     sierra_out_dir = "path/to/sierra/output"  # 'output.dir' in CountPeaks
     sp_meta_dir = "path/to/visium/spatial/metadata"  # 'spatial' directory in 10X Visium data
@@ -225,7 +255,20 @@ Converting Sierra output to AnnData
     adata = load_visium_sp_meta(adata, f"{sp_meta_dir}/", library_id='adata_peak')
     adata = adata[adata.obs['in_tissue'].astype(bool), :].copy()
 
+
+.. raw:: html
+
+   </details>
+
+
+.. raw:: html
+
+   <details>
+   <summary><strong>Custom AnnData filtering (click to expand)</strong></summary>
+   <br>
+
 SPLISOSM compares all events associated with the same gene and is agnostic to their specific structure. Filter out low-abundance features before testing to reduce computation and improve power.
+
 
 .. code-block:: python
 
@@ -273,6 +316,10 @@ SPLISOSM compares all events associated with the same gene and is agnostic to th
     print(f"Number of genes after QC: {sum(_gene_keep)}")
     print(f"Number of peaks after QC: {sum(_iso_keep)}")
     print(f"Average number of peaks per gene after QC: {sum(_iso_keep) / sum(_gene_keep)}")
+
+.. raw:: html
+
+   </details>
 
 
 Short-read targeted ST data
@@ -356,9 +403,8 @@ Given Xenium Ranger output, the following code creates a binned ``SpatialData`` 
 
    sdata = load_xenium_codeword(
      path=xenium_ranger_outs,
-     spatial_resolutions=[8.0, 16.0],
+     spatial_resolutions=[8.0, 16.0], # None or [] if you only want segmented cell-level data
      quality_threshold=20.0,
-     n_jobs=-1,
      chunk_batch_size=64,
      counts_layer_name="counts",
      build_cell_codeword_table=True,

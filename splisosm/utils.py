@@ -3,20 +3,19 @@
 from __future__ import annotations
 
 import warnings
-import json
 from typing import Any, Optional, Literal
+from scipy.stats import norm as _norm_dist
+from scipy.sparse.csgraph import connected_components as _connected_components
 
-from pathlib import Path
 import numpy as np
 from numpy.typing import ArrayLike
 import scipy.sparse
 from tqdm import tqdm
 import pandas as pd
 import torch
-from matplotlib.image import imread
 from anndata import AnnData
-from smoother import SpatialWeightMatrix, SpatialLoss
 from splisosm.likelihood import liu_sf
+from splisosm.io import load_visium_sp_meta  # noqa: F401 — backward compat
 
 __all__ = [
     "get_cov_sp",
@@ -24,29 +23,69 @@ __all__ = [
     "false_discovery_control",
     "load_visium_sp_meta",
     "prepare_inputs_from_anndata",
+    "add_ratio_layer",
     "extract_counts_n_ratios",
+    "compute_feature_summaries",
     "extract_gene_level_statistics",
     "run_sparkx",
     "run_hsic_gc",
 ]
 
 
+def _index_rows_sparse_coo(t: torch.Tensor, keep_indices: np.ndarray) -> torch.Tensor:
+    """Row-index a 2-D sparse COO tensor without densifying.
+
+    Operates entirely on the stored indices and values so memory usage is
+    proportional to the number of retained non-zeros, not to ``n × m``.
+
+    Parameters
+    ----------
+    t : torch.Tensor
+        Sparse COO tensor of shape ``(n, m)``.  Need not be coalesced.
+    keep_indices : np.ndarray
+        1-D integer array of row positions to retain, in ascending order
+        (as returned by ``np.where(mask)[0]``).
+
+    Returns
+    -------
+    torch.Tensor
+        Sparse COO tensor of shape ``(len(keep_indices), m)`` with the same
+        dtype as *t*.
+    """
+    t = t.coalesce()
+    n = t.shape[0]
+
+    # Build old_row → new_row lookup (-1 means the row is dropped)
+    row_map = torch.full((n,), -1, dtype=torch.long)
+    keep_t = torch.from_numpy(keep_indices.astype(np.int64))
+    row_map[keep_t] = torch.arange(len(keep_indices), dtype=torch.long)
+
+    row_idx = t.indices()[0]  # (nnz,)
+    new_rows = row_map[row_idx]
+    mask = new_rows >= 0  # entries that survive
+
+    new_indices = torch.stack([new_rows[mask], t.indices()[1][mask]])
+    new_values = t.values()[mask]
+    new_size = torch.Size([len(keep_indices), t.shape[1]])
+
+    return torch.sparse_coo_tensor(new_indices, new_values, new_size, dtype=t.dtype)
+
+
 def get_cov_sp(
     coords: np.ndarray | torch.Tensor, k: int = 4, rho: float = 0.99
 ) -> torch.Tensor:
-    """Wrapper function to get the spatial covariance matrix from spatial coordinates.
+    """Return the dense standardised CAR spatial covariance matrix.
 
-    It will first construct a mutual-k-nearest neighbor graph from the euclidean spatial coordinates,
-    then convert the adjacency matrix to a standardized spatial covariance matrix using the
-    intrinsic conditional autoregressive (ICAR) model with spatial autocorrelation coefficient rho.
-    See :cite:`su2023smoother` for details.
+    Constructs a k-mutual-nearest-neighbour graph from *coords*, builds the
+    CAR precision matrix M = I - rho * D^{-1/2} W_sym D^{-1/2}, and
+    returns K = M⁻¹ with unit marginal variance.
 
     Parameters
     ----------
     coords
         Shape (n_spots, n_dims). Euclidean spatial coordinates of spots.
     k
-        Number of nearest neighbors.
+        Number of mutual nearest neighbors.
     rho
         Spatial autocorrelation coefficient.
 
@@ -55,34 +94,43 @@ def get_cov_sp(
     cov_sp : torch.Tensor
         Shape (n_spots, n_spots). Spatial covariance matrix with standardized variance (== 1).
     """
-    # first calculate the spatial weights matrix (swm)
-    # here swm is the binary adjacency matrix of the knn graph
-    weights = SpatialWeightMatrix()
-    weights.calc_weights_knn(coords, k=k, verbose=False)
+    from splisosm.kernel import SpatialCovKernel
 
-    # # convert the swm to spatial covariance matrix with standardized variance (== 1)
-    # spatial_loss = SpatialLoss("icar", weights, rho=rho, standardize_cov=True)
-    # cov_sp = torch.cholesky_inverse(torch.linalg.cholesky(spatial_loss.inv_cov[0].to_dense())) # n_spots x n_spots
-    spatial_loss = SpatialLoss("icar", weights, rho=rho, standardize_cov=False)
-    cov_sp = torch.cholesky_inverse(
-        torch.linalg.cholesky(spatial_loss.inv_cov[0].to_dense())
-    )  # n_spots x n_spots
-    inv_sds = torch.diagflat(torch.diagonal(cov_sp) ** (-0.5))
-    cov_sp = inv_sds @ cov_sp @ inv_sds
-
-    return cov_sp
+    return SpatialCovKernel.from_coordinates(
+        coords, k_neighbors=k, rho=rho, standardize_cov=True, centering=False
+    ).realization()
 
 
 def counts_to_ratios(
     counts: np.ndarray | torch.Tensor,
     transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
     nan_filling: Literal["mean", "none"] = "mean",
+    fill_before_transform: Optional[bool] = None,
 ) -> torch.Tensor:
     """Convert isoform counts to proportions.
 
-    By default, isoform ratios at zero-coverage spots are filled with the mean ratio per isoform across all spots.
-    After conversion, the isoform ratios can be further transformed using log-ratio-based transformations
-    (clr, ilr, alr) or radial transformation :cite:`park2022kernel`.
+    Spots with zero total counts ("zero-coverage spots") are handled according to
+    ``nan_filling`` and ``fill_before_transform``.  When ``nan_filling='mean'`` the
+    zero-coverage rows are replaced with the per-isoform mean of the remaining rows.
+    The timing of this fill relative to the ratio transformation is controlled by
+    ``fill_before_transform``:
+
+    * ``False`` (**new default**): zero-coverage rows are filled with the column-wise
+      mean of the **transformed** values (i.e. after the ratio transform is applied).
+      For log-ratio transforms (clr, ilr, alr) this means pseudocount-filled rows are
+      replaced with the mean of the true transformed values.
+    * ``True`` (**old behaviour**): zero-coverage rows are filled with the mean of the
+      raw isoform ratios **before** the transformation is applied.  For log-ratio
+      transforms the pseudocount-based rows are kept as-is (no explicit fill).
+
+    .. note::
+        **Behaviour change since v1.1.0:** the default filling now happens *after*
+        transformation.  Code that relied on the previous before-transform fill
+        should pass ``fill_before_transform=True`` explicitly.  Passing
+        ``fill_before_transform=False`` adopts the new default without a warning.
+
+    After conversion, the isoform ratios can be further transformed using log-ratio-based
+    transformations (clr, ilr, alr) or radial transformation :cite:`park2022kernel`.
 
     Parameters
     ----------
@@ -97,8 +145,17 @@ def counts_to_ratios(
         ``'radial'``: radial transformation :cite:`park2022kernel`.
     nan_filling
         Method to fill all-zero rows.
-        ``'mean'``: fill all-zero rows with the mean of the mean per column **before transformation**.
+        ``'mean'``: fill all-zero rows with the per-isoform mean across expressed spots
+        (timing controlled by ``fill_before_transform``).
         ``'none'``: do not fill rows and return NaNs at all-zero rows.
+    fill_before_transform
+        Controls when zero-coverage rows are mean-filled relative to the ratio
+        transformation.  Only relevant when ``nan_filling='mean'`` and
+        ``transformation != 'none'``.
+        ``False``: fill **after** transformation (new default).
+        ``True``: fill **before** transformation (old behaviour).
+        ``None`` (default): use the new default (``False``) and emit a
+        :class:`FutureWarning` to inform callers of the behaviour change.
 
     Returns
     -------
@@ -120,11 +177,30 @@ def counts_to_ratios(
             )  # for ratio transformation
         except ImportError:
             warnings.warn(
-                f"Please install scikit-bio to use ratio transformation='{transformation}'. Switching to 'none'."
+                f"Please install scikit-bio to use ratio transformation='{transformation}'. Switching to 'none'.",
+                UserWarning,
+                stacklevel=2,
             )
             transformation = "none"
 
     assert nan_filling in ["mean", "none"]
+
+    # Resolve fill timing; warn when the new default differs from old behaviour.
+    if fill_before_transform is None:
+        if nan_filling == "mean" and transformation != "none":
+            warnings.warn(
+                "The default NaN-filling timing for `counts_to_ratios` has changed: "
+                "zero-coverage spots are now filled with the per-isoform mean "
+                "**after** the ratio transformation (previously filled before). "
+                "Pass `fill_before_transform=False` to silence this warning and "
+                "use the new default, or `fill_before_transform=True` to restore "
+                "the previous behaviour.",
+                FutureWarning,
+                stacklevel=2,
+            )
+        _fill_before = False
+    else:
+        _fill_before = fill_before_transform
 
     if isinstance(counts, np.ndarray):
         counts = torch.from_numpy(counts).float()
@@ -134,14 +210,20 @@ def counts_to_ratios(
 
     # calculate isoform ratios
     if transformation in ["clr", "ilr", "alr"]:
-        # add pseudocounts equal to 1% of the global mean per isoform to avoid zeros in the ratio
+        # add pseudocounts equal to 1% of the global mean per isoform to avoid zeros
         y = (1 - 1e-2) * counts + 1e-2 * counts.mean(0, keepdim=True)
-        y = y / y.sum(1, keepdim=True)  # isoform ratio without nans and zeros
+        y = y / y.sum(1, keepdim=True)
+        if nan_filling == "mean" and _fill_before:
+            # old behaviour: replace pseudocount-filled rows with the mean of
+            # the raw (pre-pseudocount) ratios of expressed spots
+            _raw = counts / counts.sum(1, keepdim=True)
+            if (~is_nan).any():
+                y[is_nan] = _raw[~is_nan].mean(0, keepdim=True)
     else:
-        y = counts / counts.sum(1, keepdim=True)  # isoform ratio with nans
-        # fill nan values with the mean ratio per column (isoform)
-        if nan_filling == "mean":
-            y[is_nan] = y[~is_nan].mean(0, keepdim=True)
+        y = counts / counts.sum(1, keepdim=True)  # NaN where is_nan
+        if nan_filling == "mean" and _fill_before:
+            if (~is_nan).any():
+                y[is_nan] = y[~is_nan].mean(0, keepdim=True)
 
     # apply transformation
     if transformation == "clr":
@@ -151,10 +233,13 @@ def counts_to_ratios(
     elif transformation == "alr":
         y = torch.from_numpy(alr(y)).float()  # (n_spots, n_isos - 1)
     elif transformation == "radial":
-        y = y / y.norm(dim=1, keepdim=True)  # radial transformation with nans
+        y = y / y.norm(dim=1, keepdim=True)  # NaN rows stay NaN
 
-    # fill back nan to rows with zero counts if needed
-    if nan_filling == "none":
+    # post-transform fill (new default) or explicit NaN restore
+    if nan_filling == "mean" and not _fill_before:
+        if is_nan.any() and (~is_nan).any():
+            y[is_nan] = y[~is_nan].mean(0, keepdim=True)
+    elif nan_filling == "none":
         y[is_nan] = torch.nan
 
     return y
@@ -204,7 +289,11 @@ def false_discovery_control(
 
     # Handle NaNs
     if np.isnan(ps).any():
-        warnings.warn("NaNs encountered in p-values. These will be ignored.")
+        warnings.warn(
+            "NaNs encountered in p-values. These will be ignored.",
+            UserWarning,
+            stacklevel=2,
+        )
         # ignore NaNs in the p-values
         ps_in_range = np.issubdtype(ps.dtype, np.number) and np.all(
             ps[~np.isnan(ps)] == np.clip(ps[~np.isnan(ps)], 0, 1)
@@ -268,91 +357,6 @@ def false_discovery_control(
     return np.clip(ps, 0, 1)
 
 
-# Similar to scanpy.read_visium
-# https://github.com/scverse/scanpy/blob/main/scanpy/readwrite.py#L356-L512
-def load_visium_sp_meta(
-    adata: AnnData, path_to_spatial: str | Path, library_id: Optional[str] = None
-) -> AnnData:
-    """Helper function to load Visium spatial metadata.
-
-    Parameters
-    ----------
-    adata
-        Annotated data matrix to store the spatial metadata.
-    path_to_spatial
-        Path to the `spatial` folder generated by Space Ranger.
-    library_id
-        Library ID of the spatial data.
-
-    Returns
-    -------
-    anndata : anndata.AnnData
-        AnnData with spatial metadata.
-    """
-    if library_id is None:  # default library_id
-        library_id = "library_id"
-
-    adata.uns["spatial"] = dict()
-    adata.uns["spatial"][library_id] = dict()
-
-    path = Path(path_to_spatial)
-    tissue_positions_file = (
-        path / "tissue_positions.csv"
-        if (path / "tissue_positions.csv").exists()
-        else path / "tissue_positions_list.csv"
-    )
-
-    files = dict(
-        tissue_positions_file=tissue_positions_file,
-        scalefactors_json_file=path / "scalefactors_json.json",
-        hires_image=path / "tissue_hires_image.png",
-        lowres_image=path / "tissue_lowres_image.png",
-    )
-
-    # load images
-    adata.uns["spatial"][library_id]["images"] = dict()
-    for res in ["hires", "lowres"]:
-        try:
-            adata.uns["spatial"][library_id]["images"][res] = imread(
-                str(files[f"{res}_image"])
-            )
-        except Exception:
-            warnings.warn(
-                f"Missing '{res}' image in {path_to_spatial}. Will be ignored."
-            )
-            adata.uns["spatial"][library_id]["images"][res] = None
-
-    # read json scalefactors
-    with open(files["scalefactors_json_file"]) as f:
-        adata.uns["spatial"][library_id]["scalefactors"] = json.load(f)
-
-    # read coordinates
-    positions = pd.read_csv(
-        files["tissue_positions_file"],
-        header=0,
-        index_col=0,
-    )
-    positions.columns = [
-        "in_tissue",
-        "array_row",
-        "array_col",
-        "pxl_col_in_fullres",
-        "pxl_row_in_fullres",
-    ]
-
-    # add coordinates to spot metadata
-    adata.obs = adata.obs.join(positions, how="left")
-    adata.obsm["spatial"] = adata.obs[
-        ["pxl_row_in_fullres", "pxl_col_in_fullres"]
-    ].to_numpy()
-    adata.obs.drop(
-        columns=["pxl_row_in_fullres", "pxl_col_in_fullres"],
-        inplace=True,
-    )
-
-    return adata
-
-
 def _process_design_mtx(
     adata: AnnData,
     design_mtx: Optional[Any],
@@ -395,7 +399,7 @@ def _process_design_mtx(
 
     Returns
     -------
-    resolved_design : np.ndarray | None
+    resolved_design : numpy.ndarray | scipy.sparse.spmatrix | None
         Design matrix of shape ``(n_spots, n_factors)``, dtype float32.
         Returns ``None`` if ``design_mtx`` is ``None``.
     resolved_covariates : list[str] | None
@@ -482,8 +486,8 @@ def _process_design_mtx(
             resolved_design = design_mtx.cpu().numpy().astype(np.float32)
             resolved_cov_names = None
         elif scipy.sparse.issparse(design_mtx):
-            # Convert sparse matrix to dense
-            resolved_design = design_mtx.toarray().astype(np.float32)
+            # Convert sparse matrix to csr format
+            resolved_design = design_mtx.tocsr().astype(np.float32)
             resolved_cov_names = None
         elif isinstance(design_mtx, np.ndarray):
             resolved_design = design_mtx.astype(np.float32)
@@ -493,6 +497,10 @@ def _process_design_mtx(
                 f"Unsupported design_mtx type: {type(design_mtx)}. "
                 "Expected array-like, DataFrame, tensor, or sparse matrix."
             )
+
+    # Reshape 1-D arrays/tensors to 2-D column vectors
+    if not scipy.sparse.issparse(resolved_design) and np.ndim(resolved_design) == 1:
+        resolved_design = resolved_design.reshape(-1, 1)
 
     # Validate shapes
     n_spots = adata.n_obs
@@ -523,18 +531,24 @@ def prepare_inputs_from_anndata(
     layer: str,
     group_iso_by: str,
     spatial_key: str,
-    min_counts: int,
-    min_bin_pct: float,
-    filter_single_iso_genes: bool,
-    gene_names: Optional[str],
-    design_mtx: Optional[Any],
-    covariate_names: Optional[list[str]],
+    adj_key: Optional[str] = None,
+    min_counts: int = 0,
+    min_bin_pct: float = 0,
+    filter_single_iso_genes: bool = False,
+    gene_names: Optional[str] = None,
+    design_mtx: Optional[Any] = None,
+    covariate_names: Optional[list[str]] = None,
+    min_component_size: int = 1,
+    k_neighbors: int = 4,
+    return_filtered_anndata: bool = False,
 ) -> tuple[
     list[torch.Tensor],
     torch.Tensor,
     list[str],
     Optional[Any],
     Optional[list[str]],
+    "scipy.sparse.spmatrix | None",
+    "AnnData | None",
 ]:
     """Extract and filter isoform count tensors from an AnnData object.
 
@@ -553,6 +567,11 @@ def prepare_inputs_from_anndata(
         Column in ``adata.var`` used to group isoforms by gene.
     spatial_key
         Key in ``adata.obsm`` for spatial coordinates.
+    adj_key
+        Key in ``adata.obsp`` for a pre-built adjacency matrix.
+        When provided, it overrides the k-NN graph construction
+        from coordinates and be used directly to build the spatial kernel.
+        The adjacency matrix is symmetrized internally before returned.
     min_counts
         Minimum total isoform count across spots required to retain an isoform.
     min_bin_pct
@@ -571,6 +590,22 @@ def prepare_inputs_from_anndata(
     covariate_names
         Explicit covariate names.  When ``design_mtx`` is given as column
         name(s) and this is ``None``, the column names are used automatically.
+    min_component_size
+        Minimum number of spots a connected component must contain to be
+        retained.  Spots in smaller components are removed from all arrays
+        (counts, coordinates, design matrix).  Requires building a k-NN
+        graph from coordinates (unless ``adj_key`` is provided).
+        Default 1 disables filtering.  Emits ``UserWarning`` when spots
+        are removed.
+    k_neighbors
+        Number of nearest neighbours for the k-NN graph when
+        ``adj_key`` is ``None`` and component filtering is active.
+        Default 4.
+    return_filtered_anndata
+        If ``True``, return a copy of ``adata`` restricted to the spots and
+        isoforms that survived all filtering steps, with columns ordered to
+        match ``counts_list``.  Default ``False`` returns ``None`` as the
+        seventh element.
 
     Returns
     -------
@@ -586,6 +621,23 @@ def prepare_inputs_from_anndata(
         array-like; ``None`` when ``design_mtx`` is ``None``.
     resolved_covariates : list[str] or None
         Resolved covariate names, or ``None`` when ``design_mtx`` is ``None``.
+    adj_matrix : scipy.sparse.spmatrix or None
+        The (possibly filtered) adjacency matrix to use for building the
+        spatial kernel.  This is:
+
+        * ``adata.obsp[adj_key]`` (filtered to retained spots) when
+          ``adj_key`` is provided, or
+        * the k-NN adjacency built from coordinates (filtered) when
+          ``min_component_size > 1`` and filtering removed spots, or
+        * ``None`` otherwise (caller should build k-NN inside
+          :class:`~splisosm.kernel.SpatialCovKernel`).
+    filtered_adata : anndata.AnnData
+        A copy of ``adata`` restricted to the spots and isoforms that survived
+        all filtering steps (component filtering + min_counts / min_bin_pct /
+        single-isoform-gene filtering).  Columns are ordered to match the
+        concatenation order of isoforms across genes in ``counts_list``.
+        This is useful for computing per-feature summary statistics without
+        re-running the filtering logic.
 
     Raises
     ------
@@ -599,8 +651,6 @@ def prepare_inputs_from_anndata(
         raise ValueError(f"Layer `{layer}` was not found in `adata.layers`.")
     if group_iso_by not in adata.var.columns:
         raise ValueError(f"`{group_iso_by}` was not found in `adata.var`.")
-    if spatial_key not in adata.obsm:
-        raise ValueError(f"`{spatial_key}` was not found in `adata.obsm`.")
     if min_counts < 0:
         raise ValueError("`min_counts` must be >= 0.")
     if min_bin_pct < 0 or min_bin_pct > 100:
@@ -609,32 +659,145 @@ def prepare_inputs_from_anndata(
         raise ValueError(
             "In AnnData mode, `gene_names` must be a var-column name (str) or None."
         )
+    if not isinstance(min_component_size, int) or min_component_size < 1:
+        raise ValueError("`min_component_size` must be an integer >= 1.")
+    if hasattr(design_mtx, "shape") and design_mtx.shape[0] != adata.n_obs:
+        raise ValueError(
+            f"Design matrix row count ({design_mtx.shape[0]}) "
+            f"must match number of spots ({adata.n_obs})."
+        )
+    if spatial_key not in adata.obsm:
+        raise ValueError(f"`{spatial_key}` was not found in `adata.obsm`.")
 
+    # Extract spatial coordinates
+    coordinates = adata.obsm[spatial_key]
+    coordinates = torch.as_tensor(np.asarray(coordinates), dtype=torch.float32)
+    if coordinates.dim() != 2:
+        raise ValueError("Coordinates in `adata.obsm[spatial_key]` must be a 2D array.")
+
+    # Load/build adjacency and filter disconnected components if needed
+    _adj_out: Optional[scipy.sparse.spmatrix] = None
+
+    # Load adj from adata.obsp if adj_key is provided
+    if adj_key is not None:
+        if adj_key not in adata.obsp:
+            raise ValueError(f"`adj_key` '{adj_key}' was not found in `adata.obsp`.")
+        _adj_raw = adata.obsp[adj_key]
+        _adj_out = (
+            _adj_raw.tocsc()
+            if scipy.sparse.issparse(_adj_raw)
+            else scipy.sparse.csc_matrix(_adj_raw)
+        )
+
+        # Symmetrize the adjacency matrix if it's not already symmetric
+        if not (_adj_out != _adj_out.T).nnz == 0:
+            _adj_out = (_adj_out + _adj_out.T) / 2
+            warnings.warn(
+                "Provided adjacency matrix is not symmetric; symmetrising by averaging with its transpose.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    elif min_component_size > 1:
+        # Build k-NN graph from coordinates for component filtering
+        from splisosm.kernel import _build_adj_from_coords
+
+        _adj_out = _build_adj_from_coords(
+            coordinates, k_neighbors=k_neighbors, mutual_neighbors=True
+        ).tocsc()
+
+    # Spot-level filtering
+    if min_component_size > 1:
+        # Count connected components
+        _, _labels = _connected_components(_adj_out, directed=False)
+        _comp_sizes = np.bincount(_labels)
+        _keep_mask = _comp_sizes[_labels] >= min_component_size
+        _n_removed = int((~_keep_mask).sum())
+
+        # filter out spots in small components from adata, coords, adj, and design_mtx
+        if _n_removed > 0:
+            _n_remaining = int(_keep_mask.sum())
+            if _n_remaining == 0:
+                raise ValueError(
+                    "No spots remained after filtering small graph components. "
+                    "Lower `min_component_size` or check your coordinate/adjacency matrix."
+                )
+            adata = adata[
+                _keep_mask, :
+            ].copy()  # filter adata to keep only the retained spots
+            coordinates = adata.obsm[spatial_key] if coordinates is not None else None
+            _adj_out = _adj_out[_keep_mask][:, _keep_mask].tocsc()
+
+            # Filter design matrix if provided as array-like
+            if design_mtx is not None:
+                if isinstance(design_mtx, pd.DataFrame):
+                    design_mtx = design_mtx.iloc[_keep_mask].copy()
+                elif isinstance(design_mtx, torch.Tensor):
+                    design_mtx = design_mtx[_keep_mask].clone()
+                elif scipy.sparse.issparse(design_mtx):
+                    design_mtx = design_mtx.tocsr()[_keep_mask].copy()
+                elif isinstance(design_mtx, np.ndarray):
+                    design_mtx = design_mtx[_keep_mask, :].copy()
+
+            warnings.warn(
+                f"Removed {_n_removed} spot(s) belonging to graph components "
+                f"with fewer than {min_component_size} member(s). "
+                f"{_n_remaining} spot(s) remain.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    # Feature-level filtering
     iso_counts = adata.layers[layer]
     min_bin_frac = float(min_bin_pct)
     if min_bin_frac > 1.0:
         min_bin_frac /= 100.0
 
-    total_counts = np.asarray(iso_counts.sum(axis=0)).ravel()
-    if hasattr(iso_counts, "toarray"):
-        bin_pct = np.asarray((iso_counts > 0).sum(axis=0)).ravel() / adata.n_obs
-    else:
-        bin_pct = np.count_nonzero(np.asarray(iso_counts) > 0, axis=0) / adata.n_obs
+    is_sparse_input = scipy.sparse.issparse(iso_counts)
 
-    var_df = adata.var.copy()
-    var_df["__iso_name__"] = adata.var_names.astype(str)
+    # Normalise sparse format to CSR/CSC once, upfront — avoids repeated conversions.
+    if is_sparse_input and not (
+        scipy.sparse.isspmatrix_csr(iso_counts)
+        or scipy.sparse.isspmatrix_csc(iso_counts)
+    ):
+        iso_counts = iso_counts.tocsr()
+
+    # Compute per-isoform stats efficiently.
+    total_counts = np.asarray(iso_counts.sum(axis=0)).ravel()
+    if is_sparse_input:
+        # getnnz reads directly from the sparse internal arrays — no intermediate
+        # boolean matrix compared to (iso_counts > 0).sum(axis=0).
+        bin_pct = iso_counts.getnnz(axis=0).astype(np.float64) / adata.n_obs
+    else:
+        counts_arr_for_stats = np.asarray(iso_counts)
+        bin_pct = np.count_nonzero(counts_arr_for_stats, axis=0) / adata.n_obs
+
+    # Copy only the columns needed from adata.var — avoids duplicating potentially
+    # hundreds of annotation columns that are irrelevant here.
+    needed_var_cols = [group_iso_by]
+    if gene_names is not None:
+        if gene_names not in adata.var.columns:
+            raise ValueError(
+                f"`gene_names` column `{gene_names}` was not found in `adata.var`."
+            )
+        if gene_names != group_iso_by:
+            needed_var_cols.append(gene_names)
+
+    # var_df index == adata.var_names (isoform names)
+    var_df = adata.var[needed_var_cols].copy()
     var_df["__total_counts__"] = total_counts
     var_df["__bin_pct__"] = bin_pct
 
+    # Remove isoforms that do not meet the count and bin percentage thresholds.
     var_df = var_df[
         (var_df["__total_counts__"] >= min_counts)
         & (var_df["__bin_pct__"] >= min_bin_frac)
     ]
     if var_df.shape[0] == 0:
         raise ValueError(
-            "No isoforms remained after applying `min_counts`/`min_bin_pct` filtering."
+            "No features remained after applying `min_counts`/`min_bin_pct` filtering."
         )
 
+    # Remove genes with fewer than 2 isoforms if requested.
     if filter_single_iso_genes:
         n_iso_per_gene = var_df.groupby(group_iso_by, observed=True).size()
         keep_genes = n_iso_per_gene[n_iso_per_gene >= 2].index
@@ -642,52 +805,73 @@ def prepare_inputs_from_anndata(
         if var_df.shape[0] == 0:
             raise ValueError("No genes with >=2 isoforms remained after filtering.")
 
-    is_sparse_input = scipy.sparse.issparse(iso_counts)
-    if (
-        is_sparse_input
-        and not scipy.sparse.isspmatrix_csr(iso_counts)
-        and not scipy.sparse.isspmatrix_csc(iso_counts)
-    ):
-        iso_counts = iso_counts.tocsr()
-
-    iso_name_to_col = {name: i for i, name in enumerate(adata.var_names)}
-
-    counts_list: list[torch.Tensor] = []
-    grouped_genes: list[str] = []
-    for gene_id, group in var_df.groupby(group_iso_by, observed=True, sort=False):
-        iso_indices = [iso_name_to_col[name] for name in group["__iso_name__"]]
-        if is_sparse_input:
-            _counts_coo = iso_counts[:, iso_indices].tocoo()
-            _i = torch.LongTensor(np.vstack((_counts_coo.row, _counts_coo.col)))
-            _v = torch.FloatTensor(_counts_coo.data)
-            _counts = torch.sparse_coo_tensor(_i, _v, torch.Size(_counts_coo.shape))
-        else:
-            _counts_np = np.asarray(iso_counts[:, iso_indices], dtype=np.float32)
-            _counts = torch.from_numpy(_counts_np)
-        counts_list.append(_counts)
-        grouped_genes.append(gene_id)
-
-    if len(counts_list) == 0:
+    # Prepare per-gene spot-by-isoform count tensors.
+    # We also resolve gene display names here to avoid a second groupby call.
+    iso_groups = list(var_df.groupby(group_iso_by, observed=True, sort=False))
+    if len(iso_groups) == 0:
         raise ValueError("No genes remained after extracting isoform counts.")
 
-    if gene_names is not None:
-        if gene_names not in adata.var.columns:
-            raise ValueError(
-                f"`gene_names` column `{gene_names}` was not found in `adata.var`."
-            )
-        gene_name_map = var_df.groupby(group_iso_by, observed=True)[gene_names].first()
-        resolved_gene_names = [str(gene_name_map.loc[_g]) for _g in grouped_genes]
-    else:
-        resolved_gene_names = [str(_g) for _g in grouped_genes]
+    all_iso_names_flat: list[str] = []
+    gene_slice_offsets: list[tuple[int, int]] = []
+    grouped_genes: list[str] = []
+    resolved_gene_names: list[str] = []
+    pos = 0
+    for gene_id, group in iso_groups:
+        # group.index contains the isoform names for this gene (== adata.var_names subset)
+        iso_names = group.index.astype(str).tolist()
+        all_iso_names_flat.extend(iso_names)
+        gene_slice_offsets.append((pos, pos + len(iso_names)))
+        pos += len(iso_names)
+        grouped_genes.append(str(gene_id))
+        resolved_gene_names.append(
+            str(group[gene_names].iloc[0]) if gene_names is not None else str(gene_id)
+        )
 
-    coordinates = adata.obsm[spatial_key]
-    coordinates = torch.as_tensor(np.asarray(coordinates), dtype=torch.float32)
-    if coordinates.dim() != 2:
-        raise ValueError("Coordinates in `adata.obsm[spatial_key]` must be a 2D array.")
+    # Vectorised column-index lookup. This is much faster than a Python dict
+    # comprehension loop for large var_df
+    var_index = pd.Index(adata.var_names)
+    all_iso_indices = var_index.get_indexer(all_iso_names_flat)
+    if (all_iso_indices < 0).any():
+        missing = [n for n, idx in zip(all_iso_names_flat, all_iso_indices) if idx < 0]
+        raise ValueError(
+            f"Could not locate {len(missing)} isoform name(s) in adata.var_names "
+            f"(first few: {missing[:5]}). This indicates an internal inconsistency."
+        )
+
+    # Single upfront column slice + one format conversion
+    if is_sparse_input:
+        # Build a CSC sub-matrix (fast per-gene column access) in float32.
+        sub_csc = iso_counts[:, all_iso_indices].tocsc().astype(np.float32, copy=False)
+    else:
+        # One contiguous float32 copy; per-gene views share this memory (no per-gene copy).
+        sub_arr = np.ascontiguousarray(iso_counts[:, all_iso_indices], dtype=np.float32)
+        sub_tensor = torch.from_numpy(sub_arr)  # zero-copy
+
+    # Per-gene extraction: fast positional slices from the small sub-matrix
+    counts_list: list[torch.Tensor] = []
+    for (_, _group), (start, end) in zip(iso_groups, gene_slice_offsets):
+        if is_sparse_input:
+            _coo = sub_csc[:, start:end].tocoo()
+            # torch.from_numpy avoids an extra copy vs torch.LongTensor/FloatTensor
+            _i = torch.from_numpy(
+                np.vstack((_coo.row, _coo.col)).astype(np.int64, copy=False)
+            )
+            _v = torch.from_numpy(_coo.data)  # already float32
+            with torch.sparse.check_sparse_tensor_invariants(False):
+                _counts = torch.sparse_coo_tensor(_i, _v, torch.Size(_coo.shape))
+        else:
+            _counts = sub_tensor[:, start:end]  # zero-copy view
+        counts_list.append(_counts)
 
     # Process design matrix (handles column extraction, categorical encoding, etc.)
     resolved_design, resolved_covariates = _process_design_mtx(
         adata, design_mtx, covariate_names
+    )
+
+    # Optionally build filtered adata: spots retained after component filtering, isoforms
+    # in the same order as all_iso_names_flat (matches counts_list gene/iso ordering).
+    filtered_adata = (
+        adata[:, all_iso_names_flat].copy() if return_filtered_anndata else None
     )
 
     return (
@@ -696,7 +880,115 @@ def prepare_inputs_from_anndata(
         resolved_gene_names,
         resolved_design,
         resolved_covariates,
+        _adj_out,
+        filtered_adata,
     )
+
+
+def add_ratio_layer(
+    adata: AnnData,
+    layer: str,
+    group_iso_by: str,
+    ratio_layer_key: str,
+    fill_nan_with_mean: bool = False,
+) -> None:
+    """Compute within-gene isoform usage ratios and store them as a new layer.
+
+    For each spot and gene, every isoform's ratio is its count divided by the
+    total count of that gene at that spot.  The result is written to
+    ``adata.layers[ratio_layer_key]`` **in-place**.
+
+    Parameters
+    ----------
+    adata
+        Annotated data matrix.
+    layer
+        Key in ``adata.layers`` containing raw isoform counts.
+    group_iso_by
+        Column in ``adata.var`` grouping isoforms to genes.
+    ratio_layer_key
+        Key under which to store the computed ratio matrix.  Must differ
+        from *layer*.
+    fill_nan_with_mean : bool, optional
+        How to handle spots where the gene has zero total counts.
+
+        * ``False`` (default): store as a **sparse CSR matrix** with the same
+          sparsity structure as the count layer.  Spots with zero gene total
+          have ratio 0 for all isoforms of that gene (structural zeros, not
+          stored explicitly).
+        * ``True``: store as a dense float32 matrix; spots with zero gene
+          total are filled with the per-isoform mean ratio across expressed
+          spots (or 0.0 if no spot expresses the isoform).
+
+    Raises
+    ------
+    ValueError
+        If *layer* is missing, *group_iso_by* is not a ``var`` column, or
+        *ratio_layer_key* equals *layer*.
+    """
+    if layer not in adata.layers:
+        raise ValueError(f"Layer '{layer}' not found in adata.layers.")
+    if group_iso_by not in adata.var.columns:
+        raise ValueError(f"'{group_iso_by}' not found in adata.var.")
+    if ratio_layer_key == layer:
+        raise ValueError("`ratio_layer_key` must differ from `layer`.")
+
+    iso_counts = adata.layers[layer]
+    is_sparse = scipy.sparse.issparse(iso_counts)
+    n_isos = adata.n_vars
+
+    # Map each isoform to its gene index (stable sort preserves var order)
+    gene_labels = adata.var[group_iso_by].values
+    _, gene_idx = np.unique(gene_labels, return_inverse=True)  # (n_isos,)
+    n_genes = int(gene_idx.max()) + 1 if n_isos > 0 else 0
+
+    # Summation matrix S[i, g] = 1 iff isoform i belongs to gene g
+    # shape (n_isos, n_genes) — used to aggregate isoforms to gene totals
+    S = scipy.sparse.csc_matrix(
+        (np.ones(n_isos, dtype=np.float32), (np.arange(n_isos), gene_idx)),
+        shape=(n_isos, n_genes),
+    )
+
+    if is_sparse:
+        _csr = (
+            iso_counts
+            if scipy.sparse.isspmatrix_csr(iso_counts)
+            else iso_counts.tocsr()
+        )
+        _csr = _csr.astype(np.float32, copy=False)
+        gene_totals = (_csr @ S).toarray()  # (n_spots, n_genes)
+    else:
+        counts_dense = np.asarray(iso_counts, dtype=np.float32)
+        # S.T: (n_genes, n_isos) sparse; counts_dense.T: (n_isos, n_spots) dense
+        # scipy handles sparse @ dense → dense ndarray
+        gene_totals = np.asarray((S.T @ counts_dense.T).T)  # (n_spots, n_genes)
+
+    # Expand gene totals back to per-isoform denominators
+    gene_sum_per_iso = gene_totals[:, gene_idx]  # (n_spots, n_isos)
+
+    if fill_nan_with_mean:
+        # Dense output: safe division, NaN → per-isoform column mean (or 0)
+        counts_dense = _csr.toarray() if is_sparse else counts_dense
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ratios = np.where(
+                gene_sum_per_iso > 0, counts_dense / gene_sum_per_iso, np.nan
+            )
+        iso_means = np.nanmean(ratios, axis=0)  # (n_isos,)
+        iso_means = np.where(np.isnan(iso_means), 0.0, iso_means)
+        nan_locs = np.isnan(ratios)
+        if nan_locs.any():
+            ratios[nan_locs] = iso_means[np.where(nan_locs)[1]]
+        adata.layers[ratio_layer_key] = ratios.astype(np.float32)
+    else:
+        # Sparse output: same sparsity as the count matrix.
+        # ratio[s, i] = count[s, i] / gene_total[s, gene(i)], 0 where count == 0.
+        # No division-by-zero risk: if count > 0 then gene total > 0.
+        if is_sparse:
+            _result = _csr.copy()
+        else:
+            _result = scipy.sparse.csr_matrix(counts_dense.astype(np.float32))
+        _result.data /= gene_sum_per_iso[_result.nonzero()]
+        adata.layers[ratio_layer_key] = _result
 
 
 def extract_counts_n_ratios(
@@ -707,6 +999,12 @@ def extract_counts_n_ratios(
     filter_single_iso_genes: bool = True,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[str], Optional[np.ndarray]]:
     """Extract per-gene lists of isoform counts and ratios from anndata.
+
+    .. deprecated:: 1.1.0
+        Use :func:`add_ratio_layer` to compute ratios and store them in
+        ``adata.layers``, then use
+        :func:`prepare_inputs_from_anndata` with the ratio layer key to
+        extract per-gene ratio tensors.
 
     Parameters
     ----------
@@ -734,6 +1032,13 @@ def extract_counts_n_ratios(
     ratio_obs_merged : np.ndarray | None
         Observed isoform ratios, shape (n_spots, n_isos_total), or None if `return_sparse` is True.
     """
+    warnings.warn(
+        "`extract_counts_n_ratios` is deprecated. "
+        "Use `add_ratio_layer` to compute ratios inplace, then call "
+        "`prepare_inputs_from_anndata` with the ratio layer key.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     # extract isoform counts
     iso_counts = adata.layers[layer]  # (n_spots, n_isos_total)
 
@@ -752,9 +1057,8 @@ def extract_counts_n_ratios(
     gene_name_list = []  # of length n_genes
     iso_ind_list = []  # of length n_genes
 
-    for _gene, _group in tqdm(
-        adata.var.reset_index().groupby(group_iso_by, observed=True)
-    ):
+    _gene_groups = adata.var.reset_index().groupby(group_iso_by, observed=True)
+    for _gene, _group in tqdm(_gene_groups, desc="Genes", total=_gene_groups.ngroups):
         # filter single-isoform genes if needed
         if filter_single_iso_genes and _group.shape[0] < 2:
             continue
@@ -780,7 +1084,8 @@ def extract_counts_n_ratios(
             i = torch.LongTensor(indices)
             v = torch.FloatTensor(values)
             shape = _counts_coo.shape
-            _counts = torch.sparse_coo_tensor(i, v, torch.Size(shape))
+            with torch.sparse.check_sparse_tensor_invariants(False):
+                _counts = torch.sparse_coo_tensor(i, v, torch.Size(shape))
             counts_list.append(_counts)
         else:
             if is_sparse_input:
@@ -812,10 +1117,202 @@ def extract_counts_n_ratios(
     return counts_list, ratios_list, gene_name_list, ratio_obs_merged
 
 
+def compute_feature_summaries(
+    adata: AnnData,
+    gene_names: list[str],
+    layer: str = "counts",
+    group_iso_by: str = "gene_symbol",
+    print_progress: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute gene-level and isoform-level summary statistics.
+
+    This is the shared implementation behind
+    :meth:`~splisosm.SplisosmNP.extract_feature_summary`,
+    :meth:`~splisosm.SplisosmFFT.extract_feature_summary`, and
+    :meth:`~splisosm.SplisosmGLMM.extract_feature_summary`.
+
+    Parameters
+    ----------
+    adata
+        Annotated data matrix (typically the filtered AnnData from ``setup_data``).
+    gene_names
+        Ordered list of gene display names (length ``n_genes``).
+    layer
+        Layer in ``adata.layers`` containing raw isoform counts.
+    group_iso_by
+        Column in ``adata.var`` that groups isoforms by gene.
+    print_progress
+        Show a tqdm progress bar.
+
+    Returns
+    -------
+    gene_summary : pandas.DataFrame
+        Indexed by gene name with columns: ``n_isos``, ``perplexity``,
+        ``pct_bin_on``, ``count_avg``, ``count_std``, ``major_ratio_avg``.
+    isoform_summary : pandas.DataFrame
+        Indexed by isoform name with original ``adata.var`` columns plus:
+        ``pct_bin_on``, ``count_total``, ``count_avg``, ``count_std``,
+        ``ratio_total``, ``ratio_avg``, ``ratio_std``.
+    """
+    iso_counts = adata.layers[layer]
+    n_bins = iso_counts.shape[0]
+    is_sparse = scipy.sparse.issparse(iso_counts)
+
+    if is_sparse:
+        if not scipy.sparse.isspmatrix_csc(iso_counts):
+            iso_counts = iso_counts.tocsc()
+    else:
+        iso_counts = np.asarray(iso_counts, dtype=float)
+
+    iso_groups = list(adata.var.groupby(group_iso_by, observed=True, sort=False))
+
+    # gene_names may be display names (e.g. 'Gnai3') while groupby keys are
+    # raw identifiers (e.g. 'ENSMUSG00000000001').  We only require that the
+    # *count* matches — the order is guaranteed by construction (both come
+    # from the same filtered, sorted adata.var).
+    if len(iso_groups) != len(gene_names):
+        raise ValueError(
+            f"gene_names length ({len(gene_names)}) does not match the number "
+            f"of gene groups ({len(iso_groups)}) in adata.var['{group_iso_by}']."
+        )
+
+    gene_rows: list[dict] = []
+    iso_rows: list[dict] = []
+    all_iso_names: list[str] = []
+
+    iterator = tqdm(
+        zip(gene_names, iso_groups),
+        desc="Genes",
+        total=len(gene_names),
+        disable=not print_progress,
+    )
+
+    for gene_name, (_, iso_group_df) in iterator:
+        iso_names = iso_group_df.index.tolist()
+        iso_idx = adata.var_names.get_indexer(iso_names)
+
+        if is_sparse:
+            gene_counts = iso_counts[:, iso_idx]
+            iso_total = np.asarray(gene_counts.sum(axis=0), dtype=float).ravel()
+            iso_sumsq = np.asarray(
+                gene_counts.power(2).sum(axis=0), dtype=float
+            ).ravel()
+            iso_nnz = np.diff(gene_counts.indptr).astype(float)
+            row_sums = np.asarray(gene_counts.sum(axis=1), dtype=float).ravel()
+        else:
+            gene_counts = np.asarray(iso_counts[:, iso_idx], dtype=float)
+            iso_total = gene_counts.sum(axis=0)
+            iso_sumsq = np.square(gene_counts).sum(axis=0)
+            iso_nnz = np.count_nonzero(gene_counts, axis=0).astype(float)
+            row_sums = gene_counts.sum(axis=1)
+
+        gene_total = float(iso_total.sum())
+        valid_rows = np.flatnonzero(row_sums > 0.0)
+        n_valid = int(valid_rows.size)
+
+        iso_count_avg = iso_total / n_bins
+        iso_count_var = np.maximum((iso_sumsq / n_bins) - np.square(iso_count_avg), 0.0)
+        iso_count_std = np.sqrt(iso_count_var)
+        iso_pct_bin_on = iso_nnz / n_bins
+
+        if gene_total > 0.0:
+            ratio_total = iso_total / gene_total
+        else:
+            ratio_total = np.zeros(len(iso_names), dtype=float)
+
+        if n_valid > 0:
+            if is_sparse:
+                ratio_counts = gene_counts.tocsr()[valid_rows]
+                ratio_counts = ratio_counts.multiply(
+                    (1.0 / row_sums[valid_rows])[:, None]
+                )
+                ratio_sum = np.asarray(ratio_counts.sum(axis=0), dtype=float).ravel()
+                ratio_sumsq = np.asarray(
+                    ratio_counts.power(2).sum(axis=0), dtype=float
+                ).ravel()
+            else:
+                ratio_counts = gene_counts[valid_rows] / row_sums[valid_rows, None]
+                ratio_sum = ratio_counts.sum(axis=0)
+                ratio_sumsq = np.square(ratio_counts).sum(axis=0)
+
+            ratio_avg = ratio_sum / n_valid
+            ratio_var = np.maximum((ratio_sumsq / n_valid) - np.square(ratio_avg), 0.0)
+            ratio_std = np.sqrt(ratio_var)
+        else:
+            ratio_avg = np.zeros(len(iso_names), dtype=float)
+            ratio_std = np.zeros(len(iso_names), dtype=float)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            entropy = -(np.log(ratio_total) * ratio_total)
+            entropy = float(np.nan_to_num(entropy).sum())
+
+        gene_count_avg = float(gene_total / n_bins)
+        gene_count_sumsq = float(np.square(row_sums).sum())
+        gene_count_var = max((gene_count_sumsq / n_bins) - (gene_count_avg**2), 0.0)
+
+        gene_rows.append(
+            {
+                "gene": gene_name,
+                "n_isos": len(iso_names),
+                "perplexity": float(np.exp(entropy)),
+                "pct_bin_on": float(n_valid / n_bins),
+                "count_avg": gene_count_avg,
+                "count_std": float(np.sqrt(gene_count_var)),
+                "major_ratio_avg": (
+                    float(ratio_total.max()) if ratio_total.size > 0 else 0.0
+                ),
+            }
+        )
+
+        all_iso_names.extend(iso_names)
+        for (
+            iso_name,
+            pct_bin_on,
+            count_total,
+            count_avg,
+            count_std,
+            iso_ratio_total,
+            iso_ratio_avg,
+            iso_ratio_std,
+        ) in zip(
+            iso_names,
+            iso_pct_bin_on,
+            iso_total,
+            iso_count_avg,
+            iso_count_std,
+            ratio_total,
+            ratio_avg,
+            ratio_std,
+        ):
+            iso_rows.append(
+                {
+                    "isoform": iso_name,
+                    "pct_bin_on": float(pct_bin_on),
+                    "count_total": float(count_total),
+                    "count_avg": float(count_avg),
+                    "count_std": float(count_std),
+                    "ratio_total": float(iso_ratio_total),
+                    "ratio_avg": float(iso_ratio_avg),
+                    "ratio_std": float(iso_ratio_std),
+                }
+            )
+
+    gene_summary = pd.DataFrame(gene_rows).set_index("gene")
+    var_df = adata.var.loc[all_iso_names].copy()
+    stats_df = pd.DataFrame(iso_rows).set_index("isoform")
+    isoform_summary = pd.concat([var_df, stats_df], axis=1)
+
+    return gene_summary, isoform_summary
+
+
 def extract_gene_level_statistics(
     adata: AnnData, layer: str = "counts", group_iso_by: str = "gene_symbol"
 ) -> pd.DataFrame:
     """Extract gene-level metadata from isoform-level counts anndata.
+
+    .. deprecated::
+        Use :func:`compute_feature_summaries` instead, which returns both
+        gene-level and isoform-level statistics.
 
     Parameters
     ----------
@@ -829,84 +1326,22 @@ def extract_gene_level_statistics(
     Returns
     -------
     pandas.DataFrame
-        Gene-level metadata with columns:
-
-        - ``'n_iso'``: int. Number of isoforms per gene.
-        - ``'pct_spot_on'``: float. Percentage of spots with non-zero counts.
-        - ``'count_avg'``: float. Average counts per gene.
-        - ``'count_std'``: float. Standard deviation of counts per gene.
-        - ``'perplexity'``: float. Expression-based effective number of isoforms.
-        - ``'major_ratio_avg'``: float. Average ratio of the major isoform.
+        Gene-level metadata.
     """
-    # extract isoform counts
-    iso_counts = adata.layers[layer]  # (n_spots, n_isos_total)
-
-    # Check if input is sparse
-    is_sparse_input = scipy.sparse.issparse(iso_counts)
-    if (
-        is_sparse_input
-        and not scipy.sparse.isspmatrix_csc(iso_counts)
-        and not scipy.sparse.isspmatrix_csr(iso_counts)
-    ):
-        iso_counts = iso_counts.tocsr()
-
-    df_list = []
-    # loop through genes
-    for _gene, _group in tqdm(
-        adata.var.reset_index().groupby(group_iso_by, observed=True)
-    ):
-        # extract isoform counts and relative ratio
-        iso_indices = _group.index.tolist()
-        _counts = iso_counts[:, iso_indices]
-
-        if is_sparse_input:
-            # Calculate statistics on sparse matrix without densifying
-            _sum_per_iso = np.asarray(_counts.sum(0)).flatten()  # (n_isos,)
-            _row_sums = np.asarray(_counts.sum(1)).flatten()  # (n_spots,)
-            _total_sum = _sum_per_iso.sum()
-
-            pct_spot_on = (_row_sums > 0).mean()
-            count_avg = _row_sums.mean()
-            count_std = _row_sums.std()
-        else:
-            if not isinstance(_counts, np.ndarray):
-                _counts = np.asarray(_counts)
-
-            _sum_per_iso = _counts.sum(0)
-            _row_sums = _counts.sum(1)
-            _total_sum = _counts.sum()
-
-            pct_spot_on = (_row_sums > 0).mean()
-            count_avg = _row_sums.mean()
-            count_std = _row_sums.std()
-
-        # Avoid division by zero
-        if _total_sum == 0:
-            _ratios_avg = np.zeros_like(_sum_per_iso)
-        else:
-            _ratios_avg = _sum_per_iso / _total_sum  # (n_isos,)
-
-        # calculate and store gene-level statistics
-        # handle zeros in log
-        with np.errstate(divide="ignore", invalid="ignore"):
-            entropy = -(np.log(_ratios_avg) * _ratios_avg)
-            entropy = np.nan_to_num(entropy).sum()
-
-        df_list.append(
-            {
-                "gene": _gene,
-                "n_iso": _group.shape[0],
-                "pct_spot_on": pct_spot_on,
-                "count_avg": count_avg,
-                "count_std": count_std,
-                "perplexity": np.exp(entropy),
-                "major_ratio_avg": _ratios_avg.max() if _ratios_avg.size > 0 else 0.0,
-            }
-        )
-
-    df_gene_meta = pd.DataFrame(df_list).set_index("gene")
-
-    return df_gene_meta
+    warnings.warn(
+        "extract_gene_level_statistics is deprecated; use compute_feature_summaries() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    gene_names = list(
+        adata.var.groupby(group_iso_by, observed=True, sort=False).groups.keys()
+    )
+    gene_df, iso_df = compute_feature_summaries(
+        adata, gene_names, layer=layer, group_iso_by=group_iso_by, print_progress=True
+    )
+    # Remap column names for backward compatibility
+    gene_df = gene_df.rename(columns={"n_isos": "n_iso", "pct_bin_on": "pct_spot_on"})
+    return gene_df
 
 
 def run_sparkx(
@@ -981,81 +1416,271 @@ def run_sparkx(
 
 
 def run_hsic_gc(
-    counts_gene: np.ndarray | torch.Tensor,
-    coordinates: np.ndarray | torch.Tensor,
-    approx_rank: Optional[int] = None,
+    counts_gene: "np.ndarray | torch.Tensor | None" = None,
+    coordinates: "np.ndarray | torch.Tensor | None" = None,
+    null_method: Literal["eig", "trace"] = "eig",
+    null_configs: Optional[dict[str, Any]] = None,
+    min_component_size: int = 1,
+    adata: "AnnData | None" = None,
+    layer: "str | None" = None,
+    spatial_key: str = "spatial",
+    adj_key: "str | None" = None,
+    min_counts: int = 0,
+    min_bin_pct: float = 0.0,
     **spatial_kernel_kwargs: Any,
 ) -> dict[str, Any]:
-    """Function to compute HSIC-GC statistic for gene-level counts.
+    """Compute the HSIC-GC statistic for gene-level counts.
 
     This function is designed to be a plugin replacement for SPARK-X.
 
     Parameters
     ----------
     counts_gene
-        Shape (n_spots, n_genes). Gene counts.
+        Shape ``(n_spots, n_genes)``. Gene counts.
     coordinates
-        Shape (n_spots, 2). Spatial coordinates of spots.
-    approx_rank
-        Approximate rank of the spatial kernel matrix.
+        Shape ``(n_spots, n_dim)``. Spatial coordinates of spots.
+    null_method : {"eig", "trace"}, optional
+        Method for computing the null distribution of the test statistic:
+
+        * ``"eig"`` (default): asymptotic chi-square mixture using kernel
+          eigenvalues; Liu's method.  Supports optional
+          ``null_configs["approx_rank"]`` (int) to restrict to the top-k
+          eigenvalues.
+        * ``"trace"``: moment-matching normal approximation using
+          tr(K') and tr(K'²) of the centred spatial kernel and the scalar
+          per-gene variance.
+    null_configs : dict or None, optional
+        Extra keyword arguments for the chosen ``null_method``.
+    min_component_size : int, optional
+        Minimum number of spots a connected component must contain to be
+        retained.  Spots that belong to components smaller than this
+        threshold are removed from all data structures (counts, coordinates,
+        design matrix) before the spatial kernel is built. Components are detected
+        on the same k-NN graph used for the spatial kernel (controlled by ``k_neighbors``).
+        The default value of ``1`` disables filtering.
+        A ``UserWarning`` is issued whenever spots are removed.
+    adata : AnnData or None, optional
+        If provided, use ``adata.X`` (when ``layer=None``) or
+        ``adata.layers[layer]`` as ``counts_gene`` — a ``(n_spots, n_genes)``
+        count matrix (dense or sparse) — and ``adata.obsm[spatial_key]`` for
+        coordinates.  Mutually exclusive with ``counts_gene`` / ``coordinates``.
+    layer : str or None, optional
+        Layer key in ``adata.layers``.  When ``None`` (default), ``adata.X``
+        is used.  Used only in AnnData mode.
+    spatial_key : str, optional
+        Key in ``adata.obsm`` for spatial coordinates.  Used only in
+        AnnData mode.
+    adj_key : str or None, optional
+        Key in ``adata.obsp`` for a pre-built adjacency matrix.  When
+        provided in AnnData mode, the adjacency is loaded from
+        ``adata.obsp[adj_key]`` and used for both component filtering and
+        the spatial kernel construction.  Ignored in matrix mode.
+    min_counts : int, optional
+        Minimum total count to retain a gene in AnnData mode.  Default 0.
+    min_bin_pct : float, optional
+        Minimum fraction of spots expressing a gene (count > 0).  Default 0.
     **spatial_kernel_kwargs
-        Additional arguments for SpatialCovKernel.
+        Additional arguments forwarded to :class:`~splisosm.kernel.SpatialCovKernel`.
 
     Returns
     -------
     dict
-        Results of the HSIC-GC spatial variability test with keys:
+        Results with keys:
 
-        - ``'statistic'``: np.ndarray of shape (n_genes,). HSIC-GC statistics.
-        - ``'pvalue'``: np.ndarray of shape (n_genes,). P-values.
-        - ``'pvalue_adj'``: np.ndarray of shape (n_genes,). Adjusted p-values.
-        - ``'method'``: str. Method name "hsic-gc".
+        - ``'statistic'``: np.ndarray of shape (n_genes,).
+        - ``'pvalue'``: np.ndarray of shape (n_genes,).
+        - ``'pvalue_adj'``: np.ndarray of shape (n_genes,).
+        - ``'method'``: ``"hsic-gc"``.
+        - ``'null_method'``: the value of *null_method*.
+        - ``'n_spots'``: number of spots after component filtering.
     """
 
-    from splisosm.kernel import SpatialCovKernel
+    # ── AnnData mode: load gene-level counts directly ────────────────────────
+    _adj_prebuilt: "scipy.sparse.spmatrix | None" = None
+    if adata is not None:
+        if counts_gene is not None or coordinates is not None:
+            raise ValueError(
+                "When `adata` is provided, `counts_gene` and `coordinates` "
+                "must not be provided."
+            )
+
+        # Load count matrix: adata.X or adata.layers[layer]
+        _raw = adata.X if layer is None else adata.layers[layer]
+
+        # Convert to torch (keep sparse as COO for now)
+        if scipy.sparse.issparse(_raw):
+            _coo = _raw.tocoo().astype(np.float32)
+            _i = torch.from_numpy(
+                np.vstack((_coo.row, _coo.col)).astype(np.int64, copy=False)
+            )
+            _v = torch.from_numpy(_coo.data)
+            with torch.sparse.check_sparse_tensor_invariants(False):
+                counts_gene = torch.sparse_coo_tensor(_i, _v, torch.Size(_coo.shape))
+        else:
+            counts_gene = torch.as_tensor(np.asarray(_raw, dtype=np.float32))
+
+        # Apply gene-level filters (min_counts, min_bin_pct)
+        if min_counts > 0 or min_bin_pct > 0:
+            _dense = counts_gene.to_dense() if counts_gene.is_sparse else counts_gene
+            _gene_totals = _dense.sum(0)  # (n_genes,)
+            _gene_bin_pcts = (_dense > 0).float().mean(0)  # (n_genes,)
+            _gene_mask = (_gene_totals >= min_counts) & (_gene_bin_pcts >= min_bin_pct)
+            counts_gene = (
+                counts_gene.to_dense()[:, _gene_mask]
+                if counts_gene.is_sparse
+                else counts_gene[:, _gene_mask]
+            )
+
+        # Load spatial coordinates
+        coordinates = torch.as_tensor(
+            np.asarray(adata.obsm[spatial_key], dtype=np.float32)
+        )
+
+        # Load pre-built adjacency if provided
+        if adj_key is not None:
+            _adj_prebuilt = adata.obsp[adj_key]
+
+        # Component filtering (same logic as matrix mode below)
+        if min_component_size > 1:
+            from splisosm.kernel import _build_adj_from_coords
+
+            _k_adata = spatial_kernel_kwargs.get("k_neighbors", 4)
+            if _adj_prebuilt is not None:
+                _adj_for_comp = scipy.sparse.csc_matrix(_adj_prebuilt)
+            else:
+                _adj_for_comp = _build_adj_from_coords(
+                    coordinates, k_neighbors=_k_adata, mutual_neighbors=True
+                ).tocsc()
+            _, _labels = _connected_components(_adj_for_comp, directed=False)
+            _comp_sizes = np.bincount(_labels)
+            _keep_mask = _comp_sizes[_labels] >= min_component_size
+            _n_removed = int((~_keep_mask).sum())
+            if _n_removed > 0:
+                warnings.warn(
+                    f"Removed {_n_removed} spot(s) belonging to graph components "
+                    f"with fewer than {min_component_size} member(s). "
+                    f"{int(_keep_mask.sum())} spot(s) remain.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                _dense_cg = (
+                    counts_gene.to_dense() if counts_gene.is_sparse else counts_gene
+                )
+                counts_gene = _dense_cg[_keep_mask]
+                coordinates = coordinates[_keep_mask]
+                if _adj_prebuilt is not None:
+                    _adj_prebuilt = scipy.sparse.csc_matrix(_adj_prebuilt)[_keep_mask][
+                        :, _keep_mask
+                    ]
+                else:
+                    _adj_prebuilt = _adj_for_comp[_keep_mask][:, _keep_mask]
+
+        # Filtering already done above — skip component filtering below
+        min_component_size = 1
+    elif counts_gene is None or coordinates is None:
+        raise ValueError(
+            "Either `adata` or both `counts_gene` and `coordinates` must be provided."
+        )
+    else:
+        # Matrix mode: apply component filtering if requested
+        if min_component_size > 1:
+            from splisosm.kernel import _build_adj_from_coords
+
+            _k_mat = spatial_kernel_kwargs.get("k_neighbors", 4)
+            _coords_t = (
+                coordinates
+                if isinstance(coordinates, torch.Tensor)
+                else torch.as_tensor(np.asarray(coordinates), dtype=torch.float32)
+            )
+            _adj_mat = _build_adj_from_coords(
+                _coords_t, k_neighbors=_k_mat, mutual_neighbors=True
+            ).tocsc()
+            _, _labels = _connected_components(_adj_mat, directed=False)
+            _comp_sizes = np.bincount(_labels)
+            _keep_mask = _comp_sizes[_labels] >= min_component_size
+            _n_removed = int((~_keep_mask).sum())
+            if _n_removed > 0:
+                _n_remaining = int(_keep_mask.sum())
+                warnings.warn(
+                    f"Removed {_n_removed} spot(s) belonging to graph components "
+                    f"with fewer than {min_component_size} member(s). "
+                    f"{_n_remaining} spot(s) remain.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                if scipy.sparse.issparse(counts_gene):
+                    counts_gene = counts_gene[_keep_mask]
+                elif isinstance(counts_gene, torch.Tensor):
+                    counts_gene = counts_gene[_keep_mask]
+                else:
+                    counts_gene = np.asarray(counts_gene)[_keep_mask]
+                coordinates = (
+                    coordinates[_keep_mask]
+                    if isinstance(coordinates, torch.Tensor)
+                    else np.asarray(coordinates)[_keep_mask]
+                )
+                _adj_prebuilt = _adj_mat[_keep_mask][:, _keep_mask].tocsc()
+
+    from splisosm.kernel import (
+        SpatialCovKernel,
+    )
 
     n_spots = counts_gene.shape[0]
     n_genes = counts_gene.shape[1]
+    configs = null_configs or {}
 
-    # determine the maximum rank for spatial kernel computation
-    if n_spots > 5000:
-        # 10x Visium has 4992 spots per slide. For larger datasets (i.e. Slideseq-V2),
-        # it is recommended to use low-rank approximation
-        max_rank = np.ceil(np.sqrt(n_spots) * 4).astype(int)
-        approx_rank = (
-            min(approx_rank, max_rank) if approx_rank is not None else max_rank
-        )
-    else:
-        if approx_rank is not None:
-            approx_rank = approx_rank if approx_rank < n_spots else None
-
-    # set default spatial kernel kwargs
+    # Set default spatial kernel kwargs
     default_spatial_kernel_kwargs = {
         "k_neighbors": 4,
-        "model": "icar",
         "rho": 0.99,
         "standardize_cov": True,
         "centering": True,
-        "approx_rank": approx_rank,
     }
     if spatial_kernel_kwargs is not None:
         if "centering" in spatial_kernel_kwargs:
             warnings.warn(
-                "The 'centering' argument in spatial_kernel_kwargs will be ignored. It is always set to True for HSIC-GC."
+                "The 'centering' argument in spatial_kernel_kwargs will be ignored. "
+                "It is always set to True for HSIC-GC.",
+                UserWarning,
+                stacklevel=2,
             )
             spatial_kernel_kwargs.pop("centering")
         default_spatial_kernel_kwargs.update(spatial_kernel_kwargs)
 
-    # compute the spatial kernel
-    # Ensure coordinates is numpy for SpatialCovKernel/smoother
-    if isinstance(coordinates, torch.Tensor):
-        coordinates = coordinates.detach().cpu().numpy()
+    # If a pre-built adjacency is provided, we skip the k-NN graph construction
+    if _adj_prebuilt is not None:
+        K_sp = SpatialCovKernel(
+            coords=None, adj_matrix=_adj_prebuilt, **default_spatial_kernel_kwargs
+        )
+    else:
+        # Otherwise, build the spatial kernel from coordinates
+        K_sp = SpatialCovKernel(
+            coords=coordinates, adj_matrix=None, **default_spatial_kernel_kwargs
+        )
 
-    K_sp = SpatialCovKernel(coordinates, **default_spatial_kernel_kwargs)
-
-    # get the eigenvalues
-    lambda_sp = K_sp.eigenvalues()  # (rank,)
-    lambda_sp = lambda_sp[lambda_sp > 1e-5]  # filter small eigenvalues
+    # Pre-compute null distribution inputs (once, before the gene loop)
+    if null_method == "eig":
+        approx_rank = configs.get("approx_rank", None)
+        # auto-cap rank for large datasets to keep eigendecomposition tractable
+        if n_spots > 5000:
+            max_rank = int(np.ceil(np.sqrt(n_spots) * 4))
+            approx_rank = (
+                min(approx_rank, max_rank) if approx_rank is not None else max_rank
+            )
+        elif approx_rank is not None:
+            approx_rank = approx_rank if approx_rank < n_spots else None
+        lambda_sp = K_sp.eigenvalues(k=approx_rank)
+        lambda_sp = lambda_sp[lambda_sp > 1e-5]
+        k_eff = len(lambda_sp)
+        # Low-rank factor Q_k so that K ≈ Q_k Q_k^T; used per-gene to
+        # produce a rank-consistent test stat for liu_sf.
+        _Q_sp_raw = getattr(K_sp, "Q", None)
+        _Q_sp = _Q_sp_raw[:, :k_eff] if _Q_sp_raw is not None else None
+    elif null_method == "trace":
+        trK = K_sp.trace()
+        trK2 = K_sp.square_trace()
+    else:
+        raise ValueError(f"null_method must be 'eig' or 'trace', got {null_method!r}")
 
     # compute the HSIC-GC statistic per-gene
     is_scipy_sparse = scipy.sparse.issparse(counts_gene)
@@ -1087,7 +1712,7 @@ def run_hsic_gc(
         )  # center the counts, (n_spots, n_genes)
 
     hsic_list, pvals_list = [], []
-    for i in tqdm(range(n_genes)):
+    for i in tqdm(range(n_genes), desc="Genes", total=n_genes):
         if is_scipy_sparse:
             col = counts_gene[:, i].toarray()  # dense (n_spots, 1)
             counts = torch.from_numpy(col).float()
@@ -1104,10 +1729,36 @@ def run_hsic_gc(
         else:
             counts = y_dense[:, i : i + 1]  # (n_spots, 1)
 
-        lambda_y = counts.T @ counts  # (1, 1)
-        lambda_spy = lambda_sp * lambda_y  # (rank, 1)
-        hsic_scaled = torch.trace(K_sp.xtKx(counts))  # scalar
-        pval = liu_sf((hsic_scaled * n_spots).numpy(), lambda_spy.numpy())
+        # Compute HSIC test statistic.
+        # When `eig` null is used and a low-rank factor Q is available, use
+        # the Q-based projection so the stat and the Liu null eigenvalues are
+        # on the same (rank-k) scale — preventing the p=0 scale-mismatch bug.
+        # Otherwise fall back to the exact full-kernel quadratic form.
+        if null_method == "eig" and _Q_sp is not None:
+            xtQ = counts.t() @ _Q_sp  # (1, k_eff)
+            hsic_scaled = torch.trace(xtQ @ xtQ.t())
+        else:
+            hsic_scaled = torch.trace(K_sp.xtKx_exact(counts))
+
+        if null_method == "eig":
+            try:
+                lambda_y = torch.linalg.eigvalsh(counts.T @ counts)  # (1,)
+            except torch._C._LinAlgError:
+                lambda_y = torch.linalg.eigvalsh(
+                    counts.T @ counts + 1e-6 * torch.eye(counts.shape[1])
+                )
+            lambda_y = lambda_y[lambda_y > 1e-5]
+            lambda_spy = (lambda_sp.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
+            pval = liu_sf((hsic_scaled * n_spots).numpy(), lambda_spy.numpy())
+        else:  # "trace"
+            S = counts.T @ counts  # (1, 1)
+            trS = torch.trace(S).item()
+            trS2 = torch.trace(S @ S).item()
+            n1 = n_spots - 1
+            mean_null = trK.item() * trS / n1
+            var_null = 2.0 * trK2.item() * trS2 / (n1**2)
+            z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
+            pval = float(_norm_dist.sf(z))
 
         hsic_list.append(hsic_scaled / (n_spots - 1) ** 2)  # HSIC statistic
         pvals_list.append(pval)
@@ -1116,6 +1767,8 @@ def run_hsic_gc(
         "statistic": torch.tensor(hsic_list).numpy(),
         "pvalue": torch.tensor(pvals_list).numpy(),
         "method": "hsic-gc",
+        "null_method": null_method,
+        "n_spots": n_spots,
     }
 
     # calculate adjusted p-values

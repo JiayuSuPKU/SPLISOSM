@@ -23,242 +23,26 @@ except ImportError:
 
 import numpy as np
 import pandas as pd
-import scipy.fft
 import scipy.sparse as sp
 import torch
 from anndata import AnnData
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
+from splisosm.kernel import FFTKernel  # noqa: F401 — re-export for backward compat
 from splisosm.kernel_gpr import (
     FFTKernelOp,
     FFTKernelGPR,
     _DEFAULT_GPR_CONFIGS,
 )
 from splisosm.likelihood import liu_sf
-from splisosm.utils import counts_to_ratios, false_discovery_control
+from splisosm.utils import (
+    compute_feature_summaries,
+    counts_to_ratios,
+    false_discovery_control,
+)
 
 __all__ = ["FFTKernel", "FFTKernelOp", "FFTKernelGPR", "SplisosmFFT"]
-
-
-class FFTKernel:
-    """FFT-based spatial kernel on a periodic 2D raster grid.
-
-    This implementation currently supports only a CAR-style spatial kernel
-    equivalent to a periodic, neighborhood graph-based autoregressive model.
-
-    Parameters
-    ----------
-    shape
-        Grid shape ``(ny, nx)``.
-    spacing
-        Physical spacing ``(dy, dx)`` between neighboring raster cells.
-    rho
-        Spatial autocorrelation coefficient in CAR kernel.
-    neighbor_degree
-        Neighbor ring degree for graph construction.
-        ``1`` uses nearest neighbors in the periodic metric.
-    workers
-        Number of workers used by ``scipy.fft.fft2``.
-    """
-
-    def __init__(
-        self,
-        shape: tuple[int, int],
-        spacing: tuple[float, float] = (1.0, 1.0),
-        rho: float = 0.99,
-        neighbor_degree: int = 1,
-        workers: int | None = None,
-    ) -> None:
-        if len(shape) != 2:
-            raise ValueError("`shape` must be a tuple of length 2: (ny, nx).")
-        if shape[0] <= 0 or shape[1] <= 0:
-            raise ValueError("Grid dimensions must be positive.")
-        if neighbor_degree < 1:
-            raise ValueError("`neighbor_degree` must be >= 1.")
-
-        self.ny, self.nx = int(shape[0]), int(shape[1])
-        self.dy, self.dx = float(spacing[0]), float(spacing[1])
-        self.n_grid = self.ny * self.nx
-        self.neighbor_degree = int(neighbor_degree)
-        self.rho = min(float(rho), 0.99)
-        self.workers = workers
-
-        self._min_dist_sq = self._precompute_square_torus_distances()
-        self._spectrum_2d = self._compute_car_spectrum()
-        self.spectrum = self._spectrum_2d.ravel()
-
-    def _precompute_square_torus_distances(self) -> np.ndarray:
-        """Compute squared torus distances from origin for periodic grid."""
-        y = np.arange(self.ny, dtype=float) * self.dy
-        x = np.arange(self.nx, dtype=float) * self.dx
-        y = np.minimum(y, (self.ny * self.dy) - y)
-        x = np.minimum(x, (self.nx * self.dx) - x)
-        yy, xx = np.meshgrid(y, x, indexing="ij")
-        return yy**2 + xx**2
-
-    def _compute_car_spectrum(self) -> np.ndarray:
-        """Compute eigenvalues of the periodic CAR kernel via FFT."""
-        unique_d2 = np.unique(self._min_dist_sq)
-        if self.neighbor_degree < len(unique_d2):
-            cutoff_sq = unique_d2[self.neighbor_degree]
-        else:
-            cutoff_sq = unique_d2[-1]
-
-        # Graph adjacency image centered at (0, 0) in periodic metric.
-        w_img = (self._min_dist_sq <= cutoff_sq).astype(float)
-        w_img[0, 0] = 0.0
-        degree = float(np.sum(w_img))
-
-        if degree <= 0.0:
-            return np.ones((self.ny, self.nx), dtype=float)
-
-        lam_w = np.real(scipy.fft.fft2(w_img, workers=self.workers)) / degree
-        return 1.0 / (1.0 - self.rho * lam_w)
-
-    def power_spectral_density_1d(
-        self, bins: int = 50
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Compute the 1D power spectral density (radial profile).
-
-        Parameters
-        ----------
-        bins
-            Number of bins for the 1D radial frequency.
-
-        Returns
-        -------
-        freq_bins : np.ndarray
-            The center frequencies of the valid bins.
-        psd_1d : np.ndarray
-            The average power (eigenvalue) in each frequency bin.
-        """
-        if bins < 1:
-            raise ValueError("`bins` must be >= 1.")
-
-        # Compute 2D frequencies
-        fy = scipy.fft.fftfreq(self.ny, d=self.dy)
-        fx = scipy.fft.fftfreq(self.nx, d=self.dx)
-        FY, FX = np.meshgrid(fy, fx, indexing="ij")
-
-        # Compute radial frequency (norm)
-        F_r = np.sqrt(FY**2 + FX**2)
-        f_r_flat = F_r.ravel()
-        spectrum_flat = self._spectrum_2d.ravel()
-
-        # Bin the radial frequencies to get the average power per bin
-        bin_edges = np.linspace(0, f_r_flat.max(), bins + 1)
-
-        # Sum of spectrum in each bin
-        psd_sum, _ = np.histogram(f_r_flat, bins=bin_edges, weights=spectrum_flat)
-        counts, _ = np.histogram(f_r_flat, bins=bin_edges)
-
-        # Avoid division by zero for empty bins
-        valid = counts > 0
-        psd_1d = np.zeros(bins)
-        psd_1d[valid] = psd_sum[valid] / counts[valid]
-
-        # Calculate bin centers for plotting
-        freq_bins = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-
-        # Return only the valid (non-empty) bins
-        return freq_bins[valid], psd_1d[valid]
-
-    def xtKx(self, x: np.ndarray) -> float | np.ndarray:
-        """Compute ``x^T K x`` in ``O(N log N)`` via FFT.
-
-        Parameters
-        ----------
-        x
-            Input with shape ``(ny, nx)`` or ``(ny, nx, m)``.
-
-        Returns
-        -------
-        float or np.ndarray
-            Scalar for 2D input, or shape ``(m,)`` for 3D input.
-        """
-        x = np.asarray(x, dtype=float)
-        if x.ndim == 2:
-            x = x[..., None]
-        if x.ndim != 3:
-            raise ValueError("`x` must have shape (ny, nx) or (ny, nx, m).")
-
-        ny, nx, _ = x.shape
-        if ny != self.ny or nx != self.nx:
-            raise ValueError(
-                f"Input shape ({ny}, {nx}) does not match kernel shape ({self.ny}, {self.nx})."
-            )
-
-        x_hat = scipy.fft.fft2(x, axes=(0, 1), workers=self.workers)
-        power = np.abs(x_hat) ** 2
-        weighted = np.sum(power * self._spectrum_2d[:, :, None], axis=(0, 1))
-        q = weighted / (self.n_grid)
-        return float(q[0]) if q.size == 1 else q
-
-    def eigenvalues(self, k: int | None = None) -> np.ndarray:
-        """Return kernel eigenvalues.
-
-        Parameters
-        ----------
-        k
-            Number of leading eigenvalues to return. If ``None``, return all.
-
-        Returns
-        -------
-        np.ndarray
-            Eigenvalues in descending order.
-        """
-        evals = np.sort(self.spectrum)[::-1]
-        if k is None:
-            return evals
-        return evals[:k]
-
-    def apply_residual_op(self, x: np.ndarray, epsilon: float) -> np.ndarray:
-        """Apply the kernel regression residual operator ``R = epsilon * (K + epsilon * I)**(-1)``.
-
-        Computed in O(N log N) via FFT as::
-
-            R @ v = IFFT2( epsilon / (lambda + epsilon) * FFT2(v) )
-
-        Parameters
-        ----------
-        x
-            Input with shape ``(ny, nx)`` or ``(ny, nx, m)``.
-        epsilon
-            Regularization / noise level.
-
-        Returns
-        -------
-        np.ndarray
-            Residuals of the same shape as ``x``.
-        """
-        x = np.asarray(x, dtype=float)
-        scalar = x.ndim == 2
-        if scalar:
-            x = x[..., None]
-        if x.ndim != 3:
-            raise ValueError("`x` must have shape (ny, nx) or (ny, nx, m).")
-
-        ny, nx, _ = x.shape
-        if ny != self.ny or nx != self.nx:
-            raise ValueError(
-                f"Input shape ({ny}, {nx}) does not match kernel shape ({self.ny}, {self.nx})."
-            )
-
-        x_hat = scipy.fft.fft2(x, axes=(0, 1), workers=self.workers)
-        scale = epsilon / (self._spectrum_2d[:, :, None] + epsilon)
-        result = np.real(
-            scipy.fft.ifft2(scale * x_hat, axes=(0, 1), workers=self.workers)
-        )
-        return result[..., 0] if scalar else result
-
-    def trace(self) -> float:
-        """Return ``trace(K)``."""
-        return float(np.sum(self.spectrum))
-
-    def square_trace(self) -> float:
-        """Return ``trace(K^2)``."""
-        return float(np.sum(self.spectrum**2))
 
 
 def _du_worker_fft(
@@ -318,6 +102,10 @@ def _du_worker_fft(
     stats = np.zeros(n_factors)
     pvals = np.ones(n_factors)
 
+    # Single-isoform gene: no differential usage is possible.
+    if len(iso_names) <= 1:
+        return stats, pvals
+
     # ── Load isoform ratios on-the-fly ────────────────────────────────────
     data = raster_layer.sel(c=iso_names).values  # (n_iso, ny, nx)
     counts_cube = np.moveaxis(np.asarray(data, dtype=float), 0, -1)  # (ny, nx, n_iso)
@@ -330,6 +118,7 @@ def _du_worker_fft(
         torch.from_numpy(counts_flat).float(),
         transformation=ratio_transformation,
         nan_filling="none",
+        fill_before_transform=False,
     )
     y_cube = ratios.numpy().reshape(ny_g, nx_g, -1)
 
@@ -420,6 +209,11 @@ def _sv_worker_fft(
     data = raster_layer.sel(c=iso_names).values  # (c, ny, nx)
     counts_cube = np.moveaxis(np.asarray(data, dtype=float), 0, -1)
 
+    # Single-isoform gene: HSIC-IR has no ratio variation → pval=1.
+    # HSIC-IC and HSIC-GC test count-level SV and proceed normally.
+    if method == "hsic-ir" and counts_cube.shape[2] <= 1:
+        return 0.0, 1.0
+
     if method == "hsic-ic":
         y_cube = counts_cube
     elif method == "hsic-gc":
@@ -430,6 +224,7 @@ def _sv_worker_fft(
             torch.from_numpy(counts_flat).float(),
             transformation=ratio_transformation,
             nan_filling="none",
+            fill_before_transform=False,
         )
         y_cube = ratios.numpy().reshape(kernel.ny, kernel.nx, -1)
 
@@ -470,6 +265,9 @@ class SplisosmFFT:
 
     Examples
     --------
+
+    Spatial variability test:
+
     >>> from splisosm import SplisosmFFT
     >>> model = SplisosmFFT(rho=0.9, neighbor_degree=1)
     >>> model.setup_data(
@@ -486,48 +284,59 @@ class SplisosmFFT:
     ... )
     >>> model.test_spatial_variability(method="hsic-ir")
     >>> sv_results = model.get_formatted_test_results(test_type="sv")
+
+    Differential usage test:
+
+    >>> model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+    >>> model.setup_data(
+    ...     sdata=sdata,
+    ...     bins="ID_square_016um",
+    ...     table_name="square_016um_svp",
+    ...     design_mtx="square_016um_rbp_sve",
+    ...     col_key="array_col",
+    ...     row_key="array_row",
+    ...     layer="counts",
+    ...     group_iso_by="gene_ids",
+    ...     gene_names="gene_name",
+    ...     min_counts=10,
+    ...     min_bin_pct=0.0,
+    ... )
+    >>> model.test_differential_usage(method="hsic-gp", residualize="cov_only")
+    >>> du_results = model.get_formatted_test_results("du")
     """
+
+    # -- Public attributes (populated by :meth:`setup_data`) ------------------
 
     n_genes: int
     """Number of genes after filtering."""
 
     n_spots: int
-    """Number of observed spots (bins)."""
+    """Number of observed spots (bins with non-zero data)."""
 
     n_grid: int
-    """Number of raster grid bins (including padding). n_grid = n_y * n_x"""
+    """Total raster grid cells (``ny * nx``, including zero-padded positions)."""
 
-    n_isos: list[int]
-    """List of numbers of isoforms per gene after filtering."""
+    n_isos_per_gene: list[int]
+    """Number of isoforms per gene (list of length :attr:`n_genes`)."""
 
     gene_names: list[str]
-    """List of gene names corresponding to the genes in the model after filtering."""
+    """Gene display names (length :attr:`n_genes`)."""
 
-    kernel: FFTKernel | None
-    """FFTKernel instance used for spatial kernel computations."""
+    sp_kernel: FFTKernel | None
+    """:class:`~splisosm.kernel.FFTKernel` for FFT-accelerated spatial operations."""
 
     sdata: Any | None
-    """SpatialData object containing the input data."""
+    """Source ``SpatialData`` object; ``None`` before :meth:`setup_data`."""
 
-    sv_test_results: dict
-    """Dictionary to store the spatial variability test results after running test_spatial_variability().
-    It contains the following keys:
-    
-    - ``'method'``: str, the method used for the test.
-    - ``'statistic'``: numpy.ndarray of shape (n_genes,), the test statistic for each gene.
-    - ``'pvalue'``: numpy.ndarray of shape (n_genes,), the p-value for each gene.
-    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes,), the BH adjusted p-value for each gene.
-    """
+    n_factors: int
+    """Number of covariates for differential usage testing."""
 
-    du_test_results: dict
-    """Dictionary to store the differential usage test results after running test_differential_usage(). 
-    It contains the following keys:
-    
-    - ``'method'``: str, the method used for the test.
-    - ``'statistic'``: numpy.ndarray of shape (n_genes, n_covariates), the test statistic for each gene and covariate.
-    - ``'pvalue'``: numpy.ndarray of shape (n_genes, n_covariates), the p-value for each gene and covariate.
-    - ``'pvalue_adj'``: numpy.ndarray of shape (n_genes, n_covariates), the BH adjusted p-value for each gene and covariate. Each column/covariate is adjusted separately.
-    """
+    covariate_names: list[str]
+    """Covariate display names (length :attr:`n_factors`)."""
+
+    design_mtx: Optional[Any]
+    """Design matrix stored as an AnnData table inside :attr:`sdata`.
+    ``None`` if no covariates."""
 
     def __init__(
         self,
@@ -556,7 +365,7 @@ class SplisosmFFT:
         self.n_genes = 0
         self.n_spots = 0
         self.n_grid = 0
-        self.n_isos = []
+        self.n_isos_per_gene = []
         self.gene_names: list[str] = []
 
         self.sdata: Any | None = None
@@ -569,13 +378,13 @@ class SplisosmFFT:
         self._group_iso_by: str = "gene_symbol"
         self._gene_iso_names: list[list[str]] = []
 
-        self.kernel: FFTKernel | None = None
+        self.sp_kernel: FFTKernel | None = None
         self._kernel_eigvals: np.ndarray | None = None
         self._raster_key: str | None = None
         self._raster_layer: Any | None = None
 
-        self.sv_test_results: dict[str, Any] = {}
-        self.du_test_results: dict[str, Any] = {}
+        self._sv_test_results: dict[str, Any] = {}
+        self._du_test_results: dict[str, Any] = {}
 
         self._gene_summary: Optional[pd.DataFrame] = None
         self._isoform_summary: Optional[pd.DataFrame] = None
@@ -588,26 +397,34 @@ class SplisosmFFT:
     def __str__(self) -> str:
         """Return string representation of configured model state."""
         sv_status = (
-            f"Completed ({self.sv_test_results['method']})"
-            if len(self.sv_test_results) > 0
+            f"Completed ({self._sv_test_results['method']})"
+            if len(self._sv_test_results) > 0
             else "NA"
         )
         du_status = (
-            f"Completed ({self.du_test_results['method']})"
-            if len(self.du_test_results) > 0
+            f"Completed ({self._du_test_results['method']})"
+            if len(self._du_test_results) > 0
             else "NA"
         )
-        return (
-            "=== FFT SPLISOSM model for spatial isoform testings\n"
-            f"- Number of genes: {self.n_genes}\n"
-            f"- Number of observed spots: {self.n_spots}\n"
-            f"- Number of raster cells: {self.n_grid}\n"
-            f"- Number of covariates: {self.n_factors}\n"
-            f"- Average number of isoforms per gene: {np.mean(self.n_isos) if self.n_isos else None}\n"
-            "=== Test results\n"
-            f"- Spatial variability test: {sv_status}\n"
-            f"- Differential usage test: {du_status}"
+        _avg_iso = (
+            f"{np.mean(self.n_isos_per_gene):.1f}" if self.n_isos_per_gene else "N/A"
         )
+        return (
+            f"=== SplisosmFFT\n"
+            f"- Number of genes: {self.n_genes}\n"
+            f"- Number of spots: {self.n_spots}\n"
+            f"- Number of spots after rasterization: {self.n_grid}\n"
+            f"- Number of covariates: {self.n_factors}\n"
+            f"- Average isoforms per gene: {_avg_iso}\n"
+            "=== Model configurations\n"
+            f"- Neighborhood degree: {self._neighbor_degree}\n"
+            f"- Spatial autocorrelation rho: {self._rho}\n"
+            "=== Test results\n"
+            f"- Spatial variability: {sv_status}\n"
+            f"- Differential usage: {du_status}"
+        )
+
+    __repr__ = __str__
 
     def _rasterize_bins(self, bins, table_name, col_key, row_key) -> str:
         """Rasterize bins and cache image key in sdata."""
@@ -655,31 +472,31 @@ class SplisosmFFT:
 
         Parameters
         ----------
-        sdata
+        sdata : spatialdata.SpatialData
             SpatialData-like object with ``tables`` mapping.
-        bins
+        bins : str
             Name of the SpatialData bin geometry for rasterization.
-        table_name
+        table_name : str
             Key of the table in ``sdata.tables``.
-        col_key
+        col_key : str
             Column index key in ``adata.obs`` for rasterization.
-        row_key
+        row_key : str
             Row index key in ``adata.obs`` for rasterization.
-        layer
+        layer : str, optional
             AnnData layer that stores isoform count matrix.
-        group_iso_by
+        group_iso_by : str, optional
             Column in ``adata.var`` used to group isoforms by gene. The
             unique values of this column define the gene-level groups.
-        gene_names
+        gene_names : str or None, optional
             Optional column name in ``adata.var`` whose values are used as
             display gene names in results. If ``None``, the values of
             ``group_iso_by`` are used directly.
-        min_counts
+        min_counts : int, optional
             Minimum total count (summed across all spots) required for an
             isoform to be retained. Isoforms below this threshold are
             excluded before gene grouping. Genes with fewer than two
             remaining isoforms after filtering are also excluded.
-        min_bin_pct
+        min_bin_pct : float, optional
             Minimum percentage of bins in which an isoform must be expressed
             (count greater than zero) to be retained. Values in ``[0, 1]`` are
             interpreted as fractions of bins, and values in ``(1, 100]`` are
@@ -822,17 +639,17 @@ class SplisosmFFT:
         self.n_spots = int(adata.n_obs)
         self.n_grid = int(ny * nx)
         self.n_genes = len(grouped_iso_names)
-        self.n_isos = [len(v) for v in grouped_iso_names]
+        self.n_isos_per_gene = [len(v) for v in grouped_iso_names]
         self.gene_names = grouped_gene_names
 
-        self.kernel = FFTKernel(
+        self.sp_kernel = FFTKernel(
             shape=(ny, nx),
             spacing=self._spacing,
             rho=self._rho,
             neighbor_degree=self._neighbor_degree,
             workers=self._workers,
         )
-        eigvals = self.kernel.eigenvalues()
+        eigvals = self.sp_kernel.eigenvalues()
         self._kernel_eigvals = eigvals[eigvals > 1e-8]
 
         # --- Process design_mtx: store as properly-structured AnnData table ---
@@ -932,16 +749,16 @@ class SplisosmFFT:
 
         Parameters
         ----------
-        method
+        method : {"hsic-ir", "hsic-ic", "hsic-gc"}, optional
             One of ``"hsic-ir"`` (isoform ratios), ``"hsic-ic"`` (isoform counts),
             or ``"hsic-gc"`` (gene counts).
-        ratio_transformation
+        ratio_transformation : {"none", "clr", "ilr", "alr", "radial"}, optional
             Ratio transform used when ``method="hsic-ir"``.
-        n_jobs
+        n_jobs : int, optional
             Number of joblib workers. ``-1`` uses all available CPUs.
-        return_results
+        return_results : bool, optional
             If True, return result dictionary.
-        print_progress
+        print_progress : bool, optional
             Whether to show a progress bar.
 
         Returns
@@ -953,7 +770,7 @@ class SplisosmFFT:
         --------
         :func:`splisosm.hyptest_np.SplisosmNP.test_spatial_variability`: Non-FFT version of this function for comparison.
         """
-        if self._adata is None or self.kernel is None or self._raster_layer is None:
+        if self._adata is None or self.sp_kernel is None or self._raster_layer is None:
             raise RuntimeError("Data not initialized. Call setup_data() first.")
 
         valid_methods = ["hsic-ir", "hsic-ic", "hsic-gc"]
@@ -968,15 +785,23 @@ class SplisosmFFT:
         if n_jobs == -1:
             n_jobs = os.cpu_count() or 1
 
-        iterator = self._gene_iso_names
-        if print_progress:
-            iterator = tqdm(iterator, desc=f"SV ({method})")
+        # Auto-coordinate FFT workers with joblib n_jobs to prevent thread
+        # oversubscription: scipy.fft.fft2 spawns `workers` threads internally,
+        # so total threads = n_jobs × workers without this cap.
+        self.sp_kernel.workers = max(1, (os.cpu_count() or 1) // n_jobs)
+
+        iterator = tqdm(
+            self._gene_iso_names,
+            desc=f"SV [{method}]",
+            total=len(self._gene_iso_names),
+            disable=not print_progress,
+        )
 
         results = Parallel(n_jobs=n_jobs, prefer="threads")(
             delayed(_sv_worker_fft)(
                 self._raster_layer,
                 iso_names,
-                self.kernel,
+                self.sp_kernel,
                 self._kernel_eigvals,
                 method,
                 ratio_transformation,
@@ -987,7 +812,7 @@ class SplisosmFFT:
         stats = np.asarray([r[0] for r in results], dtype=float)
         pvals_np = np.asarray([r[1] for r in results], dtype=float)
 
-        self.sv_test_results = {
+        self._sv_test_results = {
             "statistic": stats,
             "pvalue": pvals_np,
             "pvalue_adj": false_discovery_control(pvals_np),
@@ -996,7 +821,7 @@ class SplisosmFFT:
         }
 
         if return_results:
-            return self.sv_test_results
+            return self._sv_test_results
         return None
 
     def test_differential_usage(
@@ -1091,14 +916,14 @@ class SplisosmFFT:
             Whether to show the progress bar. Default to True.
         return_results : bool, optional
             Whether to return the test statistics and p-values.
-            If False, the results are stored in ``self.du_test_results``.
+            If False, the results are stored in ``self._du_test_results``.
 
         Returns
         -------
         results : dict or None
             If ``return_results`` is True, returns dict with test statistics and
             p-values. Otherwise, returns None and stores results in
-            ``self.du_test_results``.
+            ``self._du_test_results``.
 
         Raises
         ------
@@ -1111,7 +936,7 @@ class SplisosmFFT:
         --------
         :func:`splisosm.hyptest_np.SplisosmNP.test_differential_usage` : Non-FFT version of this function for comparison.
         """
-        if self._adata is None or self.kernel is None or self._raster_layer is None:
+        if self._adata is None or self.sp_kernel is None or self._raster_layer is None:
             raise RuntimeError("Data not initialized. Call setup_data() first.")
         if self._design_table_name is None:
             raise RuntimeError(
@@ -1131,11 +956,13 @@ class SplisosmFFT:
                 f"ratio_transformation must be one of {valid_transformations}."
             )
 
-        factor_names = self.covariate_names or [
-            f"factor_{i}" for i in range(self.n_factors)
-        ]
+        factor_names = (
+            self.covariate_names
+            if self.covariate_names is not None and len(self.covariate_names) > 0
+            else [f"factor_{i}" for i in range(self.n_factors)]
+        )
         n_factors = self.n_factors
-        spacing = (self.kernel.dy, self.kernel.dx)
+        spacing = (self.sp_kernel.dy, self.sp_kernel.dx)
 
         # GPR is only needed for "hsic-gp"
         use_gpr_cov = method == "hsic-gp"
@@ -1175,6 +1002,15 @@ class SplisosmFFT:
         if n_jobs == -1:
             n_jobs = os.cpu_count() or 1
 
+        # Auto-coordinate FFT workers with joblib n_jobs to prevent thread
+        # oversubscription (same rationale as in test_spatial_variability).
+        _fft_workers = max(1, (os.cpu_count() or 1) // n_jobs)
+        self.sp_kernel.workers = _fft_workers
+        if gpr_cov is not None:
+            gpr_cov._workers = _fft_workers
+        if gpr_iso_cfg is not None:
+            gpr_iso_cfg = {**gpr_iso_cfg, "workers": _fft_workers}
+
         n_genes = len(self._gene_iso_names)
         stats = np.zeros((n_genes, n_factors))
         pvals = np.ones((n_genes, n_factors))
@@ -1185,9 +1021,12 @@ class SplisosmFFT:
         show_gene_bar = print_progress and n_chunks == 1
         show_chunk_bar = print_progress and n_chunks > 1
 
-        chunk_range = range(0, n_factors, _COV_CHUNK)
-        if show_chunk_bar:
-            chunk_range = tqdm(chunk_range, desc=f"DU [{method}] factor chunks")
+        chunk_range = tqdm(
+            range(0, n_factors, _COV_CHUNK),
+            desc="Covariates",
+            total=n_chunks,
+            disable=not show_chunk_bar,
+        )
 
         for f_start in chunk_range:
             f_end = min(f_start + _COV_CHUNK, n_factors)
@@ -1227,9 +1066,12 @@ class SplisosmFFT:
                     z_res = z_cube.copy()
                 z_chunk.append(z_res)
 
-            gene_iter = self._gene_iso_names
-            if show_gene_bar:
-                gene_iter = tqdm(gene_iter, desc=f"DU [{method}]")
+            gene_iter = tqdm(
+                self._gene_iso_names,
+                desc=f"DU [{method}]",
+                total=len(self._gene_iso_names),
+                disable=not show_gene_bar,
+            )
 
             chunk_results = Parallel(n_jobs=n_jobs, prefer="threads")(
                 delayed(_du_worker_fft)(
@@ -1252,26 +1094,31 @@ class SplisosmFFT:
             [false_discovery_control(pvals[:, _f]) for _f in range(n_factors)]
         )
 
-        self.du_test_results = {
+        self._du_test_results = {
             "statistic": stats,
             "pvalue": pvals,
             "pvalue_adj": pvals_adj,
             "method": method,
         }
         if return_results:
-            return self.du_test_results
+            return self._du_test_results
         return None
 
     def get_formatted_test_results(
-        self, test_type: Literal["sv", "du"]
+        self,
+        test_type: Literal["sv", "du"],
+        with_gene_summary: bool = False,
     ) -> pd.DataFrame:
         """Get formatted test results as a pandas DataFrame.
 
         Parameters
         ----------
-        test_type
+        test_type : {"sv", "du"}
             Test type: ``"sv"`` for spatial variability or ``"du"`` for
             differential usage.
+        with_gene_summary : bool, optional
+            If ``True``, append gene-level summary statistics from
+            :meth:`extract_feature_summary`.
 
         Returns
         -------
@@ -1282,41 +1129,43 @@ class SplisosmFFT:
             raise ValueError("Invalid test type. Must be one of 'sv' or 'du'.")
 
         if test_type == "sv":
-            if len(self.sv_test_results) == 0:
+            if len(self._sv_test_results) == 0:
                 raise ValueError(
                     "No spatial variability results found. Run test_spatial_variability() first."
                 )
-            return pd.DataFrame(
+            df = pd.DataFrame(
                 {
                     "gene": self.gene_names,
-                    "statistic": self.sv_test_results["statistic"],
-                    "pvalue": self.sv_test_results["pvalue"],
-                    "pvalue_adj": self.sv_test_results["pvalue_adj"],
+                    "statistic": self._sv_test_results["statistic"],
+                    "pvalue": self._sv_test_results["pvalue"],
+                    "pvalue_adj": self._sv_test_results["pvalue_adj"],
+                }
+            )
+        else:
+            if len(self._du_test_results) == 0:
+                raise ValueError(
+                    "No differential usage results found. Run test_differential_usage() first."
+                )
+            covariate_names = (
+                self.covariate_names
+                if self.covariate_names is not None and len(self.covariate_names) > 0
+                else [f"factor_{i}" for i in range(self.n_factors)]
+            )
+            df = pd.DataFrame(
+                {
+                    "gene": np.repeat(self.gene_names, self.n_factors),
+                    "covariate": np.tile(covariate_names, self.n_genes),
+                    "statistic": self._du_test_results["statistic"].reshape(-1),
+                    "pvalue": self._du_test_results["pvalue"].reshape(-1),
+                    "pvalue_adj": self._du_test_results["pvalue_adj"].reshape(-1),
                 }
             )
 
-        if len(self.du_test_results) == 0:
-            raise ValueError(
-                "No differential usage results found. Run test_differential_usage() first."
-            )
+        if with_gene_summary:
+            gene_df = self.extract_feature_summary(level="gene", print_progress=False)
+            df = df.merge(gene_df, left_on="gene", right_index=True, how="left")
 
-        du = self.du_test_results
-        covariate_names = self.covariate_names or [
-            f"factor_{i}" for i in range(self.n_factors)
-        ]
-        rows = []
-        for _g, gene in enumerate(self.gene_names):
-            for _f, covariate in enumerate(covariate_names):
-                rows.append(
-                    {
-                        "gene": gene,
-                        "covariate": covariate,
-                        "statistic": du["statistic"][_g, _f],
-                        "pvalue": du["pvalue"][_g, _f],
-                        "pvalue_adj": du["pvalue_adj"][_g, _f],
-                    }
-                )
-        return pd.DataFrame(rows)
+        return df
 
     def _compute_feature_summaries(self, print_progress: bool = True) -> None:
         """Compute and cache both gene-level and isoform-level summaries."""
@@ -1324,148 +1173,16 @@ class SplisosmFFT:
             raise RuntimeError("Data is not initialized. Call setup_data() first.")
         if self._gene_summary is not None and self._isoform_summary is not None:
             return
-
-        adata = self._adata
-        n_bins = int(adata.n_obs)
-        var_names_index = adata.var_names
-        iso_counts = adata.layers[self._counts_layer]
-        is_sparse = sp.issparse(iso_counts)
-
-        if is_sparse:
-            if not sp.isspmatrix_csc(iso_counts):
-                iso_counts = iso_counts.tocsc()
-        else:
-            iso_counts = np.asarray(iso_counts, dtype=float)
-
-        gene_rows: list[dict[str, Any]] = []
-        iso_rows: list[dict[str, Any]] = []
-        all_iso_names: list[str] = []
-
-        iterator = zip(self.gene_names, self._gene_iso_names)
-        if print_progress:
-            iterator = tqdm(iterator, desc="Genes", total=len(self.gene_names))
-
-        for gene_name, iso_names in iterator:
-            iso_idx = var_names_index.get_indexer(iso_names)
-            if np.any(iso_idx < 0):
-                raise ValueError(
-                    f"Failed to locate one or more filtered isoforms for gene '{gene_name}'."
-                )
-
-            if is_sparse:
-                gene_counts = iso_counts[:, iso_idx]
-                iso_total = np.asarray(gene_counts.sum(axis=0), dtype=float).ravel()
-                iso_sumsq = np.asarray(
-                    gene_counts.power(2).sum(axis=0), dtype=float
-                ).ravel()
-                iso_nnz = np.diff(gene_counts.indptr).astype(float)
-                row_sums = np.asarray(gene_counts.sum(axis=1), dtype=float).ravel()
-            else:
-                gene_counts = np.asarray(iso_counts[:, iso_idx], dtype=float)
-                iso_total = gene_counts.sum(axis=0)
-                iso_sumsq = np.square(gene_counts).sum(axis=0)
-                iso_nnz = np.count_nonzero(gene_counts, axis=0).astype(float)
-                row_sums = gene_counts.sum(axis=1)
-
-            gene_total = float(iso_total.sum())
-            valid_rows = np.flatnonzero(row_sums > 0.0)
-            n_valid = int(valid_rows.size)
-
-            iso_count_avg = iso_total / n_bins
-            iso_count_var = np.maximum(
-                (iso_sumsq / n_bins) - np.square(iso_count_avg), 0.0
-            )
-            iso_count_std = np.sqrt(iso_count_var)
-            iso_pct_bin_on = iso_nnz / n_bins
-
-            if gene_total > 0.0:
-                ratio_total = iso_total / gene_total
-            else:
-                ratio_total = np.zeros(len(iso_names), dtype=float)
-
-            if n_valid > 0:
-                if is_sparse:
-                    ratio_counts = gene_counts.tocsr()[valid_rows]
-                    ratio_counts = ratio_counts.multiply(
-                        (1.0 / row_sums[valid_rows])[:, None]
-                    )
-                    ratio_sum = np.asarray(
-                        ratio_counts.sum(axis=0), dtype=float
-                    ).ravel()
-                    ratio_sumsq = np.asarray(
-                        ratio_counts.power(2).sum(axis=0), dtype=float
-                    ).ravel()
-                else:
-                    ratio_counts = gene_counts[valid_rows] / row_sums[valid_rows, None]
-                    ratio_sum = ratio_counts.sum(axis=0)
-                    ratio_sumsq = np.square(ratio_counts).sum(axis=0)
-
-                ratio_avg = ratio_sum / n_valid
-                ratio_var = np.maximum(
-                    (ratio_sumsq / n_valid) - np.square(ratio_avg), 0.0
-                )
-                ratio_std = np.sqrt(ratio_var)
-            else:
-                ratio_avg = np.zeros(len(iso_names), dtype=float)
-                ratio_std = np.zeros(len(iso_names), dtype=float)
-
-            with np.errstate(divide="ignore", invalid="ignore"):
-                entropy = -(np.log(ratio_total) * ratio_total)
-                entropy = float(np.nan_to_num(entropy).sum())
-
-            gene_count_avg = float(gene_total / n_bins)
-            gene_count_sumsq = float(np.square(row_sums).sum())
-            gene_count_var = max((gene_count_sumsq / n_bins) - (gene_count_avg**2), 0.0)
-
-            gene_rows.append(
-                {
-                    "gene": gene_name,
-                    "n_isos": len(iso_names),
-                    "perplexity": float(np.exp(entropy)),
-                    "pct_bin_on": float(n_valid / n_bins),
-                    "count_avg": gene_count_avg,
-                    "count_std": float(np.sqrt(gene_count_var)),
-                }
-            )
-
-            all_iso_names.extend(iso_names)
-            for (
-                iso_name,
-                pct_bin_on,
-                count_total,
-                count_avg,
-                count_std,
-                iso_ratio_total,
-                iso_ratio_avg,
-                iso_ratio_std,
-            ) in zip(
-                iso_names,
-                iso_pct_bin_on,
-                iso_total,
-                iso_count_avg,
-                iso_count_std,
-                ratio_total,
-                ratio_avg,
-                ratio_std,
-            ):
-                iso_rows.append(
-                    {
-                        "isoform": iso_name,
-                        "pct_bin_on": float(pct_bin_on),
-                        "count_total": float(count_total),
-                        "count_avg": float(count_avg),
-                        "count_std": float(count_std),
-                        "ratio_total": float(iso_ratio_total),
-                        "ratio_avg": float(iso_ratio_avg),
-                        "ratio_std": float(iso_ratio_std),
-                    }
-                )
-
-        self._gene_summary = pd.DataFrame(gene_rows).set_index("gene")
-
-        var_df = adata.var.loc[all_iso_names].copy()
-        stats_df = pd.DataFrame(iso_rows).set_index("isoform")
-        self._isoform_summary = pd.concat([var_df, stats_df], axis=1)
+        # self._adata is the full unfiltered table; restrict to filtered isoforms
+        kept_isos = [iso for gene_isos in self._gene_iso_names for iso in gene_isos]
+        filtered_adata = self._adata[:, kept_isos]
+        self._gene_summary, self._isoform_summary = compute_feature_summaries(
+            filtered_adata,
+            self.gene_names,
+            layer=self._counts_layer,
+            group_iso_by=self._group_iso_by,
+            print_progress=print_progress,
+        )
 
     def extract_feature_summary(
         self,
@@ -1528,7 +1245,7 @@ class SplisosmFFT:
             If ``level`` is not ``'gene'`` or ``'isoform'``.
         """
         if self._adata is None:
-            raise RuntimeError("Data is not initialized. Call setup_data() first.")
+            raise RuntimeError("Call setup_data() first.")
         if level not in {"gene", "isoform"}:
             raise ValueError("`level` must be one of 'gene' or 'isoform'.")
 

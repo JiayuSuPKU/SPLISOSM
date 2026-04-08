@@ -4,13 +4,6 @@ This module provides an abstract interface and concrete implementations for
 kernel-based conditional independence testing (via spatial residualization)
 used by the SPLISOSM differential-usage tests.
 
-Kernel-operator hierarchy
---------------------------
-``SpatialKernelOp`` (abstract):
-
-    - ``DenseKernelOp``     - stores K explicitly; Cholesky solve; O(n^2) memory.
-    - ``FFTKernelOp``       - operates in the spectral domain; O(N log N); no matrix.
-
 GPR-residualizer hierarchy
 ---------------------------
 ``KernelGPR`` (abstract):
@@ -28,6 +21,7 @@ from typing import Any, Literal, Optional, Union
 
 import numpy as np
 import scipy.fft
+import scipy.sparse
 import torch
 from scipy.optimize import minimize, minimize_scalar
 
@@ -38,10 +32,10 @@ from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 from splisosm.likelihood import liu_sf
 
 __all__ = [
-    # Kernel linear operators
-    "SpatialKernelOp",
-    "DenseKernelOp",
-    "FFTKernelOp",
+    # # Kernel linear operators
+    # "SpatialKernelOp",
+    # "DenseKernelOp",
+    # "FFTKernelOp",
     # GPR residualizers
     "KernelGPR",
     "SklearnKernelGPR",
@@ -405,18 +399,31 @@ class FFTKernelOp(SpatialKernelOp):
 
 
 def linear_hsic_test(
-    X: torch.Tensor, Y: torch.Tensor, centering: bool = True
+    X: "torch.Tensor | scipy.sparse.spmatrix",
+    Y: "torch.Tensor | scipy.sparse.spmatrix",
+    centering: bool = True,
 ) -> tuple[float, float]:
     """The linear HSIC test (multivariate RV coefficient).
 
     Equivalent to a multivariate extension of Pearson correlation.
 
+    Supports sparse inputs for memory and speed efficiency:
+
+    * **Sparse X** (scipy sparse matrix, shape ``(n, p)``): the cross-product
+      ``Y_c.T @ X_c`` is computed via a sparse matrix multiply
+      (``X.T.dot(Y_c)``).  Because ``Y`` is mean-centred, the ``X`` centering
+      correction reduces to zero, so only the original sparse ``X`` is needed.
+      ``X_c.T @ X_c`` is obtained as ``X.T @ X  -  n * mean_X ⊗ mean_X``,
+      keeping the first term sparse.
+    * **Sparse Y** (scipy sparse or torch sparse COO): densified once upfront
+      before any computation.
+
     Parameters
     ----------
-    X : torch.Tensor, shape (n_samples, n_x)
-    Y : torch.Tensor, shape (n_samples, n_y)
+    X : torch.Tensor or scipy.sparse.spmatrix, shape (n_samples, n_x)
+    Y : torch.Tensor or scipy.sparse.spmatrix, shape (n_samples, n_y)
     centering : bool
-        Whether to mean-centre X and Y.
+        Whether to mean-centre X and Y before computing the statistic.
 
     Returns
     -------
@@ -425,23 +432,78 @@ def linear_hsic_test(
     pvalue : float
         P-value from the asymptotic chi-squared mixture distribution.
     """
-    is_nan = torch.isnan(X).any(1) | torch.isnan(Y).any(1)
-    X = X[~is_nan]
-    Y = Y[~is_nan]
-
-    if centering:
-        X = X - X.mean(0)
-        Y = Y - Y.mean(0)
-
-    n = X.shape[0]
     eigv_th = 1e-5
 
-    hsic_scaled = torch.norm(Y.T @ X, p="fro").pow(2)
+    # ── Normalise Y to a dense float32 tensor ─────────────────────────────
+    if scipy.sparse.issparse(Y):
+        Y = torch.from_numpy(np.asarray(Y.todense(), dtype=np.float32))
+    elif isinstance(Y, torch.Tensor) and Y.is_sparse:
+        Y = Y.to_dense().float()
+    elif isinstance(Y, np.ndarray):
+        Y = torch.from_numpy(Y.astype(np.float32))
+    else:
+        Y = Y.float()
 
-    lambda_x = torch.linalg.eigvalsh(X.T @ X)
-    lambda_x = lambda_x[lambda_x > eigv_th]
-    lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
-    lambda_y = lambda_y[lambda_y > eigv_th]
+    X_is_sparse = scipy.sparse.issparse(X)
+
+    # ── NaN filtering ─────────────────────────────────────────────────────
+    is_nan_y = torch.isnan(Y).any(1)
+    if X_is_sparse:
+        # Sparse matrices contain no NaN by construction.
+        is_nan = is_nan_y
+    else:
+        if isinstance(X, np.ndarray):
+            X = torch.from_numpy(X.astype(np.float32))
+        else:
+            X = X.float()
+        is_nan = is_nan_y | torch.isnan(X).any(1)
+
+    if is_nan.any():
+        keep = ~is_nan
+        Y = Y[keep]
+        if X_is_sparse:
+            X = X[keep.numpy()]
+        else:
+            X = X[keep]
+
+    n = Y.shape[0]
+
+    # ── Sparse-X path ─────────────────────────────────────────────────────
+    if X_is_sparse:
+        X_sp = X.tocsr()
+        if centering:
+            Y = Y - Y.mean(0)
+
+        # Key identity: when Y is centred, Y_c.T @ X_c == Y_c.T @ X
+        # because the correction term Y_c.sum(0) == 0 vanishes.
+        # So we can use the original (non-centred) sparse X directly.
+        YcTX = torch.from_numpy(
+            X_sp.T.dot(Y.numpy()).astype(np.float32)
+        ).T  # (n_y, n_x)
+        hsic_scaled = YcTX.pow(2).sum()
+
+        # X_c.T @ X_c = X.T @ X - n * mean_X.outer(mean_X)
+        X_mean = np.asarray(X_sp.mean(axis=0), dtype=np.float32).ravel()
+        XcTXc = torch.from_numpy(
+            X_sp.T.dot(X_sp).toarray().astype(np.float32) - n * np.outer(X_mean, X_mean)
+        )
+        lambda_x = torch.linalg.eigvalsh(XcTXc)
+        lambda_x = lambda_x[lambda_x > eigv_th]
+        lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
+        lambda_y = lambda_y[lambda_y > eigv_th]
+
+    # ── Dense-X path (original) ───────────────────────────────────────────
+    else:
+        if centering:
+            X = X - X.mean(0)
+            Y = Y - Y.mean(0)
+
+        hsic_scaled = torch.norm(Y.T @ X, p="fro").pow(2)
+
+        lambda_x = torch.linalg.eigvalsh(X.T @ X)
+        lambda_x = lambda_x[lambda_x > eigv_th]
+        lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
+        lambda_y = lambda_y[lambda_y > eigv_th]
 
     lambda_xy = (lambda_x.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
     pval = liu_sf((hsic_scaled * n).numpy(), lambda_xy.numpy())
@@ -660,9 +722,10 @@ _DEFAULT_GPR_CONFIGS = {
         "constant_value_bounds": (1e-3, 1e3),
         "length_scale": 1.0,
         "length_scale_bounds": "fixed",
-        # n_inducing: number of inducing points.
-        # sklearn  — full GP when n ≤ n_inducing; subset-GP otherwise.
-        # gpytorch — FITC sparse GP; set to None for exact GP.
+        # n_inducing: subset-of-data size limit for sklearn (not inducing-point
+        # approximation); FITC inducing-point limit for gpytorch.
+        # sklearn  — full GP when n ≤ n_inducing (or None); subset-of-data otherwise.
+        # gpytorch — FITC sparse GP when n > n_inducing; set to None for exact GP.
         "n_inducing": 5_000,
     },
     # Isoform GPR: same calibrated config as covariate — signal amplitude
@@ -701,17 +764,23 @@ class SklearnKernelGPR(KernelGPR):
         Initial RBF length scale.
     length_scale_bounds : tuple or ``"fixed"``
         Search bounds for the length scale.
-    n_inducing : int
-        Number of inducing points.  When ``n_obs <= n_inducing`` the full
-        exact GP is used.  When ``n_obs > n_inducing``, a subset of
-        ``n_inducing`` randomly sampled points is used as the inducing set
-        for an approximate GP (subset-of-data / Nyström-style approximation).
+    n_inducing : int or None
+        Maximum number of observations used for hyperparameter fitting.
+        When ``n_obs <= n_inducing`` (or ``n_inducing`` is ``None``), all
+        observations are used for an exact GP fit.  When ``n_obs > n_inducing``,
+        a randomly sampled **subset-of-data** of ``n_inducing`` points is used
+        for hyperparameter search, then the fitted kernel is applied to predict
+        on all observations.  This is **not** an inducing-point (FITC/VFE)
+        approximation — the subset is only used to determine hyperparameters.
+        Setting ``n_inducing=None`` disables the subset shortcut and always
+        uses the full dataset; a warning is issued when ``n_obs > 10_000``.
 
     Notes
     -----
-    This backend always materialises a dense n x n kernel matrix up to
-    ``n_inducing`` points.  For very large n consider ``GPyTorchKernelGPR``
-    with inducing points.
+    This backend always materialises a dense n x n kernel matrix (up to
+    ``n_inducing`` x ``n_inducing`` when the subset path is taken).  For
+    very large n, consider ``GPyTorchKernelGPR`` with FITC inducing points
+    or ``FFTKernelGPR`` for regular raster grids.
     """
 
     def __init__(
@@ -720,7 +789,7 @@ class SklearnKernelGPR(KernelGPR):
         constant_value_bounds: Union[tuple, str] = (1e-3, 1e3),
         length_scale: float = 1.0,
         length_scale_bounds: Union[tuple, str] = "fixed",
-        n_inducing: int = 5_000,
+        n_inducing: Optional[int] = 5_000,
     ) -> None:
         self._constant_value = constant_value
         self._constant_value_bounds = constant_value_bounds
@@ -784,10 +853,11 @@ class SklearnKernelGPR(KernelGPR):
         -------
         None
         """
-        if coords.shape[0] > self.n_inducing:
+        if self.n_inducing is not None and coords.shape[0] > self.n_inducing:
             warnings.warn(
                 f"n={coords.shape[0]} > n_inducing={self.n_inducing}; "
-                "large-n approximate path will be used; precompute_shared_kernel skipped.",
+                "large-n subset-of-data path will be used; precompute_shared_kernel skipped.",
+                UserWarning,
                 stacklevel=2,
             )
             return
@@ -795,6 +865,7 @@ class SklearnKernelGPR(KernelGPR):
             warnings.warn(
                 "precompute_shared_kernel() has no effect when signal bounds "
                 "are not fixed; the full GP will still be fitted per target.",
+                UserWarning,
                 stacklevel=2,
             )
             return
@@ -863,11 +934,15 @@ class SklearnKernelGPR(KernelGPR):
         return self._fit_no_nan(coords, Y)
 
     def _fit_large_n(self, coords: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-        """Approximate residualization for n > n_inducing via subset GP + chunked prediction.
+        """Residualization for n > n_inducing via subset-of-data GP + chunked prediction.
 
-        Fits sklearn GP on a randomly sub-sampled ``n_inducing`` reference set,
-        extracts hyperparameters, then computes GP posterior-mean predictions at
-        every point in ``coords`` using O(chunk x m) peak memory per chunk.
+        Fits an sklearn GP on a randomly sub-sampled ``n_inducing`` reference set
+        to determine hyperparameters, then predicts on all ``n`` points using
+        chunked matrix operations to limit peak memory.
+
+        This is a **subset-of-data** approximation: hyperparameters are estimated
+        from a subset but residuals are computed for all observations.  It is *not*
+        an inducing-point (FITC/VFE) approximation.
 
         Returns
         -------
@@ -915,7 +990,16 @@ class SklearnKernelGPR(KernelGPR):
 
     def _fit_no_nan(self, coords: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         """Inner residualization without NaN handling."""
-        if coords.shape[0] > self.n_inducing:
+        if self.n_inducing is None:
+            if coords.shape[0] > 10_000:
+                warnings.warn(
+                    f"n_inducing=None: using all {coords.shape[0]} observations for GP "
+                    "hyperparameter fitting. This may be slow for large datasets. "
+                    "Consider setting n_inducing to limit the subset size.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+        elif coords.shape[0] > self.n_inducing:
             return self._fit_large_n(coords, Y)
         if (
             self.signal_bounds_fixed
@@ -1309,19 +1393,23 @@ class FFTKernelGPR(KernelGPR):
     Kernel eigenvalues are computed via :class:`FFTKernelOp`; all linear-algebra
     is O(N log N) with no n x n matrix formed.
 
-    Hyperparameter optimization strategy
-    -------------------------------------
-    The spectral log-marginal-likelihood (LML) for Y (n observations, m channels)
+    Notes
+    -----
+    **Hyperparameter optimization strategy**
+
+    The spectral log-marginal-likelihood (LML) for Y (n = nx * ny observations, m channels)
     is::
 
-        -2 LML = m * sum_k log(lam_k + eps)
-                 + (1/n) * sum_k ||Y_hat_k||^2 / (lam_k + eps)
+        -2 LML = m * sum_k log(lambda_k + eps)
+                 + (1/n) * sum_k ||Y_hat_k||^2 / (lambda_k + eps)
 
-    where ``lam_k = sigma^2 * s_k(l)`` are the kernel eigenvalues,
-    ``s_k(l)`` the unit-spectrum eigenvalues at length scale ``l``, and
+    where ``lambda_k = sigma^2 * s_k(l)`` are the kernel eigenvalues with
+    ``sigma`` being the constant value (signal variance) and ``s_k(l)``
+    the unit-spectrum eigenvalues at length scale ``l``, and
     ``Y_hat = FFT2(Y_cube)`` (unnormalized 2-D DFT).
 
-    Four optimization cases based on which bounds are ``"fixed"``:
+    Four optimization cases based on which bounds (constant_value_bounds, length_scale_bounds)
+    are ``"fixed"``:
 
     1. **Both fixed** → 1-D bounded scalar search over ``log(eps)`` only.
        Fastest; unit spectrum cached across repeated calls.
@@ -1928,7 +2016,7 @@ def fit_kernel_gpr(
 ) -> Union[tuple[torch.Tensor, float], torch.Tensor]:
     """Fit a Gaussian process regression and optionally return residuals.
 
-    .. deprecated::
+    .. deprecated:: 1.0.4
         Use :class:`SklearnKernelGPR` directly.  This wrapper is kept for
         backward compatibility and will be removed in a future release.
 

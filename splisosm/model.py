@@ -176,6 +176,7 @@ class MultinomGLM(BaseModel, nn.Module):
             - ``'lr'``: float, Learning rate for gradient descent or Newton's method.
             - ``'optim'``: str, Optimizer type, one of ``'adam'``, ``'sgd'``, or ``'lbfgs'``.
             - ``'tol'``: float, Tolerance for convergence.
+            - ``'tol_relative'``: bool, Whether to use relative tolerance for improvement.
             - ``'max_epochs'``: int, Maximum number of epochs for fitting.
             - ``'patience'``: int, Number of epochs to wait for improvement before stopping.
         """
@@ -194,6 +195,7 @@ class MultinomGLM(BaseModel, nn.Module):
             "lr": 1e-2,
             "optim": "adam",
             "tol": 1e-5,
+            "tol_relative": False,
             "max_epochs": 1000,
             "patience": 5 if fitting_method == "gd" else 2,
         }
@@ -206,7 +208,7 @@ class MultinomGLM(BaseModel, nn.Module):
         self.fitting_time = 0
 
     def __str__(self):
-        return (
+        base = (
             "A Multinomial Generalized Linear Model (GLM)\n"
             + f"- Number of genes in the batch: {self.n_genes}\n"
             + f"- Number of spots: {self.n_spots}\n"
@@ -214,12 +216,29 @@ class MultinomGLM(BaseModel, nn.Module):
             + f"- Number of covariates: {self.n_factors}\n"
             + f"- Fitting method: {self.fitting_method}"
         )
+        lg = getattr(self, "logger", None)
+        if lg is not None:
+            n_conv = int(lg.convergence.sum().item())
+            med_epoch = int(lg.best_epoch.median().item())
+            med_loss = float(lg.best_loss.median().item())
+            training = (
+                "\n=== Training summary (fitted)"
+                + f"\n- Fitting time: {self.fitting_time:.2f} s"
+                + f"\n- Converged: {n_conv} / {self.n_genes} genes"
+                + f"\n- Best epoch (median): {med_epoch}"
+                + f"\n- Best loss (median): {med_loss:.4f}"
+            )
+        else:
+            training = "\n=== Training summary (not yet fitted)"
+        return base + training
+
+    __repr__ = __str__
 
     def setup_data(
         self,
         counts: torch.Tensor,
         design_mtx: Optional[torch.Tensor] = None,
-        device: Literal["cpu", "cuda"] = "cpu",
+        device: Literal["cpu", "cuda", "mps"] = "cpu",
     ) -> None:
         """Set up the data for the model.
 
@@ -232,7 +251,7 @@ class MultinomGLM(BaseModel, nn.Module):
             Shape (n_spots, n_factors). Design matrix of spatial covariates.
             If None, an intercept-only design matrix will be used.
         device
-            'cpu' or 'cuda'. 'mps' currently not supported (torch.lgamma not supported on mps).
+            'cpu', 'cuda', or 'mps' (torch v2.11.0+).
         """
         # need to switch to a different count model (e.g., Poisson) when only one isoform is provided
         if counts.shape[-1] == 1:
@@ -240,14 +259,15 @@ class MultinomGLM(BaseModel, nn.Module):
                 "Only one isoform provided. Please use a different count model."
             )
 
-        assert device in ["cpu", "cuda"]
+        assert device in [
+            "cpu",
+            "cuda",
+            "mps",
+        ], f"device must be 'cpu', 'cuda', or 'mps'; got {device!r}"
         self.device = torch.device(device)
 
         if counts.ndim == 2:
             counts = counts.unsqueeze(0)  # (1, n_spots, n_isos)
-            print(
-                "Batched calculation has been implemented. Provide a batch of counts to speed up calculation."
-            )
 
         # convert sparse tensors to dense tensors
         if counts.is_sparse:
@@ -442,50 +462,73 @@ class MultinomGLM(BaseModel, nn.Module):
 
         return score
 
-    def _get_log_lik_hessian_eta(self):
-        """Get the Hessian matrix of the log joint probability wrt eta."""
+    def _get_multinom_hessian_raw(self):
+        """Get the per-spot multinomial Hessian blocks (compact form, before melting).
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_spots, n_isos - 1, n_isos - 1)``.
+            Entry ``[b, s, j, k]`` is the (j,k) element of the Hessian block at spot s
+            for gene b.
+        """
         n_isos = self.n_isos
         props = self._alpha()  # (n_genes, n_spots, n_isos)
-
-        # multinom_hessian[s] = - sum(counts[s,:]) * {diag(p) - p@p.T}
-        # (n_genes, n_spots, n_isos - 1, n_isos - 1)
-        multinom_hessian = -self.counts.sum(-1).view(self.n_genes, -1, 1, 1) * (
+        # multinom_hessian[b,s,j,k] = -counts_total[b,s] * (δ_jk * p_j - p_j * p_k)
+        return -self.counts.sum(-1).view(self.n_genes, -1, 1, 1) * (
             props[..., :-1].unsqueeze(-1).expand(-1, -1, -1, n_isos - 1)
             * torch.eye(n_isos - 1, device=self.device)
             - torch.einsum("bsi,bsj->bsij", (props[..., :-1], props[..., :-1]))
         )
 
+    def _get_log_lik_hessian_eta(self):
+        """Get the Hessian matrix of the log joint probability wrt eta."""
         # reshape the hessian into (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
         # (1) zeros for spots i != j
         # (2) at spot i, isoform j and k are connected via multinom_hessian[i, j, k]
-        return _melt_tensor_along_first_dim(multinom_hessian)
+        return _melt_tensor_along_first_dim(self._get_multinom_hessian_raw())
 
     def _get_log_lik_hessian_beta_bias(self):
-        """Get the Hessian matrix of the log joint probability wrt the fixed effects."""
-        # combine beta and the intercept bias_eta
-        X_expand = torch.cat(
-            [
-                self.X_spot,
-                torch.ones(1, self.n_spots, 1, device=self.device),
-            ],
+        """Get the Hessian matrix of the log joint probability wrt the fixed effects.
+
+        Computes ``X^T H_eta X`` directly from the per-spot Hessian blocks using
+        einsum, avoiding the large ``n_spots*(n_isos-1) × n_spots*(n_isos-1)``
+        intermediate matrix produced by ``_get_log_lik_hessian_eta``.
+
+        Note: uses ``self.X_spot.shape[-1]`` for the factor dimension rather than
+        ``self.n_factors``, because some callers (e.g. score test) extend ``X_spot``
+        without updating ``n_factors``.
+        """
+        n_isos = self.n_isos
+        props = self._alpha()  # (n_genes, n_spots, n_isos)
+
+        # Per-spot log-lik Hessian blocks w.r.t. eta:
+        # H_block[b, s, r, k] = -counts[b,s] * (diag(p) - p*p^T)[r,k]
+        # Shape (n_genes, n_spots, n_isos-1, n_isos-1)
+        H_block = -self.counts.sum(-1).view(self.n_genes, -1, 1, 1) * (
+            props[..., :-1].unsqueeze(-1).expand(-1, -1, -1, n_isos - 1)
+            * torch.eye(n_isos - 1, device=self.device)
+            - torch.einsum("bsi,bsj->bsij", props[..., :-1], props[..., :-1])
+        )
+
+        # X_s: (n_spots, n_factors_actual+1) — design matrix augmented with intercept column.
+        # Use X_spot.shape[-1] (not self.n_factors) to handle cases where X_spot is
+        # temporarily extended by callers (e.g., score test).
+        X_s = torch.cat(
+            [self.X_spot.squeeze(0), torch.ones(self.n_spots, 1, device=self.device)],
             dim=-1,
-        )  # (1, n_spots, n_factors + 1)
-        # (n_genes, n_spots * (n_isos - 1), (n_factors + 1) * (n_isos - 1))
-        X_expand_full = torch.stack(
-            [torch.block_diag(*[x] * (self.n_isos - 1)) for x in X_expand], dim=0
-        )
+        )  # (n_spots, n_factors_actual+1)
+        nF1 = X_s.shape[-1]  # n_factors_actual + 1
 
-        # calculate the hessian of the log likelihood wrt [beta, bias]
-        # W is the hessian of the log multinomial likelihood wrt eta := X@beta + nu
-        # W[s] = - sum(counts[s,:]) * {diag(p) - p@p.T}
-        # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
-        W = self._get_log_lik_hessian_eta()
-        # hessian_beta = X.T @ W @ X, ((n_factors + 1)(n_isos - 1), (n_factors + 1)(n_isos - 1))
-        # (n_genes, (n_factors + 1) * (n_isos - 1), (n_factors + 1) * (n_isos - 1))
-        hessian_beta_expand = (
-            X_expand_full.transpose(1, 2).matmul(W).matmul(X_expand_full)
+        # X^T H X directly via einsum (no large W matrix needed):
+        # XtHX[b, r*nF1+f, k*nF1+g] = Σ_s X_s[s,f] * H_block[b,s,r,k] * X_s[s,g]
+        XtHX_5d = torch.einsum("sf, bsrk, sg -> brfkg", X_s, H_block, X_s)
+        # (n_genes, n_isos-1, nF1, n_isos-1, nF1)
+        hessian_beta_expand = XtHX_5d.reshape(
+            self.n_genes,
+            (n_isos - 1) * nF1,
+            (n_isos - 1) * nF1,
         )
-
         return hessian_beta_expand
 
     """Functions for model fitting.
@@ -572,7 +615,12 @@ class MultinomGLM(BaseModel, nn.Module):
         )
 
     def _update_iwls(self):
-        """Update the model parameters using the iteratively reweighted least squares (IWLS)."""
+        """Update the model parameters using the iteratively reweighted least squares (IWLS).
+
+        Avoids materialising the large ``n_spots*(n_isos-1) × n_spots*(n_isos-1)``
+        block-diagonal weight matrix by computing ``X^T W X`` and ``X^T W y``
+        directly via einsum on the per-spot weight blocks.
+        """
         n_genes, n_spots, n_isos, n_factors = (
             self.n_genes,
             self.n_spots,
@@ -581,65 +629,54 @@ class MultinomGLM(BaseModel, nn.Module):
         )
         props = self._alpha()  # (n_genes, n_spots, n_isos)
 
-        # define the working variable (pseudo data)
-        # working_y = eta + [d_eta/d_mu][counts - mu]
-        # [d_eta/d_mu] = [d_mu/d_eta]^-1 = W^-1
-        # W = N_i * (diag(alpha[i,:-1]) - alpha[i,:-1].T @ alpha[i,:-1]) at given location i
-
-        # W = sum(counts[s,:]) * {diag(p) - p@p.T}
-        # (n_genes, n_spots, n_isos - 1, n_isos - 1)
+        # Per-spot IWLS weight blocks:
+        # W[b, s, r, k] = counts[b,s] * (diag(p) - p*p^T)[r, k]
+        # Shape (n_genes, n_spots, n_isos-1, n_isos-1)
         W = self.counts.sum(-1).view(n_genes, n_spots, 1, 1) * (
             props[..., :-1].unsqueeze(-1).expand(-1, -1, -1, n_isos - 1)
             * torch.eye(n_isos - 1, device=self.device)
-            - torch.einsum("bsi,bsj->bsij", (props[..., :-1], props[..., :-1]))
+            - torch.einsum("bsi,bsj->bsij", props[..., :-1], props[..., :-1])
         )
-        # for stability
+        # Invert per-spot weight (small (n_isos-1)×(n_isos-1) blocks, not n×n)
         W_inv = torch.linalg.inv(W + 1e-5 * torch.eye(n_isos - 1, device=self.device))
+
+        # Pseudo-response: y_tilde = eta + W^{-1}(counts - mu)
         residuals = self.counts - props * self.counts.sum(-1, keepdim=True)
-        working_y = residuals[..., :-1].unsqueeze(
-            -1
-        )  # (n_genes, n_spots, n_isos - 1, 1)
-        working_y = (W_inv.matmul(working_y)).squeeze(
-            -1
-        )  # (n_genes, n_spots, n_isos - 1)
-        working_y += self._eta()  # (n_genes, n_spots, n_isos - 1)
+        working_y = W_inv.matmul(residuals[..., :-1].unsqueeze(-1)).squeeze(-1)
+        working_y += self._eta()  # (n_genes, n_spots, n_isos-1)
 
-        # calculate the IWLS update for beta and bias_eta
-        # beta_new = (X.T @ W @ X)^-1 @ X.T @ W @ y
-        # reshape W
-        # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
-        W = _melt_tensor_along_first_dim(W)
-        # reshape X to include the intercept term
-        # (1, n_spots, n_factors + 1)
-        X_expand = torch.cat(
-            [self.X_spot, torch.ones(1, n_spots, 1, device=self.device)], dim=-1
-        )
-        # (1, n_spots * (n_isos - 1), (n_factors + 1) * (n_isos - 1))
-        X_expand_full = torch.stack(
-            [torch.block_diag(*[x] * (n_isos - 1)) for x in X_expand], dim=0
-        )
-        # calculate the analytical solution
-        # (n_genes, (n_factors + 1) * (n_isos - 1), n_spots * (n_isos - 1))
-        Xt_W = X_expand_full.transpose(1, 2).matmul(W)
-        # (n_genes, (n_factors + 1) * (n_isos - 1), (n_factors + 1) * (n_isos - 1))
-        Xt_W_X = Xt_W.matmul(X_expand_full)
-        # add a small value to the diagonal for stability
-        Xt_W_X += 1e-5 * torch.eye((n_factors + 1) * (n_isos - 1))
+        # X_s: (n_spots, n_factors+1) — design with intercept column (no n_spots² allocation)
+        X_s = torch.cat(
+            [self.X_spot.squeeze(0), torch.ones(n_spots, 1, device=self.device)], dim=-1
+        )  # (n_spots, n_factors+1)
 
-        # (n_genes, (n_factors + 1) x (n_isos - 1))
-        Xt_W_y = torch.einsum("bij,bj->bi", Xt_W, working_y.transpose(1, 2).flatten(1))
+        # Efficient X^T W X via einsum (avoids the n_spots*(n_isos-1) × n_spots*(n_isos-1) W):
+        # XtWX[b, r*(F+1)+f, k*(F+1)+g] = Σ_s X_s[s,f] * W[b,s,r,k] * X_s[s,g]
+        XtWX_5d = torch.einsum("sf, bsrk, sg -> brfkg", X_s, W, X_s)
+        # (n_genes, n_isos-1, n_factors+1, n_isos-1, n_factors+1)
+        Xt_W_X = XtWX_5d.reshape(
+            n_genes, (n_isos - 1) * (n_factors + 1), (n_isos - 1) * (n_factors + 1)
+        )
+        Xt_W_X += 1e-5 * torch.eye((n_isos - 1) * (n_factors + 1), device=self.device)
+
+        # Efficient X^T W y via einsum:
+        # XtWy[b, r*(F+1)+f] = Σ_s X_s[s,f] * Σ_k W[b,s,r,k] * y[b,s,k]
+        Wy = torch.einsum(
+            "bsrk, bsk -> bsr", W, working_y
+        )  # (n_genes, n_spots, n_isos-1)
+        XtWy = torch.einsum(
+            "sf, bsr -> brf", X_s, Wy
+        )  # (n_genes, n_isos-1, n_factors+1)
+        Xt_W_y = XtWy.reshape(n_genes, -1)  # (n_genes, (n_isos-1)*(n_factors+1))
+
         res = torch.linalg.solve(Xt_W_X, Xt_W_y).reshape(
             n_genes, n_isos - 1, n_factors + 1
         )
 
         # extract beta and bias_eta
-        beta_new = res[..., :-1].transpose(1, 2)  # (n_genes, n_factors, n_isos - 1)
-        bias_eta_new = res[..., -1]  # (n_genes, n_isos - 1)
+        beta_new = res[..., :-1].transpose(1, 2)  # (n_genes, n_factors, n_isos-1)
+        bias_eta_new = res[..., -1]  # (n_genes, n_isos-1)
 
-        # update the parameters and clear the gradients
-        # with torch.no_grad():
-        #     self.beta[~self.convergence].copy_(beta_new[~self.convergence])
-        #     self.bias_eta[~self.convergence].copy_(bias_eta_new[~self.convergence])
         self.beta.data.copy_(update_at_idx(self.beta, beta_new, self.convergence))
         self.bias_eta.data.copy_(
             update_at_idx(self.bias_eta, bias_eta_new, self.convergence)
@@ -647,29 +684,43 @@ class MultinomGLM(BaseModel, nn.Module):
 
     def fit(
         self,
-        diagnose: bool = False,
+        store_param_history: bool = False,
         verbose: bool = False,
         quiet: bool = False,
         random_seed: Optional[int] = None,
+        diagnose: Optional[bool] = None,
     ) -> dict:
-        """Fit the model using all data
+        """Fit the model using all data.
 
         Parameters
         ----------
-        diagnose
-            Whether to store parameter changes during training (passed to PatienceLogger).
+        store_param_history
+            Whether to store per-epoch parameter snapshots during training.
+            Loss history is always recorded via ``model.logger.loss_history``
+            regardless of this flag.
         verbose
             Whether to print verbose information during fitting.
         quiet
             Whether to suppress output during fitting.
         random_seed
             Random seed for reproducibility.
+        diagnose
+            Deprecated alias for ``store_param_history``.
 
         Returns
         -------
         params_iter : dict or None
-            If `diagnose` is True, returns a dictionary of parameter changes during training. Otherwise returns None.
+            If ``store_param_history=True``, returns a dictionary of parameter
+            snapshots during training.  Otherwise returns ``None``.
         """
+        if diagnose is not None:
+            warnings.warn(
+                "The `diagnose` parameter is deprecated; use `store_param_history` instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            store_param_history = diagnose
+
         if random_seed is not None:  # set random seed for reproducibility
             torch.manual_seed(random_seed)
 
@@ -681,13 +732,19 @@ class MultinomGLM(BaseModel, nn.Module):
         max_epochs = self.fitting_configs["max_epochs"]
         patience = self.fitting_configs["patience"]
         tol = self.fitting_configs["tol"]
+        tol_relative = self.fitting_configs.get("tol_relative", False)
         max_epochs = 10000 if max_epochs == -1 else max_epochs
         patience = patience if patience > 0 else 1
 
-        # set iteration limits
         batch_size = self.n_genes
         t_start = timer()
-        logger = PatienceLogger(batch_size, patience, min_delta=tol, diagnose=diagnose)
+        logger = PatienceLogger(
+            batch_size,
+            patience,
+            min_delta=tol,
+            tol_relative=tol_relative,
+            store_param_history=store_param_history,
+        )
 
         while logger.epoch < max_epochs and not logger.convergence.all():
             # update the model parameters
@@ -698,24 +755,22 @@ class MultinomGLM(BaseModel, nn.Module):
             elif self.fitting_method == "iwls":
                 self._update_iwls()
 
-            # check convergence
+            # evaluate post-step loss for convergence checking
             with torch.no_grad():
-                # calculate the negative log-likelihood
                 neg_log_prob = -self().detach().cpu()
 
-                # d_loss = prev_loss - neg_log_prob.detach().item()
-
-                # # update the epoch and patience
-                # epoch += 1
-                # if d_loss < 0:  # if loss increases
-                #     patience -= 1
-
-                # # update the loss
-                # prev_loss = neg_log_prob.detach().item()
-
-            # if self.fitting_method == "gd":
-            # update learning rate
-            # self.scheduler.step(neg_log_prob[~self.convergence].mean())
+            # NaN/Inf guard — mark affected genes converged to avoid wasted iterations
+            if not torch.isfinite(neg_log_prob).all():
+                nan_genes = int((~torch.isfinite(neg_log_prob)).sum().item())
+                warnings.warn(
+                    f"{nan_genes} gene(s) produced non-finite loss at epoch "
+                    f"{logger.epoch}. Check for numerical issues (extreme counts, "
+                    "degenerate design matrix).",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.convergence |= ~torch.isfinite(neg_log_prob)
+                neg_log_prob = torch.nan_to_num(neg_log_prob, nan=float("inf"))
 
             logger.log(
                 neg_log_prob,
@@ -729,15 +784,17 @@ class MultinomGLM(BaseModel, nn.Module):
 
             if (verbose and not quiet) and logger.epoch % 10 == 0:
                 print(
-                    f"Epoch {logger.epoch}. Loss (neg_log_prob): {logger.best_loss.mean():.4f}. "
+                    f"Epoch {logger.epoch}. Loss (neg_log_prob): {logger.best_loss.mean():.4f}."
                 )
 
         # check model convergence
         num_not_converge = (~logger.convergence).sum()
-        if num_not_converge:
+        if num_not_converge and not quiet:
             warnings.warn(
-                f"{num_not_converge} Genes did not converge after epoch {max_epochs}. "
-                "Try larger max_epochs."
+                f"{num_not_converge} gene(s) did not converge after epoch {max_epochs}. "
+                "Try larger max_epochs.",
+                UserWarning,
+                stacklevel=2,
             )
 
         # save runtime
@@ -750,7 +807,7 @@ class MultinomGLM(BaseModel, nn.Module):
                 f"(neg_log_prob): {neg_log_prob.mean():.3f}."
             )
 
-        # collect parameters corresponding to the best epoch for each sample in batch
+        # restore parameters from the best epoch for each sample in the batch
         if max_epochs > 0:
             for k, v in self.named_parameters():
                 if "_fake" not in k:
@@ -765,7 +822,9 @@ class MultinomGLM(BaseModel, nn.Module):
         new_model = type(self)(
             fitting_method=self.fitting_method, fitting_configs=self.fitting_configs
         )
-        new_model.setup_data(counts=self.counts, design_mtx=self.X_spot)
+        new_model.setup_data(
+            counts=self.counts, design_mtx=self.X_spot, device=self.device.type
+        )
         new_model.load_state_dict(self.state_dict())
 
         return new_model
@@ -791,8 +850,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         Y ~ Multinomial(alpha, Y.sum(1))
         eta = multinomial-logit(alpha) = X @ beta + bias_eta + nu
-        nu ~ MVN(0, sigma^2 * (theta * V_sp + (1-theta) * I) =
-             MVN(0, sigma_sp^2 * V_sp + sigma_nsp^2 * I)
+        nu ~ MVN(0, sigma^2 * (theta * V_sp + (1-theta) * I))
 
     Given isoform counts of a gene ``Y`` (n_spots, n_isos), design matrix ``X`` (n_spots, n_factors),
     and spatial covariance matrix ``V_sp`` (n_spots, n_spots), the model estimates the isoform usage
@@ -802,11 +860,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     - ``beta``: (n_factors, n_isos - 1) covariate coefficients of the fixed effect term.
     - ``bias_eta``: (n_isos - 1) intercepts of the fixed effect term.
     - ``nu``: (n_spots, n_isos - 1) the random effect term.
-    - variance components: each of length n_isos - 1 (or 1 if `share_variance` is True).
-      If `var_parameterization_sigma_theta` is True, they are (``sigma``, ``theta_logit``),
-      representing total variance and logit of spatial variance proportion ``theta``.
-      Otherwise they are (``sigma_sp``, ``sigma_nsp``), representing spatial and non-spatial
-      variance components.
+    - variance components: (``sigma``, ``theta_logit``), each of length n_isos - 1
+      (or 1 if `share_variance` is True), representing total variance and logit of
+      spatial variance proportion ``theta``.
 
     Inference algorithms can be categorized into two types based on the optimization objective:
 
@@ -856,11 +912,15 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     share_variance: bool
     """Whether to use the same variance across isoforms."""
 
-    var_parameterization_sigma_theta: bool
-    """Whether variance components are parameterized as (``sigma``, ``theta_logit``) or (``sigma_sp``, ``sigma_nsp``)."""
-
     var_fix_sigma: bool
-    """Whether to fix the total variance (``sigma``) or not."""
+    """Whether to fix the total variance (``sigma``) to its initial value.
+
+    When ``True`` (default), sigma is frozen at the Fano-factor estimate
+    and only ``theta_logit`` (spatial variance proportion) is learned.
+    This yields conservative but well-calibrated SV and DU tests:
+    near-zero false positive rates with strong power on true signals.
+    Set to ``False`` to learn sigma jointly, which may increase power
+    at the cost of inflated false positive rates."""
 
     var_prior_model: Literal["none", "gamma", "inv_gamma"]
     """The prior model on the total variance ``sigma``."""
@@ -885,11 +945,10 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     def __init__(
         self,
         share_variance: bool = True,
-        var_parameterization_sigma_theta: bool = True,
         var_fix_sigma: bool = True,
         var_prior_model: Literal["none", "gamma", "inv_gamma"] = "none",
         var_prior_model_params: dict = {},
-        init_ratio: Literal["observed", "uniform"] = "observed",
+        init_ratio: Literal["observed", "uniform"] = "uniform",
         fitting_method: Literal[
             "joint_gd", "joint_newton", "marginal_gd", "marginal_newton"
         ] = "joint_gd",
@@ -901,16 +960,13 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         share_variance
             Whether to use the same variance across isoforms. If True, the variance components
             will be of length 1. If False, the variance components will be of length n_isos - 1.
-        var_parameterization_sigma_theta
-            Whether to parameterize the variance components as (``sigma``, ``theta_logit``) or (``sigma_sp``, ``sigma_nsp``).
-            If True, the variance components will be (``sigma``, ``theta_logit``), where ``sigma`` is the total variance and
-            ``theta_logit`` is the logit of the spatial variance proportion.
-            If False, the variance components will be (``sigma_sp``, ``sigma_nsp``), where ``sigma_sp`` is the spatial
-            variance and ``sigma_nsp`` is the non-spatial variance.
         var_fix_sigma
-            Whether to fix the total variance (``sigma``) or not. If True, the total variance will be fixed to the initial value,
-            which is the average per-spot variance of isoform counts normalized by its mean expression.
-            See `MultinomGLMM._initialize_params` for details.
+            Whether to fix the total variance (``sigma``) to the Fano-factor
+            initial estimate.  When ``True`` (default), only ``theta_logit``
+            is learned, producing conservative but well-calibrated hypothesis
+            tests.  Set to ``False`` to learn sigma jointly with other
+            parameters; this may yield higher power for the SV test but can
+            inflate false positive rates for both SV and DU tests.
         var_prior_model
             The prior model on the total variance ``sigma``. Default is ``'none'`` with no prior.
             Other options are ``'gamma'`` (Gamma prior) and ``'inv_gamma'`` (Inverse Gamma prior).
@@ -938,23 +994,19 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         """
         super().__init__()
 
-        # specify the parameterization of variance components
-        # if True:
+        # variance parameterization:
         # 	var(sigma, theta) = sigma^2 (theta * V_sp + (1-theta) * I)
-        # else:
-        # 	var(sigma_sp, sigma_nsp) = sigma_sp^2 * V_sp + sigma_nsp^2 * I
-        self.var_parameterization_sigma_theta = var_parameterization_sigma_theta
         self.share_variance = (
             share_variance  # whether to share variance across isoforms
         )
         self.var_fix_sigma = var_fix_sigma  # whether to fix sigma
 
-        # specify the prior model on sigma^2 (or sigma_sp^2 + sigma_nsp^2))
+        # specify the prior model on sigma^2
         assert var_prior_model in ["none", "gamma", "inv_gamma"]
         self.var_prior_model = var_prior_model  # prior on the variance size sigma
         if self.var_prior_model == "gamma":
             # Chung, Yeojin, et al. Psychometrika 78.4 (2013): 685-709.
-            # this prior is applied on sigma (or sqrt(sigma_sp^2 + sigma_nsp^2))
+            # this prior is applied on sigma
             # Gamma(2, 0.3): prior mode of sigma ~= 3
             self.var_prior_model_params = {
                 "alpha": 2.0,
@@ -967,11 +1019,11 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             )
         elif self.var_prior_model == "inv_gamma":
             # conjugacy prior
-            # this prior is applied on sigma^2 (or sigma_sp^2 + sigma_nsp^2)
-            # InverseGamma(3, 0.5): prior mode of sigma^2 ~= 0.25
+            # this prior is applied on sigma^2
+            # InverseGamma(2, 0.1): weakly informative, mode at beta/(alpha+1) = 0.033
             self.var_prior_model_params = {
-                "alpha": 3,
-                "beta": 0.5,
+                "alpha": 2,
+                "beta": 0.1,
             }
             self.var_prior_model_params.update(var_prior_model_params)
             self.var_prior_model_dist = InverseGamma(
@@ -1032,27 +1084,43 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         self.fitting_time = 0
 
     def __str__(self):
-        return (
+        base = (
             "A Multinomial Generalized Linear Mixed Model (GLMM)\n"
             + f"- Number of genes in the batch: {self.n_genes}\n"
             + f"- Number of spots: {self.n_spots}\n"
             + f"- Number of isoforms per gene: {self.n_isos}\n"
             + f"- Number of covariates: {self.n_factors}\n"
             + "- Variance formulation:\n"
-            + f"\t* Parameterized using sigma and theta: {self.var_parameterization_sigma_theta}\n"
             + f"\t* Learnable variance: {not self.var_fix_sigma}\n"
             + f"\t* Same variance across isoforms: {self.share_variance}\n"
             + f"\t* Prior on total variance: {self.var_prior_model}\n"
             + f"- Initialization method: {self.init_ratio}\n"
             + f"- Fitting method: {self.fitting_method}"
         )
+        lg = getattr(self, "logger", None)
+        if lg is not None:
+            n_conv = int(lg.convergence.sum().item())
+            med_epoch = int(lg.best_epoch.median().item())
+            med_loss = float(lg.best_loss.median().item())
+            training = (
+                "\n=== Training summary (fitted)"
+                + f"\n- Fitting time: {self.fitting_time:.2f} s"
+                + f"\n- Converged: {n_conv} / {self.n_genes} genes"
+                + f"\n- Best epoch (median): {med_epoch}"
+                + f"\n- Best loss (median): {med_loss:.4f}"
+            )
+        else:
+            training = "\n=== Training summary (not yet fitted)"
+        return base + training
+
+    __repr__ = __str__
 
     def setup_data(
         self,
         counts: torch.Tensor,
         corr_sp: Optional[torch.Tensor] = None,
         design_mtx: Optional[torch.Tensor] = None,
-        device: Literal["cpu", "cuda"] = "cpu",
+        device: Literal["cpu", "cuda", "mps"] = "cpu",
         corr_sp_eigvals: Optional[torch.Tensor] = None,
         corr_sp_eigvecs: Optional[torch.Tensor] = None,
     ) -> None:
@@ -1070,7 +1138,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             Shape (n_spots, n_factors). Design matrix of spatial covariates.
             If None, an intercept-only design matrix will be used.
         device
-            'cpu' or 'cuda'. 'mps' currently not supported (torch.lgamma not supported on mps).
+            'cpu', 'cuda', or 'mps' (torch v2.11.0+).
         corr_sp_eigvals
             Shape (n_spots,), eigenvalues of spatial covariance.
             If None, the spatial covariance matrix `corr_sp` must be provided.
@@ -1080,14 +1148,15 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         """
         # need to switch to a different count model (e.g., Poisson) when only one isoform is provided
 
-        assert device in ["cpu", "cuda"]
+        assert device in [
+            "cpu",
+            "cuda",
+            "mps",
+        ], f"device must be 'cpu', 'cuda', or 'mps'; got {device!r}"
         self.device = torch.device(device)
 
         if counts.ndim == 2:
             counts = counts.unsqueeze(0)  # (1, n_spots, n_isos)
-            print(
-                "Batched calculation has been implemented. Provide a batch of counts to speed up calculation."
-            )
         else:
             if not counts.ndim == 3:
                 raise ValueError(
@@ -1099,6 +1168,24 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             )
         # set model dimensions based on the input shape
         self.n_genes, self.n_spots, self.n_isos = counts.shape
+
+        # Warn early when marginal mode is used with a large spot count.
+        # The Hessian has shape (n_spots × (n_isos-1))², leading to an O(n³)
+        # Cholesky decomposition per epoch.  For n_spots=500, n_isos=3 this is
+        # a 1000×1000 Cholesky — already ~1 Gflop per gene-epoch.
+        if (
+            self.fitting_method in ("marginal_gd", "marginal_newton")
+            and self.n_spots > 300
+        ):
+            warnings.warn(
+                f"fitting_method='{self.fitting_method}' with n_spots={self.n_spots} > 300. "
+                "Marginal mode requires a Cholesky decomposition of the full "
+                f"({self.n_spots} × (n_isos-1))² Hessian per epoch (O(n³) cost), "
+                "which becomes prohibitively slow for large datasets. "
+                "Consider 'joint_gd' or 'joint_newton' instead.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         # switch to float type
         if not counts.dtype.is_floating_point:
@@ -1144,7 +1231,9 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             if corr_sp_eigvals is not None or corr_sp_eigvecs is not None:
                 warnings.warn(
                     "Both the correlation matrix and its eigendecomposition are provided. "
-                    "The latter will be ignored."
+                    "The latter will be ignored.",
+                    UserWarning,
+                    stacklevel=2,
                 )
 
             assert corr_sp.shape == (self.n_spots, self.n_spots)
@@ -1164,29 +1253,63 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
             self.register_buffer("corr_sp_eigvals", corr_sp_eigvals)
             self.register_buffer("corr_sp_eigvecs", corr_sp_eigvecs)
+            # Full eigendecomposition — always full-rank
+            self._rank = self.n_spots
+            self._is_low_rank = False
 
         else:
-            assert corr_sp_eigvals.shape == (self.n_spots,)
-            assert corr_sp_eigvecs.shape == (self.n_spots, self.n_spots)
-
-            corr_sp = corr_sp_eigvecs.matmul(torch.diag(corr_sp_eigvals)).matmul(
-                corr_sp_eigvecs.t()
+            rank = corr_sp_eigvals.shape[0]
+            assert corr_sp_eigvecs.shape[0] == self.n_spots, (
+                f"corr_sp_eigvecs must have {self.n_spots} rows, "
+                f"got {corr_sp_eigvecs.shape[0]}"
             )
-            # (n_spots, n_spots), the spatial covariance matrix
-            self.register_buffer("corr_sp", corr_sp)
-            # (n_spots,), the eigenvalues of the spatial covariance matrix
+            assert corr_sp_eigvecs.shape[1] == rank, (
+                "corr_sp_eigvecs columns must match corr_sp_eigvals length "
+                f"({rank}), got {corr_sp_eigvecs.shape[1]}"
+            )
+
+            # Store the rank as a plain Python int (not a buffer, not a param).
+            # This is used by _cov/_inv_cov and the log-prob methods.
+            self._rank = rank
+            self._is_low_rank = rank < self.n_spots
+
+            # Never reconstruct the n×n corr_sp from eigenpairs — it is not used
+            # in any computation (only the eigenpairs are needed).
+            self.register_buffer("corr_sp", None)
+
+            # (rank,), leading eigenvalues of the spatial correlation matrix
             self.register_buffer("corr_sp_eigvals", corr_sp_eigvals)
-            # (n_spots, n_spots), the eigenvectors of the spatial covariance matrix
+            # (n_spots, rank), corresponding orthonormal eigenvectors
             self.register_buffer("corr_sp_eigvecs", corr_sp_eigvecs)
 
         self.register_buffer("convergence", torch.zeros(self.n_genes, dtype=bool))
 
         # set up learnable parameters according to the model architecture
         self._configure_learnable_variables()
+
+        # send to device before initialising params so that parameters and
+        # counts are on the same device (avoids cross-device ops for non-CPU)
+        self.to(self.device)
+        self._move_prior_to_device()
         self._initialize_params()
 
-        # send to device
-        self.to(self.device)
+    def _move_prior_to_device(self):
+        """Recreate the variance prior distribution on the model's device."""
+        if self.var_prior_model_dist is not None:
+            alpha = torch.tensor(
+                self.var_prior_model_params["alpha"],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            beta = torch.tensor(
+                self.var_prior_model_params["beta"],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            if self.var_prior_model == "gamma":
+                self.var_prior_model_dist = Gamma(alpha, beta)
+            elif self.var_prior_model == "inv_gamma":
+                self.var_prior_model_dist = InverseGamma(alpha, beta)
 
     def _configure_learnable_variables(self):
         """Set up learnable parameters according to the model architecture."""
@@ -1206,24 +1329,14 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         # the variance components
         n_var_components = 1 if self.share_variance else self.n_isos - 1
-        if self.var_parameterization_sigma_theta:
-            # cov = sigma^2 (theta * V_sp + (1-theta) * I)
-            sigma = torch.ones(self.n_genes, n_var_components)
-            theta_logit = torch.zeros(self.n_genes, n_var_components)
-            self.register_parameter("sigma", nn.Parameter(sigma))
-            self.register_parameter("theta_logit", nn.Parameter(theta_logit))
+        # cov = sigma^2 (theta * V_sp + (1-theta) * I)
+        sigma = torch.ones(self.n_genes, n_var_components)
+        theta_logit = torch.zeros(self.n_genes, n_var_components)
+        self.register_parameter("sigma", nn.Parameter(sigma))
+        self.register_parameter("theta_logit", nn.Parameter(theta_logit))
 
-            if self.var_fix_sigma:
-                self.sigma.requires_grad = False
-        else:
-            # cov = sigma_sp^2 * V_sp + sigma_nsp^2 * I
-            sigma_sp = torch.ones(self.n_genes, n_var_components)
-            sigma_nsp = torch.ones(self.n_genes, n_var_components)
-            self.register_parameter("sigma_sp", nn.Parameter(sigma_sp))
-            self.register_parameter("sigma_nsp", nn.Parameter(sigma_nsp))
-
-            if self.var_fix_sigma:
-                self.sigma_nsp.requires_grad = False
+        if self.var_fix_sigma:
+            self.sigma.requires_grad = False
 
     def _initialize_params(self):
         """Initialize model parameters."""
@@ -1244,22 +1357,17 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             with torch.no_grad():
                 self.nu.copy_(torch.zeros(self.n_genes, self.n_spots, self.n_isos - 1))
 
-        # initial estimate of the variance components
+        # initial estimate of the variance parameter sigma using the Fano-factor heuristic
         sigma_init = (
-            (self.counts.var(1).mean(1) / self.counts.sum(2).mean(1))
-            .clamp(max=0.9)
+            (self.counts.var(1).mean(1) / self.counts.sum(2).mean(1).clamp(min=1))
+            .clamp(min=1e-4, max=0.9)
             .pow(0.5)
         ).unsqueeze(-1)
 
-        # initialize proportion of spatial variance to be ~0.05
-        if self.var_parameterization_sigma_theta:
-            with torch.no_grad():
-                self.sigma.copy_(torch.ones_like(self.sigma) * sigma_init)
-                self.theta_logit.copy_(torch.ones_like(self.theta_logit) * -3.0)
-        else:
-            with torch.no_grad():
-                self.sigma_nsp.copy_(torch.ones_like(self.sigma_nsp) * sigma_init)
-                self.sigma_sp.copy_(torch.ones_like(self.sigma_sp) * 0.2 * sigma_init)
+        # initialise spatial variance proportion to ~5% (theta ≈ sigmoid(-3) ≈ 0.047).
+        with torch.no_grad():
+            self.sigma.copy_(torch.ones_like(self.sigma) * sigma_init)
+            self.theta_logit.copy_(torch.ones_like(self.theta_logit) * -3.0)
 
     """Below are a bunch of helper functions to update intermediate variables after each optimization step.
     """
@@ -1272,13 +1380,14 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         var_total : torch.Tensor
             The total variance ``sigma`` of shape (n_genes, n_var_components).
         """
-        if self.var_parameterization_sigma_theta:
-            var_total = self.sigma**2
-        else:
-            var_total = self.sigma_sp**2 + self.sigma_nsp**2
+        var_total = self.sigma**2
 
         if var_total.min() < 1e-2:
-            warnings.warn("Total variance is close to zero.")
+            warnings.warn(
+                "Total variance is close to zero.",
+                UserWarning,
+                stacklevel=2,
+            )
         var_total = torch.clip(var_total, min=1e-2)  # (n_genes, n_var_components)
         return var_total
 
@@ -1291,52 +1400,126 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             The proportion ``theta`` of spatial variance of shape (n_genes, n_var_components).
         """
         # return: (n_genes, n_var_components)
-        if self.var_parameterization_sigma_theta:
-            return torch.sigmoid(self.theta_logit)
-        else:
-            return self.sigma_sp**2 / self.var_total()
+        return torch.sigmoid(self.theta_logit)
 
     def _corr_eigvals(self):
-        """Output the eigenvalues of the correlation matrix."""
+        """Output the leading eigenvalues of the correlation matrix.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_components, rank)`` where ``rank`` is the
+            number of stored eigenpairs (``n_spots`` for full-rank, ``k`` for
+            low-rank approximations).
+        """
         var_sp_prop = self.var_sp_prop().unsqueeze(-1)  # (n_genes, n_var_components, 1)
-        # return: (n_genes, n_var_components, n_spots)
         return var_sp_prop * self.corr_sp_eigvals.unsqueeze(0) + (1 - var_sp_prop)
-        # return torch.stack(
-        #     [(p * self.corr_sp_eigvals + (1 - p)) for p in self.var_sp_prop()], dim=0
-        # )
 
     def _cov_eigvals(self):
-        """Output the eigenvalues of the covariance matrix."""
-        # (n_genes, n_var_components, n_spots) * (n_genes, n_var_components, 1)
-        # return: (n_genes, n_var_components, n_spots)
+        """Output the leading eigenvalues of the covariance matrix.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_components, rank)``.
+        """
         return self._corr_eigvals() * self.var_total().unsqueeze(-1)
 
+    def _residual_cov_eigval(self):
+        """Residual (noise-only) covariance eigenvalue for uncaptured modes.
+
+        In the low-rank approximation the ``n_spots - rank`` uncaptured spatial
+        modes are treated as pure white noise with eigenvalue
+        ``σ²(1 − θ)`` (equivalently ``σ_nsp²``).
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_components, 1)``.  Each entry equals the
+            residual covariance eigenvalue ``d`` for the corresponding gene and
+            variance component.
+        """
+        # (1 - θ) * σ²:  var_total = σ², var_sp_prop = θ   → d = σ²(1-θ)
+        var_sp_prop = self.var_sp_prop().unsqueeze(-1)  # (n_genes, n_var_comp, 1)
+        return (1.0 - var_sp_prop) * self.var_total().unsqueeze(-1)
+
     def _cov(self):
-        """Reconstruct the covariance of the random effect."""
-        # return (
-        #     self.corr_sp_eigvecs.unsqueeze(0)
-        #     @ torch.diag_embed(self._cov_eigvals())
-        #     @ self.corr_sp_eigvecs.T.unsqueeze(0)
-        # )  # (n_isos - 1) or 1 x n_spots x n_spots
-        # return: (n_genes, n_var_components, n_spots, n_spots)
-        return self.corr_sp_eigvecs[None, None, ...].matmul(
-            torch.diag_embed(self._cov_eigvals()).matmul(
-                self.corr_sp_eigvecs.transpose(0, 1)[None, None, ...]
-            )
-        )
+        """Reconstruct the covariance matrix of the random effect.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_components, n_spots, n_spots)``.
+
+        Notes
+        -----
+        **Full-rank**: ``C = V diag(c) V^T``
+
+        **Low-rank** (when ``_is_low_rank`` is True):
+        ``C = d I + V_k diag(c_k − d) V_k^T``
+        where ``d = _residual_cov_eigval()`` and ``c_k = _cov_eigvals()``.
+        """
+        V = self.corr_sp_eigvecs[None, None, ...]  # (1, 1, n_spots, rank)
+        c = self._cov_eigvals()  # (n_genes, n_var_comp, rank)
+        if not self._is_low_rank:
+            return V.matmul(torch.diag_embed(c).matmul(V.transpose(-1, -2)))
+
+        # Low-rank: C = d*I + V_k diag(c_k - d) V_k^T
+        d = self._residual_cov_eigval().unsqueeze(-1)  # (n_genes, n_var_comp, 1, 1)
+        delta = c - d.squeeze(-1)  # (n_genes, n_var_comp, rank)
+        eye = torch.eye(
+            self.n_spots, device=V.device, dtype=V.dtype
+        )  # (n_spots, n_spots)
+        return d * eye + V.matmul(torch.diag_embed(delta).matmul(V.transpose(-1, -2)))
+
+    @property
+    def _is_identity_cov(self) -> bool:
+        """True when the spatial variance proportion is zero (C = σ²I).
+
+        This holds for null models where ``theta_logit = -inf``,
+        making the spatial kernel contribute nothing.
+        """
+        sp = self.var_sp_prop()  # (n_genes, n_var_comp)
+        return bool((sp.detach().abs() < 1e-10).all())
 
     def _inv_cov(self):
-        """Reconstruct the inverse covariance of the random effect."""
-        # return (
-        #     self.corr_sp_eigvecs.unsqueeze(0)
-        #     @ torch.diag_embed(1 / self._cov_eigvals())
-        #     @ self.corr_sp_eigvecs.T.unsqueeze(0)
-        # )  # (n_isos - 1) or 1 x n_spots x n_spots
-        # return: (n_genes, n_var_components, n_spots, n_spots)
-        return self.corr_sp_eigvecs[None, None, ...].matmul(
-            torch.diag_embed(1 / self._cov_eigvals()).matmul(
-                self.corr_sp_eigvecs.transpose(0, 1)[None, None, ...]
-            )
+        """Reconstruct the inverse covariance of the random effect.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_components, n_spots, n_spots)``.
+
+        Notes
+        -----
+        **Identity fast path** (when ``theta = 0``):
+        ``C = σ²I`` so ``C^{-1} = (1/σ²) I``.
+
+        **Full-rank**: ``C^{-1} = V diag(1/c) V^T``
+
+        **Low-rank** (Woodbury identity):
+        ``C^{-1} = (1/d) I + V_k diag(1/c_k − 1/d) V_k^T``
+        """
+        # Fast path: when theta = 0, covariance is sigma^2 * I
+        if self._is_identity_cov:
+            inv_var = (1.0 / self.var_total()).unsqueeze(-1).unsqueeze(-1)
+            eye = torch.eye(self.n_spots, device=self.device, dtype=self.nu.dtype)
+            return inv_var * eye  # (n_genes, n_var_comp, n_spots, n_spots)
+
+        V = self.corr_sp_eigvecs[None, None, ...]  # (1, 1, n_spots, rank)
+        c = self._cov_eigvals()  # (n_genes, n_var_comp, rank)
+        if not self._is_low_rank:
+            return V.matmul(torch.diag_embed(1.0 / c).matmul(V.transpose(-1, -2)))
+
+        # Low-rank Woodbury: C^{-1} = (1/d)I + V_k diag(1/c_k - 1/d) V_k^T
+        d = self._residual_cov_eigval().unsqueeze(-1)  # (n_genes, n_var_comp, 1, 1)
+        # Clamp to prevent catastrophic cancellation when c ≈ d (theta near 0)
+        inv_correction = (1.0 / c - 1.0 / d.squeeze(-1)).clamp(-1e6, 1e6)
+        eye = torch.eye(
+            self.n_spots, device=V.device, dtype=V.dtype
+        )  # (n_spots, n_spots)
+        return (1.0 / d) * eye + V.matmul(
+            torch.diag_embed(inv_correction).matmul(V.transpose(-1, -2))
         )
 
     def _eta(self):
@@ -1363,19 +1546,51 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         # add mvn prob of nu ~ MVN(0, S)
         data = self.nu.transpose(1, 2)  # (n_genes, n_isos - 1, n_spots)
-        # use the same variance components for all genes if cov_eigvals.shape[1] == 1
-        cov_eigvals = self._cov_eigvals().expand(
-            self.n_genes, data.shape[1], self.n_spots
-        )
-        cov_eigvecs = self.corr_sp_eigvecs.expand(
-            1, data.shape[1], self.n_spots, self.n_spots
-        )
-        log_prob += log_prob_fastmvn_batched(
-            locs=torch.zeros_like(data),
-            cov_eigvals=cov_eigvals,
-            cov_eigvecs=cov_eigvecs,
-            data=data,
-        )
+
+        if self._is_identity_cov:
+            # Fast path: C = σ²I.  MVN log-prob =
+            #   -0.5 * (n*p*log(2π) + n*p*log(σ²) + ||ν||² / σ²)
+            n_p = data.shape[1]  # n_isos - 1
+            var_total = self.var_total()  # (n_genes, n_var_comp)
+            if self.share_variance:
+                var_total = var_total.expand(self.n_genes, n_p)
+            import math
+
+            log_2pi = torch.log(
+                torch.tensor(2.0 * math.pi, device=self.device, dtype=data.dtype)
+            )
+            # sum over isoform classes and spots
+            nu_sq = (data**2).sum(-1)  # (n_genes, n_isos-1)
+            log_prob += (
+                -0.5
+                * (
+                    self.n_spots * log_2pi
+                    + self.n_spots * var_total.log()
+                    + nu_sq / var_total
+                )
+            ).sum(-1)
+        else:
+            # General eigenspace path
+            cov_eigvals = self._cov_eigvals().expand(
+                self.n_genes, data.shape[1], -1
+            )  # (n_genes, n_isos-1, rank)
+            cov_eigvecs = self.corr_sp_eigvecs.expand(
+                1, data.shape[1], self.n_spots, self._rank
+            )  # (1, n_isos-1, n_spots, rank)
+
+            residual_eigval = None
+            if self._is_low_rank:
+                residual_eigval = self._residual_cov_eigval().expand(
+                    self.n_genes, data.shape[1], 1
+                )
+
+            log_prob += log_prob_fastmvn_batched(
+                locs=torch.zeros_like(data),
+                cov_eigvals=cov_eigvals,
+                cov_eigvecs=cov_eigvecs,
+                data=data,
+                residual_eigval=residual_eigval,
+            )
 
         # add Multinomial likelihood of the counts
         log_prob += log_prob_fastmult_batched(
@@ -1423,24 +1638,52 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
     def _get_log_lik_hessian_nu(self):
         """Get the Hessian matrix of the log joint probability wrt the random effect nu."""
-        n_genes, n_isos = self.n_genes, self.n_isos
-        # full_hessian = multinom_hessian + mvn_hessian # n_spots * (n_isos - 1) x n_spots * (n_isos - 1)
-        # mvn_hessian: (n_isos - 1) x n_spots x n_spots
-        # mvn_hessian[q] = - cov[q]^-1 # n_spots * n_spots
-        mvn_hessian = -self._inv_cov()  # (n_genes, n_var_components, n_spots, n_spots)
-        if self.share_variance:  # the same variance across isoforms
-            # (n_genes, n_isos - 1, n_spots, n_spots)
-            mvn_hessian = mvn_hessian.expand(n_genes, n_isos - 1, -1, -1)
-        # reshape the hessian into (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
-        full_hessian = torch.stack(
-            [torch.block_diag(*[_m for _m in m_gene]) for m_gene in mvn_hessian], dim=0
+        n_genes, n_isos, n_spots = self.n_genes, self.n_isos, self.n_spots
+        n_p = n_spots * (n_isos - 1)
+
+        # Single allocation: pre-allocate the output tensor once to avoid a second
+        # (n_genes, n_p, n_p) allocation from _get_log_lik_hessian_eta / _melt_tensor.
+        full_hessian = torch.zeros(
+            n_genes, n_p, n_p, device=self.device, dtype=self.nu.dtype
         )
 
-        # multinom_hessian[s] = - sum(counts[s,:]) * {diag(p) - p@p.T}
-        # self._get_log_lik_hessian_eta() already reshapes the hessian into
-        # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
-        multinom_hessian = self._get_log_lik_hessian_eta()
-        full_hessian += multinom_hessian
+        # Fill MVN blocks in-place.
+        # mvn_hessian[q] = -cov[q]^{-1}, shape (n_genes, n_spots, n_spots)
+        # In the isoform-major index ordering, isoform q occupies
+        # rows/cols [q*n_spots : (q+1)*n_spots].
+        if self._is_identity_cov:
+            # Fast path: C = σ²I → C^{-1} = (1/σ²)I, so MVN Hessian = -(1/σ²)I
+            # Fill the diagonal directly — O(n_spots) per isoform, no dense matrix.
+            inv_var = 1.0 / self.var_total()  # (n_genes, n_var_comp)
+            if self.share_variance:
+                inv_var = inv_var.expand(n_genes, n_isos - 1)
+            diag_idx = torch.arange(n_spots, device=self.device)
+            for q in range(n_isos - 1):
+                full_hessian[
+                    :, q * n_spots + diag_idx, q * n_spots + diag_idx
+                ] -= inv_var[:, q].unsqueeze(-1)
+        else:
+            mvn_hessian = -self._inv_cov()  # (n_genes, n_var_comp, n_spots, n_spots)
+            if self.share_variance:
+                mvn_hessian = mvn_hessian.expand(n_genes, n_isos - 1, -1, -1)
+            for q in range(n_isos - 1):
+                full_hessian[
+                    :, q * n_spots : (q + 1) * n_spots, q * n_spots : (q + 1) * n_spots
+                ].add_(mvn_hessian[:, q])
+
+        # Fill multinomial blocks in-place via scatter (compact form avoids second
+        # large allocation; uses the same index arithmetic as _melt_tensor_along_first_dim).
+        # raw: (n_genes, n_spots, n_isos-1, n_isos-1)
+        raw = self._get_multinom_hessian_raw()
+        i_idx, j_idx, k_idx = torch.meshgrid(
+            torch.arange(n_spots, device=self.device),
+            torch.arange(n_isos - 1, device=self.device),
+            torch.arange(n_isos - 1, device=self.device),
+            indexing="ij",
+        )
+        row_idx = (i_idx + j_idx * n_spots).view(-1)
+        col_idx = (i_idx + k_idx * n_spots).view(-1)
+        full_hessian[:, row_idx, col_idx] += raw.flatten(1)
 
         return full_hessian
 
@@ -1450,41 +1693,35 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         Parameters
         ----------
         sigma_expand : torch.Tensor
-            Shape (n_genes, n_var_components, 2). The two variance parameters,
-            either (sigma, theta) or (sigma_sp, sigma_nsp), are stacked along the last dimension.
+            Shape (n_genes, n_var_components, 2). The two variance parameters
+            (sigma, theta_logit) are stacked along the last dimension.
         """
         if self.share_variance:  # the same variance components across isoforms
             sigma_expand = sigma_expand.expand(self.n_genes, self.n_isos - 1, -1)
 
-        if self.var_parameterization_sigma_theta:
-            sigma, theta_logit = sigma_expand[..., 0], sigma_expand[..., 1]
-            var_sp_prop = torch.sigmoid(theta_logit).unsqueeze(
-                -1
-            )  # (n_genes, n_iso - 1, -1)
-            sigma_total = sigma  # (n_genes, n_iso - 1)
-            # (n_genes, n_iso - 1, n_spots) * (n_genes, n_iso - 1, 1) -> (n_genes, n_iso - 1, n_spots)
-            cov_eigvals = (
-                var_sp_prop * self.corr_sp_eigvals.unsqueeze(0) + (1 - var_sp_prop)
-            ) * sigma_total.unsqueeze(-1)
-        else:
-            sigma_sp, sigma_nsp = sigma_expand[..., 0], sigma_expand[..., 1]
-            sigma_total = torch.sqrt(sigma_sp**2 + sigma_nsp**2)  # (n_genes, n_iso - 1)
-            # (n_genes, n_iso - 1, 1) * (1, n_spots) -> (n_genes, n_iso - 1, n_spots)
-            cov_eigvals = sigma_sp.unsqueeze(-1).pow(
-                2
-            ) * self.corr_sp_eigvals.unsqueeze(0) + sigma_nsp.unsqueeze(-1).pow(2)
+        sigma, theta_logit = sigma_expand[..., 0], sigma_expand[..., 1]
+        var_sp_prop = torch.sigmoid(theta_logit).unsqueeze(
+            -1
+        )  # (n_genes, n_iso - 1, 1)
+        sigma_total = sigma  # (n_genes, n_iso - 1)
+        # (n_genes, n_iso - 1, rank)
+        cov_eigvals = (
+            var_sp_prop * self.corr_sp_eigvals.unsqueeze(0) + (1 - var_sp_prop)
+        ) * sigma_total.unsqueeze(-1)
+        # residual = σ²(1-θ), shape (n_genes, n_iso-1, 1)
+        residual_eigval = (1.0 - var_sp_prop) * sigma_total.unsqueeze(-1)
 
         # MVN prior likelihood as a function of the input eta
         data = self.nu.transpose(1, 2)  # (n_genes, n_isos - 1, n_spots)
-        # use the same variance components for all genes if cov_eigvals.shape[1] == 1
         cov_eigvecs = self.corr_sp_eigvecs.expand(
-            1, data.shape[1], self.n_spots, self.n_spots
+            1, data.shape[1], self.n_spots, self._rank
         )
         log_prob = log_prob_fastmvn_batched(
             locs=torch.zeros_like(data),
             cov_eigvals=cov_eigvals,
             cov_eigvecs=cov_eigvecs,
             data=data,
+            residual_eigval=residual_eigval if self._is_low_rank else None,
         )
 
         # add prior prob of sigma_total
@@ -1501,16 +1738,156 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         # sum over the batch dim to get shape of (n_var_components, 2)
         return torch.autograd.grad(log_prob, sigma_expand, create_graph=True)[0].sum(0)
 
+    def _get_log_lik_hessian_sigma_expand_analytic(self):
+        """Analytic Hessian of log(MVN prior + sigma prior) wrt variance parameters.
+
+        Drop-in replacement for :meth:`_get_log_lik_hessian_sigma_expand` that avoids
+        the expensive ``torch.autograd.functional.jacobian`` call by computing all
+        second derivatives in closed form.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_genes, n_var_comps * 2, n_var_comps * 2)``.  Each gene-slice
+            is ``(1/n_genes) * d²log_prob_g / d(sigma_params)²``, matching the scale
+            of the autograd version.
+        """
+        n_genes, n_isos, n_spots = self.n_genes, self.n_isos, self.n_spots
+        rank = self._rank
+        n_var_comps = self.sigma.shape[1]
+        dtype = self.nu.dtype
+
+        V_k = self.corr_sp_eigvecs  # (n_spots, rank)
+        lam = self.corr_sp_eigvals  # (rank,)
+
+        # Data projections: z[b,q,k] = (V_k^T nu_q)[b,q,k]
+        data = self.nu.transpose(1, 2)  # (n_genes, n_isos-1, n_spots)
+        z = torch.einsum("bqs,sk->bqk", data, V_k)  # (n_genes, n_isos-1, rank)
+        if self._is_low_rank:
+            # ||x_perp_q||^2 = ||nu_q||^2 - ||z_q||^2  (n_genes, n_isos-1)
+            x_perp_sq = (data**2).sum(-1) - (z**2).sum(-1)
+
+        # Variance params (n_genes, n_var_comps)
+        sigma = self.sigma
+        theta = torch.sigmoid(self.theta_logit)
+        D = theta * (1 - theta)  # sigmoid derivative, (n_genes, n_var_comps)
+
+        # Accumulate per-class MVN Hessian contributions into (n_genes, n_var_comps, 2, 2)
+        H_diag = torch.zeros(
+            n_genes, n_var_comps, 2, 2, device=self.device, dtype=dtype
+        )
+
+        for q in range(n_isos - 1):
+            vc = 0 if self.share_variance else q
+            zq = z[:, q, :]  # (n_genes, rank)
+
+            # Covariance eigenvalues c_k and residual d for this class
+            # NOTE: in _calc_log_prob_mvn_wrt_sigma, σ enters LINEARLY:
+            #   c_k = σ · (θ·λ_k + (1-θ)),  d = σ · (1-θ)
+            s = sigma[:, vc]  # (n_genes,)
+            th = theta[:, vc]
+            Dq = D[:, vc]
+            c_q = s.unsqueeze(-1) * (
+                th.unsqueeze(-1) * (lam - 1) + 1
+            )  # (n_genes, rank)
+            d_q = (1 - th) * s  # (n_genes,)
+
+            # First/second derivs of l_{g,q} wrt c_k (n_genes, rank) and d (n_genes,)
+            # Clamp c_q and d_q to prevent overflow in reciprocal powers
+            c_q_safe = c_q.clamp(min=1e-6)
+            dl_dc = -0.5 / c_q_safe + 0.5 * zq**2 / c_q_safe**2
+            d2l_dc2 = 0.5 / c_q_safe**2 - zq**2 / c_q_safe**3
+
+            if self._is_low_rank:
+                xp = x_perp_sq[:, q]  # (n_genes,)
+                d_q_safe = d_q.clamp(min=1e-6)
+                dl_dd = -0.5 * (n_spots - rank) / d_q_safe + 0.5 * xp / d_q_safe**2
+                d2l_dd2 = 0.5 * (n_spots - rank) / d_q_safe**2 - xp / d_q_safe**3
+
+            # Jacobians: ∂c_k/∂p1, ∂c_k/∂p2, ∂d/∂p1, ∂d/∂p2, and their second derivatives
+            # p1=sigma, p2=theta_logit,  θ=sigmoid(p2),  D=θ(1-θ)
+            # c_k = σ·(θ(λ_k-1)+1),  d = σ·(1-θ)  (LINEAR in σ)
+            dc_dp1 = c_q / s.unsqueeze(-1)  # = θ(λ_k-1)+1
+            dc_dp2 = s.unsqueeze(-1) * (lam - 1) * Dq.unsqueeze(-1)
+            d2c_dp11 = torch.zeros_like(c_q)
+            d2c_dp22 = (
+                s.unsqueeze(-1)
+                * (lam - 1)
+                * Dq.unsqueeze(-1)
+                * (1 - 2 * th).unsqueeze(-1)
+            )
+            d2c_dp12 = (lam - 1) * Dq.unsqueeze(-1).expand_as(c_q)
+            dd_dp1 = d_q / s  # = (1-θ)
+            dd_dp2 = -s * Dq
+            d2d_dp11 = torch.zeros_like(s)
+            d2d_dp22 = -s * Dq * (1 - 2 * th)
+            d2d_dp12 = -Dq
+
+            def _hc(dc_pi, dc_pj, d2c_ij):
+                return (d2l_dc2 * dc_pi * dc_pj + dl_dc * d2c_ij).sum(
+                    -1
+                )  # sum over rank
+
+            def _hd(dd_pi, dd_pj, d2d_ij):
+                if self._is_low_rank:
+                    return d2l_dd2 * dd_pi * dd_pj + dl_dd * d2d_ij
+                return torch.zeros(n_genes, device=self.device, dtype=dtype)
+
+            H_diag[:, vc, 0, 0] += _hc(dc_dp1, dc_dp1, d2c_dp11) + _hd(
+                dd_dp1, dd_dp1, d2d_dp11
+            )
+            H_diag[:, vc, 0, 1] += _hc(dc_dp1, dc_dp2, d2c_dp12) + _hd(
+                dd_dp1, dd_dp2, d2d_dp12
+            )
+            H_diag[:, vc, 1, 0] += _hc(dc_dp2, dc_dp1, d2c_dp12) + _hd(
+                dd_dp2, dd_dp1, d2d_dp12
+            )
+            H_diag[:, vc, 1, 1] += _hc(dc_dp2, dc_dp2, d2c_dp22) + _hd(
+                dd_dp2, dd_dp2, d2d_dp22
+            )
+
+        # Prior contributions (per var_comp; scale by n_isos-1 for share_variance)
+        prior_scale = (n_isos - 1) if self.share_variance else 1
+        if self.var_prior_model != "none":
+            alpha = self.var_prior_model_params["alpha"]
+            beta = self.var_prior_model_params["beta"]
+            # Prior on sigma_total = sigma; theta_logit has no effect on prior
+            s_all = self.sigma  # (n_genes, n_var_comps)
+            if self.var_prior_model == "inv_gamma":
+                # InverseGamma on u=sigma^2: d²logp/dσ² = 2(α+1)/σ² - 6β/σ⁴
+                u = s_all**2
+                d2logp_du2 = (alpha + 1) / u**2 - 2 * beta / u**3
+                dlogp_du = -(alpha + 1) / u + beta / u**2
+                d2prior_dp1 = d2logp_du2 * (2 * s_all) ** 2 + dlogp_du * 2
+            else:  # gamma on sigma
+                v = s_all.abs()
+                d2prior_dp1 = -(alpha - 1) / v**2
+            H_diag[:, :, 0, 0] += prior_scale * d2prior_dp1
+            # [0,1], [1,0], [1,1] entries: 0 (prior doesn't depend on theta_logit)
+
+        # Build block-diagonal output (n_genes, n_var_comps*2, n_var_comps*2)
+        if n_var_comps == 1:
+            H_full = H_diag[:, 0, :, :]  # (n_genes, 2, 2)
+        else:
+            H_full = torch.zeros(
+                n_genes,
+                n_var_comps * 2,
+                n_var_comps * 2,
+                device=self.device,
+                dtype=dtype,
+            )
+            for vc in range(n_var_comps):
+                H_full[:, vc * 2 : vc * 2 + 2, vc * 2 : vc * 2 + 2] = H_diag[
+                    :, vc, :, :
+                ]
+
+        return H_full / n_genes
+
     def _get_log_lik_hessian_sigma_expand(self):
         """Get the Hessian matrix of the log mvn wrt the variance components."""
-        if self.var_parameterization_sigma_theta:
-            sigma_expand = torch.stack(
-                [self.sigma, self.theta_logit], dim=-1
-            )  # (n_genes, n_var_components, 2)
-        else:
-            sigma_expand = torch.stack(
-                [self.sigma_sp, self.sigma_nsp], dim=-1
-            )  # (n_genes, n_var_components, 2)
+        sigma_expand = torch.stack(
+            [self.sigma, self.theta_logit], dim=-1
+        )  # (n_genes, n_var_components, 2)
 
         # calculate the hessian using pytorch's functional
         # x = sigma_expand.clone().detach().requires_grad_(True)
@@ -1543,24 +1920,15 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         n_genes = self.n_genes
 
         # calculate the updates for variance parameters
-        if self.var_parameterization_sigma_theta:
-            sigma_expand = torch.stack(
-                [self.sigma, self.theta_logit], dim=-1
-            )  # (n_genes, n_var_components, 2)
-            sigma_expand_grad = torch.stack(
-                [self.sigma.grad, self.theta_logit.grad], dim=-1
-            )  # (n_genes, n_var_components, 2)
-        else:
-            sigma_expand = torch.stack(
-                [self.sigma_sp, self.sigma_nsp], dim=-1
-            )  # (n_genes, n_var_components, 2)
-            sigma_expand_grad = torch.stack(
-                [self.sigma_sp.grad, self.sigma_nsp.grad], dim=-1
-            )  # (n_genes, n_var_components, 2)
+        sigma_expand = torch.stack(
+            [self.sigma, self.theta_logit], dim=-1
+        )  # (n_genes, n_var_components, 2)
+        sigma_expand_grad = torch.stack(
+            [self.sigma.grad, self.theta_logit.grad], dim=-1
+        )  # (n_genes, n_var_components, 2)
 
-        # TODO: analytical solutions when var_prior_model in ['none', 'inv_gamma']?
         hessian_sigma_expand = (
-            -self._get_log_lik_hessian_sigma_expand()
+            -self._get_log_lik_hessian_sigma_expand_analytic()
         )  # (n_genes, n_var_components * 2, n_var_components * 2)
         hessian_sigma_expand += 1e-5 * torch.eye(
             hessian_sigma_expand.shape[-1]
@@ -1581,16 +1949,10 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         # update the parameters and clear the gradients
         with torch.no_grad():
-            if self.var_parameterization_sigma_theta:
-                self.sigma.copy_(sigma_expand_new[..., 0])
-                self.theta_logit.copy_(sigma_expand_new[..., 1])
-                self.sigma.grad.zero_()
-                self.theta_logit.grad.zero_()
-            else:
-                self.sigma_sp.copy_(sigma_expand_new[..., 0])
-                self.sigma_nsp.copy_(sigma_expand_new[..., 1])
-                self.sigma_sp.grad.zero_()
-                self.sigma_nsp.grad.zero_()
+            self.sigma.copy_(sigma_expand_new[..., 0])
+            self.theta_logit.copy_(sigma_expand_new[..., 1])
+            self.sigma.grad.zero_()
+            self.theta_logit.grad.zero_()
 
         if return_variables:
             return sigma_expand_new
@@ -1651,16 +2013,17 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             hessian_beta_expand.shape[-1]
         ).unsqueeze(0).to(self.device)
 
-        # combine beta and bias_eta
-        # # (n_genes, n_factors + 1, n_isos - 1)
-        # gradient_beta_expand = torch.cat(
-        #     [self.beta.grad, self.bias_eta.grad.unsqueeze(1)], dim=1
-        # )
-        # (n_genes, n_factors + 1, n_isos - 1)
+        # combine beta and bias_eta into a single (n_genes, n_factors+1, n_isos-1) tensor
+        # gradient w.r.t. neg log-likelihood = -grad w.r.t. log-likelihood
+        gradient_beta_expand = -torch.cat(
+            [self.beta.grad, self.bias_eta.grad.unsqueeze(1)], dim=1
+        )  # (n_genes, n_factors + 1, n_isos - 1)
         beta_expand = torch.cat([self.beta, self.bias_eta.unsqueeze(1)], dim=1)
+        # Newton step: β_new = β − H⁻¹ ∇L(β)
+        # Equivalent form: H β_new = H β − ∇L  ⟹  right = H β − ∇L
         right = hessian_beta_expand.matmul(
             beta_expand.transpose(1, 2).reshape(n_genes, -1, 1)
-        ) - step * beta_expand.transpose(1, 2).reshape(
+        ) - step * gradient_beta_expand.transpose(1, 2).reshape(
             n_genes, -1, 1
         )  # (n_genes, (n_factors + 1) * (n_isos - 1), 1)
         beta_expand_new = (
@@ -1701,17 +2064,16 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         n_genes, n_spots, n_isos = self.n_genes, self.n_spots, self.n_isos
         step = 1  # step size
 
-        hessian_nu_inv = torch.cholesky_inverse(
-            chol
-        )  # (n_genes, n_spots * (n_isos - 1), n_spots * (n_isos - 1))
+        # Use cholesky_solve to compute H⁻¹ g without materialising the full inverse.
+        # This avoids an O(n_genes × (n_spots*(n_isos-1))²) memory allocation.
         gradient_nu = self.nu.grad.transpose(1, 2).reshape(
             n_genes, -1, 1
         )  # (n_genes, n_spots * (n_isos - 1), 1)
-        nu_new = self.nu.transpose(1, 2).reshape(n_genes, -1, 1) - (
-            step * hessian_nu_inv
-        ).matmul(
-            gradient_nu
+        # delta_nu = H⁻¹ g, solved via the stored Cholesky factor
+        delta_nu = torch.cholesky_solve(
+            gradient_nu, chol
         )  # (n_genes, n_spots * (n_isos - 1), 1)
+        nu_new = self.nu.transpose(1, 2).reshape(n_genes, -1, 1) - step * delta_nu
         nu_new = nu_new.reshape(n_genes, n_isos - 1, n_spots).transpose(1, 2)
         # update the parameters and clear the gradients
         with torch.no_grad():
@@ -1723,7 +2085,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
     def _fit(
         self,
-        diagnose: bool = False,
+        store_param_history: bool = False,
         verbose: bool = False,
         quiet: bool = False,
         random_seed=None,
@@ -1735,20 +2097,22 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         max_epochs = self.fitting_configs["max_epochs"]
         patience = self.fitting_configs["patience"]
         tol = self.fitting_configs["tol"]
+        tol_relative = self.fitting_configs.get("tol_relative", False)
         max_epochs = 10000 if max_epochs == -1 else max_epochs
         patience = patience if patience > 0 else 1
 
         if random_seed is not None:  # set random seed for reproducibility
             torch.manual_seed(random_seed)
 
-        # set iteration limits
-        epoch = 0
-        batch_size = self.n_genes
-
-        # set iteration limits
         batch_size = self.n_genes
         t_start = timer()
-        logger = PatienceLogger(batch_size, patience, min_delta=tol, diagnose=diagnose)
+        logger = PatienceLogger(
+            batch_size,
+            patience,
+            min_delta=tol,
+            tol_relative=tol_relative,
+            store_param_history=store_param_history,
+        )
 
         # start training
         self.train()
@@ -1758,17 +2122,18 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
             # minimize the negative log-likelihood or the negative log-marginal-likelihood
             neg_log_prob = -self()  # (n_genes,)
-            neg_log_prob.mean().backward()  # backpropate gradients
+            neg_log_prob.mean().backward()  # backpropagate gradients
 
             if fitting_method == "joint_newton":
                 # update nu, beta, bias, and sigmas using Newton's method
                 self._update_joint_newton()
 
             elif fitting_method == "marginal_newton":
-                # update nu every k epochs
-                if epoch % self.fitting_configs["update_nu_every_k"] == 0:
+                # update nu every k epochs using Newton's method;
+                # use logger.epoch (canonical counter) — NOT a stale local variable
+                if logger.epoch % self.fitting_configs["update_nu_every_k"] == 0:
                     self._update_marginal_nu_newton()
-                # skip gradient descent update
+                # skip gradient descent update for nu
                 self.nu.grad.zero_()
 
             # gradient-based updates
@@ -1780,10 +2145,22 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
                 # update the remaining parameters with non-zero gradients using gradient descent
                 self.optimizer.step()
 
-            # check convergence
+            # evaluate post-step loss for convergence checking
             with torch.no_grad():
-                # calculate the negative log-likelihood
                 neg_log_prob = -self().detach().cpu()
+
+            # NaN/Inf guard — mark affected genes converged to avoid wasted iterations
+            if not torch.isfinite(neg_log_prob).all():
+                nan_genes = int((~torch.isfinite(neg_log_prob)).sum().item())
+                warnings.warn(
+                    f"{nan_genes} gene(s) produced non-finite loss at epoch "
+                    f"{logger.epoch}. Check for numerical issues (extreme counts, "
+                    "degenerate design matrix).",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                self.convergence |= ~torch.isfinite(neg_log_prob)
+                neg_log_prob = torch.nan_to_num(neg_log_prob, nan=float("inf"))
 
             logger.log(
                 neg_log_prob,
@@ -1797,7 +2174,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
             if (verbose and not quiet) and logger.epoch % 10 == 0:
                 print(
-                    f"Epoch {logger.epoch}. Loss (neg_log_prob): {logger.best_loss.mean():.4f}. "
+                    f"Epoch {logger.epoch}. Loss (neg_log_prob): {logger.best_loss.mean():.4f}."
                 )
 
         # make sure constraints are satisfied
@@ -1805,10 +2182,12 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
         # check model convergence
         num_not_converge = (~logger.convergence).sum()
-        if num_not_converge:
+        if num_not_converge and not quiet:
             warnings.warn(
-                f"{num_not_converge} Genes did not converge after epoch {max_epochs}. "
-                "Try larger max_epochs."
+                f"{num_not_converge} gene(s) did not converge after epoch {max_epochs}. "
+                "Try larger max_epochs.",
+                UserWarning,
+                stacklevel=2,
             )
 
         # save runtime
@@ -1821,7 +2200,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
                 f"(neg_log_prob): {neg_log_prob.mean():.3f}."
             )
 
-        # collect parameters corresponding to the best epoch for each sample in batch
+        # restore parameters from the best epoch for each sample in the batch
         if max_epochs > 0:
             for k, v in self.named_parameters():
                 if "_fake" not in k:
@@ -1835,49 +2214,61 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
     def _final_sanity_check(self):
         """Make sure constraints are satisfied."""
         # ensure positive parameters
-        if self.var_parameterization_sigma_theta:
-            self.sigma.abs_()
-        else:
-            self.sigma_sp.abs_()
-            self.sigma_nsp.abs_()
+        self.sigma.abs_()
 
     def fit(
         self,
-        diagnose: bool = False,
+        store_param_history: bool = False,
         verbose: bool = False,
         quiet: bool = False,
         random_seed: Optional[int] = None,
+        diagnose: Optional[bool] = None,
     ) -> Optional[dict]:
-        """Fit the model using all data
+        """Fit the model using all data.
 
         Parameters
         ----------
-        diagnose
-            Whether to store parameter changes during training (passed to PatienceLogger).
+        store_param_history
+            Whether to store per-epoch parameter snapshots during training.
+            Loss history is always recorded via ``model.logger.loss_history``
+            regardless of this flag.
         verbose
             Whether to print verbose information during fitting.
         quiet
             Whether to suppress output during fitting.
         random_seed
             Random seed for reproducibility.
+        diagnose
+            Deprecated alias for ``store_param_history``.
 
         Returns
         -------
         params_iter : dict or None
-            If `diagnose` is True, returns a dictionary of parameter changes during training. Otherwise returns None.
+            If ``store_param_history=True``, returns a dictionary of parameter
+            snapshots during training.  Otherwise returns ``None``.
         """
+        if diagnose is not None:
+            warnings.warn(
+                "The `diagnose` parameter is deprecated; use `store_param_history` instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            store_param_history = diagnose
+
         self._configure_optimizer(verbose=verbose)
         diag_outputs = self._fit(
-            diagnose=diagnose, verbose=verbose, quiet=quiet, random_seed=random_seed
+            store_param_history=store_param_history,
+            verbose=verbose,
+            quiet=quiet,
+            random_seed=random_seed,
         )
-        if diagnose:
+        if store_param_history:
             return diag_outputs
 
     def clone(self) -> "MultinomGLMM":
         """Clone a Multinomial GLMM model with the same set of parameters."""
         new_model = type(self)(
             share_variance=self.share_variance,
-            var_parameterization_sigma_theta=self.var_parameterization_sigma_theta,
             var_fix_sigma=self.var_fix_sigma,
             var_prior_model=self.var_prior_model,
             var_prior_model_params=self.var_prior_model_params,
@@ -1891,6 +2282,7 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             design_mtx=self.X_spot,
             corr_sp_eigvals=self.corr_sp_eigvals,
             corr_sp_eigvecs=self.corr_sp_eigvecs,
+            device=self.device.type,
         )
         new_model.load_state_dict(self.state_dict())
 
