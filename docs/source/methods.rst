@@ -148,7 +148,7 @@ See :func:`splisosm.likelihood.liu_sf` for implementation details.
 
 **2. Moment-matching normal approximation**: ``null_method='trace'``
 
-Alternatively, we may use the first two moments of the null distribution to compute pvalues (i.e., via Central Limit Theorem), 
+Alternatively, we may use the first two moments of the null distribution to compute p-values (i.e., via Central Limit Theorem), 
 which requires only :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)`:
 
 .. math::

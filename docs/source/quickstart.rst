@@ -65,25 +65,26 @@ Summary of class features:
    **SplisosmNP vs SplisosmFFT:** same test, different assumptions, potentially different results.
 
 .. raw:: html
-   
+
    <details>
    <summary>Show details</summary>
 
    While classes compute the same HSIC test statistic and use the same spectrum-based null, 
-   results can still differ because SplisosmFFT (i) assumes **periodic boundaries** 
+   results can still differ because SplisosmFFT (i) assumes <b>periodic boundaries</b> 
    (the grid wraps around, so edge bins become neighbours) and
-   (ii) operates on the **full raster grid**, zero-padding unobserved bins. On the other hand,
+   (ii) operates on the <b>full raster grid</b>, zero-padding unobserved bins. On the other hand,
    SplisosmNP works only on the observed spots with a k-NN graph that has no wrap-around.  
    The discrepancy is small when the grid is densely observed and 
    the tissue is far from the slide edges (i.e. boundaries are already all zero).
 
-... raw:: html
+.. raw:: html
+
    </details>
 
 Inputs and outputs
 ------------------
 
-:class:`~splisosm.SplisosmNP` and :class:`~splisosm.SplisosmGLMM` accept isoform-level quantification as either an ``AnnData`` object or as raw tensors.
+:class:`~splisosm.SplisosmNP` and :class:`~splisosm.SplisosmGLMM` accept isoform-level quantification as an ``AnnData`` object.
 
 .. code-block:: python
 
@@ -101,7 +102,7 @@ Inputs and outputs
        # ----- Feature filtering options (applied after spot filtering)
        min_counts=10,                # minimal total counts per isoform to keep
        min_bin_pct=0.01,             # minimal proportion of non-zero expression spots per isoform to keep
-       filter_single_iso_genes=True, # remove genes with only one isoform (no usage variation)
+       filter_single_iso_genes=True, # remove single-isoform genes (SplisosmNP/FFT only; GLMM always requires ≥2)
    )
 
 .. note::
@@ -453,7 +454,7 @@ reduced power).
        fitting_method="joint_gd",   # 'joint_gd' | 'joint_newton' | 'marginal_gd' | 'marginal_newton'
        fitting_configs={"max_epochs": 500},
        device="cpu",                # 'cpu' | 'cuda' (NVIDIA) | 'mps' (Apple Silicon)
-       approx_rank="auto",          # 'auto' (default) | None (full rank) | int (fixed low-rank)
+       # approx_rank: omit for auto (default) | None (force full rank) | int (fixed low-rank)
    )
    model.setup_data(
        adata=adata_svp,
@@ -637,7 +638,7 @@ adjust them only when you hit performance or accuracy limits.
        share GPU context.
    * - **Low-rank spatial kernel**
      - ``SplisosmGLMM(approx_rank=k)``
-     - ``"auto"``: full rank when ``n_spots ≤ 5 000``, else ``⌈4√n⌉``
+     - ``"auto"``: full rank when ``n_spots ≤ 5000``, else ``⌈4√n⌉``
      - Fewer eigenvectors → faster fitting and lower memory (with accuracy loss).
        Pass ``None`` to force full rank regardless of ``n_spots``;
        pass an integer to set a fixed rank.

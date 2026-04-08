@@ -267,7 +267,7 @@ def false_discovery_control(
         is raveled before performing the adjustment.
     method
         The false discovery rate control procedure to apply: ``'bh'`` is for
-        Benjamini-Hochberg :cite:`benjamini1995controlling` (Eq. 1), ``'by'`` is for Benjaminini-Yekutieli
+        Benjamini-Hochberg :cite:`benjamini1995controlling` (Eq. 1), ``'by'`` is for Benjamini-Yekutieli
         :cite:`benjamini2001control` (Theorem 1.3). The latter is more conservative, but it is
         guaranteed to control the FDR even when the p-values are not from
         independent tests.

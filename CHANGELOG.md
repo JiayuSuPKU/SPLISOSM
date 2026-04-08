@@ -33,7 +33,7 @@
   - replace `use_perm_null`/`n_perms_per_gene` in `test_spatial_variability` with `null_method="perm"` and the `null_configs={'n_perms_per_gene': ...}` dict
 - `SplisosmGLMM`:
   - `PatienceLogger` now always logs the training loss. Use `store_param_history` instead of `diagnose` to keep track of parameter trajectories.
-  - `fit(quiet=True)` now suppresses not convergence warnings.
+  - `fit(quiet=True)` now suppresses non-convergence warnings.
 
 **Removed parameters:**
 - `setup_data()` from `SplisosmNP` and `SplisosmGLMM` now only accepts AnnData as input; legacy array-based setup removed

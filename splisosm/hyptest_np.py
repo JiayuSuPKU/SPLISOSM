@@ -314,32 +314,27 @@ class SplisosmNP:
 
     Examples
     --------
-    Setup data:
-
-    >>> from splisosm import SplisosmNP
-    >>> import torch
-    >>> # Simulate data for 10 genes with different number of isoforms
-    >>> data_3_iso = [torch.randint(low=0, high=5, size=(100, 3)) for _ in range(5)]  # 5 genes with 3 isoforms
-    >>> data_4_iso = [torch.randint(low=0, high=5, size=(100, 4)) for _ in range(5)]  # 5 genes with 4 isoforms
-    >>> data = data_3_iso + data_4_iso
-    >>> coordinates = torch.rand(100, 2)  # 100 spots with 2D coordinates
-    >>> design_mtx = torch.rand(100, 2)  # 100 spots with 2 covariates
-
     Spatial variability test:
 
+    >>> from splisosm import SplisosmNP
+    >>> # adata : AnnData of shape (n_spots, n_isoforms)
+    >>> #   adata.layers["counts"]    — raw isoform counts
+    >>> #   adata.var["gene_symbol"]  — column grouping isoforms by gene
+    >>> #   adata.obsm["spatial"]     — (n_spots, 2) spatial coordinates
     >>> model = SplisosmNP()
-    >>> model.setup_data(data, coordinates)
-    >>> model.test_spatial_variability(method='hsic-ir')
-    >>> sv_results = model.get_formatted_test_results('sv')
-    >>> print(sv_results.head())
+    >>> model.setup_data(adata, layer="counts", group_iso_by="gene_symbol")
+    >>> model.test_spatial_variability(method="hsic-ir")
+    >>> sv_results = model.get_formatted_test_results("sv")
 
     Differential usage test:
 
     >>> model = SplisosmNP()
-    >>> model.setup_data(data, coordinates, design_mtx=design_mtx)
-    >>> model.test_differential_usage(method='hsic-gp', residualize='cov_only')
-    >>> du_results = model.get_formatted_test_results('du')
-    >>> print(du_results.head())
+    >>> model.setup_data(
+    ...     adata, layer="counts", group_iso_by="gene_symbol",
+    ...     design_mtx="covariate",  # obs column name, or (n_spots, n_factors) array
+    ... )
+    >>> model.test_differential_usage(method="hsic-gp", residualize="cov_only")
+    >>> du_results = model.get_formatted_test_results("du")
     """
 
     # -- Public attributes (populated by :meth:`setup_data`) ------------------
@@ -1262,8 +1257,7 @@ class SplisosmNP:
             x = torch.as_tensor(
                 self._coordinates, dtype=torch.float64
             ).clone()  # (n_spots, n_dims)
-            x = (x - x.mean(0)) / x.std(0)
-            x[torch.isinf(x)] = 0  # guard against constant coordinate axes
+            x = (x - x.mean(0)) / x.std(0).clamp(min=1e-8)
 
             # Fit GPR for covariates and get residuals (n_factors small tensors, never sparse)
             gpr_cov = make_kernel_gpr(gpr_backend, **cov_config)

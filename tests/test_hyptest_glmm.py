@@ -373,7 +373,7 @@ class TestSplisosmGLMM(unittest.TestCase):
         )
         model.fit(quiet=True, batch_size=5)
         fitted_models = model.get_fitted_models()
-        self.assertTrue(len(fitted_models) == 20)
+        self.assertEqual(len(fitted_models), 20)
 
     def test_splisosm_glmm_fit(self):
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 5})
@@ -389,7 +389,7 @@ class TestSplisosmGLMM(unittest.TestCase):
         )
         model.fit(quiet=True, batch_size=5)
         fitted_models = model.get_fitted_models()
-        self.assertTrue(len(fitted_models) == 20)
+        self.assertEqual(len(fitted_models), 20)
 
     def test_get_gene_model_and_getitem(self):
         """get_gene_model / __getitem__ return the correct per-gene model."""

@@ -160,7 +160,7 @@ class MultinomGLM(BaseModel, nn.Module):
     def __init__(
         self,
         fitting_method: Literal["iwls", "newton", "gd"] = "iwls",
-        fitting_configs: dict = {},
+        fitting_configs: dict | None = None,
     ):
         """
         Parameters
@@ -199,7 +199,8 @@ class MultinomGLM(BaseModel, nn.Module):
             "max_epochs": 1000,
             "patience": 5 if fitting_method == "gd" else 2,
         }
-        self.fitting_configs.update(fitting_configs)
+        if fitting_configs is not None:
+            self.fitting_configs.update(fitting_configs)
 
         # for now, restricting the optimization method to Adam, SGD and lbfgs
         assert self.fitting_configs["optim"] in ["adam", "sgd", "lbfgs"]
@@ -947,12 +948,12 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
         share_variance: bool = True,
         var_fix_sigma: bool = True,
         var_prior_model: Literal["none", "gamma", "inv_gamma"] = "none",
-        var_prior_model_params: dict = {},
+        var_prior_model_params: dict | None = None,
         init_ratio: Literal["observed", "uniform"] = "uniform",
         fitting_method: Literal[
             "joint_gd", "joint_newton", "marginal_gd", "marginal_newton"
         ] = "joint_gd",
-        fitting_configs: dict = {},
+        fitting_configs: dict | None = None,
     ):
         """
         Parameters
@@ -1012,7 +1013,8 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
                 "alpha": 2.0,
                 "beta": 0.3,
             }
-            self.var_prior_model_params.update(var_prior_model_params)
+            if var_prior_model_params is not None:
+                self.var_prior_model_params.update(var_prior_model_params)
             self.var_prior_model_dist = Gamma(
                 self.var_prior_model_params["alpha"],
                 self.var_prior_model_params["beta"],
@@ -1025,7 +1027,8 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
                 "alpha": 2,
                 "beta": 0.1,
             }
-            self.var_prior_model_params.update(var_prior_model_params)
+            if var_prior_model_params is not None:
+                self.var_prior_model_params.update(var_prior_model_params)
             self.var_prior_model_dist = InverseGamma(
                 self.var_prior_model_params["alpha"],
                 self.var_prior_model_params["beta"],
@@ -1055,7 +1058,8 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             "max_epochs": 1000,
             "patience": 5,
         }
-        self.fitting_configs.update(fitting_configs)
+        if fitting_configs is not None:
+            self.fitting_configs.update(fitting_configs)
         if self.fitting_method == "joint_newton":
             # Newton's method is fast but can't very well handel saddle points
             # use small patience to avoid loss increase in the final iterations
@@ -1075,7 +1079,8 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
             self.fitting_configs["update_nu_every_k"] = 3
 
         # override the default if user provides a different configuration
-        self.fitting_configs.update(fitting_configs)
+        if fitting_configs is not None:
+            self.fitting_configs.update(fitting_configs)
 
         # for now, restricting the optimization method to Adam, SGD and lbfgs
         assert self.fitting_configs["optim"] in ["adam", "sgd", "lbfgs"]

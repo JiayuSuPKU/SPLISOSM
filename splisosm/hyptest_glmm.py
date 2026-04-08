@@ -74,7 +74,7 @@ class SplisosmGLMM:
     ...     model_type="glmm-full",    # 'glmm-full' | 'glmm-null' | 'glm'
     ...     fitting_method="joint_gd", # 'joint_gd' | 'joint_newton' | 'marginal_gd' | 'marginal_newton'
     ...     device="cpu",              # 'cpu' | 'cuda' (NVIDIA) | 'mps' (Apple Silicon)
-    ...     approx_rank=None,          # None (exact) or int (low-rank spatial kernel)
+    ...     # approx_rank: omit for auto | None (force full rank) | int (fixed low-rank)
     ... )
     >>> model.setup_data(
     ...     adata,
@@ -133,10 +133,10 @@ class SplisosmGLMM:
         share_variance: bool = True,
         var_fix_sigma: bool = True,
         var_prior_model: str = "none",
-        var_prior_model_params: dict = {},
+        var_prior_model_params: dict | None = None,
         init_ratio: str = "uniform",
         fitting_method: str = "joint_gd",
-        fitting_configs: dict = {"max_epochs": 500},
+        fitting_configs: dict | None = None,
         k_neighbors: int = 4,
         rho: float = 0.99,
         approx_rank=_APPROX_RANK_AUTO,
@@ -220,7 +220,9 @@ class SplisosmGLMM:
             "var_prior_model_params": var_prior_model_params,
             "init_ratio": init_ratio,
             "fitting_method": fitting_method,
-            "fitting_configs": fitting_configs,
+            "fitting_configs": (
+                fitting_configs if fitting_configs is not None else {"max_epochs": 500}
+            ),
         }
 
         # kernel construction configs (used in setup_data)

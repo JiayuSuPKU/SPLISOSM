@@ -2054,11 +2054,9 @@ def fit_kernel_gpr(
     Y_ = Y[~is_nan]
 
     if normalize_x:
-        X_ = (X_ - X_.mean(0)) / X_.std(0)
-        X_[torch.isinf(X_)] = 0.0
+        X_ = (X_ - X_.mean(0)) / X_.std(0).clamp(min=1e-8)
     if normalize_y:
-        Y_ = (Y_ - Y_.mean(0)) / Y_.std(0)
-        Y_[torch.isinf(Y_)] = 0.0
+        Y_ = (Y_ - Y_.mean(0)) / Y_.std(0).clamp(min=1e-8)
 
     x_np = X_.numpy()
     kernel = C(constant_value, constant_value_bounds) * RBF(

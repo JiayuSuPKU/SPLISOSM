@@ -123,7 +123,7 @@ Choosing a model class
 
   Note that both conditional tests (``'hsic-gp'`` and ``'glmm'``) are computationally intensive and may take hours to run on large datasets. 
   For ``'hsic-gp'``, inducing-point approximations and GPU acceleration (via the `gpytorch` backend) are available.
-  For ``'glmm'``, model fitting is handled naively with pytorch with GPU device support, and low-rank kernel approximation is also available (via ``SplisosmGLMM(approx_rank=...)``).
+  For ``'glmm'``, model fitting is handled natively with PyTorch with GPU device support, and low-rank kernel approximation is also available (via ``SplisosmGLMM(approx_rank=...)``).
 
   .. code-block:: python
 
