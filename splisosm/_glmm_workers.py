@@ -584,12 +584,15 @@ def _calc_score_differential_usage(fitted_full_model: MultinomGLM, covar_to_test
         :, n_factors_design:, :, :
     ]  # exclude the design matrix in the fitted model
 
-    # calculate the score statistic: s^T F^{-1} s per (gene, factor)
-    # Use linalg.solve instead of explicit inv to avoid a PyTorch "output resized"
-    # warning from batched matmul with mismatched pre-allocated output shape.
-    _solve = torch.linalg.solve(fisher_info, score.unsqueeze(-1)).squeeze(
-        -1
-    )  # (n_genes, n_factors_covar, n_isos - 1)
-    score_stat = (score * _solve).sum(-1)  # (n_genes, n_factors_covar)
+    # Score statistic: s^T F^{-1} s per (gene, factor).
+    # Compute F^{-1} s via solve.  Per-factor loop avoids a PyTorch
+    # deprecation warning about output-tensor resizing in batched solve
+    # when the gene dimension is 1 (common for reconstructed per-gene models).
+    score_stat = torch.empty(n_genes, n_factors_covar, device=score.device)
+    for f in range(n_factors_covar):
+        # fisher_info[:, f] shape: (n_genes, n_isos-1, n_isos-1)
+        # score[:, f]       shape: (n_genes, n_isos-1)
+        _sol = torch.linalg.solve(fisher_info[:, f], score[:, f])  # (n_genes, n_isos-1)
+        score_stat[:, f] = (score[:, f] * _sol).sum(-1)
 
     return score_stat, n_isos - 1

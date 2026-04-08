@@ -27,7 +27,7 @@ import scipy.sparse as sp
 import torch
 from anndata import AnnData
 from joblib import Parallel, delayed
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from splisosm.kernel import FFTKernel  # noqa: F401 — re-export for backward compat
 from splisosm.kernel_gpr import (
@@ -956,9 +956,11 @@ class SplisosmFFT:
                 f"ratio_transformation must be one of {valid_transformations}."
             )
 
-        factor_names = self.covariate_names or [
-            f"factor_{i}" for i in range(self.n_factors)
-        ]
+        factor_names = (
+            self.covariate_names
+            if self.covariate_names is not None and len(self.covariate_names) > 0
+            else [f"factor_{i}" for i in range(self.n_factors)]
+        )
         n_factors = self.n_factors
         spacing = (self.sp_kernel.dy, self.sp_kernel.dx)
 
@@ -1144,9 +1146,11 @@ class SplisosmFFT:
                 raise ValueError(
                     "No differential usage results found. Run test_differential_usage() first."
                 )
-            covariate_names = self.covariate_names or [
-                f"factor_{i}" for i in range(self.n_factors)
-            ]
+            covariate_names = (
+                self.covariate_names
+                if self.covariate_names is not None and len(self.covariate_names) > 0
+                else [f"factor_{i}" for i in range(self.n_factors)]
+            )
             df = pd.DataFrame(
                 {
                     "gene": np.repeat(self.gene_names, self.n_factors),

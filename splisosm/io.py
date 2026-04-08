@@ -17,7 +17,7 @@ import pandas as pd
 import scipy.sparse
 from anndata import AnnData
 from matplotlib.image import imread
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 __all__ = [
     "load_visium_sp_meta",

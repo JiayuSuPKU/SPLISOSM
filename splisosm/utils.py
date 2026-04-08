@@ -10,7 +10,7 @@ from scipy.sparse.csgraph import connected_components as _connected_components
 import numpy as np
 from numpy.typing import ArrayLike
 import scipy.sparse
-from tqdm.auto import tqdm
+from tqdm import tqdm
 import pandas as pd
 import torch
 from anndata import AnnData
@@ -1166,13 +1166,14 @@ def compute_feature_summaries(
 
     iso_groups = list(adata.var.groupby(group_iso_by, observed=True, sort=False))
 
-    # Sanity check: groupby order must match gene_names
-    group_keys = [k for k, _ in iso_groups]
-    if group_keys != list(gene_names):
+    # gene_names may be display names (e.g. 'Gnai3') while groupby keys are
+    # raw identifiers (e.g. 'ENSMUSG00000000001').  We only require that the
+    # *count* matches — the order is guaranteed by construction (both come
+    # from the same filtered, sorted adata.var).
+    if len(iso_groups) != len(gene_names):
         raise ValueError(
-            "gene_names order does not match adata.var groupby order. "
-            f"First mismatch: gene_names has '{gene_names[0]}' but "
-            f"groupby has '{group_keys[0]}'."
+            f"gene_names length ({len(gene_names)}) does not match the number "
+            f"of gene groups ({len(iso_groups)}) in adata.var['{group_iso_by}']."
         )
 
     gene_rows: list[dict] = []

@@ -14,7 +14,7 @@ import torch
 from anndata import AnnData
 import torch.multiprocessing as mp
 from joblib import Parallel, delayed
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from splisosm.utils import (
     compute_feature_summaries,
@@ -824,9 +824,11 @@ class SplisosmGLMM:
                 raise ValueError(
                     "No differential usage results. Run test_differential_usage() first."
                 )
-            covariate_names = self.covariate_names or [
-                f"factor_{i}" for i in range(self.n_factors)
-            ]
+            covariate_names = (
+                self.covariate_names
+                if self.covariate_names is not None and len(self.covariate_names) > 0
+                else [f"factor_{i}" for i in range(self.n_factors)]
+            )
             df = pd.DataFrame(
                 {
                     "gene": np.repeat(self.gene_names, self.n_factors),

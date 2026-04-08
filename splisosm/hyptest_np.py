@@ -12,7 +12,7 @@ import numpy as np
 import scipy.sparse
 import pandas as pd
 import torch
-from tqdm.auto import tqdm
+from tqdm import tqdm
 from anndata import AnnData
 
 from splisosm.utils import (
@@ -405,6 +405,7 @@ class SplisosmNP:
         self.adata: AnnData | None = None
         self._setup_input_mode: str | None = None
         self._skip_kernel_construction: bool = False
+        self._kernel_source: str | None = None
 
         # Feature summary cache (populated by _compute_feature_summaries)
         self._filtered_adata: AnnData | None = None
@@ -420,17 +421,20 @@ class SplisosmNP:
         _sv_status = (
             f"Completed ({self._sv_test_results['method']})"
             if len(self._sv_test_results) > 0
-            else "NA"
+            else "N/A"
         )
         _du_status = (
             f"Completed ({self._du_test_results['method']})"
             if len(self._du_test_results) > 0
-            else "NA"
+            else "N/A"
         )
         _avg_iso = (
             f"{np.mean(self.n_isos_per_gene):.1f}"
             if self.n_isos_per_gene is not None
             else "N/A"
+        )
+        _k_neighors = (
+            self._k_neighbors if "spatial_key" in self._kernel_source else "N/A"
         )
         return (
             "=== SplisosmNP\n"
@@ -439,10 +443,9 @@ class SplisosmNP:
             + f"- Number of covariates: {self.n_factors}\n"
             + f"- Average isoforms per gene: {_avg_iso}\n"
             + "=== Model configurations\n"
-            + f"- Mutual neighbors K: {self._k_neighbors}\n"
-            + f"- Spatial autocorrelation rho: {self._rho}\n"
-            + f"- Standardize kernel variance: {self._standardize_cov}\n"
-            + f"- Skip kernel construction: {self._skip_kernel_construction}\n"
+            + f"- Spatial kernel source: {self._kernel_source}\n"
+            + f"- k_neighbors: {_k_neighors}, rho: {self._rho}\n"
+            + f"- Standardize spatial covariance: {self._standardize_cov}\n"
             + "=== Test results\n"
             + f"- Spatial variability: {_sv_status}\n"
             + f"- Differential usage: {_du_status}"
@@ -618,6 +621,7 @@ class SplisosmNP:
         self._skip_kernel_construction = skip_spatial_kernel
         if skip_spatial_kernel:
             self.sp_kernel = IdentityKernel(self.n_spots)
+            self._kernel_source = "identity (skip_spatial_kernel=True)"
         elif adj_matrix is not None:
             self.sp_kernel = SpatialCovKernel(
                 coords=None,
@@ -625,6 +629,11 @@ class SplisosmNP:
                 rho=self._rho,
                 standardize_cov=self._standardize_cov,
                 centering=True,
+            )
+            self._kernel_source = (
+                f"adj_key='{adj_key}'"
+                if adj_key is not None
+                else f"spatial_key='{spatial_key}' (component-filtered)"
             )
         else:
             self.sp_kernel = SpatialCovKernel(
@@ -635,6 +644,7 @@ class SplisosmNP:
                 standardize_cov=self._standardize_cov,
                 centering=True,
             )
+            self._kernel_source = f"spatial_key='{spatial_key}'"
 
         # Process design matrix from _process_design_mtx.
         # resolved_design is a numpy float32 array, a scipy sparse CSR matrix, or None.
@@ -825,9 +835,11 @@ class SplisosmNP:
                 raise ValueError(
                     "No differential usage results. Run test_differential_usage() first."
                 )
-            covariate_names = self.covariate_names or [
-                f"factor_{i}" for i in range(self.n_factors)
-            ]
+            covariate_names = (
+                self.covariate_names
+                if self.covariate_names is not None and len(self.covariate_names) > 0
+                else [f"factor_{i}" for i in range(self.n_factors)]
+            )
             df = pd.DataFrame(
                 {
                     "gene": np.repeat(self.gene_names, self.n_factors),
