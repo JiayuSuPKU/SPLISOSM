@@ -1,27 +1,33 @@
 Tutorial Gallery
 ================
 
-Explore notebook tutorials for running SPLISOSM on various spatial transcriptomics platforms.
 
-.. note::
+Running SPLISOSM on spatial and single-cell datasets
+-------------------------------------------------------------------
+.. base-gallery::
+  :caption: Available notebooks
+  :tooltip:
 
-  More tutorials under development. Please check back later for updates.
+  sit_mob_demo
+  xenium_sc_segmented
 
-Spatial variability analysis for large-scale data
---------------------------------------------------
+
+Scaling SPLISOSM to large-scale datasets with millions of spots
+-----------------------------------------------------------------
 .. base-gallery::
   :caption: Available notebooks
   :tooltip:
 
   visiumhd_ffpe
-  visiumhd_3prime
-  visiumhd_ont
-  xenium_prime_5k
+  visiumhd_ffpe_du
 
-Differential usage analysis for large-scale data
--------------------------------------------------
+
+Detecting variable transcript usage across ST platforms
+-------------------------------------------------------------------
 .. base-gallery::
   :caption: Available notebooks
   :tooltip:
 
-  visiumhd_ffpe_du
+  visiumhd_3prime
+  visiumhd_ont
+  xenium_prime_5k
