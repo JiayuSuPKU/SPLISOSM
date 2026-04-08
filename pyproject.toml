@@ -62,4 +62,4 @@ docs = [
 repository = "https://github.com/JiayuSuPKU/SPLISOSM"
 
 [tool.setuptools]
-packages.find = {where = ["."], exclude = ["docs", "tests", "scripts"]}
+packages.find = {where = ["."], exclude = ["docs", "docs.*", "tests", "tests.*", "scripts", "scripts.*"]}
