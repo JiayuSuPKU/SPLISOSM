@@ -164,14 +164,16 @@ Running SPLISOSM
 
 **6. Can I run SPLISOSM on single-cell spatial transcriptomics data?**
 
-  Yes. See the :doc:`Feature Quantification page <txquant>` for guidance on preparing input data from Space Ranger and Xenium Ranger segmentation outputs.
+  Yes. :class:`~splisosm.SplisosmNP` works directly on segmented single-cell data — simply pass the cell-level AnnData with spatial coordinates.
+  See the :doc:`Xenium segmented single-cell tutorial <tutorials/xenium_sc_segmented>` for a worked example, and the :doc:`Feature Quantification page <txquant>` for guidance on preparing input data from Space Ranger and Xenium Ranger segmentation outputs.
 
 
 **7. Can I run SPLISOSM on a subset of cells/spots instead of the whole tissue?**
 
   Yes. SPLISOSM can be run on any subset of cells or spots. This is useful when focusing on specific regions of interest or cell types. 
-  Simply filter your AnnData object to the subset of interest before passing it to SPLISOSM. 
-  However, if your selection consists of disconnected regions, the spatial relationships might be distorted. 
+  Simply filter your AnnData object to the subset of interest before passing it to SPLISOSM. See the :doc:`Xenium segmented single-cell tutorial <tutorials/xenium_sc_segmented>` for an example.
+
+  If your selection consists of disconnected regions, the spatial relationships might be distorted. 
   To preserve the original global spatial context, you can use the full dataset to build the spatial kernel. 
   A simple way to achieve this is to prepare an input matrix containing all spots but set the isoform counts for unselected spots to zero. 
   SPLISOSM will then ignore these spots in the statistical tests while still using their coordinates to build the spatial kernel.
@@ -182,7 +184,8 @@ Running SPLISOSM
   Yes. While SPLISOSM is designed to identify patterns associated with physical spatial coordinates, it is technically possible to run it on non-spatial single-cell RNA-seq data.
   This can be done by treating cell embeddings (e.g., PCA or UMAP coordinates) as "pseudo-spatial coordinates."
   :class:`~splisosm.SplisosmNP` natively supports high-dimensional coordinate arrays (any number of dimensions ≥ 2) — simply pass the PCA embedding matrix as the ``spatial_key`` 
-  (or a pre-computed graph adjacency matrix, such as ``adata.obsp['connectivities']`` as the ``adj_key``) in ``setup_data``.
+  (or a pre-computed graph adjacency matrix, such as ``adata.obsp['connectivities']`` as the ``adj_key``) in ``setup_data``. 
+  See the final section of the :doc:`Xenium segmented single-cell tutorial <tutorials/xenium_sc_segmented>` for an example.
 
   This approach should be used with caution: 'spatial' patterns in this case are only as meaningful as the biological relationships captured by the embedding.
   Furthermore, be aware of potential circularity if the isoform data was used to generate the embeddings, as this may lead to spurious associations.

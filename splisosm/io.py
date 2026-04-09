@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 __all__ = [
     "load_visium_sp_meta",
+    "load_visium_probe",
     "load_visiumhd_probe",
     "load_xenium_codeword",
 ]
@@ -109,6 +110,121 @@ def load_visium_sp_meta(
         columns=["pxl_row_in_fullres", "pxl_col_in_fullres"],
         inplace=True,
     )
+
+    return adata
+
+
+def load_visium_probe(
+    path: str | Path,
+    *,
+    counts_file: str = "raw_probe_bc_matrix.h5",
+    library_id: Optional[str] = None,
+    load_spatial: bool = True,
+    counts_layer_name: str = "counts",
+) -> AnnData:
+    """Load standard Visium Space Ranger probe-based outputs as AnnData.
+
+    Reads the probe-level count matrix (``raw_probe_bc_matrix.h5`` by default)
+    from a Space Ranger ``outs`` directory and optionally attaches spatial
+    metadata (coordinates, images, scale factors) from the ``spatial/`` subfolder.
+
+    This is the standard-resolution Visium counterpart of
+    :func:`load_visiumhd_probe` (which handles Visium HD multi-bin outputs).
+
+    Parameters
+    ----------
+    path
+        Path to the Space Ranger ``outs`` directory, e.g.
+        ``<run_id>/outs``.  Must contain the HDF5 count matrix and,
+        when ``load_spatial=True``, a ``spatial/`` subfolder.
+    counts_file
+        Name of the HDF5 count matrix file inside ``path``.
+        Typical choices:
+
+        * ``"raw_probe_bc_matrix.h5"`` — all barcodes, probe-level features
+          (default; preserves per-probe information).
+        * ``"raw_feature_bc_matrix.h5"`` — all barcodes, gene-level features.
+        * ``"filtered_feature_bc_matrix.h5"`` — tissue barcodes only,
+          gene-level features.
+    library_id
+        Library identifier stored in ``adata.uns["spatial"]``.
+        Defaults to the parent directory name of *path*.
+    load_spatial
+        Whether to load spatial metadata (tissue positions, images,
+        scale factors) from ``<path>/spatial/``.
+    counts_layer_name
+        Layer name for the raw count matrix.  The counts are stored in
+        ``adata.layers[counts_layer_name]`` and ``adata.X`` is set to the
+        same matrix.
+
+    Returns
+    -------
+    anndata.AnnData
+        Annotated data matrix with:
+
+        * ``.X`` / ``.layers[counts_layer_name]`` — sparse count matrix
+        * ``.var`` — feature (probe or gene) metadata
+        * ``.obs`` — barcode metadata; when ``load_spatial=True`` also
+          includes ``in_tissue``, ``array_row``, ``array_col``
+        * ``.obsm["spatial"]`` — ``(n_spots, 2)`` spatial pixel coordinates
+          (when ``load_spatial=True``)
+        * ``.uns["spatial"]`` — images and scale factors
+          (when ``load_spatial=True``)
+
+    Raises
+    ------
+    FileNotFoundError
+        If the counts file or spatial directory is missing.
+
+    Examples
+    --------
+    >>> from splisosm.io import load_visium_probe
+    >>> adata = load_visium_probe("CytAssist_FFPE_Mouse_Brain_Rep1/outs")
+    >>> adata
+    AnnData object with n_obs x n_vars = ...
+    >>> adata.layers["counts"]
+    <sparse matrix ...>
+    """
+    try:
+        import scanpy as sc
+    except ImportError as e:
+        raise ImportError(
+            "scanpy is required for load_visium_probe(). "
+            "Install it via `pip install scanpy`."
+        ) from e
+
+    path = Path(path)
+    h5_file = path / counts_file
+    if not h5_file.exists():
+        raise FileNotFoundError(
+            f"Count matrix not found: {h5_file}\n"
+            f"Available .h5 files: {sorted(p.name for p in path.glob('*.h5'))}"
+        )
+
+    # Read the 10x HDF5 count matrix
+    adata = sc.read_10x_h5(str(h5_file), gex_only=False)
+    adata.var_names_make_unique()
+
+    # Store raw counts in a named layer
+    adata.layers[counts_layer_name] = adata.X.copy()
+
+    # Attach spatial metadata
+    if load_spatial:
+        spatial_dir = path / "spatial"
+        if not spatial_dir.exists():
+            warnings.warn(
+                f"Spatial directory not found at {spatial_dir}. "
+                f"Skipping spatial metadata loading.",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            if library_id is None:
+                library_id = path.parent.name
+            load_visium_sp_meta(adata, spatial_dir, library_id=library_id)
+
+    # Ensure obs index is string (consistent with other loaders)
+    adata.obs_names = adata.obs_names.astype(str)
 
     return adata
 

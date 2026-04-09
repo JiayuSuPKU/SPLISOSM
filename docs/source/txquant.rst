@@ -26,7 +26,7 @@ The table below summarizes the supported ST platforms, the type of isoform featu
      - 3\' end diversity (TREND) event (peak)
      - `Sierra <https://github.com/VCCRI/Sierra>`__ for *de novo* peak calling
    * - **Short-read targeted**
-     - 10x Visium/Visium HD (FFPE), 10x Flex
+     - 10x Visium v2 CytAssist (FFPE), 10x Visium HD (FFPE), 10x Flex
      - Exon/junction probe
      - Space Ranger output directly (``raw_probe_bc_matrix.h5``)
    * - **In situ targeted**
@@ -122,8 +122,8 @@ Tested platforms:
 .. note::
   If you encounter issues when running Sierra's ``CountPeaks``, the following workaround quantification workflow may be helpful:
 
-Visium HD 3' data (custom quantification)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+10x Visium HD 3' data (custom quantification)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 For 10x Visium HD 3' data, we have prepared a hybrid quantification workflow where Sierra is used for peak calling but not counting.
 See the attached bash script (`scripts/visiumhd_3p_trend_quant.sh <https://github.com/JiayuSuPKU/SPLISOSM/blob/main/scripts/visiumhd_3p_trend_quant.sh>`_).
@@ -174,14 +174,10 @@ The generated ``SpatialData`` object has the following structure (example):
 
 For downstream analysis of TREND spatial patterns, see the :doc:`Visium HD 3' tutorial <tutorials/visiumhd_3prime>`.
 
-Visium/Slide-seqV2 3' data (Sierra quantification)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+10x Visium / Slide-seqV2 3' data (Sierra quantification)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-.. raw:: html
-
-   <details>
-   <summary><strong>Running Sierra on Space Ranger BAM (click to expand)</strong></summary>
-   <br>
+**Running Sierra on Space Ranger BAM**
 
 .. code-block:: r
 
@@ -205,11 +201,6 @@ Visium/Slide-seqV2 3' data (Sierra quantification)
      whitelist.file = '${whitelist_file}', # barcodes.tsv file from SpaceRanger
      output.dir = '${output_dir}',
    )
-
-.. raw:: html
-
-   </details>
-
 
 .. raw:: html
 
@@ -325,11 +316,15 @@ SPLISOSM compares all events associated with the same gene and is agnostic to th
 Short-read targeted ST data
 ----------------------------
 
-10x Visium HD FFPE uses a fixed pan-genome probe for read enrichment. SPLISOSM treats probe-level counts as the isoform-level quantification — probes targeting the same gene are grouped and tested jointly.
+10x Visium and Visium HD FFPE kits use fixed pan-genome probes for read enrichment. SPLISOSM treats probe-level counts as the isoform-level quantification — probes targeting the same gene are grouped and tested jointly.
 
-Tested platform: 
+Tested platforms:
 
+- 10x Visium FFPE (v2 CytAssist Spatial Gene Expression)
 - 10x Visium HD FFPE
+
+10x Visium HD FFPE
+^^^^^^^^^^^^^^^^^^^
 
 Given Space Ranger output, the following code creates a ``SpatialData`` object with probe-level counts (from ``raw_probe_bc_matrix.h5``):
 
@@ -383,6 +378,68 @@ The generated ``SpatialData`` object has the following structure (example):
           Visium_HD_Mouse_Brain_lowres_image (Images), Visium_HD_Mouse_Brain_cell_segmentations (Shapes), Visium_HD_Mouse_Brain_square_002um (Shapes), Visium_HD_Mouse_Brain_square_008um (Shapes), Visium_HD_Mouse_Brain_square_016um (Shapes)
 
 For downstream analysis, see the :doc:`Visium HD FFPE tutorial <tutorials/visiumhd_ffpe>`.
+
+
+10x Visium FFPE (v2 CytAssist)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Standard-resolution Visium CytAssist FFPE uses a probe-based capture workflow.
+Space Ranger (**v3.0+**) outputs a ``raw_probe_bc_matrix.h5`` file containing per-probe, per-barcode counts
+that SPLISOSM uses directly for probe usage testing.
+
+**Running Space Ranger count**
+
+See the `10x documentation <https://www.10xgenomics.com/support/software/space-ranger/latest/analysis/running-pipelines/probe-based-assay-count-cytassist-gex>`_ for detailed instructions.
+Example Space Ranger command:
+
+.. code-block:: bash
+
+   spaceranger count \
+       --id="CytAssist_FFPE_Mouse_Brain_Rep1" \
+       --transcriptome=refdata-gex-mm10-2020-A \
+       --probe-set=CytAssist_FFPE_Mouse_Brain_Rep1_probe_set.csv \
+       --fastqs=path/to/fastqs \
+       --cytaimage=CytAssist_FFPE_Mouse_Brain_Rep1_image.tif \
+       --image=CytAssist_FFPE_Mouse_Brain_Rep1_tissue_image.tif \
+       --loupe-alignment=CytAssist_FFPE_Mouse_Brain_Rep1_alignment_file.json \
+       --slide=V42A20-353 \
+       --area=A1 \
+       --create-bam=false \
+       --localcores=16 \
+       --localmem=64
+
+
+**Loading as AnnData**
+
+.. code-block:: python
+
+   from splisosm.io import load_visium_probe
+
+   adata = load_visium_probe(
+       "CytAssist_FFPE_Mouse_Brain_Rep1/outs",
+       counts_file="raw_probe_bc_matrix.h5",  # probe-level counts (default)
+       counts_layer_name="counts",
+   )
+
+The loaded ``AnnData`` has the following structure:
+
+.. code-block:: text
+
+   AnnData object with n_obs x n_vars = 4992 x 21178
+       obs: 'filtered_barcodes', 'in_tissue', 'array_row', 'array_col'
+       var: 'gene_ids', 'probe_ids', 'feature_types', 'filtered_probes', 'gene_name', 'genome', 'probe_region'
+       uns: 'spatial'
+       obsm: 'spatial'
+       layers: 'counts'
+
+Each row is a Visium spot (barcode) and each column is an individual probe.
+The ``gene_ids`` column in ``.var`` groups probes by gene — pass ``group_iso_by="gene_ids"``
+and ``gene_names="gene_name"`` to :meth:`~splisosm.SplisosmNP.setup_data`.
+
+.. note::
+   On the `Mouse Brain Coronal Section 1 (FFPE) <https://www.10xgenomics.com/datasets/mouse-brain-coronal-section-1-ffpe-2-standard>`_ dataset,
+   281 genes with multiple probes passed filtering (``min_counts=10, filter_single_iso_genes=True``),
+   of which 83 were identified as spatially variably processed (SVP, HSIC-IR) at FDR < 0.01.
 
 
 In situ targeted ST data
