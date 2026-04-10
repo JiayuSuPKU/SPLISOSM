@@ -858,5 +858,241 @@ class TestIO(unittest.TestCase):
             self.assertEqual(list(table_codeword.var_names), ["GeneA|0", "GeneB|1"])
 
 
+load_visium_probe = io_mod.load_visium_probe
+load_visium_sp_meta = io_mod.load_visium_sp_meta
+
+
+def _make_fake_visium_outs(root: Path, n_spots: int = 10, n_probes: int = 6):
+    """Create a minimal Space Ranger ``outs`` directory for testing.
+
+    Returns the ``outs`` path and a dict with the probe-level AnnData used to
+    generate the H5 files (for assertion comparisons).
+    """
+    outs = root / "outs"
+    outs.mkdir(parents=True, exist_ok=True)
+
+    rng = np.random.default_rng(42)
+    barcodes = [f"AAAA-{i}" for i in range(n_spots)]
+
+    # Probe-level counts (raw_probe_bc_matrix.h5)
+    X_probe = scipy.sparse.random(
+        n_spots, n_probes, density=0.5, format="csc", random_state=42, dtype=np.float32
+    )
+    gene_ids = [f"ENSMUSG{i // 2:08d}" for i in range(n_probes)]
+    var_probe = pd.DataFrame(
+        {
+            "gene_ids": gene_ids,
+            "probe_ids": [f"probe_{i}" for i in range(n_probes)],
+            "feature_types": ["Gene Expression"] * n_probes,
+            "filtered_probes": [False] * n_probes,
+            "gene_name": [f"Gene{i // 2}" for i in range(n_probes)],
+            "genome": ["mm10"] * n_probes,
+            "probe_region": ["spliced"] * n_probes,
+        },
+        index=[f"Gene{i // 2}|p{i}" for i in range(n_probes)],
+    )
+
+    adata_probe = AnnData(X=X_probe, obs=pd.DataFrame(index=barcodes), var=var_probe)
+
+    # Gene-level filtered counts (filtered_feature_bc_matrix.h5)
+    # Keep only first n_spots // 2 barcodes as "in-tissue"
+    n_filtered = max(n_spots // 2, 2)
+    X_gene = scipy.sparse.random(
+        n_filtered,
+        n_probes // 2,
+        density=0.5,
+        format="csc",
+        random_state=7,
+        dtype=np.float32,
+    )
+    var_gene = pd.DataFrame(
+        {
+            "gene_ids": [f"ENSMUSG{i:08d}" for i in range(n_probes // 2)],
+            "feature_types": ["Gene Expression"] * (n_probes // 2),
+            "genome": ["mm10"] * (n_probes // 2),
+        },
+        index=[f"Gene{i}" for i in range(n_probes // 2)],
+    )
+    adata_gene = AnnData(
+        X=X_gene, obs=pd.DataFrame(index=barcodes[:n_filtered]), var=var_gene
+    )
+
+    # Write H5 files via scanpy — mock this with direct write
+    import h5py
+
+    for fname, ad in [
+        ("raw_probe_bc_matrix.h5", adata_probe),
+        ("filtered_feature_bc_matrix.h5", adata_gene),
+    ]:
+        h5_path = outs / fname
+        with h5py.File(h5_path, "w") as f:
+            g = f.create_group("matrix")
+            # 10x H5 convention: matrix is (n_features, n_barcodes) in CSC
+            X_t = ad.X.T.tocsc()
+            g.create_dataset("data", data=X_t.data)
+            g.create_dataset("indices", data=X_t.indices)
+            g.create_dataset("indptr", data=X_t.indptr)
+            g.create_dataset("shape", data=np.array(X_t.shape))
+            g.create_dataset("barcodes", data=np.array(ad.obs_names, dtype="S"))
+            fg = g.create_group("features")
+            fg.create_dataset("id", data=np.array(ad.var_names, dtype="S"))
+            fg.create_dataset(
+                "name",
+                data=np.array(
+                    (
+                        ad.var["gene_name"].values
+                        if "gene_name" in ad.var
+                        else ad.var_names
+                    ),
+                    dtype="S",
+                ),
+            )
+            fg.create_dataset(
+                "feature_type", data=np.array(ad.var["feature_types"].values, dtype="S")
+            )
+            fg.create_dataset(
+                "genome", data=np.array(ad.var["genome"].values, dtype="S")
+            )
+            if "probe_ids" in ad.var:
+                fg.create_dataset(
+                    "probe_id", data=np.array(ad.var["probe_ids"].values, dtype="S")
+                )
+                fg.create_dataset(
+                    "filtered_probes", data=np.array(ad.var["filtered_probes"].values)
+                )
+                fg.create_dataset(
+                    "probe_region",
+                    data=np.array(ad.var["probe_region"].values, dtype="S"),
+                )
+
+    # Spatial directory
+    spatial_dir = outs / "spatial"
+    spatial_dir.mkdir()
+
+    # tissue_positions.csv
+    positions = pd.DataFrame(
+        {
+            "in_tissue": [1] * n_filtered + [0] * (n_spots - n_filtered),
+            "array_row": list(range(n_spots)),
+            "array_col": [
+                2 * i if r % 2 == 0 else 2 * i + 1
+                for r, i in zip(range(n_spots), range(n_spots))
+            ],
+            "pxl_col_in_fullres": rng.integers(0, 1000, n_spots).tolist(),
+            "pxl_row_in_fullres": rng.integers(0, 1000, n_spots).tolist(),
+        },
+        index=barcodes,
+    )
+    positions.to_csv(spatial_dir / "tissue_positions.csv")
+
+    # scalefactors_json.json
+    import json
+
+    with open(spatial_dir / "scalefactors_json.json", "w") as f:
+        json.dump(
+            {
+                "tissue_hires_scalef": 0.1,
+                "tissue_lowres_scalef": 0.03,
+                "fiducial_diameter_fullres": 200.0,
+                "spot_diameter_fullres": 100.0,
+            },
+            f,
+        )
+
+    # Minimal images (2x2 pixel, 3-channel RGB)
+    from matplotlib.image import imsave
+
+    for name in ["tissue_hires_image.png", "tissue_lowres_image.png"]:
+        imsave(str(spatial_dir / name), np.zeros((2, 2, 3), dtype=np.uint8))
+
+    return outs, {"adata_probe": adata_probe, "n_filtered": n_filtered}
+
+
+class TestLoadVisiumProbe(unittest.TestCase):
+    """Tests for :func:`splisosm.io.load_visium_probe`."""
+
+    def test_anndata_mode_default(self):
+        """Default call returns filtered AnnData with probe metadata and spatial."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outs, info = _make_fake_visium_outs(Path(tmpdir))
+            adata = load_visium_probe(outs)
+
+            # Should be filtered to in-tissue barcodes
+            self.assertEqual(adata.n_obs, info["n_filtered"])
+            # Probe-level var columns preserved (scanpy reads probe_id, not probe_ids)
+            for col in ["gene_ids", "feature_types", "probe_region"]:
+                self.assertIn(col, adata.var.columns)
+            # Counts layer
+            self.assertIn("counts", adata.layers)
+            # Spatial metadata
+            self.assertIn("spatial", adata.obsm)
+            self.assertIn("spatial", adata.uns)
+
+    def test_anndata_mode_unfiltered(self):
+        """filtered_counts_file=False returns all barcodes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outs, info = _make_fake_visium_outs(Path(tmpdir), n_spots=10)
+            adata = load_visium_probe(outs, filtered_counts_file=False)
+            self.assertEqual(adata.n_obs, 10)
+
+    def test_anndata_mode_no_spatial(self):
+        """load_spatial=False skips spatial metadata."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outs, _ = _make_fake_visium_outs(Path(tmpdir))
+            adata = load_visium_probe(outs, load_spatial=False)
+            self.assertNotIn("spatial", adata.obsm)
+
+    def test_anndata_mode_custom_layer(self):
+        """counts_layer_name is respected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outs, _ = _make_fake_visium_outs(Path(tmpdir))
+            adata = load_visium_probe(outs, counts_layer_name="raw")
+            self.assertIn("raw", adata.layers)
+            self.assertNotIn("counts", adata.layers)
+
+    def test_missing_counts_file_raises(self):
+        """FileNotFoundError when counts file doesn't exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outs = Path(tmpdir) / "outs"
+            outs.mkdir()
+            with self.assertRaises(FileNotFoundError):
+                load_visium_probe(outs, counts_file="nonexistent.h5")
+
+    def test_invalid_return_type_raises(self):
+        """ValueError for unknown return_type."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outs, _ = _make_fake_visium_outs(Path(tmpdir))
+            with self.assertRaisesRegex(ValueError, "Unknown return_type"):
+                load_visium_probe(outs, return_type="invalid")
+
+    def test_spatialdata_mode(self):
+        """return_type='spatialdata' returns SpatialData with probe table."""
+        try:
+            import spatialdata as sd  # noqa: F401
+            import spatialdata_io  # noqa: F401
+        except ImportError:
+            self.skipTest("spatialdata-io not installed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outs, info = _make_fake_visium_outs(Path(tmpdir), n_spots=20, n_probes=8)
+            sdata = load_visium_probe(outs, return_type="spatialdata")
+
+            # Should be a SpatialData
+            self.assertIsInstance(sdata, sd.SpatialData)
+            # Table should have probe-level features
+            table = sdata.tables["table"]
+            self.assertEqual(table.n_vars, 8)  # n_probes
+            # Probe var metadata restored from scanpy H5 read
+            for col in ["gene_ids", "feature_types", "probe_region"]:
+                self.assertIn(col, table.var.columns, f"Missing var column: {col}")
+            # Counts layer
+            self.assertIn("counts", table.layers)
+            # Obs should have spatial columns
+            self.assertIn("array_row", table.obs.columns)
+            self.assertIn("array_col", table.obs.columns)
+            # Shapes element should exist
+            self.assertTrue(len(sdata.shapes) > 0)
+
+
 if __name__ == "__main__":
     unittest.main()

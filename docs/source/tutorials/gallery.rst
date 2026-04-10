@@ -18,6 +18,7 @@ Scaling SPLISOSM to large-scale datasets with millions of spots
   :caption: Available notebooks
   :tooltip:
 
+  visium_ffpe
   visiumhd_ffpe
   visiumhd_ffpe_du
 

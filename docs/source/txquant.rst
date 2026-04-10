@@ -409,7 +409,7 @@ Example Space Ranger command:
        --localmem=64
 
 
-**Loading as AnnData**
+**Loading as AnnData/SpatialData**
 
 .. code-block:: python
 
@@ -436,10 +436,22 @@ Each row is a Visium spot (barcode) and each column is an individual probe.
 The ``gene_ids`` column in ``.var`` groups probes by gene — pass ``group_iso_by="gene_ids"``
 and ``gene_names="gene_name"`` to :meth:`~splisosm.SplisosmNP.setup_data`.
 
+To load as a ``SpatialData`` object (e.g., for :class:`~splisosm.SplisosmFFT`), pass ``return_type="spatialdata"``:
+
+.. code-block:: python
+
+   sdata = load_visium_probe(
+       "CytAssist_FFPE_Mouse_Brain_Rep1/outs",
+       return_type="spatialdata",
+   )
+
 .. note::
    On the `Mouse Brain Coronal Section 1 (FFPE) <https://www.10xgenomics.com/datasets/mouse-brain-coronal-section-1-ffpe-2-standard>`_ dataset,
    281 genes with multiple probes passed filtering (``min_counts=10, filter_single_iso_genes=True``),
    of which 83 were identified as spatially variably processed (SVP, HSIC-IR) at FDR < 0.01.
+
+For downstream analysis comparing ``SplisosmNP`` (AnnData) and ``SplisosmFFT`` (SpatialData) spatial variability tests using this dataset,
+see the :doc:`Visium FFPE tutorial <tutorials/visium_ffpe>`.
 
 
 In situ targeted ST data

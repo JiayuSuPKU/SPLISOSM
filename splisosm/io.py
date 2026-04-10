@@ -121,8 +121,10 @@ def load_visium_probe(
     library_id: Optional[str] = None,
     load_spatial: bool = True,
     counts_layer_name: str = "counts",
-) -> AnnData:
-    """Load standard Visium Space Ranger probe-based outputs as AnnData.
+    filtered_counts_file: bool = True,
+    return_type: str = "anndata",
+) -> Any:
+    """Load standard Visium Space Ranger probe-based outputs.
 
     Reads the probe-level count matrix (``raw_probe_bc_matrix.h5`` by default)
     from a Space Ranger ``outs`` directory and optionally attaches spatial
@@ -147,29 +149,47 @@ def load_visium_probe(
         * ``"filtered_feature_bc_matrix.h5"`` — tissue barcodes only,
           gene-level features.
     library_id
-        Library identifier stored in ``adata.uns["spatial"]``.
+        Library identifier stored in ``adata.uns["spatial"]`` (AnnData mode)
+        or used to name SpatialData elements (SpatialData mode).
         Defaults to the parent directory name of *path*.
     load_spatial
         Whether to load spatial metadata (tissue positions, images,
-        scale factors) from ``<path>/spatial/``.
+        scale factors).  Only used when ``return_type="anndata"``.
     counts_layer_name
         Layer name for the raw count matrix.  The counts are stored in
-        ``adata.layers[counts_layer_name]`` and ``adata.X`` is set to the
-        same matrix.
+        ``adata.layers[counts_layer_name]``.
+    filtered_counts_file
+        If ``True`` (default), keep only in-tissue barcodes that appear in
+        ``filtered_feature_bc_matrix.h5``.  If ``False``, keep all barcodes
+        from ``counts_file`` (including background spots).
+    return_type
+        Output format.
+
+        * ``"anndata"`` (default) — return an :class:`~anndata.AnnData`
+          with spatial metadata in ``.obsm["spatial"]`` and ``.uns["spatial"]``.
+        * ``"spatialdata"`` — return a :class:`~spatialdata.SpatialData` object
+          built by ``spatialdata_io.visium()``, with probe-level ``var``
+          metadata restored and a counts layer added.  Suitable for use with
+          :class:`~splisosm.SplisosmFFT`.
 
     Returns
     -------
-    anndata.AnnData
-        Annotated data matrix with:
+    anndata.AnnData or spatialdata.SpatialData
+        When ``return_type="anndata"``:
 
         * ``.X`` / ``.layers[counts_layer_name]`` — sparse count matrix
         * ``.var`` — feature (probe or gene) metadata
-        * ``.obs`` — barcode metadata; when ``load_spatial=True`` also
-          includes ``in_tissue``, ``array_row``, ``array_col``
-        * ``.obsm["spatial"]`` — ``(n_spots, 2)`` spatial pixel coordinates
-          (when ``load_spatial=True``)
+        * ``.obs`` — barcode metadata with ``in_tissue``, ``array_row``,
+          ``array_col`` (when ``load_spatial=True``)
+        * ``.obsm["spatial"]`` — ``(n_spots, 2)`` pixel coordinates
         * ``.uns["spatial"]`` — images and scale factors
-          (when ``load_spatial=True``)
+
+        When ``return_type="spatialdata"``:
+
+        * ``sdata.tables["table"]`` — AnnData with probe-level counts in
+          ``.layers[counts_layer_name]`` and full probe metadata in ``.var``
+        * ``sdata.shapes[dataset_id]`` — spot geometries
+        * ``sdata.images`` — tissue images at multiple resolutions
 
     Raises
     ------
@@ -178,12 +198,14 @@ def load_visium_probe(
 
     Examples
     --------
+    Load as AnnData (for :class:`~splisosm.SplisosmNP`):
+
     >>> from splisosm.io import load_visium_probe
-    >>> adata = load_visium_probe("CytAssist_FFPE_Mouse_Brain_Rep1/outs")
-    >>> adata
-    AnnData object with n_obs x n_vars = ...
-    >>> adata.layers["counts"]
-    <sparse matrix ...>
+    >>> adata = load_visium_probe("sample/outs")
+
+    Load as SpatialData (for :class:`~splisosm.SplisosmFFT`):
+
+    >>> sdata = load_visium_probe("sample/outs", return_type="spatialdata")
     """
     try:
         import scanpy as sc
@@ -201,9 +223,110 @@ def load_visium_probe(
             f"Available .h5 files: {sorted(p.name for p in path.glob('*.h5'))}"
         )
 
+    if library_id is None:
+        library_id = path.parent.name
+
+    # ------------------------------------------------------------------
+    # SpatialData mode
+    # ------------------------------------------------------------------
+    if return_type == "spatialdata":
+        try:
+            from spatialdata_io.readers.visium import visium as _visium_reader
+        except ImportError as e:
+            raise ImportError(
+                "spatialdata-io is required for return_type='spatialdata'. "
+                "Install it via `pip install spatialdata-io`."
+            ) from e
+        try:
+            from spatialdata.models import TableModel
+        except ImportError as e:
+            raise ImportError(
+                "spatialdata is required for return_type='spatialdata'. "
+                "Install it via `pip install spatialdata`."
+            ) from e
+
+        # 1. Build the SpatialData scaffold (shapes, images, coordinate
+        #    systems) using the gene-level matrix.  This gives us the
+        #    canonical Visium spot geometry and spatial metadata.
+        scaffold_counts = (
+            "filtered_feature_bc_matrix.h5"
+            if filtered_counts_file
+            else "raw_feature_bc_matrix.h5"
+        )
+        sdata = _visium_reader(
+            path=str(path),
+            counts_file=scaffold_counts,
+            dataset_id=library_id,
+        )
+
+        # 2. Read the probe-level matrix with full var metadata.
+        adata_probe = sc.read_10x_h5(str(h5_file), gex_only=False)
+        adata_probe.var_names_make_unique()
+
+        # Align barcodes: keep only barcodes present in the scaffold
+        # table (which carries array_row/col and spot_id).
+        scaffold = sdata.tables["table"]
+        common_bcs = scaffold.obs_names.intersection(adata_probe.obs_names)
+        adata_probe = adata_probe[common_bcs].copy()
+
+        # Copy spatial obs columns from the scaffold table.
+        for col in ["in_tissue", "array_row", "array_col", "spot_id", "region"]:
+            if col in scaffold.obs.columns:
+                adata_probe.obs[col] = scaffold.obs.loc[common_bcs, col].values
+
+        # Register as a SpatialData table annotating the same shapes element.
+        adata_probe.obs["region"] = scaffold.obs.loc[common_bcs, "region"].values
+        adata_probe.obs["spot_id"] = scaffold.obs.loc[common_bcs, "spot_id"].values
+        if "spatialdata_attrs" in adata_probe.uns:
+            del adata_probe.uns["spatialdata_attrs"]
+        adata_probe = TableModel.parse(
+            adata_probe,
+            region=library_id,
+            region_key="region",
+            instance_key="spot_id",
+        )
+
+        # Copy obsm from scaffold (spatial pixel coordinates).
+        if "spatial" in scaffold.obsm:
+            adata_probe.obsm["spatial"] = scaffold.obsm["spatial"][
+                scaffold.obs_names.get_indexer(common_bcs)
+            ]
+
+        adata_probe.layers[counts_layer_name] = adata_probe.X.copy()
+
+        # 3. Replace the gene-level table with the probe-level table.
+        del sdata.tables["table"]
+        sdata.tables["table"] = adata_probe
+
+        return sdata
+
+    # ------------------------------------------------------------------
+    # AnnData mode (default)
+    # ------------------------------------------------------------------
+    if return_type != "anndata":
+        raise ValueError(
+            f"Unknown return_type={return_type!r}. "
+            f"Expected 'anndata' or 'spatialdata'."
+        )
+
     # Read the 10x HDF5 count matrix
     adata = sc.read_10x_h5(str(h5_file), gex_only=False)
     adata.var_names_make_unique()
+
+    # Filter to in-tissue barcodes if requested
+    if filtered_counts_file:
+        filtered_h5 = path / "filtered_feature_bc_matrix.h5"
+        if filtered_h5.exists():
+            filtered_bcs = sc.read_10x_h5(str(filtered_h5)).obs_names
+            keep = adata.obs_names.isin(filtered_bcs)
+            adata = adata[keep].copy()
+        else:
+            warnings.warn(
+                f"filtered_feature_bc_matrix.h5 not found at {path}. "
+                f"Returning all barcodes.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     # Store raw counts in a named layer
     adata.layers[counts_layer_name] = adata.X.copy()
@@ -219,8 +342,6 @@ def load_visium_probe(
                 stacklevel=2,
             )
         else:
-            if library_id is None:
-                library_id = path.parent.name
             load_visium_sp_meta(adata, spatial_dir, library_id=library_id)
 
     # Ensure obs index is string (consistent with other loaders)
