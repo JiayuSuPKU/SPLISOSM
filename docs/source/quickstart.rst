@@ -214,7 +214,7 @@ SPLISOSM tests for statistical independence between isoform expression and spati
        method="hsic-ir",          # 'hsic-ir' | 'hsic-gc' | 'hsic-ic' | 'spark-x'
        ratio_transformation="none",  # 'none' | 'clr' | 'ilr' | 'alr'
        nan_filling="mean",           # if 'none', use only non-zero spots per gene (slow)
-       null_method="eig",            # 'eig' (Liu) | 'trace' (normal approx) | 'perm'
+       null_method="eig",            # 'eig' (Liu) | 'trace' (normal approx) | 'welch' (scaled chi²) | 'perm'
        null_configs=None,            # e.g. {"approx_rank": 20} to cap eigenvalues
        n_jobs=-1,                    # gene-level parallelism; -1 = all CPUs
        print_progress=True,

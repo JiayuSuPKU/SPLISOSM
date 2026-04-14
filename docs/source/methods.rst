@@ -119,7 +119,7 @@ Null distribution
 ~~~~~~~~~~~~~~~~~~
 
 To compute p-values, we need to compute the distribution of :math:`\widehat{\mathrm{HSIC}}` under the null hypothesis of no spatial variability.
-Three methods are available via the ``null_method`` argument to :meth:`~splisosm.SplisosmNP.test_spatial_variability`.
+Four methods are available via the ``null_method`` argument to :meth:`~splisosm.SplisosmNP.test_spatial_variability`.
 
 .. _null-eig:
 
@@ -165,9 +165,35 @@ Note that for non-Gaussian data :math:`Y`, the null variance is off by a kurtosi
    - As the sample size increases, the approximation becomes more accurate, and the test is generally well-calibrated for large :math:`n`.
    - For implicit kernels (where only the sparse precision matrix :math:`M=K^{-1}` is stored), :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` are estimated via the **Hutchinson stochastic trace estimator** using 30 Rademacher probing vectors.
 
+.. _null-welch:
+
+**3. Welch-Satterthwaite scaled chi-squared approximation**: ``null_method='welch'``
+
+With all positive eigenvalues, the chi-squared mixture null can also be approximated by the `Welch-Satterthwaite method <https://en.wikipedia.org/wiki/Welch%E2%80%93Satterthwaite_equation>`_, 
+using one scaled chi-squared variable :math:`g \, \chi^2_h` with scale parameter :math:`g` and degrees of freedom :math:`h`. 
+The parameters are chosen to match the first two moments of the null :math:`(\mu_0, \sigma_0^2)` (same as in the :ref:`trace <null-trace>` method).
+
+.. math::
+
+   g = \frac{\sigma_0^2}{2\mu_0}, \qquad h = \frac{2\mu_0^2}{\sigma_0^2},
+
+and the p-value is :math:`\mathbb{P}\!\left(\chi^2_h \geq \widehat{\mathrm{HSIC}}/g\right)`.
+
+.. note::
+
+   - Same cost as ``null_method='trace'`` (only :math:`\mathrm{tr}(K)` and
+     :math:`\mathrm{tr}(K^2)` are needed), but typically more accurate in the
+     right tail because the null under H₀ is a weighted sum of
+     :math:`\chi^2_1` variables rather than Gaussian.  In practice its
+     p-values are close to the :ref:`eig <null-eig>` (Liu) reference while
+     remaining as cheap as the :ref:`trace <null-trace>` method.
+   - Recommended when ``null_method='eig'`` is too slow for the dataset
+     (e.g., very large :math:`n` with no FFT grid) but a reliable right-tail
+     calibration is still needed.
+
 .. _null-perm:
 
-**3. Batched permutation test**: ``null_method='perm'``
+**4. Batched permutation test**: ``null_method='perm'``
 
 Generates a null distribution by repeatedly permuting the rows of :math:`Y` (breaking the spatial structure) and recomputing :math:`\mathrm{tr}(Y_\pi^\top K Y_\pi)` for each permutation :math:`\pi`.
 
@@ -349,17 +375,17 @@ Summary
      - SplisosmNP / FFT
      - Isoform ratios
      - None
-     - ``eig`` / ``trace`` / ``perm``
+     - ``eig`` [#fft]_ / ``trace`` / ``welch`` / ``perm``
    * - HSIC-GC (SVE)
      - SplisosmNP / FFT
      - Gene counts
      - None
-     - ``eig`` / ``trace`` / ``perm``
+     - ``eig`` [#fft]_ / ``trace`` / ``welch`` / ``perm``
    * - HSIC-IC
      - SplisosmNP / FFT
      - Isoform counts
      - None
-     - ``eig`` / ``trace`` / ``perm``
+     - ``eig`` [#fft]_ / ``trace`` / ``welch`` / ``perm``
    * - DU (unconditional)
      - SplisosmNP / FFT
      - Isoform ratios
@@ -380,3 +406,5 @@ Summary
      - Isoform counts
      - GRF random effect
      - Chi-squared (score)
+
+.. [#fft] :class:`~splisosm.SplisosmFFT` does not take a ``null_method`` parameter; ``'eig'`` is the default and only option for FFT-accelerated tests, since the full kernel spectrum is efficiently computed via FFT.

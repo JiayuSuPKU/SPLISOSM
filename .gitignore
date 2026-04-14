@@ -74,5 +74,9 @@ dist/
 .coverage
 .hypothesis/
 
-# copilot 
+# copilot
 .github/copilot-instructions.md
+
+# claude code
+CLAUDE.md
+.claude/

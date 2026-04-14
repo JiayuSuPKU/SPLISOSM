@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import warnings
 from typing import Any, Optional, Literal
-from scipy.stats import norm as _norm_dist
+from scipy.stats import norm as _norm_dist, chi2 as _chi2_dist
 from scipy.sparse.csgraph import connected_components as _connected_components
 
 import numpy as np
@@ -1418,7 +1418,7 @@ def run_sparkx(
 def run_hsic_gc(
     counts_gene: "np.ndarray | torch.Tensor | None" = None,
     coordinates: "np.ndarray | torch.Tensor | None" = None,
-    null_method: Literal["eig", "trace"] = "eig",
+    null_method: Literal["eig", "trace", "welch"] = "eig",
     null_configs: Optional[dict[str, Any]] = None,
     min_component_size: int = 1,
     adata: "AnnData | None" = None,
@@ -1439,16 +1439,19 @@ def run_hsic_gc(
         Shape ``(n_spots, n_genes)``. Gene counts.
     coordinates
         Shape ``(n_spots, n_dim)``. Spatial coordinates of spots.
-    null_method : {"eig", "trace"}, optional
+    null_method : {"eig", "trace", "welch"}, optional
         Method for computing the null distribution of the test statistic:
 
         * ``"eig"`` (default): asymptotic chi-square mixture using kernel
           eigenvalues; Liu's method.  Supports optional
           ``null_configs["approx_rank"]`` (int) to restrict to the top-k
           eigenvalues.
-        * ``"trace"``: moment-matching normal approximation using
+        * ``"trace"``: moment-matching normal (CLT) approximation using
           tr(K') and tr(K'²) of the centred spatial kernel and the scalar
           per-gene variance.
+        * ``"welch"``: Welch-Satterthwaite scaled chi-squared approximation
+          using the same two traces as ``"trace"``.  Typically more accurate
+          in the right tail than ``"trace"`` at the same cost.
     null_configs : dict or None, optional
         Extra keyword arguments for the chosen ``null_method``.
     min_component_size : int, optional
@@ -1676,11 +1679,13 @@ def run_hsic_gc(
         # produce a rank-consistent test stat for liu_sf.
         _Q_sp_raw = getattr(K_sp, "Q", None)
         _Q_sp = _Q_sp_raw[:, :k_eff] if _Q_sp_raw is not None else None
-    elif null_method == "trace":
+    elif null_method in ("trace", "welch"):
         trK = K_sp.trace()
         trK2 = K_sp.square_trace()
     else:
-        raise ValueError(f"null_method must be 'eig' or 'trace', got {null_method!r}")
+        raise ValueError(
+            f"null_method must be 'eig', 'trace', or 'welch', got {null_method!r}"
+        )
 
     # compute the HSIC-GC statistic per-gene
     is_scipy_sparse = scipy.sparse.issparse(counts_gene)
@@ -1750,15 +1755,24 @@ def run_hsic_gc(
             lambda_y = lambda_y[lambda_y > 1e-5]
             lambda_spy = (lambda_sp.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
             pval = liu_sf((hsic_scaled * n_spots).numpy(), lambda_spy.numpy())
-        else:  # "trace"
+        else:  # "trace" or "welch"
             S = counts.T @ counts  # (1, 1)
             trS = torch.trace(S).item()
             trS2 = torch.trace(S @ S).item()
             n1 = n_spots - 1
             mean_null = trK.item() * trS / n1
             var_null = 2.0 * trK2.item() * trS2 / (n1**2)
-            z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
-            pval = float(_norm_dist.sf(z))
+            if null_method == "trace":
+                z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
+                pval = float(_norm_dist.sf(z))
+            else:  # "welch": scaled chi-squared moment matching
+                if var_null > 0 and mean_null > 0:
+                    scale_g = var_null / (2.0 * mean_null)
+                    df_h = 2.0 * mean_null**2 / var_null
+                    pval = float(_chi2_dist.sf(hsic_scaled.item() / scale_g, df=df_h))
+                else:
+                    z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
+                    pval = float(_norm_dist.sf(z))
 
         hsic_list.append(hsic_scaled / (n_spots - 1) ** 2)  # HSIC statistic
         pvals_list.append(pval)

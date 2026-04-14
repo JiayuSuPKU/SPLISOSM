@@ -636,7 +636,7 @@ class TestSplisosmNP(unittest.TestCase):
             min_bin_pct=0.0,
             filter_single_iso_genes=False,
         )
-        for null_method in ["eig", "trace", "perm"]:
+        for null_method in ["eig", "trace", "welch", "perm"]:
             with self.subTest(null_method=null_method):
                 configs = (
                     {"n_perms_per_gene": 50, "perm_batch_size": 10}
@@ -1079,13 +1079,13 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertGreater(rho, 0.9, f"Spearman rank correlation={rho:.3f} too low")
 
     def test_null_methods_agreement(self):
-        """eig, trace and perm null methods should yield broadly similar p-value ranks.
+        """eig, trace, welch and perm null methods should yield broadly similar p-value ranks.
 
-        We run all three methods on the same data and check pairwise Spearman rank
-        correlations on –log10(p).  The two asymptotic methods (eig/trace) should
-        agree tightly (ρ > 0.9); each asymptotic method vs. the permutation null
-        should agree moderately (ρ > 0.6), allowing for the discrete, noisy nature
-        of a permutation p-value with a finite number of permutations.
+        We run all four methods on the same data and check pairwise Spearman rank
+        correlations on –log10(p).  The three asymptotic methods (eig/trace/welch)
+        should agree tightly (ρ > 0.9); each asymptotic method vs. the permutation
+        null should agree moderately (ρ > 0.6), allowing for the discrete, noisy
+        nature of a permutation p-value with a finite number of permutations.
         """
         from scipy.stats import spearmanr
 
@@ -1101,7 +1101,7 @@ class TestSplisosmNP(unittest.TestCase):
         )
 
         pvals = {}
-        for null_method in ("eig", "trace", "perm"):
+        for null_method in ("eig", "trace", "welch", "perm"):
             null_configs = (
                 {"n_perms_per_gene": 2000, "perm_batch_size": 100}
                 if null_method == "perm"
@@ -1121,8 +1121,11 @@ class TestSplisosmNP(unittest.TestCase):
         # Thresholds: asymptotic methods should agree tightly; perm is noisier.
         thresholds = {
             ("eig", "trace"): 0.90,
+            ("eig", "welch"): 0.90,
+            ("trace", "welch"): 0.90,
             ("eig", "perm"): 0.70,
             ("trace", "perm"): 0.70,
+            ("welch", "perm"): 0.70,
         }
         for (m1, m2), thr in thresholds.items():
             rho, _ = spearmanr(pvals[m1], pvals[m2])

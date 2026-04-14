@@ -76,8 +76,8 @@ To use this functionality, ensure that the conda environment where SPLISOSM is i
    print(test_results['pvalue'])     # p-values, (n_gene,)
 
    # for large datasets, you can also choose alternative null approximations via
-   # (1) moment-matching normal approximation (no eigen-decomposition)
-   test_results = run_hsic_gc(gene_counts, coordinates, null_method="trace")
+   # (1) moment-matching Welch-Satterthwaite approximation (no eigen-decomposition)
+   test_results = run_hsic_gc(gene_counts, coordinates, null_method="welch")
 
    # (2) or restrict eigenvalue null to the top-k eigenvalues
    test_results = run_hsic_gc(

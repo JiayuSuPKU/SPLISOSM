@@ -42,8 +42,8 @@ Platform compatibility
     print(test_results['statistic'])  # test statistics, (n_gene,)
     print(test_results['pvalue'])     # p-values, (n_gene,)
 
-    # moment-matching normal approximation (faster, no eigendecomposition)
-    test_results = run_hsic_gc(gene_counts, coordinates, null_method="trace")
+    # moment-matching Welch-Satterthwaite approximation (faster, no eigendecomposition)
+    test_results = run_hsic_gc(gene_counts, coordinates, null_method="welch")
 
     # cap eigenvalue rank for large n (auto-capped at ceil(sqrt(n)*4) when n > 5000)
     test_results = run_hsic_gc(

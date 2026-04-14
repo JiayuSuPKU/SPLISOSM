@@ -512,7 +512,9 @@ class SpatialCovKernel(Kernel):
             self._lu = splu(self.inv_cov)
         return self._lu
 
-    def _hutchinson_trace(self, squared: bool, n_vectors: int = 30) -> float:
+    def _hutchinson_trace(
+        self, squared: bool, n_vectors: int = 30, seed: int = 0
+    ) -> float:
         """Hutchinson stochastic estimator for tr(HKH) or tr((HKH)²).
 
         Centred ±1 probing vectors target the double-centred kernel K' = HKH.
@@ -523,10 +525,12 @@ class SpatialCovKernel(Kernel):
             If ``True`` estimate tr((HKH)²), else tr(HKH).
         n_vectors
             Number of probing vectors.
+        seed
+            Random seed for reproducibility.
         """
         lu = self._get_lu()
         n, m = self._n, n_vectors
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(seed=seed)
         rvs = rng.choice([-1.0, 1.0], size=(n, m))
         rvs_c = rvs - rvs.mean(axis=0)  # H @ rvs
         Kv = lu.solve(rvs_c)  # K (H rvs)

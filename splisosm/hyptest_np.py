@@ -7,7 +7,12 @@ import warnings
 import re
 from typing import Any, Optional, Union, Literal
 from joblib import Parallel, delayed
-from scipy.stats import ttest_ind, combine_pvalues, norm as _norm_dist
+from scipy.stats import (
+    ttest_ind,
+    combine_pvalues,
+    norm as _norm_dist,
+    chi2 as _chi2_dist,
+)
 import numpy as np
 import scipy.sparse
 import pandas as pd
@@ -193,15 +198,29 @@ def _sv_gene_worker_np(
         lambda_spy = (lambda_sp_eff.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
         pval = liu_sf((hsic_scaled * n_spots_eff).numpy(), lambda_spy.numpy())
 
-    elif null_method == "trace":
+    elif null_method in ("trace", "welch"):
         S = y.T @ y
         trS = torch.trace(S).item()
         trS2 = torch.trace(S @ S).item()
         n1 = n_spots_eff - 1
         mean_null = trK.item() * trS / n1
         var_null = 2.0 * trK2.item() * trS2 / (n1**2)
-        z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
-        pval = float(_norm_dist.sf(z))
+        if null_method == "trace":
+            # moment-matching normal (CLT) approximation
+            z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
+            pval = float(_norm_dist.sf(z))
+        else:
+            # Welch-Satterthwaite: match the first two moments of the chi-squared
+            # mixture null to a scaled chi-squared g * chi2(h), with
+            #   g = Var/(2 * E),  h = 2 * E^2 / Var
+            # Falls back to the CLT z-test if the variance is non-positive.
+            if var_null > 0 and mean_null > 0:
+                scale_g = var_null / (2.0 * mean_null)
+                df_h = 2.0 * mean_null**2 / var_null
+                pval = float(_chi2_dist.sf(hsic_scaled.item() / scale_g, df=df_h))
+            else:
+                z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
+                pval = float(_norm_dist.sf(z))
 
     else:  # null_method == "perm"
         p_isos = y.shape[1]
@@ -856,7 +875,7 @@ class SplisosmNP:
         method: Literal["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"] = "hsic-ir",
         ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
         nan_filling: Literal["mean", "none"] = "mean",
-        null_method: Literal["eig", "trace", "perm"] = "eig",
+        null_method: Literal["eig", "trace", "welch", "perm"] = "eig",
         null_configs: Optional[dict[str, Any]] = None,
         n_jobs: int = -1,
         return_results: bool = False,
@@ -885,7 +904,7 @@ class SplisosmNP:
         nan_filling : {"mean", "none"}, optional
             Strategy for NaN values in isoform ratios.
             See :func:`splisosm.utils.counts_to_ratios` for details.
-        null_method : {"eig", "trace", "perm"}, optional
+        null_method : {"eig", "trace", "welch", "perm"}, optional
             Method for computing the null distribution of the test statistic:
 
             * ``"eig"`` (default): asymptotic chi-square mixture using kernel
@@ -894,8 +913,16 @@ class SplisosmNP:
               eigenvalues. By default, approx_rank = np.ceil(np.sqrt(n_spots) * 4)
               for large datasets (n_spots > 5000). Set it to None to use
               all eigenvalues, which can be slow for large n_spots.
-            * ``"trace"``: moment-matching normal approximation using
-              tr(K') and tr(K'²) of the (centred) spatial kernel.
+            * ``"trace"``: moment-matching normal (CLT) approximation using
+              tr(K') and tr(K'²) of the (centred) spatial kernel.  Fastest,
+              but tail probabilities can be inaccurate when the effective
+              degrees of freedom of the chi-squared mixture is small.
+            * ``"welch"``: Welch-Satterthwaite moment matching.  Uses the same
+              tr(K') and tr(K'²) as ``"trace"`` but approximates the null by a
+              scaled chi-squared ``g * chi2(h)`` with
+              ``g = Var/(2*E)`` and ``h = 2*E^2/Var``.  Comparable cost to
+              ``"trace"`` with more accurate right-tail p-values, typically
+              closer to the ``"eig"`` (Liu) reference.
             * ``"perm"``: permutation-based null distribution.  Supports
               optional ``null_configs["n_perms_per_gene"]`` (default 1000),
               and ``null_configs["perm_batch_size"]`` (default 50, larger values
@@ -932,7 +959,7 @@ class SplisosmNP:
             )
 
         valid_methods = ["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"]
-        valid_null_methods = ["eig", "trace", "perm"]
+        valid_null_methods = ["eig", "trace", "welch", "perm"]
         valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
         valid_nan_filling = ["mean", "none"]
         assert (
@@ -999,7 +1026,7 @@ class SplisosmNP:
                 lambda_sp = self.sp_kernel.eigenvalues(k=approx_rank)
                 lambda_sp = lambda_sp[lambda_sp > 1e-5]
                 k_eff = len(lambda_sp)
-            elif null_method == "trace":
+            elif null_method in ("trace", "welch"):
                 trK = self.sp_kernel.trace()
                 trK2 = self.sp_kernel.square_trace()
             elif null_method == "perm":
@@ -1018,8 +1045,8 @@ class SplisosmNP:
                     K_sp,
                     lambda_sp if null_method == "eig" else None,
                     k_eff if null_method == "eig" else 0,
-                    trK if null_method == "trace" else None,
-                    trK2 if null_method == "trace" else None,
+                    trK if null_method in ("trace", "welch") else None,
+                    trK2 if null_method in ("trace", "welch") else None,
                     n_nulls if null_method == "perm" else 0,
                     _perm_batch_size if null_method == "perm" else 1,
                 )
