@@ -364,11 +364,15 @@ class SplisosmGLMM:
             spatial coordinates from ``adata.obsm[spatial_key]``.
         spatial_key : str, optional
             Key in ``adata.obsm`` for spatial coordinates (default
-            ``"spatial"``).
+            ``"spatial"``).  Optional when ``adj_key`` is provided: if the key
+            is missing from ``adata.obsm`` the spatial kernel is built from
+            the adjacency alone.  SplisosmGLMM does not require raw
+            coordinates past kernel construction.
         adj_key : str or None, optional
             Key in ``adata.obsp`` for a pre-built adjacency matrix.
             When provided, it overrides the k-NN graph construction
             from coordinates and be used directly to build the spatial kernel.
+            Also makes ``spatial_key`` optional (see above).
             The adjacency matrix is symmetrized internally.
         layer : str, optional
             Layer in ``adata.layers`` storing isoform counts (default
@@ -592,7 +596,7 @@ class SplisosmGLMM:
     def _setup_from_prebuilt(
         self,
         data: list,
-        coordinates: torch.Tensor,
+        coordinates: Optional[torch.Tensor],
         sp_kernel,
         corr_sp_eigvals: torch.Tensor,
         corr_sp_eigvecs: torch.Tensor,

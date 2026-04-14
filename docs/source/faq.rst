@@ -183,9 +183,12 @@ Running SPLISOSM
 
   Yes. While SPLISOSM is designed to identify patterns associated with physical spatial coordinates, it is technically possible to run it on non-spatial single-cell RNA-seq data.
   This can be done by treating cell embeddings (e.g., PCA or UMAP coordinates) as "pseudo-spatial coordinates."
-  :class:`~splisosm.SplisosmNP` natively supports high-dimensional coordinate arrays (any number of dimensions ≥ 2) — simply pass the PCA embedding matrix as the ``spatial_key`` 
-  (or a pre-computed graph adjacency matrix, such as ``adata.obsp['connectivities']`` as the ``adj_key``) in ``setup_data``. 
-  See the final section of the :doc:`Xenium segmented single-cell tutorial <tutorials/xenium_sc_segmented>` for an example.
+
+  :class:`~splisosm.SplisosmNP` natively supports high-dimensional coordinate arrays (any number of dimensions ≥ 2). 
+  Simply pass the PCA embedding matrix as the ``spatial_key`` 
+  (or a pre-computed graph adjacency matrix, such as ``adata.obsp['connectivities']`` as the ``adj_key``) in ``setup_data``.
+  Note that the conditional differential usage test ``method='hsic-gp'`` requires coordinates from ``spatial_key`` to fit Gaussian Process models, even if ``adj_key`` is provided.
+  See the final section of the :doc:`Xenium segmented single-cell tutorial <tutorials/xenium_sc_segmented>` for an example. 
 
   This approach should be used with caution: 'spatial' patterns in this case are only as meaningful as the biological relationships captured by the embedding.
   Furthermore, be aware of potential circularity if the isoform data was used to generate the embeddings, as this may lead to spurious associations.

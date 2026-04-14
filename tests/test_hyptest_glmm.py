@@ -303,6 +303,35 @@ class TestSplisosmGLMM(unittest.TestCase):
         self.assertIsNotNone(model.design_mtx)
         self.assertIsNotNone(model._coordinates)
 
+    def test_splisosm_glmm_setup_data_adj_only(self):
+        """setup_data accepts adj_key alone with no obsm[spatial_key]."""
+        from splisosm.kernel import _build_adj_from_coords
+
+        adata = self.adata.copy()
+        coords_t = torch.as_tensor(
+            np.asarray(adata.obsm["spatial"]), dtype=torch.float32
+        )
+        adata.obsp["adj"] = _build_adj_from_coords(
+            coords_t, k_neighbors=4, mutual_neighbors=True
+        )
+        del adata.obsm["spatial"]
+
+        model = SplisosmGLMM()
+        model.setup_data(
+            adata=adata,
+            layer="counts",
+            spatial_key="spatial",
+            adj_key="adj",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            min_counts=0,
+            min_bin_pct=0.0,
+            group_gene_by_n_iso=True,
+        )
+        self.assertIsNone(model._coordinates)
+        self.assertIsNotNone(model.sp_kernel)
+        self.assertEqual(model.n_spots, self.n_spots)
+
     def test_splisosm_glmm_setup_data_from_anndata(self):
         model = SplisosmGLMM()
         model.setup_data(

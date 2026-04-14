@@ -1336,6 +1336,101 @@ class TestSplisosmNP(unittest.TestCase):
                 min_component_size=2,
             )
 
+    def _make_adata_adj_only(self):
+        """Return (adata, adj) with adata stripped of obsm['spatial']."""
+        from splisosm.kernel import _build_adj_from_coords
+
+        adata = self.adata_5g.copy()
+        coords_t = torch.as_tensor(
+            np.asarray(adata.obsm["spatial"]), dtype=torch.float32
+        )
+        adj = _build_adj_from_coords(coords_t, k_neighbors=4, mutual_neighbors=True)
+        adata.obsp["adj"] = adj
+        del adata.obsm["spatial"]
+        return adata, adj
+
+    def test_setup_adj_only_no_spatial_key(self):
+        """setup_data accepts adj_key alone; SV HSIC tests run without raw coords."""
+        adata, _ = self._make_adata_adj_only()
+        model = SplisosmNP()
+        model.setup_data(
+            adata=adata,
+            layer="counts",
+            spatial_key="spatial",  # deliberately missing from obsm
+            adj_key="adj",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        self.assertIsNone(model._coordinates)
+        for m in ("hsic-ir", "hsic-ic", "hsic-gc"):
+            with self.subTest(method=m):
+                model.test_spatial_variability(method=m, print_progress=False)
+                res = model.get_formatted_test_results("sv")
+                self.assertEqual(len(res), model.n_genes)
+                self.assertTrue(np.all(res["pvalue"].values >= 0))
+                self.assertTrue(np.all(res["pvalue"].values <= 1))
+
+    def test_setup_no_spatial_no_adj_raises(self):
+        """Missing both spatial_key and adj_key raises a clear error."""
+        adata = self.adata_5g.copy()
+        del adata.obsm["spatial"]
+        model = SplisosmNP()
+        with self.assertRaises(ValueError) as ctx:
+            model.setup_data(
+                adata=adata,
+                layer="counts",
+                spatial_key="spatial",
+                group_iso_by="gene_symbol",
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
+            )
+        msg = str(ctx.exception)
+        self.assertIn("spatial", msg)
+        self.assertIn("adj_key", msg)
+
+    def test_sparkx_without_coords_raises(self):
+        """spark-x raises a targeted ValueError when coordinates are absent."""
+        adata, _ = self._make_adata_adj_only()
+        model = SplisosmNP()
+        model.setup_data(
+            adata=adata,
+            layer="counts",
+            spatial_key="spatial",
+            adj_key="adj",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            model.test_spatial_variability(method="spark-x", print_progress=False)
+        self.assertIn("spark-x", str(ctx.exception))
+        self.assertIn("spatial", str(ctx.exception))
+
+    def test_hsic_gp_without_coords_raises(self):
+        """hsic-gp raises a targeted ValueError when coordinates are absent."""
+        adata, _ = self._make_adata_adj_only()
+        model = SplisosmNP()
+        model.setup_data(
+            adata=adata,
+            layer="counts",
+            spatial_key="spatial",
+            adj_key="adj",
+            group_iso_by="gene_symbol",
+            design_mtx=["cov_1", "cov_2"],
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            model.test_differential_usage(method="hsic-gp", print_progress=False)
+        self.assertIn("hsic-gp", str(ctx.exception))
+        self.assertIn("spatial", str(ctx.exception))
+
     def test_calc_ttest_sparse_groups_matches_dense(self):
         """Sparse groups column produces identical results to the dense path."""
         np.random.seed(7)

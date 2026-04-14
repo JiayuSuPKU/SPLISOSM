@@ -518,11 +518,18 @@ class SplisosmNP:
             full preprocessing details.
         spatial_key : str, optional
             Key in ``adata.obsm`` for spatial coordinates (default
-            ``"spatial"``).
+            ``"spatial"``).  Optional when ``adj_key`` is provided: if the key
+            is missing from ``adata.obsm`` the spatial kernel is built from
+            the adjacency alone and coordinate-free SV tests
+            (``"hsic-ir"`` / ``"hsic-ic"`` / ``"hsic-gc"``) and DU tests still
+            run.  ``method="spark-x"`` (SV) and ``method="hsic-gp"`` (DU)
+            require raw coordinates and raise a clear error at call time
+            when they are absent.
         adj_key : str or None, optional
             Key in ``adata.obsp`` for a pre-built adjacency matrix.
             When provided, it overrides the k-NN graph construction
             from coordinates and be used directly to build the spatial kernel.
+            Also makes ``spatial_key`` optional (see above).
             The adjacency matrix is symmetrized internally.
         layer : str, optional
             Layer in ``adata.layers`` that stores isoform counts (default
@@ -620,7 +627,8 @@ class SplisosmNP:
         self._isoform_summary = None
 
         self.n_genes = len(data)
-        self.n_spots = coordinates.shape[0]
+        # Derive n_spots from the filtered anndata
+        self.n_spots = filtered_adata.shape[0]
         self.n_isos_per_gene = [g.shape[1] for g in data]
         self.gene_names = resolved_gene_names
 
@@ -986,6 +994,13 @@ class SplisosmNP:
             )
 
         if method == "spark-x":  # run the gene-level SPARK-X test
+            if self._coordinates is None:
+                raise ValueError(
+                    "method='spark-x' requires raw spatial coordinates, but "
+                    "setup_data was called on an AnnData without "
+                    "`obsm[spatial_key]`. Re-run setup_data with spatial "
+                    "coordinates, or choose the kernel-based 'hsic-gc'."
+                )
             # prepare the data in gene-level counts
             counts_g = torch.concat(
                 [_counts.sum(1, keepdim=True) for _counts in self._data], axis=1
@@ -1266,6 +1281,14 @@ class SplisosmNP:
             }
 
         elif method == "hsic-gp":  # conditional HSIC via GP regression residuals
+            if self._coordinates is None:
+                raise ValueError(
+                    "method='hsic-gp' fits a Gaussian process on raw spatial "
+                    "coordinates, but setup_data was called on an AnnData "
+                    "without `obsm[spatial_key]`. Re-run setup_data with "
+                    "spatial coordinates, or use an unconditional DU method "
+                    "(e.g. method='hsic', 't-fisher', 't-tippett')."
+                )
             # Build GPR configs (merge user overrides over defaults)
             cov_config = {**_DEFAULT_GPR_CONFIGS["covariate"]}
             iso_config = {**_DEFAULT_GPR_CONFIGS["isoform"]}

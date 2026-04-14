@@ -966,6 +966,32 @@ class TestRunHsicGc(unittest.TestCase):
         self.assertEqual(len(res_adj["statistic"]), X.shape[1])
         self.assertTrue(np.all(res_adj["pvalue"] >= 0))
 
+    def test_anndata_mode_adj_key_no_spatial_key(self):
+        """adj_key alone is sufficient; obsm[spatial_key] is optional."""
+        from splisosm.kernel import _build_adj_from_coords
+
+        adata, X, coords = self._make_adata()
+        coords_t = torch.from_numpy(coords)
+        adj = _build_adj_from_coords(coords_t, k_neighbors=4, mutual_neighbors=True)
+        adata.obsp["spatial_adj"] = adj
+        # Strip coordinates to simulate a non-spatial AnnData.
+        del adata.obsm["spatial"]
+        self.assertNotIn("spatial", adata.obsm)
+
+        res_adj = run_hsic_gc(adata=adata, adj_key="spatial_adj")
+        self.assertEqual(len(res_adj["statistic"]), X.shape[1])
+        self.assertTrue(np.all(res_adj["pvalue"] >= 0))
+
+    def test_anndata_mode_no_spatial_no_adj_raises(self):
+        """Missing both spatial_key and adj_key raises a clear error."""
+        adata, _, _ = self._make_adata()
+        del adata.obsm["spatial"]
+        with self.assertRaises(ValueError) as ctx:
+            run_hsic_gc(adata=adata)
+        msg = str(ctx.exception)
+        self.assertIn("spatial", msg)
+        self.assertIn("adj_key", msg)
+
 
 if __name__ == "__main__":
     unittest.main()

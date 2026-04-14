@@ -543,7 +543,7 @@ def prepare_inputs_from_anndata(
     return_filtered_anndata: bool = False,
 ) -> tuple[
     list[torch.Tensor],
-    torch.Tensor,
+    Optional[torch.Tensor],
     list[str],
     Optional[Any],
     Optional[list[str]],
@@ -566,7 +566,12 @@ def prepare_inputs_from_anndata(
     group_iso_by
         Column in ``adata.var`` used to group isoforms by gene.
     spatial_key
-        Key in ``adata.obsm`` for spatial coordinates.
+        Key in ``adata.obsm`` for spatial coordinates.  Optional when
+        ``adj_key`` is provided: if the key is missing from ``adata.obsm`` the
+        returned ``coordinates`` is ``None`` and downstream kernel construction
+        proceeds from the adjacency matrix alone.  Raw coordinates are still
+        required by SPARK-X and the GP-conditional DU test; those callers
+        raise a dedicated error at call time when coordinates are absent.
     adj_key
         Key in ``adata.obsp`` for a pre-built adjacency matrix.
         When provided, it overrides the k-NN graph construction
@@ -612,8 +617,10 @@ def prepare_inputs_from_anndata(
     counts_list : list[torch.Tensor]
         Per-gene isoform count tensors, each of shape ``(n_spots, n_isos)``.
         Sparse ``adata.layers[layer]`` input yields sparse COO tensors.
-    coordinates : torch.Tensor
-        Shape ``(n_spots, 2)`` spatial coordinates, dtype float32.
+    coordinates : torch.Tensor or None
+        Shape ``(n_spots, n_spatial_dims)`` spatial coordinates, dtype float32.  ``None``
+        when ``spatial_key`` is missing from ``adata.obsm`` and ``adj_key``
+        supplies the neighborhood graph instead.
     resolved_gene_names : list[str]
         Display names for each gene in ``counts_list``.
     resolved_design : np.ndarray or tensor or None
@@ -666,14 +673,26 @@ def prepare_inputs_from_anndata(
             f"Design matrix row count ({design_mtx.shape[0]}) "
             f"must match number of spots ({adata.n_obs})."
         )
-    if spatial_key not in adata.obsm:
-        raise ValueError(f"`{spatial_key}` was not found in `adata.obsm`.")
-
-    # Extract spatial coordinates
-    coordinates = adata.obsm[spatial_key]
-    coordinates = torch.as_tensor(np.asarray(coordinates), dtype=torch.float32)
-    if coordinates.dim() != 2:
-        raise ValueError("Coordinates in `adata.obsm[spatial_key]` must be a 2D array.")
+    # Extract spatial coordinates if available.  When `adj_key` is provided we
+    # accept non-spatial AnnData (no `obsm[spatial_key]`): downstream kernel
+    # construction can proceed from the adjacency matrix alone.  Operations
+    # that genuinely require raw coordinates (SPARK-X, GP-conditional DU)
+    # raise targeted errors later, at call time.
+    if spatial_key in adata.obsm:
+        coordinates = adata.obsm[spatial_key]
+        coordinates = torch.as_tensor(np.asarray(coordinates), dtype=torch.float32)
+        if coordinates.dim() != 2:
+            raise ValueError(
+                "Coordinates in `adata.obsm[spatial_key]` must be a 2D array."
+            )
+    elif adj_key is not None and adj_key in adata.obsp:
+        coordinates = None
+    else:
+        raise ValueError(
+            f"Neither `adata.obsm['{spatial_key}']` nor `adata.obsp['{adj_key}']` "
+            "is available. Provide spatial coordinates via `spatial_key` and/or "
+            "a pre-built adjacency via `adj_key`."
+        )
 
     # Load/build adjacency and filter disconnected components if needed
     _adj_out: Optional[scipy.sparse.spmatrix] = None
@@ -698,7 +717,15 @@ def prepare_inputs_from_anndata(
                 stacklevel=2,
             )
     elif min_component_size > 1:
-        # Build k-NN graph from coordinates for component filtering
+        # Build k-NN graph from coordinates for component filtering.  This path
+        # requires raw coordinates; with no `adj_key` and no `spatial_key` the
+        # upstream check already raised, so `coordinates` must be non-None here.
+        if coordinates is None:
+            raise ValueError(
+                "`min_component_size > 1` without `adj_key` requires spatial "
+                "coordinates via `spatial_key`.  Either provide `adj_key` or "
+                "set `min_component_size=1`."
+            )
         from splisosm.kernel import _build_adj_from_coords
 
         _adj_out = _build_adj_from_coords(
@@ -724,7 +751,13 @@ def prepare_inputs_from_anndata(
             adata = adata[
                 _keep_mask, :
             ].copy()  # filter adata to keep only the retained spots
-            coordinates = adata.obsm[spatial_key] if coordinates is not None else None
+            # Preserve coordinates only if they were available before filtering.
+            if coordinates is not None and spatial_key in adata.obsm:
+                coordinates = torch.as_tensor(
+                    np.asarray(adata.obsm[spatial_key]), dtype=torch.float32
+                )
+            else:
+                coordinates = None
             _adj_out = _adj_out[_keep_mask][:, _keep_mask].tocsc()
 
             # Filter design matrix if provided as array-like
@@ -1472,12 +1505,15 @@ def run_hsic_gc(
         is used.  Used only in AnnData mode.
     spatial_key : str, optional
         Key in ``adata.obsm`` for spatial coordinates.  Used only in
-        AnnData mode.
+        AnnData mode and optional when ``adj_key`` is provided: if the key
+        is missing from ``adata.obsm`` the kernel is built from the
+        adjacency alone.
     adj_key : str or None, optional
         Key in ``adata.obsp`` for a pre-built adjacency matrix.  When
         provided in AnnData mode, the adjacency is loaded from
         ``adata.obsp[adj_key]`` and used for both component filtering and
-        the spatial kernel construction.  Ignored in matrix mode.
+        the spatial kernel construction.  In AnnData mode this also makes
+        ``spatial_key`` optional.  Ignored in matrix mode.
     min_counts : int, optional
         Minimum total count to retain a gene in AnnData mode.  Default 0.
     min_bin_pct : float, optional
@@ -1534,10 +1570,22 @@ def run_hsic_gc(
                 else counts_gene[:, _gene_mask]
             )
 
-        # Load spatial coordinates
-        coordinates = torch.as_tensor(
-            np.asarray(adata.obsm[spatial_key], dtype=np.float32)
-        )
+        # Load spatial coordinates (optional when a pre-built adjacency is
+        # provided via `adj_key`: the kernel is built from the adjacency alone
+        # and HSIC-GC does not need raw coordinates).
+        if spatial_key in adata.obsm:
+            coordinates = torch.as_tensor(
+                np.asarray(adata.obsm[spatial_key], dtype=np.float32)
+            )
+        elif adj_key is not None and adj_key in adata.obsp:
+            coordinates = None
+        else:
+            raise ValueError(
+                f"Neither `adata.obsm['{spatial_key}']` nor "
+                f"`adata.obsp['{adj_key}']` is available. Provide spatial "
+                "coordinates via `spatial_key` and/or a pre-built adjacency "
+                "via `adj_key`."
+            )
 
         # Load pre-built adjacency if provided
         if adj_key is not None:
@@ -1550,10 +1598,15 @@ def run_hsic_gc(
             _k_adata = spatial_kernel_kwargs.get("k_neighbors", 4)
             if _adj_prebuilt is not None:
                 _adj_for_comp = scipy.sparse.csc_matrix(_adj_prebuilt)
-            else:
+            elif coordinates is not None:
                 _adj_for_comp = _build_adj_from_coords(
                     coordinates, k_neighbors=_k_adata, mutual_neighbors=True
                 ).tocsc()
+            else:
+                raise ValueError(
+                    "`min_component_size > 1` without `adj_key` requires "
+                    "spatial coordinates via `spatial_key`."
+                )
             _, _labels = _connected_components(_adj_for_comp, directed=False)
             _comp_sizes = np.bincount(_labels)
             _keep_mask = _comp_sizes[_labels] >= min_component_size
@@ -1570,7 +1623,8 @@ def run_hsic_gc(
                     counts_gene.to_dense() if counts_gene.is_sparse else counts_gene
                 )
                 counts_gene = _dense_cg[_keep_mask]
-                coordinates = coordinates[_keep_mask]
+                if coordinates is not None:
+                    coordinates = coordinates[_keep_mask]
                 if _adj_prebuilt is not None:
                     _adj_prebuilt = scipy.sparse.csc_matrix(_adj_prebuilt)[_keep_mask][
                         :, _keep_mask
