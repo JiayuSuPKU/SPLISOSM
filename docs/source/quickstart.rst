@@ -84,26 +84,123 @@ Summary of class features:
 Inputs and outputs
 ------------------
 
-:class:`~splisosm.SplisosmNP` and :class:`~splisosm.SplisosmGLMM` accept isoform-level quantification as an ``AnnData`` object.
+Expected input data format
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:class:`~splisosm.SplisosmNP` and :class:`~splisosm.SplisosmGLMM` accept an
+`AnnData <https://anndata.readthedocs.io/en/latest/index.html>`_ of shape ``(n_spots, n_isoforms)``:
+
+- ``.layers[<layer>]`` — raw isoform counts.
+- ``.var`` — isoform metadata with at least a ``<group_iso_by>`` column
+  (e.g. ``"gene_symbol"``, ``"gene_ids"``) assigning each isoform to a gene.
+- Spatial information, either (or both) of:
+
+  - ``.obsm[<spatial_key>]`` — an ``(n_spots, n_dim)`` coordinate array
+    (≥2 dimensions; Scanpy/Squidpy use ``"spatial"``).
+  - ``.obsp[<adj_key>]`` — a pre-built ``(n_spots, n_spots)`` adjacency matrix
+    (e.g. ``"connectivities"`` from `scanpy.pp.neighbors <https://scanpy.readthedocs.io/en/stable/api/generated/scanpy.pp.neighbors.html>`_).
+
+:class:`~splisosm.SplisosmFFT` instead takes a `SpatialData <https://spatialdata.scverse.org/en/latest/index.html>`_ 
+object whose table follows the same conventions, plus rasterisation metadata:
+
+- ``sdata.tables[<table_name>]`` — an AnnData of shape
+  ``(n_bins, n_isoforms)`` with the ``.layers``/``.var`` fields above plus
+  ``.obs[[<row_key>, <col_key>]]`` (e.g. ``"array_row"`` / ``"array_col"``) for
+  grid rasterisation.
+- ``sdata.shapes[<bins>]`` — the grid of bins where each row represents a bin, and the ``"geometry"`` column contains the bin geometries. 
+  See the `Intro to SpatialData tutorial <https://spatialdata.scverse.org/en/latest/tutorials/notebooks/notebooks/examples/intro.html#shapes>`_ for details.
+  Internally, the count table is converted into an image-like square grid using `spatialdata.rasterize_bins <https://spatialdata.scverse.org/en/latest/api/operations.html#spatialdata.rasterize_bins>`_,
+  with zero-padding at unobserved locations.
+
+See the :doc:`Feature Quantification page <txquant>` for platform-specific
+loaders and preprocessing recipes, and
+:func:`splisosm.utils.prepare_inputs_from_anndata` for parsing details.
+
+Setting up a model
+~~~~~~~~~~~~~~~~~~
+
+A typical :class:`~splisosm.SplisosmNP` / :class:`~splisosm.SplisosmGLMM` call:
 
 .. code-block:: python
 
    model.setup_data(
-       adata,                        # AnnData of shape (n_spots, n_isoforms)
-       spatial_key="spatial",        # key in adata.obsm for spatial coordinates
-       layer="counts",               # layer containing raw isoform counts
-       group_iso_by="gene_symbol",   # adata.var column grouping isoforms by gene
-       gene_names="gene_symbol",     # adata.var column for gene names
-       # ----- Differential usage testing
+       adata,                           # AnnData of shape (n_spots, n_isoforms)
+       spatial_key="spatial",           # adata.obsm key for coordinates
+       adj_key=None,                    # or adata.obsp key — see below
+       layer="counts",                  # raw isoform counts layer
+       group_iso_by="gene_symbol",      # adata.var column grouping isoforms by gene
+       gene_names="gene_symbol",        # adata.var column for gene display names
+       # ----- Differential usage testing (optional)
        design_mtx=covariates,           # (n_spots, n_factors)
        covariate_names=covariate_names, # list of covariate names
-       # ----- Spot filtering options (for removing disconnected tissue fragments, etc.)
-       min_component_size=1,         # minimal size of a connected spatial k-NN graph component to keep
-       # ----- Feature filtering options (applied after spot filtering)
-       min_counts=10,                # minimal total counts per isoform to keep
-       min_bin_pct=0.01,             # minimal proportion of non-zero expression spots per isoform to keep
-       filter_single_iso_genes=True, # remove single-isoform genes (SplisosmNP/FFT only; GLMM always requires ≥2)
+       # ----- Spot filtering
+       min_component_size=1,            # set > 1 to drop small disconnected tissue fragments
+       # ----- Feature filtering (applied after spot filtering)
+       min_counts=10,                   # min total counts per isoform to keep
+       min_bin_pct=0.01,                # min fraction of spots expressing the isoform
+       filter_single_iso_genes=True,    # SplisosmNP/FFT only; GLMM always requires ≥2
    )
+
+For :class:`~splisosm.SplisosmFFT`, the grid metadata replaces ``spatial_key``:
+
+.. code-block:: python
+
+   model.setup_data(
+       sdata,                      # SpatialData object
+       bins="Visium_HD_Mouse_Brain_square_016um",  # sdata.shapes key (the grid of bins)
+       table_name="square_016um",  # sdata.tables key (the isoform AnnData)
+       col_key="array_col",        # column in sdata.tables[table_name].obs for column indices
+       row_key="array_row",        # column in sdata.tables[table_name].obs for row indices
+       layer="counts",
+       group_iso_by="gene_ids",
+       gene_names="gene_name",
+       min_counts=10,
+       min_bin_pct=0.01,
+   )
+
+Non-spatial single-cell data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:class:`~splisosm.SplisosmNP` and :class:`~splisosm.SplisosmGLMM` work on single-cell data without spatial information.
+In this case, the tests will try to find and explain variability along a pre-computed graph, 
+providing the graph adjacency matrix via ``adj_key`` (e.g., ``.obsp["connectivities"]`` from ``scanpy.pp.neighbors``).
+
+.. code-block:: python
+
+   import scanpy as sc
+
+   sc.pp.neighbors(adata)   # writes adata.obsp["connectivities"]
+
+   model.setup_data(
+       adata,
+       adj_key="connectivities",
+       layer="counts",
+       group_iso_by="gene_symbol",
+   )
+   model.test_spatial_variability(method="hsic-ir")   # works without coordinates
+
+Alternatively, pass a low-dimensional embedding (e.g. PCA/UMAP) as pseudo-coordinates
+via ``adata.obsm[spatial_key]``; :class:`~splisosm.SplisosmNP` natively supports
+arrays of any dimensionality ≥ 2. Interpret such "spatial" patterns with care,
+and avoid circularity if the isoform data was itself used to compute the embedding.
+
+.. note::
+
+   The conditional DU test ``test_differential_usage(method="hsic-gp")`` fits
+   a Gaussian process using raw spatial coordinates. It will raise a targeted
+   ``ValueError`` when called on an adjacency-only setup.
+   Use ``method="hsic"`` (unconditional) or supply an embedding via ``spatial_key`` instead.
+
+Outputs
+~~~~~~~
+
+All classes share the same output convention, accessed via
+:meth:`~splisosm.SplisosmNP.get_formatted_test_results`:
+
+- ``"sv"`` — per-gene SV test statistics and p-values (one row per gene).
+- ``"du"`` — DU test statistics and p-values (one row per gene-covariate pair).
+
+Both include a Benjamini-Hochberg adjusted ``pvalue_adj`` column. For DU tests, the adjustment is performed per covariate across tested genes.
 
 .. note::
     Since ``v1.1.0``, the ``approx_rank`` argument was moved out of ``setup_data``:
@@ -115,29 +212,6 @@ Inputs and outputs
       at construction time to control the low-rank spatial kernel approximation.
     * **SplisosmFFT** uses FFT-based convolutions instead of eigendecomposition and
       does not support ``approx_rank`` or ``null_configs``.
-
-For :class:`~splisosm.SplisosmFFT`, pass a ``SpatialData`` object with isoform-level counts to ``setup_data``.
-
-.. code-block:: python
-
-   model.setup_data(
-       sdata,                     # SpatialData object
-       bins="Visium_HD_Mouse_Brain_square_016um",  # SpatialData bin element name
-       table_name="square_016um", # adata containing isoform-level counts
-       col_key="array_col",       # adata.obs column for array column indices
-       row_key="array_row",       # adata.obs column for array row indices
-       layer="counts",            # layer containing raw isoform counts
-       group_iso_by="gene_ids",   # adata.var column grouping isoforms by gene
-       gene_names="gene_name",    # adata.var column for gene names
-       min_counts=10,
-       min_bin_pct=0.01,
-   )
-
-See :doc:`Feature Quantification page <txquant>` for guidance on preparing input data from different spatial transcriptomics platforms. 
-All model classes share the same output convention:
-
-- **SV results**: a ``DataFrame`` with per-gene test statistics and p-values.
-- **DU results**: a ``DataFrame`` with test statistics and p-values for each gene-covariate pair.
 
 
 Example data

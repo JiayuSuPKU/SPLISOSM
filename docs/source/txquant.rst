@@ -2,7 +2,7 @@ Feature Quantification
 ====================================
 
 This page describes how to obtain probe/peak/isoform-level quantification for various spatial transcriptomics (ST) platforms as input to SPLISOSM. 
-If you already have a compatible ``AnnData`` or ``SpatialData`` object, skip ahead to :ref:`the expected data format <txquant:expected data format>`.
+To check if you already have a compatible ``AnnData`` or ``SpatialData`` object, see :ref:`quickstart:Expected input data format`.
 
 Platform overview
 -----------------
@@ -37,30 +37,17 @@ The table below summarizes the supported ST platforms, the type of isoform featu
 Expected data format
 --------------------
 
-SPLISOSM expects isoform-level data in an ``AnnData`` of shape ``(n_spots, n_isoforms)``:
+See :ref:`quickstart:Expected input data format` in the Quick Start for the expected
+``AnnData`` / ``SpatialData`` layout. The rest of this page covers how to
+*produce* such inputs from each platform's raw output.
 
-- ``.layers[<layer>]``: raw isoform counts.
-- ``.var``: isoform metadata with at least a ``<group_iso_by>`` column for gene assignment.
-
-- Spatial coordinates in one of:
-
-  - ``.obsm[<spatial_key>]``: a ``(n_spots, n_dim)`` array with 2/3/more columns. Scanpy/Squidpy conventions are ``'spatial'``.
-  - ``.obsp[<adj_key>]``: a custom ``(n_spots, n_spots)`` adjacency matrix (e.g., ``'connectivities'`` from calling ``scanpy.pp.neighbors``).
-
-  See :func:`splisosm.utils.prepare_inputs_from_anndata` for parsing details.
-
-The spot-by-isoform ``AnnData`` can also be a table of a ``SpatialData`` object, which is the required input format for :class:`splisosm.SplisosmFFT` (FFT-accelerated tests). 
-In such cases, we rely on `spatialdata.rasterize_bins <https://spatialdata.scverse.org/en/latest/api/operations.html#spatialdata.rasterize_bins>`_ to 
-rasterize counts into square bins (i.e., padding unobserved spots with zeros) to improve memory efficiency and computation speed. 
-The minimum required structure of the ``SpatialData`` object is as follows:
-
-- ``sdata.shapes[<bins>]``: a ``GeoDataFrame`` of ``n_bins`` elements containing the geometry of each bin (e.g., square polygons).
-- ``sdata.tables[<table_name>]``: an ``AnnData`` of shape ``(n_bins, n_isoforms)`` with 
-
-  - ``.layers[<layer>]``: raw isoform counts
-  - ``.var``: isoform metadata with at least a ``<group_iso_by>`` column for gene assignment.
-  - ``.obs``: bin metadata with ``[<row_key>, <col_key>]`` for row and column indices (e.g., ``'array_row'``, ``'array_col'``) used during rasterization.
-  - ``.uns['spatialdata_attrs']``: a dictionary with keys ``spatial_key``, ``row_key``, and ``col_key`` indicating the spatial mapping information of bins. See the `SpatialData documentation <https://spatialdata.scverse.org/en/stable/tutorials/notebooks/notebooks/examples/tables.html#table-metadata-annotation-targets>`_.
+For :class:`~splisosm.SplisosmFFT`, counts are internally rasterised into square
+bins via `spatialdata.rasterize_bins
+<https://spatialdata.scverse.org/en/latest/api/operations.html#spatialdata.rasterize_bins>`_
+(unobserved bins are zero-padded). The ``SpatialData`` table must therefore also
+carry ``.uns['spatialdata_attrs']`` with ``spatial_key`` / ``row_key`` /
+``col_key`` entries — see the `SpatialData tutorial on table metadata
+<https://spatialdata.scverse.org/en/stable/tutorials/notebooks/notebooks/examples/tables.html#table-metadata-annotation-targets>`_.
 
 
 Long-read ST data
