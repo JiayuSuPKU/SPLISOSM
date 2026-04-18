@@ -162,8 +162,8 @@ Non-spatial single-cell data
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 :class:`~splisosm.SplisosmNP` and :class:`~splisosm.SplisosmGLMM` work on single-cell data without spatial information.
-In this case, the tests will try to find and explain variability along a pre-computed graph, 
-providing the graph adjacency matrix via ``adj_key`` (e.g., ``.obsp["connectivities"]`` from ``scanpy.pp.neighbors``).
+In this case, the tests find and explain variability along a pre-computed graph whose
+adjacency matrix is supplied via ``adj_key`` (e.g., ``.obsp["connectivities"]`` from ``scanpy.pp.neighbors``).
 
 .. code-block:: python
 
@@ -589,10 +589,11 @@ adjust them only when you hit performance or accuracy limits.
    * - **SV null approximation**
      - ``null_method=`` in ``test_spatial_variability`` / ``run_hsic_gc``
      - ``"eig"`` (Liu's chi-square mixture)
-     - ``"trace"`` (moment-matching normal) avoids eigendecomposition
-       entirely — fastest for very large *n* but p-values may be slightly
-       less calibrated in the tails.  ``"perm"`` uses permutation; slowest
-       but assumption-free.
+     - ``"trace"`` (moment-matching normal) and ``"welch"`` (Welch–Satterthwaite
+       scaled chi-squared) both avoid eigendecomposition — fastest for very large
+       *n*.  ``"welch"`` is typically more accurate in the right tail than
+       ``"trace"`` at the same cost.  ``"perm"`` uses permutation; slowest but
+       assumption-free.
    * - **SV null low-rank** (when ``null_method="eig"``)
      - ``null_configs={"approx_rank": k}`` in ``test_spatial_variability`` /
        ``run_hsic_gc``

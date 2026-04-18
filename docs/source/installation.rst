@@ -38,7 +38,7 @@ To install these additional dependencies, you can use the following command:
 
   $ pip install "splisosm[sdata, gp]"
 
-For spatially variable gene expression test, we also provide a Python wrapper, :func:`splisosm.utils.run_sparkx`, for `SPARK-X <https://xzhoulab.github.io/SPARK/04_installation/>`_. 
+For spatially variable gene expression testing, we also provide a Python wrapper, :func:`splisosm.utils.run_sparkx`, for `SPARK-X <https://xzhoulab.github.io/SPARK/04_installation/>`_.
 To use this functionality, ensure that the conda environment where SPLISOSM is installed has R (>=4.0) available in ``PATH``, and that the R package `SPARK-X <https://xzhoulab.github.io/SPARK/04_installation/>`_ is properly installed.
 
 .. code-block:: zsh

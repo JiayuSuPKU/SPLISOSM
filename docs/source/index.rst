@@ -74,7 +74,7 @@ contain sufficient isoform-level information for spatial pattern discovery. Thes
 Unlike conventional gene-centric spatial analysis, SPLISOSM focuses on patterns of RNA processing (e.g., alternative splicing, alternative polyadenylation) manifested at the isoform level.
 Given feature quantification, SPLISOSM supports two types of statistical analyses:
 
-- **Spatial variability (SV)**: Detect spatially variable transcript usage (*HSIC-IR*), transcript expression (*HSIC-IC*) or gene expression (*HSIC-GC*). Genes are termed *spatially variably processed (SVP)* if their HSIC-IR test results are significant; Genes are termed *spatially variably expressed (SVE)* if their HSIC-GC test results are significant.
+- **Spatial variability (SV)**: Detect spatially variable transcript usage (*HSIC-IR*), transcript expression (*HSIC-IC*) or gene expression (*HSIC-GC*). Genes are termed *spatially variably processed (SVP)* if their HSIC-IR test results are significant, and *spatially variably expressed (SVE)* if their HSIC-GC test results are significant.
 - **Differential isoform usage (DU)**: Test the *conditional* association between transcript usage and spatial covariates, such as spatial domains and expression of potential regulators like RBPs.
 
 .. note::

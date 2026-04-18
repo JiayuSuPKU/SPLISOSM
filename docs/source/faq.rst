@@ -88,7 +88,7 @@ Choosing a model class
 
   See :doc:`Quick Start <quickstart>` for a model-selection decision tree.
 
-**4. Why SplisosmNP and SplisosmFFT give different results?**
+**4. Why do SplisosmNP and SplisosmFFT give different results?**
 
   While sharing the same statistical methodology, p-values from the two classes
   can differ for three reasons:
@@ -138,7 +138,7 @@ Choosing a model class
         gpr_configs={"covariate": {"n_inducing": 1000}}
     )
 
-  Alternatively, consider the faster unconditional tests (``'hsic'`` or ``'glm'``). While they do not account for spatial autocorrelation and may lead to inflated p-values,
+  Alternatively, consider the faster unconditional tests (``'hsic'`` or ``'glm'``). While they do not account for spatial autocorrelation and may be anti-conservative (inflated false-positive rate),
   the overall ranking of gene-covariate associations is often similar to the conditional tests, especially for top hits.
 
   .. code-block:: python
@@ -245,7 +245,7 @@ Interpretation of Results
    ONT-CBS1 and ONT-CBS2 are two long-read SiT (Visium-ONT) CBS samples.
    SR-Hippocampus: Slide-seqV2 hippocampus sample with higher spatial resolution but fewer UMIs per spot.
   
-**11. I have finished running SPLISOSM, what should I do next?**
+**11. I have finished running SPLISOSM. What should I do next?**
 
   After obtaining the test results from SPLISOSM, you can perform various downstream analyses to gain further biological insights. Examples include:
 

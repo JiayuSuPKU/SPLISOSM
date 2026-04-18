@@ -1,6 +1,11 @@
 # SPLISOSM — Spatial Isoform Statistical Modeling
 
-SPLISOSM (**SP**atia**L** **ISO**form **S**tatistical **M**odeling, pronounced as *spliceosome*) is a Python package
+[![PyPI version](https://img.shields.io/pypi/v/splisosm.svg)](https://pypi.org/project/splisosm/)
+[![License: BSD-3-Clause](https://img.shields.io/pypi/l/splisosm.svg)](https://github.com/JiayuSuPKU/SPLISOSM/blob/main/LICENSE)
+[![Docs](https://readthedocs.org/projects/splisosm/badge/?version=latest)](https://splisosm.readthedocs.io/en/latest/)
+[![PyPI Downloads](https://img.shields.io/pepy/dt/splisosm?logo=pypi)](https://pepy.tech/project/splisosm)
+
+SPLISOSM (**SP**atia**L** **ISO**form **S**tatistical **M**odeling, pronounced *spliceosome*) is a Python package
 for analyzing RNA-processing patterns in spatial transcriptomics (ST) data. It uses
 multivariate, kernel-based association tests to detect:
 
@@ -102,11 +107,11 @@ SPLISOSM works with non-spatial / single-cell data too: pass `adj_key` pointing 
 `adata.obsp[...]` neighborhood graph (e.g. `"connectivities"` from
 `scanpy.pp.neighbors`) in place of `spatial_key`.
 
-Gene-level spatial variability as a drop-in for [SPARK-X](https://xzhoulab.github.io/SPARK/) or Moran's I:
+For gene-level spatial variability as a drop-in for [SPARK-X](https://xzhoulab.github.io/SPARK/) or Moran's I:
 
 ```python
 from splisosm.utils import run_hsic_gc
-res = run_hsic_gc(gene_counts, coordinates)     # numpy in/out, or the same AnnData setup
+res = run_hsic_gc(gene_counts, coordinates)     # or run_hsic_gc(adata=adata, spatial_key="spatial")
 ```
 
 See the [Quick Start](https://splisosm.readthedocs.io/en/latest/quickstart.html) for the
@@ -133,8 +138,19 @@ See the [changelog](./CHANGELOG.md) for detailed release notes.
 Please file bugs and feature requests on the
 [GitHub Issues page](https://github.com/JiayuSuPKU/SPLISOSM/issues).
 
-## Citation
+## References
 
-Su, Jiayu, et al. “Mapping isoforms and regulatory mechanisms from spatial
-transcriptomics data with SPLISOSM.” *Nature Biotechnology* (2026): 1–12.
-[Paper](https://www.nature.com/articles/s41587-025-02965-6)
+`SplisosmNP` and `SplisosmGLMM` are described in
+
+> Su, Jiayu, et al. “Mapping isoforms and regulatory mechanisms from spatial
+> transcriptomics data with SPLISOSM.” *Nature Biotechnology* (2026): 1–12.
+>
+> [link to paper](https://www.nature.com/articles/s41587-025-02965-6)
+
+
+The FFT-based acceleration of `SplisosmFFT` is described in
+
+> Su, Jiayu, et al. "On the consistent and scalable detection of spatial patterns."
+> arXiv preprint arXiv:2602.02825 (2026).
+>
+> [link to preprint](https://arxiv.org/abs/2602.02825)

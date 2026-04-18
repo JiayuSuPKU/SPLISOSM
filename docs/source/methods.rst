@@ -372,7 +372,7 @@ and :math:`U = (u_1, \ldots, u_n)^\top \in \mathbb{R}^{n \times q}` stacks the p
    See :cite:`su2026consistent` for detailed analysis.
 
 
-For DU testing, we use a **score test** comparing coefficient gradients at the null model (no fixed-effect covariates, :math:`\theta = 0`), which avoids fitting the full model for each covariate.
+For DU testing, we use a **score test** comparing coefficient gradients at the null model (no fixed-effect covariates, :math:`\beta = 0`), which avoids fitting the full model for each covariate.
 However, it still requires estimating nuisance parameters (intercept :math:`b`, total variance :math:`\sigma^2`, and spatial variance proportion :math:`\theta`).
 To compute the maximum likelihood estimates, we approximate the marginal likelihood via **Laplace's method** at the mode of the random effects.
 See :class:`splisosm.model.MultinomGLMM` for implementation details.
