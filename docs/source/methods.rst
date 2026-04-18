@@ -2,7 +2,8 @@ Statistical Methods
 ====================
 
 This page describes the statistical framework underlying SPLISOSM's spatial variability (SV) and differential isoform usage (DU) tests.
-For a full derivation and theoretical justification, please refer to the Supplementary Notes of the `SPLISOSM paper <https://www.nature.com/articles/s41587-025-02965-6>`_ :cite:`su2026mapping`.
+For a full derivation and theoretical justification, please refer to the Supplementary Notes of the `SPLISOSM paper <https://www.nature.com/articles/s41587-025-02965-6>`_ :cite:`su2026mapping`,
+and of :cite:`su2026consistent`.
 
 Overview
 --------
@@ -17,7 +18,7 @@ Intuitively,
 
 - The **spatial kernel** :math:`K \in \mathbb{R}^{n \times n}` encodes the spatial structure of the tissue.
 - The **response kernel** :math:`L \in \mathbb{R}^{n \times n}` encodes similarity between isoform profiles of different spots/cells.
-- HSIC measures whether spots that are spatially close (large :math:`K_{ij}`) also tend to have similar isoform profiles (large :math:`L_{ij}`).
+- HSIC measures whether spots that are spatially close (large :math:`K_{ii'}`) also tend to have similar isoform profiles (large :math:`L_{ii'}`).
 
 Spatial Kernel: CAR Model
 --------------------------
@@ -29,7 +30,7 @@ Given a k-mutual-nearest-neighbor adjacency matrix :math:`W` built from spot coo
 
    M = I - \rho D^{-1/2} W D^{-1/2},
 
-where :math:`D = \mathrm{diag}(\sum_j W_{ij})` is the degree matrix and :math:`\rho \in (0, 1)` is the spatial autocorrelation coefficient.
+where :math:`D = \mathrm{diag}(\sum_{i'} W_{ii'})` is the degree matrix and :math:`\rho \in (0, 1)` is the spatial autocorrelation coefficient.
 The spatial covariance (kernel) matrix is :math:`K = M^{-1}`, standardised to unit marginal variance.
 
 We choose the CAR kernel for the following properties:
@@ -52,7 +53,7 @@ Three SV tests are available, differing only in how the response matrix :math:`Y
 Test types
 ~~~~~~~~~~
 
-Let :math:`c_{ig}` denote the raw count of isoform :math:`i` at spot :math:`g`, and :math:`r_{ig} = c_{ig} / \sum_i c_{ig}` the corresponding usage ratio.
+Let :math:`c_{ij}` denote the raw count at spot :math:`i \in \{1, \ldots, n\}` of isoform :math:`j \in \{1, \ldots, p\}`, and :math:`r_{ij} = c_{ij} / \sum_{j'} c_{ij'}` the corresponding isoform usage ratio.
 
 .. list-table::
    :header-rows: 1
@@ -63,22 +64,22 @@ Let :math:`c_{ig}` denote the raw count of isoform :math:`i` at spot :math:`g`, 
      - Null hypothesis
      - Typical use case
    * - **HSIC-IR**
-     - Centred isoform usage ratios :math:`r_{ig}` (optionally log-ratio transformed)
+     - Centred isoform usage ratios :math:`r_{ij}` (optionally log-ratio transformed)
      - Isoform *usage* is spatially uniform
      - Identify **SVP** genes (spatially variable RNA processing)
    * - **HSIC-GC**
-     - Centred total gene count :math:`\sum_i c_{ig}` (single column)
+     - Centred total gene count :math:`\sum_j c_{ij}` (single column)
      - Gene *expression* is spatially uniform
      - Identify **SVE** genes; drop-in for `SPARK-X <https://genomebiology.biomedcentral.com/articles/10.1186/s13059-021-02404-0>`_
    * - **HSIC-IC**
-     - Centred raw isoform counts :math:`c_{ig}`
+     - Centred raw isoform counts :math:`c_{ij}`
      - Isoform *counts* are spatially uniform
      - Reflects joint changes in expression and processing
 
 **HSIC-IR** is the recommended test for discovering spatially variable RNA processing (SVP genes).
 **HSIC-GC** is equivalent to a gene-level spatial variability test and can serve as a drop-in replacement for SPARK-X with improved statistical power.
 **HSIC-IC** tests the joint null; significance can arise from either differential expression or differential processing. **HSIC-IC does not test each isoform individually and instead yields a single test statistic per gene.**
-In practice, the results of **HSIC-IC** and **HSIC-GC** are often similar, as changes in overall gene expression is the main driver of isoform expression changes for many genes. 
+In practice, the results of **HSIC-IC** and **HSIC-GC** are often similar, as changes in overall gene expression are the main driver of isoform expression changes for many genes.
 
 Ratio transformations
 ~~~~~~~~~~~~~~~~~~~~~
@@ -86,11 +87,11 @@ Ratio transformations
 For HSIC-IR, the usage ratios are optionally transformed before computing the HSIC statistic.
 The ``ratio_transformation`` argument controls this:
 
-- ``'none'`` (default): raw proportions :math:`r_{ig}`, mean-centred per isoform.
-- ``'clr'``: centred log-ratio :math:`\log(r_{ig}) - \frac{1}{p}\sum_i \log(r_{ig})`.
+- ``'none'`` (default): raw proportions :math:`r_{ij}`, mean-centred per isoform.
+- ``'clr'``: centred log-ratio :math:`\log(r_{ij}) - \frac{1}{p}\sum_{j'} \log(r_{ij'})`.
 - ``'ilr'``: isometric log-ratio (orthonormal Helmert contrast in log-simplex).
 - ``'alr'``: additive log-ratio relative to the last isoform.
-- ``'radial'``: radial transformation :math:`r_{ig} / \|r_g\|` :cite:`park2022kernel`. Empirically, it is not calibrated and thus not recommended.
+- ``'radial'``: radial transformation :math:`r_{ij} / \|r_i\|` :cite:`park2022kernel`, where :math:`r_i = (r_{i1}, \ldots, r_{ip})` is the isoform-ratio vector at spot :math:`i`. Empirically, it is not calibrated and thus not recommended.
 
 Due to excessive sparsity, log-ratio-based transformations require pseudo-counts to avoid zero ratios, 
 which may lead to unwanted artefacts. Our empirical results suggest that the untransformed ratios (``'none'``) are well-calibrated, robust and often more powerful for SVP detection.
@@ -123,15 +124,16 @@ Four methods are available via the ``null_method`` argument to :meth:`~splisosm.
 
 .. _null-eig:
 
-**1. Liu's approximation of chi-square mixture (default)**: ``null_method='eig'`` 
+**1. Liu's approximation of chi-square mixture (default)**: ``null_method='eig'``
 
-Denote eigenvalues :math:`\lambda_1^K \geq \cdots \geq \lambda_n^K` of :math:`K` and :math:`\lambda_1^Y \geq \cdots \geq \lambda_p^Y` of :math:`Y^\top Y`.
-Under the null, the test statistic :math:`(n-1)^2 \widehat{\mathrm{HSIC}}` asymptotically follows a distribution that can be expressed
-as a weighted sum of independent :math:`\chi^2_{1}` variables,
+Let :math:`Q = \mathrm{tr}(Y^\top K Y) = (n-1)^2 \widehat{\mathrm{HSIC}}` denote the unnormalised HSIC V-statistic,
+with :math:`\lambda_1^K \geq \cdots \geq \lambda_n^K` the eigenvalues of :math:`K` and
+:math:`\lambda_1^Y \geq \cdots \geq \lambda_p^Y` those of :math:`Y^\top Y`.
+Under the null, :math:`Q` asymptotically follows a weighted sum of independent :math:`\chi^2_{1}` variables,
 
 .. math::
 
-   (n-1)^2 \widehat{\mathrm{HSIC}} \;\overset{d}{\approx}\; \sum_{k,\ell} \lambda_k^K \lambda_\ell^Y \, \chi^2_{1,(k,\ell)},
+   Q \;\overset{d}{\approx}\; \frac{1}{n} \sum_{i=1}^{n} \sum_{j=1}^{p} \lambda_i^K \, \lambda_j^Y \; Z_{ij}, \qquad Z_{ij} \overset{\text{iid}}{\sim} \chi^2_{1},
 
 where the double sum runs over all pairs of spatial and response eigenvalues.
 :cite:`liu2009new` propose an efficient three-moment matching scheme (skewness matching) to approximate the tail probability of this mixture with a scaled and shifted chi-squared variable.
@@ -142,26 +144,27 @@ See :func:`splisosm.likelihood.liu_sf` for implementation details.
    - Full eigen-decomposition of :math:`K` is :math:`O(n^3)` and is not feasible for large datasets.  
      For :math:`n > 5000`, we approximate the kernel via a low-rank approximation using the top-:math:`r` eigenvalues/vectors.  
      The approximation is controlled by ``approx_rank`` in ``null_configs``, with default :math:`\lceil 4\sqrt{n} \rceil` when :math:`n > 5000`.
-   - When ``nan_filling='mean'`` (default), The spatial eigenvalues are cached after the first gene and reused for all subsequent genes.
+   - When ``nan_filling='mean'`` (default), the spatial eigenvalues are cached after the first gene and reused for all subsequent genes.
 
 .. _null-trace:
 
 **2. Moment-matching normal approximation**: ``null_method='trace'``
 
-Alternatively, we may use the first two moments of the null distribution to compute p-values (i.e., via Central Limit Theorem), 
-which requires only :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)`:
+Alternatively, we may use the first two moments of the null distribution to compute p-values (i.e., via Central Limit Theorem),
+which requires only :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)`.
+Taking moments of the :math:`\chi^2_1` mixture above gives
 
 .. math::
 
-   \mu_0 &= \frac{1}{n-1}\mathrm{tr}(K)\,\mathrm{tr}(Y^\top Y), \\[4pt]
-   \sigma_0^2 &= \frac{1}{(n-1)^2}2\,\mathrm{tr}(K^2)\,\mathrm{tr}((Y^\top Y)^2).
+   \mu_0 &= \mathbb{E}[Q] = \frac{1}{n}\,\mathrm{tr}(K)\,\mathrm{tr}(Y^\top Y), \\[4pt]
+   \sigma_0^2 &= \mathrm{Var}(Q) = \frac{2}{n^2}\,\mathrm{tr}(K^2)\,\mathrm{tr}\!\bigl((Y^\top Y)^2\bigr).
 
-The p-value is :math:`\Phi^c\!\left(\frac{\widehat{\mathrm{HSIC}} - \mu_0}{\sigma_0}\right)`, where :math:`\Phi^c` is the standard normal survival function. 
+The p-value is :math:`\Phi^c\!\left(\frac{Q - \mu_0}{\sigma_0}\right)`, where :math:`\Phi^c` is the standard normal survival function.
 Note that for non-Gaussian data :math:`Y`, the null variance is off by a kurtosis factor, which we omit for brevity.
 
 .. note::
 
-   - Since the CLT approximation requires no eigen-decomposition, it is the fastest and most scalable option while being slightly less accurate for heavy-tailed null.
+   - Since the CLT approximation requires no eigen-decomposition, it is the fastest and most scalable option while being slightly less accurate for a heavy-tailed null.
    - As the sample size increases, the approximation becomes more accurate, and the test is generally well-calibrated for large :math:`n`.
    - For implicit kernels (where only the sparse precision matrix :math:`M=K^{-1}` is stored), :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` are estimated via the **Hutchinson stochastic trace estimator** using 30 Rademacher probing vectors.
 
@@ -177,7 +180,7 @@ The parameters are chosen to match the first two moments of the null :math:`(\mu
 
    g = \frac{\sigma_0^2}{2\mu_0}, \qquad h = \frac{2\mu_0^2}{\sigma_0^2},
 
-and the p-value is :math:`\mathbb{P}\!\left(\chi^2_h \geq \widehat{\mathrm{HSIC}}/g\right)`.
+and the p-value is :math:`\mathbb{P}\!\left(\chi^2_h \geq Q/g\right)`.
 
 .. note::
 
@@ -211,26 +214,33 @@ FFT acceleration for regular grids
 :class:`~splisosm.SplisosmFFT` exploits the **translation-invariance** of regular grids (Visium HD, Xenium binned data) to accelerate the SV test via the 2-D Fast Fourier Transform.
 Specifically, it reduces the kernel eigen-decomposition required for the Liu's method from :math:`O(n^3)` to :math:`O(n \log n)`, and the quadratic form computation from :math:`O(n^2 p)` to :math:`O(n p \log n)`.
 
-On a regular :math:`H \times W` grid, the CAR precision matrix :math:`M` is block-circulant.
-Its eigenvalues — and hence the spatial kernel eigenvalues — are the DFT of the first row of :math:`M`, computable in :math:`O(HW \log HW)` time:
+On a regular :math:`H \times W` grid with :math:`n = HW` spots, uniform degree :math:`d` and periodic boundaries, the CAR precision :math:`M = I - (\rho/d)\,W` is block-circulant.
+Its eigenvalues (and hence those of :math:`K = M^{-1}`) are the 2-D DFT of its first row, computable in :math:`O(n \log n)` time:
 
 .. math::
 
-   \lambda_{(h,w)}^K = \frac{1}{1 - \rho \, \hat{W}_{hw} / d},
+   \lambda_{(h,w)}^K = \frac{1}{1 - \rho \, \hat{W}_{hw} / d}, \qquad h = 0, \ldots, H-1,\; w = 0, \ldots, W-1,
 
-where :math:`\hat{W}_{hw}` is the 2-D DFT of the adjacency weight kernel and :math:`d` is the degree.
+where :math:`\hat{W}_{hw} = (\mathcal{F}\,w)_{hw}` is the unnormalised 2-D DFT of the first row of the adjacency matrix :math:`W`.
 
-The quadratic form :math:`\mathrm{tr}(Y^\top K Y)` is then computed as a *pointwise* product in Fourier space:
+The quadratic form :math:`\mathrm{tr}(Y^\top K Y)` then reduces to a *pointwise* product in Fourier space.
+Reshape each isoform image :math:`y_j \in \mathbb{R}^n` to :math:`H \times W` and let
+:math:`\hat{Y}_{hw} = \bigl((\mathcal{F} y_1)_{hw},\, \ldots,\, (\mathcal{F} y_p)_{hw}\bigr) \in \mathbb{C}^{p}`
+denote the vector of 2-D DFT coefficients at frequency :math:`(h, w)` stacked across all :math:`p` isoforms. Then
 
 .. math::
 
-   \mathrm{tr}(Y^\top K Y) = \frac{1}{n} \sum_{h,w} \lambda_{(h,w)}^K \|\hat{Y}_{hw}\|_F^2,
+   \mathrm{tr}(Y^\top K Y) \;=\; \frac{1}{n} \sum_{h=0}^{H-1} \sum_{w=0}^{W-1} \lambda_{(h,w)}^K \; \|\hat{Y}_{hw}\|_2^2,
 
-where :math:`\hat{Y}_{hw}` is the 2-D DFT of the isoform count image.
+where the leading :math:`1/n` comes from the unnormalised DFT convention (``scipy.fft.fft2``) that satisfies :math:`\mathcal{F}^{-1} = (1/n)\,\mathcal{F}^{*}`.
 This reduces the quadratic-form computation from :math:`O(n^2 p)` to :math:`O(n p \log n)`.
 
 Furthermore, the spatial eigenvalues :math:`\{\lambda_{(h,w)}^K\}` are shared across all genes (computed once), so the cost of the eigenvalue null is also :math:`O(1)` per gene in terms of kernel operations.
 
+.. note::
+
+   For irregularly spaced 2D and 3D coordinates, it is possible to compute the test statistic and its null using the `non-uniform FFT (NUFFT) <https://en.wikipedia.org/wiki/Non-uniform_discrete_Fourier_transform>`_ approach, 
+   which also scales as :math:`O(n \log n)`. We are working on an implementation of this method for future releases (depending on personal bandwidth).
 
 Differential Isoform Usage (DU) Tests
 ---------------------------------------
@@ -246,8 +256,10 @@ The unconditional test directly applies HSIC between the centred covariate vecto
 
    \widehat{\mathrm{HSIC}}_{\text{uncond}} = \frac{1}{(n-1)^2} \mathrm{tr}(Y^\top K_Z Y),
 
-where :math:`K_Z = ZZ^\top / \|Z\|^2` is a rank-1 linear kernel on the covariate.
-This is equivalent to the multivariate `RV coefficient <https://en.wikipedia.org/wiki/RV_coefficient>`_ between :math:`Z` and :math:`Y`.
+where :math:`K_Z = ZZ^\top` is a rank-1 linear kernel on the covariate, so that
+:math:`\mathrm{tr}(Y^\top K_Z Y) = \|Z^\top Y\|^2`.
+Up to a scalar, the statistic is equivalent to the multivariate
+`RV coefficient <https://en.wikipedia.org/wiki/RV_coefficient>`_ between :math:`Z` and :math:`Y`.
 When :math:`Z` is binary, this is also equivalent to a two-step procedure where two-sample T-test is first applied to each isoform separately, and the resulting p-values are combined 
 (e.g., via Fisher's method ``method='t-fisher'``).
 
@@ -273,16 +285,16 @@ Specifically, SPLISOSM first **residualises** the covariate against a Gaussian P
 
 2. **Compute covariate residuals** :math:`\tilde{Z} = Z - \hat{f}(X)`, capturing the part of covariate variation *not explained by* spatial position.
 
-3. **Test** :math:`\widehat{\mathrm{HSIC}}(\tilde{Z},\, Y)` using the linear covariate kernel :math:`K_{\tilde{Z}} = \tilde{Z}\tilde{Z}^\top / \|\tilde{Z}\|^2` and a similar linear kernel for :math:`Y`.
+3. **Test** :math:`\widehat{\mathrm{HSIC}}(\tilde{Z},\, Y)` using the rank-1 linear covariate kernel :math:`K_{\tilde{Z}} = \tilde{Z}\tilde{Z}^\top` and a similar linear kernel :math:`K_Y = Y Y^\top` for the response.
    Since both kernels are low-rank, the null distribution can be efficiently computed via the eigenvalue method.
 
 .. note::
 
-   Theoretically, the conditional association between :math:`Z` and :math:`Y` given spatial position :math:`X` requires both residualisations
-   :math:`Z | X` or :math:`Y | X` to be performed. However, :math:`\tilde{Z} \perp\!\!\!\perp Y` implies :math:`Z \perp\!\!\!\perp Y | X` (but not vice versa), 
+   Theoretically, a fully equivalent test of conditional independence :math:`Z \perp\!\!\!\perp Y \mid X` would residualise **both** :math:`Z \mid X` and :math:`Y \mid X` against the spatial GP.
+   However, :math:`\tilde{Z} \perp\!\!\!\perp Y` implies :math:`Z \perp\!\!\!\perp Y \mid X` (but not vice versa),
    so any significant dependency found by residualising only the covariate is also a true positive for the conditional association.
 
-In practice, we found the covariate-only residualisation delivers massive computational savings and remains well-calibrated.
+In practice, we found that the covariate-only residualisation delivers massive computational savings and remains well-calibrated.
 For flexibility, we provide optional control via the ``residualize`` argument:
 
 - ``residualize='cov_only'`` (default): only :math:`Z` the spatial covariate is residualised; :math:`Y` the isoform ratio matrix is used as-is.
@@ -297,6 +309,9 @@ For flexibility, we provide optional control via the ``residualize`` argument:
    - ``gpr_backend='gpytorch'``: Exact or sparse GP with ``n_inducing`` inducing points.
 
    For very large datasets, pass ``gpr_configs={"covariate": {"n_inducing": 1000}}`` to control the number of inducing points for both backends.
+   It is possible to further scale up GP fitting using the `non-uniform FFT (NUFFT) <https://en.wikipedia.org/wiki/Non-uniform_discrete_Fourier_transform>`_ approach. 
+   We are working on an implementation of this method for future releases (depending on personal bandwidth).
+
 
 FFT-accelerated conditional DU test
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -304,18 +319,21 @@ FFT-accelerated conditional DU test
 :class:`~splisosm.SplisosmFFT` accelerates the conditional DU test (``method='hsic-gp'``)
 by replacing the dense GP with an **FFT-based Gaussian process**.
 
-On a regular grid the GP covariance kernel :math:`k_\theta(x, x')` is stationary, so
-the Gram matrix :math:`K_\theta` is block-circulant.  All operations required for GP
-fitting and prediction, including matrix-vector products, log-determinants, and gradient
-computations, can be performed via 2-D FFTs:
+On a regular grid with periodic boundaries the GP covariance kernel :math:`k_\theta(x, x')` is stationary, so
+the Gram matrix :math:`K_\theta` is block-circulant with eigenvalues
+:math:`\hat{k}_{\theta,(h,w)} = (\mathcal{F}\,k_\theta)_{hw}` (2-D DFT).
+All operations required for GP fitting and prediction — matrix-vector products, log-determinants,
+and gradient computations — can be performed in the spectral domain:
 
 .. math::
 
-   K_\theta \cdot v = \mathcal{F}^{-1}\!\bigl(\hat{k}_\theta \odot \mathcal{F}(v)\bigr),
-   \quad
-   \log|K_\theta| = \sum_{h,w} \log \hat{k}_{\theta,(h,w)},
+   K_\theta \cdot v \;=\; \tfrac{1}{n}\, \mathcal{F}^{*}\!\bigl(\hat{k}_\theta \odot \mathcal{F}(v)\bigr),
+   \qquad
+   \log |K_\theta| \;=\; \sum_{h,w} \log \hat{k}_{\theta,(h,w)},
 
-where :math:`\hat{k}_\theta` is the 2-D DFT of the kernel's first row.
+where the :math:`1/n` in the matrix-vector product reflects the unnormalised DFT convention
+:math:`\mathcal{F}^{-1} = (1/n)\,\mathcal{F}^{*}`, and the log-determinant identity follows from
+:math:`\hat{k}_{\theta,(h,w)} > 0` for a positive-definite stationary kernel.
 This reduces the per-step GP cost from :math:`O(n^3)` (dense Cholesky) or
 :math:`O(nM^2)` (inducing-point) to :math:`O(n \log n)` per L-BFGS iteration,
 with no approximation error for stationary kernels on the grid.
@@ -327,24 +345,37 @@ the FFT-based posterior mean.
 
 After residualisation, the HSIC test itself proceeds identically to the
 :class:`~splisosm.SplisosmNP` path: linear-kernel HSIC via :math:`\mathrm{tr}(Y^\top K_{\tilde{Z}} Y)=\|\tilde{Z}^\top Y\|^2`,
-and p-value via the FFT-derived spatial kernel spectrum.
+with p-values from Liu's chi-squared mixture null using the eigenvalues of :math:`K_{\tilde{Z}} = \tilde{Z}\tilde{Z}^\top` (rank-1, giving a single nonzero eigenvalue :math:`\|\tilde{Z}\|^2`) and :math:`K_Y = Y Y^\top`.
 
 
 Parametric test: SplisosmGLMM
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-:class:`~splisosm.SplisosmGLMM` provides a parametric alternative based on a **multinomial GLMM** with a Gaussian random field (GRF) spatial random effect:
+:class:`~splisosm.SplisosmGLMM` provides a parametric alternative based on a **multinomial GLMM** with a Gaussian random field (GRF) random effect.
+Using a reference-category multinomial-logit link with :math:`q = p - 1` free dimensions per spot, the model is
 
 .. math::
 
-   Y_i \mid \phi_i \sim \mathrm{Multinomial}(N_i,\, \mathrm{softmax}(\eta_i)), \quad
-   \eta_i = X_i \beta + u_i, \quad
-   u \sim \mathcal{N}(0,\, \sigma^2 K),
+   Y_i \mid \eta_i &\sim \mathrm{Multinomial}(N_i,\, \mathrm{softmax}([\eta_i, 0])), \quad i = 1, \ldots, n, \\
+   \eta_i &= X_i \beta + b + u_i \;\in\; \mathbb{R}^{q}, \\
+   \mathrm{vec}(U) &\sim \mathcal{N}\!\bigl(0,\; \sigma^2 \, \Sigma \otimes I_q \bigr), \quad
+   \Sigma \;=\; \theta\, K \;+\; (1-\theta)\, I_n,
 
-where :math:`X_i` is the row of covariates for spot :math:`i`, :math:`\beta` are fixed effects, and :math:`u` is a spatially correlated random effect with covariance :math:`\sigma^2 K`.
+where :math:`X_i` is the row of covariates for spot :math:`i`, :math:`\beta \in \mathbb{R}^{d \times q}` are fixed effects, :math:`b \in \mathbb{R}^{q}` is an intercept,
+and :math:`U = (u_1, \ldots, u_n)^\top \in \mathbb{R}^{n \times q}` stacks the per-spot random effects. The covariance mixes the CAR spatial kernel :math:`K` with an i.i.d. component via :math:`\theta \in [0, 1]`, and assumes independence across the :math:`q` logit dimensions (:math:`\otimes I_q`).
 
-The marginal likelihood is approximated via **Laplace's method** at the mode of the random effects.
-DU testing uses a **score test** comparing the null model (no fixed-effect covariates) to the full model, which avoids fitting the full model for each covariate.
+.. note::
+
+   The SV test (H₀: :math:`\theta = 0`) is implemented as a likelihood ratio test (LRT) in :func:`~splisosm.SplisosmGLMM.test_spatial_variability`. 
+   However, it is not well-calibrated due to technical challenges in model fitting. 
+   The equivalent score test version also takes a quadratic form similar to the HSIC test statistic but with spot-specific adjustments. 
+   See :cite:`su2026consistent` for detailed analysis.
+
+
+For DU testing, we use a **score test** comparing coefficient gradients at the null model (no fixed-effect covariates, :math:`\theta = 0`), which avoids fitting the full model for each covariate.
+However, it still requires estimating nuisance parameters (intercept :math:`b`, total variance :math:`\sigma^2`, and spatial variance proportion :math:`\theta`).
+To compute the maximum likelihood estimates, we approximate the marginal likelihood via **Laplace's method** at the mode of the random effects.
+See :class:`splisosm.model.MultinomGLMM` for implementation details.
 
 Compared to :class:`~splisosm.SplisosmNP`, the GLMM approach:
 
