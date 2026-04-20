@@ -288,7 +288,7 @@ SPLISOSM tests for statistical independence between isoform expression and spati
        method="hsic-ir",          # 'hsic-ir' | 'hsic-gc' | 'hsic-ic' | 'spark-x'
        ratio_transformation="none",  # 'none' | 'clr' | 'ilr' | 'alr'
        nan_filling="mean",           # if 'none', use only non-zero spots per gene (slow)
-       null_method="eig",            # 'eig' (Liu) | 'trace' (normal approx) | 'welch' (scaled chi²) | 'perm'
+       null_method="eig",            # 'eig' (Liu) | 'clt' (normal approx) | 'welch' (scaled chi²) | 'perm'
        null_configs=None,            # e.g. {"approx_rank": 20} to cap eigenvalues
        n_jobs=-1,                    # gene-level parallelism; -1 = all CPUs
        print_progress=True,
@@ -589,11 +589,11 @@ adjust them only when you hit performance or accuracy limits.
    * - **SV null approximation**
      - ``null_method=`` in ``test_spatial_variability`` / ``run_hsic_gc``
      - ``"eig"`` (Liu's chi-square mixture)
-     - ``"trace"`` (moment-matching normal) and ``"welch"`` (Welch–Satterthwaite
+     - ``"clt"`` (moment-matching normal) and ``"welch"`` (Welch–Satterthwaite
        scaled chi-squared) both avoid eigendecomposition — fastest for very large
        *n*.  ``"welch"`` is typically more accurate in the right tail than
-       ``"trace"`` at the same cost.  ``"perm"`` uses permutation; slowest but
-       assumption-free.
+       ``"clt"`` at the same cost.  ``"perm"`` uses permutation; slowest but
+       assumption-free.  (``"trace"`` is a deprecated alias for ``"clt"``.)
    * - **SV null low-rank** (when ``null_method="eig"``)
      - ``null_configs={"approx_rank": k}`` in ``test_spatial_variability`` /
        ``run_hsic_gc``

@@ -300,9 +300,9 @@ class TestUtils(unittest.TestCase):
         coords_np = np.random.rand(n_spots, 2).astype(np.float32)
 
         res_eig = run_hsic_gc(counts_np, coords_np, null_method="eig")
-        res_trace = run_hsic_gc(counts_np, coords_np, null_method="trace")
+        res_clt = run_hsic_gc(counts_np, coords_np, null_method="clt")
 
-        for res, nm in [(res_eig, "eig"), (res_trace, "trace")]:
+        for res, nm in [(res_eig, "eig"), (res_clt, "clt")]:
             self.assertEqual(res["null_method"], nm)
             self.assertEqual(len(res["pvalue"]), n_genes)
             self.assertTrue(np.all(res["pvalue"] >= 0) and np.all(res["pvalue"] <= 1))
@@ -311,13 +311,13 @@ class TestUtils(unittest.TestCase):
 
         # Statistics must be identical (same kernel, same counts; only null differs)
         np.testing.assert_allclose(
-            res_eig["statistic"], res_trace["statistic"], rtol=1e-5
+            res_eig["statistic"], res_clt["statistic"], rtol=1e-5
         )
 
         # P-value rankings should agree between methods
-        rho, _ = scipy.stats.spearmanr(res_eig["pvalue"], res_trace["pvalue"])
+        rho, _ = scipy.stats.spearmanr(res_eig["pvalue"], res_clt["pvalue"])
         self.assertGreater(
-            rho, 0.9, f"Spearman r of p-values between eig and trace was only {rho:.3f}"
+            rho, 0.9, f"Spearman r of p-values between eig and clt was only {rho:.3f}"
         )
 
         # Invalid null method
@@ -787,17 +787,34 @@ class TestRunHsicGc(unittest.TestCase):
         res_sp = run_hsic_gc(torch.from_numpy(counts).to_sparse(), coords)
         np.testing.assert_allclose(res_np["statistic"], res_sp["statistic"], rtol=1e-4)
 
-    def test_matrix_mode_null_method_trace(self):
-        """'trace' null method returns valid p-values and same statistic as 'eig'."""
+    def test_matrix_mode_null_method_clt(self):
+        """'clt' null method returns valid p-values and same statistic as 'eig'."""
         counts, coords = self._make_matrix_inputs()
         res_eig = run_hsic_gc(counts, coords, null_method="eig")
-        res_trace = run_hsic_gc(counts, coords, null_method="trace")
-        self.assertEqual(res_trace["null_method"], "trace")
+        res_clt = run_hsic_gc(counts, coords, null_method="clt")
+        self.assertEqual(res_clt["null_method"], "clt")
         np.testing.assert_allclose(
-            res_eig["statistic"], res_trace["statistic"], rtol=1e-5
+            res_eig["statistic"], res_clt["statistic"], rtol=1e-5
         )
-        self.assertTrue(np.all(res_trace["pvalue"] >= 0))
-        self.assertTrue(np.all(res_trace["pvalue"] <= 1))
+        self.assertTrue(np.all(res_clt["pvalue"] >= 0))
+        self.assertTrue(np.all(res_clt["pvalue"] <= 1))
+
+    def test_matrix_mode_null_method_trace_alias_deprecated(self):
+        """'trace' is accepted as a deprecated alias for 'clt'."""
+        counts, coords = self._make_matrix_inputs()
+        res_clt = run_hsic_gc(counts, coords, null_method="clt")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            res_trace = run_hsic_gc(counts, coords, null_method="trace")
+        dep = [
+            w
+            for w in caught
+            if issubclass(w.category, DeprecationWarning) and "trace" in str(w.message)
+        ]
+        self.assertTrue(len(dep) >= 1, "expected DeprecationWarning for 'trace'")
+        self.assertEqual(res_trace["null_method"], "clt")
+        np.testing.assert_allclose(res_trace["statistic"], res_clt["statistic"])
+        np.testing.assert_allclose(res_trace["pvalue"], res_clt["pvalue"])
 
     def test_matrix_mode_invalid_null_method(self):
         """Invalid null_method raises ValueError."""

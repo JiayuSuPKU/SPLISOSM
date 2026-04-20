@@ -1,4 +1,5 @@
 import unittest
+import warnings
 import torch
 import numpy as np
 import scipy.sparse
@@ -636,7 +637,7 @@ class TestSplisosmNP(unittest.TestCase):
             min_bin_pct=0.0,
             filter_single_iso_genes=False,
         )
-        for null_method in ["eig", "trace", "welch", "perm"]:
+        for null_method in ["eig", "clt", "welch", "perm"]:
             with self.subTest(null_method=null_method):
                 configs = (
                     {"n_perms_per_gene": 50, "perm_batch_size": 10}
@@ -704,7 +705,7 @@ class TestSplisosmNP(unittest.TestCase):
             X[np.ix_(mask, iso_idx)] = 0.0
         adata.layers["counts"] = X
 
-        for null_method in ("trace", "welch", "perm"):
+        for null_method in ("clt", "welch", "perm"):
             with self.subTest(null_method=null_method):
                 model = SplisosmNP()
                 model.setup_data(
@@ -734,6 +735,47 @@ class TestSplisosmNP(unittest.TestCase):
                 self.assertTrue(np.all(np.isfinite(res["pvalue"])))
                 self.assertTrue(np.all(res["pvalue"] >= 0))
                 self.assertTrue(np.all(res["pvalue"] <= 1))
+
+    def test_sv_null_method_trace_alias_deprecated(self):
+        """`null_method='trace'` is a deprecated alias for `'clt'`: same results
+        plus a DeprecationWarning."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        # Canonical name: no warning.
+        res_clt = model.test_spatial_variability(
+            method="hsic-ir",
+            null_method="clt",
+            print_progress=False,
+            return_results=True,
+        )
+
+        # Deprecated alias: same numerics + DeprecationWarning.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            res_trace = model.test_spatial_variability(
+                method="hsic-ir",
+                null_method="trace",
+                print_progress=False,
+                return_results=True,
+            )
+        dep = [
+            w
+            for w in caught
+            if issubclass(w.category, DeprecationWarning) and "trace" in str(w.message)
+        ]
+        self.assertTrue(len(dep) >= 1, "expected DeprecationWarning for 'trace'")
+        self.assertEqual(res_trace["null_method"], "clt")
+        np.testing.assert_allclose(res_trace["statistic"], res_clt["statistic"])
+        np.testing.assert_allclose(res_trace["pvalue"], res_clt["pvalue"])
 
     def test_sv_perm_batch_size_config(self):
         """perm_batch_size in null_configs should be respected."""
@@ -1155,7 +1197,7 @@ class TestSplisosmNP(unittest.TestCase):
         )
 
         pvals = {}
-        for null_method in ("eig", "trace", "welch", "perm"):
+        for null_method in ("eig", "clt", "welch", "perm"):
             null_configs = (
                 {"n_perms_per_gene": 2000, "perm_batch_size": 100}
                 if null_method == "perm"
@@ -1174,11 +1216,11 @@ class TestSplisosmNP(unittest.TestCase):
 
         # Thresholds: asymptotic methods should agree tightly; perm is noisier.
         thresholds = {
-            ("eig", "trace"): 0.90,
+            ("eig", "clt"): 0.90,
             ("eig", "welch"): 0.90,
-            ("trace", "welch"): 0.90,
+            ("clt", "welch"): 0.90,
             ("eig", "perm"): 0.70,
-            ("trace", "perm"): 0.70,
+            ("clt", "perm"): 0.70,
             ("welch", "perm"): 0.70,
         }
         for (m1, m2), thr in thresholds.items():
@@ -1686,13 +1728,13 @@ class TestParallelNP(unittest.TestCase):
                     err_msg="SV pvalue differs between n_jobs=1 and n_jobs=2",
                 )
 
-    def test_sv_parallel_trace_null(self):
-        """SV with hsic-ir + trace null: parallel results are identical."""
+    def test_sv_parallel_clt_null(self):
+        """SV with hsic-ir + clt null: parallel results are identical."""
         for n_jobs in [1, 2]:
             model = self._setup_model(self.adata)
             model.test_spatial_variability(
                 method="hsic-ir",
-                null_method="trace",
+                null_method="clt",
                 n_jobs=n_jobs,
                 print_progress=False,
             )

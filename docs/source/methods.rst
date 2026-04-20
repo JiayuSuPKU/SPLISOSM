@@ -146,9 +146,17 @@ See :func:`splisosm.likelihood.liu_sf` for implementation details.
      The approximation is controlled by ``approx_rank`` in ``null_configs``, with default :math:`\lceil 4\sqrt{n} \rceil` when :math:`n > 5000`.
    - When ``nan_filling='mean'`` (default), the spatial eigenvalues are cached after the first gene and reused for all subsequent genes.
 
-.. _null-trace:
+.. _null-clt:
 
-**2. Moment-matching normal approximation**: ``null_method='trace'``
+**2. Moment-matching normal approximation (CLT)**: ``null_method='clt'``
+
+.. note::
+
+   The previous name ``null_method='trace'`` is retained as a deprecated
+   alias and will emit a ``DeprecationWarning``.  The canonical name is
+   now ``'clt'``, which better disambiguates this moment-matching normal
+   approximation from :ref:`welch <null-welch>` (the Welch–Satterthwaite
+   scaled chi-squared that shares the same matrix traces).
 
 Alternatively, we may use the first two moments of the null distribution to compute p-values (i.e., via Central Limit Theorem),
 which requires only :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)`.
@@ -174,7 +182,7 @@ Note that for non-Gaussian data :math:`Y`, the null variance is off by a kurtosi
 
 With all positive eigenvalues, the chi-squared mixture null can also be approximated by the `Welch-Satterthwaite method <https://en.wikipedia.org/wiki/Welch%E2%80%93Satterthwaite_equation>`_, 
 using one scaled chi-squared variable :math:`g \, \chi^2_h` with scale parameter :math:`g` and degrees of freedom :math:`h`. 
-The parameters are chosen to match the first two moments of the null :math:`(\mu_0, \sigma_0^2)` (same as in the :ref:`trace <null-trace>` method).
+The parameters are chosen to match the first two moments of the null :math:`(\mu_0, \sigma_0^2)` (same as in the :ref:`clt <null-clt>` method).
 
 .. math::
 
@@ -184,12 +192,12 @@ and the p-value is :math:`\mathbb{P}\!\left(\chi^2_h \geq Q/g\right)`.
 
 .. note::
 
-   - Same cost as ``null_method='trace'`` (only :math:`\mathrm{tr}(K)` and
+   - Same cost as ``null_method='clt'`` (only :math:`\mathrm{tr}(K)` and
      :math:`\mathrm{tr}(K^2)` are needed), but typically more accurate in the
      right tail because the null under H₀ is a weighted sum of
      :math:`\chi^2_1` variables rather than Gaussian.  In practice its
      p-values are close to the :ref:`eig <null-eig>` (Liu) reference while
-     remaining as cheap as the :ref:`trace <null-trace>` method.
+     remaining as cheap as the :ref:`clt <null-clt>` method.
    - Recommended when ``null_method='eig'`` is too slow for the dataset
      (e.g., very large :math:`n` with no FFT grid) but a reliable right-tail
      calibration is still needed.
@@ -406,17 +414,17 @@ Summary
      - SplisosmNP / FFT
      - Isoform ratios
      - None
-     - ``eig`` [#fft]_ / ``trace`` / ``welch`` / ``perm``
+     - ``eig`` [#fft]_ / ``clt`` / ``welch`` / ``perm``
    * - HSIC-GC (SVE)
      - SplisosmNP / FFT
      - Gene counts
      - None
-     - ``eig`` [#fft]_ / ``trace`` / ``welch`` / ``perm``
+     - ``eig`` [#fft]_ / ``clt`` / ``welch`` / ``perm``
    * - HSIC-IC
      - SplisosmNP / FFT
      - Isoform counts
      - None
-     - ``eig`` [#fft]_ / ``trace`` / ``welch`` / ``perm``
+     - ``eig`` [#fft]_ / ``clt`` / ``welch`` / ``perm``
    * - DU (unconditional)
      - SplisosmNP / FFT
      - Isoform ratios

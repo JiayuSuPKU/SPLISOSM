@@ -174,7 +174,7 @@ def _sv_gene_worker_np(
             lambda_sp_eff = torch.linalg.eigvalsh(K_sp_gene)
             lambda_sp_eff = lambda_sp_eff[lambda_sp_eff > 1e-5]
             k_eff_eff = len(lambda_sp_eff)
-        elif null_method in ("trace", "welch"):
+        elif null_method in ("clt", "welch"):
             trK_eff = torch.trace(K_sp_gene)
             trK2_eff = K_sp_gene.pow(2).sum()
         else:  # null_method == "perm"
@@ -215,15 +215,15 @@ def _sv_gene_worker_np(
         lambda_spy = (lambda_sp_eff.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
         pval = liu_sf((hsic_scaled * n_spots_eff).numpy(), lambda_spy.numpy())
 
-    elif null_method in ("trace", "welch"):
+    elif null_method in ("clt", "welch"):
         S = y.T @ y
         trS = torch.trace(S).item()
         trS2 = torch.trace(S @ S).item()
         n1 = n_spots_eff - 1
         mean_null = trK_eff.item() * trS / n1
         var_null = 2.0 * trK2_eff.item() * trS2 / (n1**2)
-        if null_method == "trace":
-            # moment-matching normal (CLT) approximation
+        if null_method == "clt":
+            # moment-matching normal (Central Limit Theorem) approximation
             z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
             pval = float(_norm_dist.sf(z))
         else:
@@ -900,7 +900,7 @@ class SplisosmNP:
         method: Literal["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"] = "hsic-ir",
         ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
         nan_filling: Literal["mean", "none"] = "mean",
-        null_method: Literal["eig", "trace", "welch", "perm"] = "eig",
+        null_method: Literal["eig", "clt", "welch", "perm", "trace"] = "eig",
         null_configs: Optional[dict[str, Any]] = None,
         n_jobs: int = -1,
         return_results: bool = False,
@@ -929,7 +929,7 @@ class SplisosmNP:
         nan_filling : {"mean", "none"}, optional
             Strategy for NaN values in isoform ratios.
             See :func:`splisosm.utils.counts_to_ratios` for details.
-        null_method : {"eig", "trace", "welch", "perm"}, optional
+        null_method : {"eig", "clt", "welch", "perm"}, optional
             Method for computing the null distribution of the test statistic:
 
             * ``"eig"`` (default): asymptotic chi-square mixture using kernel
@@ -938,15 +938,16 @@ class SplisosmNP:
               eigenvalues. By default, approx_rank = np.ceil(np.sqrt(n_spots) * 4)
               for large datasets (n_spots > 5000). Set it to None to use
               all eigenvalues, which can be slow for large n_spots.
-            * ``"trace"``: moment-matching normal (CLT) approximation using
-              tr(K') and tr(K'²) of the (centred) spatial kernel.  Fastest,
-              but tail probabilities can be inaccurate when the effective
-              degrees of freedom of the chi-squared mixture is small.
+            * ``"clt"``: moment-matching normal (Central Limit Theorem)
+              approximation using tr(K') and tr(K'²) of the (centred) spatial
+              kernel.  Fastest, but tail probabilities can be inaccurate when
+              the effective degrees of freedom of the chi-squared mixture is
+              small.  ``"trace"`` is accepted as a deprecated alias.
             * ``"welch"``: Welch-Satterthwaite moment matching.  Uses the same
-              tr(K') and tr(K'²) as ``"trace"`` but approximates the null by a
+              tr(K') and tr(K'²) as ``"clt"`` but approximates the null by a
               scaled chi-squared ``g * chi2(h)`` with
               ``g = Var/(2*E)`` and ``h = 2*E^2/Var``.  Comparable cost to
-              ``"trace"`` with more accurate right-tail p-values, typically
+              ``"clt"`` with more accurate right-tail p-values, typically
               closer to the ``"eig"`` (Liu) reference.
             * ``"perm"``: permutation-based null distribution.  Supports
               optional ``null_configs["n_perms_per_gene"]`` (default 1000),
@@ -984,7 +985,21 @@ class SplisosmNP:
             )
 
         valid_methods = ["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"]
-        valid_null_methods = ["eig", "trace", "welch", "perm"]
+        # Back-compat: accept the legacy "trace" alias but emit a
+        # DeprecationWarning.  The canonical name for this moment-matching
+        # normal approximation is now "clt" (Central Limit Theorem), which
+        # avoids conflating it with the Welch-Satterthwaite path (``"welch"``)
+        # that also uses matrix traces.
+        if null_method == "trace":
+            warnings.warn(
+                "null_method='trace' is deprecated; use 'clt' instead "
+                "(same moment-matching normal approximation; renamed to "
+                "disambiguate from 'welch').",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            null_method = "clt"
+        valid_null_methods = ["eig", "clt", "welch", "perm"]
         valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
         valid_nan_filling = ["mean", "none"]
         assert (
@@ -1058,7 +1073,7 @@ class SplisosmNP:
                 lambda_sp = self.sp_kernel.eigenvalues(k=approx_rank)
                 lambda_sp = lambda_sp[lambda_sp > 1e-5]
                 k_eff = len(lambda_sp)
-            elif null_method in ("trace", "welch"):
+            elif null_method in ("clt", "welch"):
                 trK = self.sp_kernel.trace()
                 trK2 = self.sp_kernel.square_trace()
             elif null_method == "perm":
@@ -1077,8 +1092,8 @@ class SplisosmNP:
                     K_sp,
                     lambda_sp if null_method == "eig" else None,
                     k_eff if null_method == "eig" else 0,
-                    trK if null_method in ("trace", "welch") else None,
-                    trK2 if null_method in ("trace", "welch") else None,
+                    trK if null_method in ("clt", "welch") else None,
+                    trK2 if null_method in ("clt", "welch") else None,
                     n_nulls if null_method == "perm" else 0,
                     _perm_batch_size if null_method == "perm" else 1,
                 )
