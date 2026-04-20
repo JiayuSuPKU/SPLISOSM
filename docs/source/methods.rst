@@ -106,7 +106,7 @@ SPLISOSM uses a **quadratic form** V-statistic, which computes HSIC with a linea
 
    \widehat{\mathrm{HSIC}} = \frac{1}{(n-1)^2} \mathrm{tr}(Y^\top K Y),
 
-where :math:`K` is the (standardised, optionally double-centred) CAR kernel.
+where :math:`K` is the (**double-centred**, optionally standardised) CAR kernel.
 This equals the sum of squared spatial autocorrelations of each linear combination of isoform profiles.
 Since we have
 

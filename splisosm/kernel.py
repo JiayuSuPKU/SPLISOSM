@@ -121,10 +121,17 @@ class IdentityKernel(Kernel):
     ----------
     n_spots : int
         Number of spatial locations.
+    centering : bool, optional
+        If ``True``, apply double-centring ``H K H`` with ``H = I - (1/n) 1 1^T``.
+        For ``K = I`` this reduces to ``H`` itself (``H`` is idempotent), whose
+        spectrum has :math:`n - 1` unit eigenvalues and one zero eigenvalue.
+        Default ``False``.  HSIC-based SV/DU tests should set this to ``True``
+        for consistency with the double-centred HSIC formulation.
     """
 
-    def __init__(self, n_spots: int) -> None:
+    def __init__(self, n_spots: int, centering: bool = False) -> None:
         self._n = n_spots
+        self._centering = bool(centering)
         # Store Q as a sparse identity to avoid allocating a dense n×n matrix.
         # K = I = Q @ Q.T, but Q is never accessed externally — use xtKx_approx().
         _idx = torch.arange(n_spots).unsqueeze(0).repeat(2, 1)  # (2, n_spots)
@@ -135,33 +142,42 @@ class IdentityKernel(Kernel):
             )
 
     def realization(self) -> torch.Tensor:
-        """Return the identity matrix of shape ``(n_spots, n_spots)``."""
+        """Return ``I`` (or ``H = I - (1/n) 1 1^T`` when ``centering=True``)."""
+        if self._centering:
+            return torch.eye(self._n) - torch.full((self._n, self._n), 1.0 / self._n)
         return torch.eye(self._n)
 
     def xtKx(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute ``x^T I x = x^T x``."""
-        return x.t() @ x
+        """Compute ``x^T K x`` where ``K = I`` (or ``H I H = H`` when centred)."""
+        xc = x - x.mean(dim=0, keepdim=True) if self._centering else x
+        return xc.t() @ xc
 
     def xtKx_exact(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute ``x^T I x = x^T x`` (exact, same as :meth:`xtKx`)."""
-        return x.t() @ x
+        """Exact quadratic form; identical to :meth:`xtKx` for this kernel."""
+        return self.xtKx(x)
 
     def xtKx_approx(self, x: torch.Tensor, k: int | None = None) -> torch.Tensor:
-        """Compute ``x^T I x = x^T x`` (K = I; no approximation required)."""
-        return x.t() @ x
+        """Quadratic form; identical to :meth:`xtKx` (no approximation needed)."""
+        return self.xtKx(x)
 
     def eigenvalues(self, k: int | None = None) -> torch.Tensor:
-        """Return ``k`` ones (all eigenvalues of I are 1)."""
-        n = k if k is not None else self._n
+        """Return the leading eigenvalues of ``K``.
+
+        For ``K = I`` all :math:`n` eigenvalues are ``1``.  For ``H I H = H``
+        there are :math:`n - 1` unit eigenvalues and a single zero eigenvalue;
+        only the nonzero ones are returned.
+        """
+        n_nonzero = max(self._n - 1, 0) if self._centering else self._n
+        n = n_nonzero if k is None else min(int(k), n_nonzero)
         return torch.ones(n)
 
     def trace(self) -> torch.Tensor:
-        """Return tr(I) = n_spots."""
-        return torch.tensor(float(self._n))
+        """Return tr(K): ``n`` for ``I`` and ``n - 1`` for ``H``."""
+        return torch.tensor(float(self._n - 1 if self._centering else self._n))
 
     def square_trace(self) -> torch.Tensor:
-        """Return tr(I²) = n_spots."""
-        return torch.tensor(float(self._n))
+        """Return tr(K²): ``n`` for ``I`` and ``n - 1`` for ``H`` (idempotent)."""
+        return torch.tensor(float(self._n - 1 if self._centering else self._n))
 
 
 def _build_adj_from_coords(
@@ -515,14 +531,17 @@ class SpatialCovKernel(Kernel):
     def _hutchinson_trace(
         self, squared: bool, n_vectors: int = 30, seed: int = 0
     ) -> float:
-        """Hutchinson stochastic estimator for tr(HKH) or tr((HKH)²).
+        """Hutchinson stochastic estimator for tr(K') [or tr((K')²)].
 
-        Centred ±1 probing vectors target the double-centred kernel K' = HKH.
+        Here ``K'`` is the *effective* kernel: ``HKH`` when
+        ``_centering=True`` and ``K`` otherwise.  With ``_centering=True``
+        the ±1 probing vectors are double-centred on both sides of the LU
+        solve; with ``_centering=False`` they are used directly.
 
         Parameters
         ----------
         squared
-            If ``True`` estimate tr((HKH)²), else tr(HKH).
+            If ``True`` estimate tr((K')²), else tr(K').
         n_vectors
             Number of probing vectors.
         seed
@@ -532,15 +551,20 @@ class SpatialCovKernel(Kernel):
         n, m = self._n, n_vectors
         rng = np.random.default_rng(seed=seed)
         rvs = rng.choice([-1.0, 1.0], size=(n, m))
-        rvs_c = rvs - rvs.mean(axis=0)  # H @ rvs
-        Kv = lu.solve(rvs_c)  # K (H rvs)
-        Kv_c = Kv - Kv.mean(axis=0)  # H K H rvs
-        if squared:
-            # tr((HKH)²) ≈ (1/m) Σ ||HKH v_i||²
-            return float((Kv_c**2).sum() / m)
+
+        if self._centering:
+            v_left = rvs - rvs.mean(axis=0)  # H @ rvs
+            Kv = lu.solve(v_left)  # K (H rvs)
+            Kv_eff = Kv - Kv.mean(axis=0)  # H K H rvs
         else:
-            # tr(HKH) ≈ (1/m) Σ v_i^T HKH v_i
-            return float((rvs_c * Kv_c).sum() / m)
+            v_left = rvs
+            Kv_eff = lu.solve(rvs)  # K rvs
+
+        if squared:
+            # tr((K')²) ≈ (1/m) Σ ||K' v_i||²
+            return float((Kv_eff**2).sum() / m)
+        # tr(K') ≈ (1/m) Σ v_i^T K' v_i
+        return float((v_left * Kv_eff).sum() / m)
 
     # ------------------------------------------------------------------
     # Kernel interface
@@ -663,9 +687,13 @@ class SpatialCovKernel(Kernel):
         if self.K_sp is not None:
             return x.t() @ self.K_sp @ x
 
-        # Implicit: sparse LU solve — M u = x  →  u = K x  →  x^T u = x^T K x.
+        # Implicit: sparse LU solve.  When ``_centering=True`` the effective
+        # kernel is HKH, so column-centre x first: x_c = Hx, then
+        # x^T (HKH) x = x_c^T K x_c  (H is symmetric idempotent).
         lu = self._get_lu()
         x_np = x.numpy().astype(np.float64)
+        if self._centering:
+            x_np = x_np - x_np.mean(axis=0, keepdims=True)
         u = lu.solve(x_np)  # shape (n, d)
         return torch.from_numpy((x_np.T @ u).astype(np.float32))
 
@@ -844,6 +872,14 @@ class FFTKernel(Kernel):
         ``1`` uses nearest neighbours in the periodic metric.
     workers
         Number of workers used by ``scipy.fft.fft2``.
+    centering
+        If ``True``, apply double-centring ``H K H`` with ``H = I - (1/n) 1 1^T``.
+        On a periodic grid the all-ones vector is the DFT DC eigenvector, so
+        double-centring is equivalent to zeroing the ``(0, 0)`` entry of the
+        spectrum; :meth:`xtKx`, :meth:`trace`, :meth:`square_trace`, and
+        :meth:`eigenvalues` all reflect the centred kernel.  Default ``False``.
+        HSIC-based SV/DU tests should set this to ``True`` for consistency with
+        the double-centred HSIC formulation.
     """
 
     def __init__(
@@ -853,6 +889,7 @@ class FFTKernel(Kernel):
         rho: float = 0.99,
         neighbor_degree: int = 1,
         workers: int | None = None,
+        centering: bool = False,
     ) -> None:
         if len(shape) != 2:
             raise ValueError("`shape` must be a tuple of length 2: (ny, nx).")
@@ -867,9 +904,15 @@ class FFTKernel(Kernel):
         self.neighbor_degree = int(neighbor_degree)
         self.rho = min(float(rho), 0.99)
         self.workers = workers
+        self._centering = bool(centering)
 
         self._min_dist_sq = self._precompute_square_torus_distances()
         self._spectrum_2d = self._compute_car_spectrum()
+        if self._centering:
+            # Zero the DC component: on a periodic grid the (0, 0) DFT basis
+            # vector is the constant mode, so dropping that eigenvalue is
+            # equivalent to the double-centring H K H.
+            self._spectrum_2d[0, 0] = 0.0
         self.spectrum = self._spectrum_2d.ravel()
 
     # ------------------------------------------------------------------

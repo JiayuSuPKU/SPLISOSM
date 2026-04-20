@@ -142,6 +142,13 @@ def _sv_gene_worker_np(
 
     lambda_sp_eff = lambda_sp
     k_eff_eff = k_eff
+    # By default, null-distribution inputs come from the global (already
+    # double-centred) K_sp.  The `hsic-ir + nan_filling='none'` branch below
+    # overrides these with per-gene values derived from K_sp_gene so that the
+    # statistic and the null reference the *same* (centred) kernel submatrix.
+    K_sp_null = K_sp
+    trK_eff = trK
+    trK2_eff = trK2
 
     if method == "hsic-ir" and nan_filling == "none":
         # per-gene spatial kernel: drop NaN spots and recompute K
@@ -158,12 +165,22 @@ def _sv_gene_worker_np(
         K_sp_gene = K_sp_gene - K_sp_gene.mean(dim=0, keepdim=True)
         K_sp_gene = K_sp_gene - K_sp_gene.mean(dim=1, keepdim=True)
 
+        hsic_scaled = torch.trace(y.T @ K_sp_gene @ y)
+
+        # The passed-in null inputs (lambda_sp, trK, trK2) describe the global
+        # K_sp; with per-gene NaN filtering they no longer match the statistic.
+        # Recompute them from the per-gene centred submatrix.
         if null_method == "eig":
             lambda_sp_eff = torch.linalg.eigvalsh(K_sp_gene)
             lambda_sp_eff = lambda_sp_eff[lambda_sp_eff > 1e-5]
             k_eff_eff = len(lambda_sp_eff)
-
-        hsic_scaled = torch.trace(y.T @ K_sp_gene @ y)
+        elif null_method in ("trace", "welch"):
+            trK_eff = torch.trace(K_sp_gene)
+            trK2_eff = K_sp_gene.pow(2).sum()
+        else:  # null_method == "perm"
+            # Use the per-gene centred kernel directly; `K_sp.xtKx` would apply
+            # the global (wrong-shape) kernel to the NaN-filtered y_batch.
+            K_sp_null = K_sp_gene
 
     else:  # global spatial kernel shared across all genes
         if method == "hsic-ic":
@@ -203,8 +220,8 @@ def _sv_gene_worker_np(
         trS = torch.trace(S).item()
         trS2 = torch.trace(S @ S).item()
         n1 = n_spots_eff - 1
-        mean_null = trK.item() * trS / n1
-        var_null = 2.0 * trK2.item() * trS2 / (n1**2)
+        mean_null = trK_eff.item() * trS / n1
+        var_null = 2.0 * trK2_eff.item() * trS2 / (n1**2)
         if null_method == "trace":
             # moment-matching normal (CLT) approximation
             z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
@@ -230,10 +247,10 @@ def _sv_gene_worker_np(
             y_batch = torch.cat(
                 [y[torch.randperm(n_spots_eff)] for _ in range(B)], dim=1
             )
-            if isinstance(K_sp, torch.Tensor):
-                R = y_batch.T @ K_sp @ y_batch
+            if isinstance(K_sp_null, torch.Tensor):
+                R = y_batch.T @ K_sp_null @ y_batch
             else:
-                R = K_sp.xtKx(y_batch)
+                R = K_sp_null.xtKx(y_batch)
             null_stats.append(torch.diagonal(R).reshape(B, p_isos).sum(dim=1))
         null_m = torch.cat(null_stats)
         pval = float((null_m > hsic_scaled).sum() / n_nulls)
@@ -642,7 +659,7 @@ class SplisosmNP:
         # (2) adj_key is provided
         self._skip_kernel_construction = skip_spatial_kernel
         if skip_spatial_kernel:
-            self.sp_kernel = IdentityKernel(self.n_spots)
+            self.sp_kernel = IdentityKernel(self.n_spots, centering=True)
             self._kernel_source = "identity (skip_spatial_kernel=True)"
         elif adj_matrix is not None:
             self.sp_kernel = SpatialCovKernel(

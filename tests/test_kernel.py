@@ -199,6 +199,80 @@ class TestSpatialCovKernel(unittest.TestCase):
         self.assertEqual(cov.shape, (self.n_small, self.n_small))
         self.assertTrue(torch.allclose(cov, cov.T, atol=1e-5))
 
+    def test_implicit_honors_centering_flag(self):
+        """Implicit (LU) mode must return the same results as dense mode for
+        both ``centering=True`` and ``centering=False``.
+
+        Regression for a latent gap where ``_hutchinson_trace`` always
+        estimated tr(HKH) and ``xtKx_exact`` always returned ``x^T K x``
+        regardless of the ``_centering`` flag.  Dense mode has always been
+        correct because ``K_sp`` is centred at construction; implicit mode
+        now applies H on the fly.
+        """
+        rng = np.random.default_rng(0)
+        n_impl = 5010
+        coords = rng.uniform(0, 10, size=(n_impl, 2))
+        # Build a small reference dense kernel by constructing an (n<=5000)
+        # SpatialCovKernel from the same adjacency so we can compare exact
+        # quantities against the Hutchinson / LU-solve implicit path.
+        from splisosm.kernel import (
+            _build_adj_from_coords,
+            _build_car_precision_from_adj,
+        )
+
+        adj = _build_adj_from_coords(coords, k_neighbors=4, mutual_neighbors=True)
+        inv_cov = _build_car_precision_from_adj(adj, rho=0.99)
+
+        for centering in (False, True):
+            with self.subTest(centering=centering):
+                # Implicit-mode kernel (n > DENSE_THRESHOLD)
+                K_impl = SpatialCovKernel.__new__(SpatialCovKernel)
+                K_impl._init_from_precision(
+                    inv_cov, standardize_cov=False, centering=centering
+                )
+                self.assertIsNone(K_impl.K_sp, "Expected implicit (LU) mode")
+
+                # Dense-mode reference via direct inversion of the same M.
+                import scipy.sparse.linalg as spla
+
+                M_inv_dense = spla.inv(inv_cov).toarray().astype(np.float64)
+                K_dense_mat = M_inv_dense.copy()
+                if centering:
+                    K_dense_mat -= K_dense_mat.mean(axis=0, keepdims=True)
+                    K_dense_mat -= K_dense_mat.mean(axis=1, keepdims=True)
+                K_dense_t = torch.from_numpy(K_dense_mat.astype(np.float32))
+
+                expected_trace = float(torch.trace(K_dense_t))
+                expected_sq_trace = float(K_dense_t.pow(2).sum())
+
+                # Hutchinson estimator uses 30 probes; tolerances reflect Monte-Carlo noise.
+                tr_impl = float(K_impl.trace())
+                sqtr_impl = float(K_impl.square_trace())
+                self.assertAlmostEqual(
+                    tr_impl / expected_trace,
+                    1.0,
+                    delta=0.15,
+                    msg=f"trace() wrong for centering={centering}: "
+                    f"impl={tr_impl:.3f} vs exact={expected_trace:.3f}",
+                )
+                self.assertAlmostEqual(
+                    sqtr_impl / expected_sq_trace,
+                    1.0,
+                    delta=0.15,
+                    msg=f"square_trace() wrong for centering={centering}: "
+                    f"impl={sqtr_impl:.3f} vs exact={expected_sq_trace:.3f}",
+                )
+
+                # xtKx_exact must match the exact dense quadratic form.
+                torch.manual_seed(0)
+                x = torch.randn(n_impl, 3, dtype=torch.float32)
+                impl_q = K_impl.xtKx_exact(x)
+                dense_q = x.t() @ K_dense_t @ x
+                self.assertTrue(
+                    torch.allclose(impl_q, dense_q, atol=1e-2, rtol=1e-3),
+                    msg=f"xtKx_exact mismatched for centering={centering}",
+                )
+
     def test_eigenvalues_cache_reuse_dense(self):
         """Dense mode: cached full decomp is always sufficient; k > n is clipped at n."""
         K = SpatialCovKernel.from_coordinates(

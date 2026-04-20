@@ -648,6 +648,7 @@ class SplisosmFFT:
             rho=self._rho,
             neighbor_degree=self._neighbor_degree,
             workers=self._workers,
+            centering=True,
         )
         eigvals = self.sp_kernel.eigenvalues()
         self._kernel_eigvals = eigvals[eigvals > 1e-8]

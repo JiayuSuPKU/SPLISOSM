@@ -681,6 +681,60 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertTrue(np.all(res["pvalue"] >= 0))
         self.assertTrue(np.all(res["pvalue"] <= 1))
 
+    def test_sv_nan_filling_none_uses_per_gene_kernel_moments(self):
+        """trace/welch/perm nulls with nan_filling='none' must use per-gene K.
+
+        The `hsic-ir + nan_filling='none'` branch builds a gene-specific
+        double-centred kernel submatrix (dropping NaN spots).  The null
+        moments / perm kernel must reference that submatrix, not the global
+        K_sp; otherwise p-values are mis-calibrated (or shape-mismatch in
+        the perm path).  This test injects NaNs into each gene's ratio
+        and checks that all three null methods run and return valid p-values.
+        """
+        # Rebuild adata with a sprinkling of dropout spots so that
+        # counts_to_ratios(nan_filling='none') actually emits NaNs.
+        rng = np.random.default_rng(0)
+        adata = self.adata.copy()
+        X = adata.layers["counts"].copy()
+        # Zero out ~10% of spots per gene to create NaN ratios after
+        # counts_to_ratios when the gene has zero total in those spots.
+        for gene in adata.var["gene_symbol"].unique():
+            iso_idx = np.where(adata.var["gene_symbol"].values == gene)[0]
+            mask = rng.random(self.n_spots) < 0.1
+            X[np.ix_(mask, iso_idx)] = 0.0
+        adata.layers["counts"] = X
+
+        for null_method in ("trace", "welch", "perm"):
+            with self.subTest(null_method=null_method):
+                model = SplisosmNP()
+                model.setup_data(
+                    adata=adata,
+                    layer="counts",
+                    spatial_key="spatial",
+                    group_iso_by="gene_symbol",
+                    gene_names="gene_label",
+                    min_counts=0,
+                    min_bin_pct=0.0,
+                    filter_single_iso_genes=False,
+                )
+                configs = (
+                    {"n_perms_per_gene": 30, "perm_batch_size": 10}
+                    if null_method == "perm"
+                    else {}
+                )
+                model.test_spatial_variability(
+                    method="hsic-ir",
+                    nan_filling="none",
+                    null_method=null_method,
+                    null_configs=configs,
+                    print_progress=False,
+                )
+                res = model._sv_test_results
+                self.assertEqual(len(res["pvalue"]), self.n_genes)
+                self.assertTrue(np.all(np.isfinite(res["pvalue"])))
+                self.assertTrue(np.all(res["pvalue"] >= 0))
+                self.assertTrue(np.all(res["pvalue"] <= 1))
+
     def test_sv_perm_batch_size_config(self):
         """perm_batch_size in null_configs should be respected."""
         model = SplisosmNP()
