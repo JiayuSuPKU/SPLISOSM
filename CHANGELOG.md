@@ -1,5 +1,90 @@
 # Changelog
 
+## v1.1.1 (2026-04-20)
+
+### Bug fixes
+
+**`SplisosmFFT` — missing kernel double-centring on FFT SV tests**
+
+Prior to v1.1.1, `SplisosmFFT.setup_data()` built the internal `FFTKernel` without passing `centering=True`, so the periodic CAR kernel
+retained its DC eigenvalue $\lambda^K_{(0,0)} = 1/(1 - \rho)$ (≈ 100 at the default `rho=0.99`). 
+This violates the standard HSIC double-centring convention and inflates p-values because the constant mode is included in the null mixture.
+
+Impact of the fix (`centering=True` is now passed explicitly):
+
+- **Test statistic** (`tr(Y^T K Y)`): **unchanged** because of existing column-centring.
+- **Gene ranking**: **unchanged** (a monotone transformation of test statistics).
+- **P-values**: systematically *smaller* (more significant) after the fix.
+- **FDR hits**: expect *more* genes to pass a fixed BH threshold after upgrading; the previous v1.1.0 results were conservative.
+  From tutorials: 
+  - `Visium FFPE`: 68 → 74 SVP genes (FDR < 0.01).
+  - `Visium HD FFPE`: 192 → 196 SVP genes (FDR < 0.01).
+  - `Visium HD 3'`: 501 → 506 SVP genes (FDR < 0.01).
+  - `Visium HD ONT`: 784 → 790 SVP genes (FDR < 0.01).
+  - `Xenium Prime 5K binned`: 2144 → 2158 SVP genes (FDR < 0.01).
+
+**`SplisosmNP` — per-gene null mismatch for `hsic-ir` + `nan_filling='none'`**
+
+In this branch the worker builds a per-gene double-centred kernel submatrix `K_sp_gene` (dropping spots whose isoform ratios are NaN),
+but the `trace` / `welch` null reused `tr(K_sp)` / `tr(K_sp²)` from the *global* kernel, and the `perm` null applied the global `K_sp` to the
+NaN-filtered `y_batch` (causing a shape mismatch and runtime error whenever filtering actually removed spots). All three null methods now
+reference `K_sp_gene` consistently.
+
+### Other bug fixes with no user-visible numerical change
+
+- `SpatialCovKernel` implicit (LU-solve) path for `n > 5000`:
+  - `_hutchinson_trace` unconditionally returned `tr(HKH)` / `tr((HKH)²)`; now branches on the `_centering` flag so
+    `centering=False` correctly returns `tr(K)` / `tr(K²)`.
+  - `xtKx_exact` returned `x^T K x` regardless of `_centering`; now applies `H` on both sides when `centering=True`.
+
+  All current call sites build the implicit kernel with `centering=True` and pre-column-centre the input, so dense-mode and implicit-mode
+  results continue to agree; these are latent API consistency fixes.
+- BED probe filtering in `load_visium_probe`: tightened substring matching to avoid spurious hits across gene name prefixes.
+
+### Renames (back-compat preserved)
+
+- **`null_method='trace'` → `null_method='clt'`** in `SplisosmNP.test_spatial_variability` and `splisosm.utils.run_hsic_gc`.
+  The previous name `'trace'` conflated the moment-matching normal (Central Limit Theorem) approximation with the Welch–Satterthwaite
+  `'welch'` path, which also uses the matrix traces `tr(K)` / `tr(K²)`.
+  `'trace'` is still accepted and returns identical results, but emits a `DeprecationWarning`; please update call sites to `'clt'`.
+
+### New features
+
+- **`null_method='welch'`** for `SplisosmNP.test_spatial_variability` and `splisosm.utils.run_hsic_gc`. 
+  Uses Welch–Satterthwaite moment matching (`g·χ²_h` with `g = Var/2E`, `h = 2E²/Var`) from the same `tr(K)` and `tr(K²)` as `null_method='clt'`. 
+  Typically close to the `eig` (Liu) reference and is recommended when `eig` is too slow.
+- **Optional `spatial_key`** when `adj_key` is provided (`SplisosmNP`, `SplisosmGLMM`, `run_hsic_gc` AnnData mode). 
+  Non-spatial AnnData (e.g. scRNA-seq with `adata.obsp['connectivities']` from `scanpy.pp.neighbors`) can now be tested end-to-end without coordinates.
+  `method='spark-x'` (SV) and `method='hsic-gp'` (DU) raise a targeted `ValueError` at call time when coordinates are absent.
+- `IdentityKernel` and `FFTKernel` now document a `centering: bool = False` constructor argument matching `SpatialCovKernel`; 
+  HSIC-based SV/DU workflows should always set `centering=True` (no direct impact).
+
+### Documentation
+
+- **`methods.rst`** — mathematical corrections and notation sweep:
+  - Liu's chi-squared mixture null: the missing `1/n` factor is now explicit, `Q = tr(Y^T K Y) ≈ (1/n) Σ λ^K_i λ^Y_j Z_{ij}`.
+  - Trace/Welch moments: `μ₀ = (1/n) tr(K) tr(Y^T Y)`, `σ₀² = (2/n²) tr(K²) tr((Y^T Y)²)` (previous form had an incorrect `1/(n−1)` scaling).
+  - FFT-DU: corrected the claim about the p-value source: covariate and response eigenvalues, not the FFT spatial spectrum.
+  - FFT convention: the `1/n` prefactor in the inverse DFT identity `F⁻¹ = (1/n) F*` is now stated explicitly.
+  - GLMM model spec rewritten with explicit dimensions (`β ∈ ℝ^{d×q}`, `U ∈ ℝ^{n×q}`), reference-category multinomial-logit
+    link, and a Kronecker-form random-effect covariance `Σ = θK + (1−θ)I_n`, `vec(U) ~ N(0, σ² Σ ⊗ I_q)`.
+  - Notation unified across the page: `i ∈ {1,…,n}` indexes spots, `j ∈ {1,…,p}` indexes isoforms; `K_{ii'}` for spot-pair kernel entries.
+- **`quickstart.rst`** — Inputs-and-outputs section rewritten and consolidated with the "Expected input data format" spec moved in from
+  `txquant.rst`. New subsection documenting the non-spatial / single-cell workflow via `adj_key` + targeted errors for operations
+  that still require coordinates.
+- **README** — platform/feature table, model-class decision tree, non-spatial path, paper + preprint references, and badges.
+- All tutorial notebooks: updated to v1.1.1. Add a new `visium_ffpe.ipynb` demo for 10x Visium FFPE (v2, CytAssit) data and for SplisosmNP vs SplisosmFFT comparison.
+
+### Testing
+
+- New: `test_sv_nan_filling_none_uses_per_gene_kernel_moments` (`tests/test_hyptest_np.py`) — regression for the per-gene null fix.
+- New: `test_implicit_honors_centering_flag` (`tests/test_kernel.py`) — dense/implicit agreement for `trace`, `square_trace`, and `xtKx_exact` under both
+  `centering=True` and `centering=False`.
+- Extended `test_null_methods_agreement` to include `welch` alongside `eig` / `clt` / `perm` (Spearman-ρ thresholds at ≥ 0.90 pairwise among the three asymptotic methods).
+- New: `test_sv_null_method_trace_alias_deprecated` (`tests/test_hyptest_np.py`) and `test_matrix_mode_null_method_trace_alias_deprecated` (`tests/test_utils.py`) — 
+  assert the deprecated `'trace'` alias returns identical results to `'clt'` and emits a `DeprecationWarning`.
+- 390 tests passing (up from 371 in v1.1.0), 4 GPU-skipped.
+
 ## v1.1.0 (2026-04-08)
 
 ### Breaking Changes

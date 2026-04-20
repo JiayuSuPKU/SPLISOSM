@@ -43,6 +43,7 @@ extensions = [
     'autoapi.extension',
     'sphinx.ext.napoleon',
     'sphinxcontrib.bibtex',
+    'sphinx.ext.mathjax',
 ]
 
 # MyST configuration
@@ -90,6 +91,12 @@ python_use_unqualified_type_names = True
 # Autosectionlabel configuration
 autosectionlabel_prefix_document = True
 
+# Silence duplicate-label warnings that are expected in the changelog —
+# every version block repeats `New features`, `Bug fixes`, `Testing`,
+# and autosectionlabel emits a warning for each.  Real broken xrefs
+# still surface as `ref.ref` warnings.
+suppress_warnings = ["autosectionlabel.changelog", "autosectionlabel.CHANGELOG"]
+
 # Intersphinx mapping (for cross-references)
 intersphinx_mapping = {
     # 'python': ('https://docs.python.org/3', None),
@@ -103,11 +110,15 @@ intersphinx_mapping = {
 }
 intersphinx_disabled_domains = ['std']
 
-# LaTeX options for math rendering (MathJax 4)
-mathjax4_config = {
+# LaTeX options for math rendering (myst-nb uses MathJax 3)
+myst_enable_extensions = [
+    "amsmath",
+    "dollarmath",
+]
+mathjax3_config = {
     'tex': {
-        'inlinemath': [['$', '$'], ['\\(', '\\)']],
-        'displaymath': [['$$', '$$'], ['\\[', '\\]']],
+        'inlinemath': [['\\(', '\\)']],
+        'displaymath': [['\\[', '\\]']],
     }
 }
 
