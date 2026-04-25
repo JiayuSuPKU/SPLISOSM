@@ -44,7 +44,7 @@ Summary of class features:
      - AnnData
      - any
      - fast
-     - optional via ``null_configs={"approx_rank": k}`` for SV, and ``gpr_configs={"covariate": {"n_inducing": m}}`` for DU.
+     - optional via ``null_configs={"n_probes": m}`` / ``{"approx_rank": k}`` for SV, and ``gpr_configs={"covariate": {"n_inducing": m}}`` for DU.
    * - :class:`~splisosm.SplisosmFFT`
      - ✓
      - ✓
@@ -205,13 +205,14 @@ Both include a Benjamini-Hochberg adjusted ``pvalue_adj`` column. For DU tests, 
 .. note::
     Since ``v1.1.0``, the ``approx_rank`` argument was moved out of ``setup_data``:
 
-    * **SplisosmNP** — pass ``null_configs={"approx_rank": k}`` to
-      :meth:`~splisosm.SplisosmNP.test_spatial_variability` to cap the eigenvalue
-      rank used for the HSIC null distribution.
+    * **SplisosmNP** — pass ``null_configs={"n_probes": m}`` to control
+      Hutchinson cumulant probes, or ``null_configs={"approx_rank": k}`` to cap
+      the eigenvalue rank used for the HSIC null distribution.
+      The same ``n_probes`` setting controls Welch Hutchinson trace probes
+      when the CAR covariance is implicit.
     * **SplisosmGLMM** — pass ``approx_rank=k`` to :class:`~splisosm.SplisosmGLMM`
       at construction time to control the low-rank spatial kernel approximation.
-    * **SplisosmFFT** uses FFT-based convolutions instead of eigendecomposition and
-      does not support ``approx_rank`` or ``null_configs``.
+    * **SplisosmFFT** uses FFT-based convolutions instead of eigendecomposition.
 
 
 Example data
@@ -288,8 +289,8 @@ SPLISOSM tests for statistical independence between isoform expression and spati
        method="hsic-ir",          # 'hsic-ir' | 'hsic-gc' | 'hsic-ic' | 'spark-x'
        ratio_transformation="none",  # 'none' | 'clr' | 'ilr' | 'alr'
        nan_filling="mean",           # if 'none', use only non-zero spots per gene (slow)
-       null_method="eig",            # 'eig' (Liu) | 'clt' (normal approx) | 'welch' (scaled chi²) | 'perm'
-       null_configs=None,            # e.g. {"approx_rank": 20} to cap eigenvalues
+       null_method="liu",            # 'liu' (default) | 'welch' (scaled chi²) | 'perm'
+       null_configs=None,            # e.g. {"n_probes": 60} or {"approx_rank": 20}
        n_jobs=-1,                    # gene-level parallelism; -1 = all CPUs
        print_progress=True,
    )
@@ -588,19 +589,24 @@ adjust them only when you hit performance or accuracy limits.
        ``"radial"`` is not calibrated. Performance of ``"none"`` is better in most cases.
    * - **SV null approximation**
      - ``null_method=`` in ``test_spatial_variability`` / ``run_hsic_gc``
-     - ``"eig"`` (Liu's chi-square mixture)
-     - ``"clt"`` (moment-matching normal) and ``"welch"`` (Welch–Satterthwaite
-       scaled chi-squared) both avoid eigendecomposition — fastest for very large
-       *n*.  ``"welch"`` is typically more accurate in the right tail than
-       ``"clt"`` at the same cost.  ``"perm"`` uses permutation; slowest but
-       assumption-free.  (``"trace"`` is a deprecated alias for ``"clt"``.)
-   * - **SV null low-rank** (when ``null_method="eig"``)
+     - ``"liu"`` (Liu's chi-square mixture)
+     - ``"welch"`` (Welch–Satterthwaite scaled chi-squared) avoids higher
+       cumulants and eigendecomposition — fastest for very large *n*.  ``"perm"``
+       uses permutation; slowest but assumption-free.  Deprecated aliases are
+       mapped automatically: ``"eig"`` → ``"liu"``, ``"clt"`` / ``"trace"`` →
+       ``"welch"``.
+   * - **SV null low-rank** (when ``null_method="liu"``)
      - ``null_configs={"approx_rank": k}`` in ``test_spatial_variability`` /
        ``run_hsic_gc``
-     - Auto: full rank when ``n_spots ≤ 5000``, else ``⌈4√n⌉``
+     - Optional; large implicit kernels otherwise use Hutchinson cumulants
      - Restricts test statistic and null computation to the top-*k* eigenvalues; 
        significant speedup for large *n* with potential power loss for high-frequency patterns 
        (usually rare in real spatial data).
+   * - **SV probes**
+     - ``null_configs={"n_probes": m}``
+     - Optional
+     - ``n_probes`` controls Liu cumulant probes and Welch Hutchinson traces
+       for implicit CAR kernels.
    * - **Conditional DU test** (``method="hsic-gp"``)
      - ``residualize=`` in ``test_differential_usage``
      - ``"cov_only"``

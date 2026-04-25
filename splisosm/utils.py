@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import warnings
 from typing import Any, Optional, Literal
-from scipy.stats import norm as _norm_dist, chi2 as _chi2_dist
 from scipy.sparse.csgraph import connected_components as _connected_components
 
 import numpy as np
@@ -14,7 +13,13 @@ from tqdm import tqdm
 import pandas as pd
 import torch
 from anndata import AnnData
-from splisosm.likelihood import liu_sf
+from splisosm._hsic_null import (
+    _feature_cumulants_from_data,
+    _hsic_liu_pvalue,
+    _hsic_welch_pvalue,
+    _kernel_cumulants_for_null,
+    _normalize_hsic_null_method,
+)
 from splisosm.io import load_visium_sp_meta  # noqa: F401 — backward compat
 
 __all__ = [
@@ -1451,7 +1456,7 @@ def run_sparkx(
 def run_hsic_gc(
     counts_gene: "np.ndarray | torch.Tensor | None" = None,
     coordinates: "np.ndarray | torch.Tensor | None" = None,
-    null_method: Literal["eig", "clt", "welch", "trace"] = "eig",
+    null_method: Literal["liu", "welch", "eig", "clt", "trace"] = "liu",
     null_configs: Optional[dict[str, Any]] = None,
     min_component_size: int = 1,
     adata: "AnnData | None" = None,
@@ -1472,22 +1477,27 @@ def run_hsic_gc(
         Shape ``(n_spots, n_genes)``. Gene counts.
     coordinates
         Shape ``(n_spots, n_dim)``. Spatial coordinates of spots.
-    null_method : {"eig", "clt", "welch"}, optional
+    null_method : {"liu", "welch"}, optional
         Method for computing the null distribution of the test statistic:
 
-        * ``"eig"`` (default): asymptotic chi-square mixture using kernel
-          eigenvalues; Liu's method.  Supports optional
+        * ``"liu"`` (default): asymptotic chi-square mixture using kernel
+          cumulants with Liu's method.  Supports optional
           ``null_configs["approx_rank"]`` (int) to restrict to the top-k
-          eigenvalues.
-        * ``"clt"``: moment-matching normal (Central Limit Theorem)
-          approximation using tr(K') and tr(K'²) of the centred spatial
-          kernel and the scalar per-gene variance.  ``"trace"`` is accepted
-          as a deprecated alias.
+          spatial eigenvalues, and ``null_configs["n_probes"]`` (int) to
+          estimate spatial cumulants with Hutchinson Rademacher probes.
         * ``"welch"``: Welch-Satterthwaite scaled chi-squared approximation
-          using the same two traces as ``"clt"``.  Typically more accurate
-          in the right tail than ``"clt"`` at the same cost.
+          using the first two HSIC null moments.  Typically more accurate
+          in the right tail than the retired normal approximation at the same
+          cost.
+        ``"eig"`` is accepted as a deprecated alias for ``"liu"``.
+        ``"clt"`` and ``"trace"`` are accepted as deprecated aliases for
+        ``"welch"``.
     null_configs : dict or None, optional
-        Extra keyword arguments for the chosen ``null_method``.
+        Extra keyword arguments for the chosen ``null_method``. Use
+        ``"n_probes"`` to control the Hutchinson
+        budget for both ``"liu"`` cumulants and ``"welch"`` first-two-moment
+        traces when the spatial kernel has no exact trace path; implicit CAR
+        kernels default to 60 probes.
     min_component_size : int, optional
         Minimum number of spots a connected component must contain to be
         retained.  Spots that belong to components smaller than this
@@ -1687,17 +1697,7 @@ def run_hsic_gc(
     n_genes = counts_gene.shape[1]
     configs = null_configs or {}
 
-    # Back-compat: accept the legacy "trace" alias for the moment-matching
-    # normal approximation, now canonically named "clt".
-    if null_method == "trace":
-        warnings.warn(
-            "null_method='trace' is deprecated; use 'clt' instead "
-            "(same moment-matching normal approximation; renamed to "
-            "disambiguate from 'welch').",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        null_method = "clt"
+    null_method = _normalize_hsic_null_method(null_method, allow_perm=False)
 
     # Set default spatial kernel kwargs
     default_spatial_kernel_kwargs = {
@@ -1729,30 +1729,16 @@ def run_hsic_gc(
         )
 
     # Pre-compute null distribution inputs (once, before the gene loop)
-    if null_method == "eig":
-        approx_rank = configs.get("approx_rank", None)
-        # auto-cap rank for large datasets to keep eigendecomposition tractable
-        if n_spots > 5000:
-            max_rank = int(np.ceil(np.sqrt(n_spots) * 4))
-            approx_rank = (
-                min(approx_rank, max_rank) if approx_rank is not None else max_rank
-            )
-        elif approx_rank is not None:
-            approx_rank = approx_rank if approx_rank < n_spots else None
-        lambda_sp = K_sp.eigenvalues(k=approx_rank)
-        lambda_sp = lambda_sp[lambda_sp > 1e-5]
-        k_eff = len(lambda_sp)
-        # Low-rank factor Q_k so that K ≈ Q_k Q_k^T; used per-gene to
-        # produce a rank-consistent test stat for liu_sf.
-        _Q_sp_raw = getattr(K_sp, "Q", None)
-        _Q_sp = _Q_sp_raw[:, :k_eff] if _Q_sp_raw is not None else None
-    elif null_method in ("clt", "welch"):
-        trK = K_sp.trace()
-        trK2 = K_sp.square_trace()
-    else:
-        raise ValueError(
-            f"null_method must be 'eig', 'clt', or 'welch', got {null_method!r}"
+    if null_method in ("liu", "welch"):
+        kernel_cumulants, kernel_approx_rank = _kernel_cumulants_for_null(
+            K_sp,
+            null_method=null_method,
+            n_spots=n_spots,
+            null_configs=configs,
+            dense_threshold=getattr(SpatialCovKernel, "DENSE_THRESHOLD", 5000),
         )
+    else:
+        raise ValueError(f"null_method must be 'liu' or 'welch', got {null_method!r}")
 
     # compute the HSIC-GC statistic per-gene
     is_scipy_sparse = scipy.sparse.issparse(counts_gene)
@@ -1802,44 +1788,31 @@ def run_hsic_gc(
             counts = y_dense[:, i : i + 1]  # (n_spots, 1)
 
         # Compute HSIC test statistic.
-        # When `eig` null is used and a low-rank factor Q is available, use
-        # the Q-based projection so the stat and the Liu null eigenvalues are
+        # When `liu` null is used with an explicit low rank, use the
+        # rank-k projection so the stat and the Liu null cumulants are
         # on the same (rank-k) scale — preventing the p=0 scale-mismatch bug.
         # Otherwise fall back to the exact full-kernel quadratic form.
-        if null_method == "eig" and _Q_sp is not None:
-            xtQ = counts.t() @ _Q_sp  # (1, k_eff)
-            hsic_scaled = torch.trace(xtQ @ xtQ.t())
+        if null_method == "liu" and kernel_approx_rank is not None:
+            hsic_scaled = torch.trace(K_sp.xtKx_approx(counts, k=kernel_approx_rank))
         else:
             hsic_scaled = torch.trace(K_sp.xtKx_exact(counts))
 
-        if null_method == "eig":
-            try:
-                lambda_y = torch.linalg.eigvalsh(counts.T @ counts)  # (1,)
-            except torch._C._LinAlgError:
-                lambda_y = torch.linalg.eigvalsh(
-                    counts.T @ counts + 1e-6 * torch.eye(counts.shape[1])
-                )
-            lambda_y = lambda_y[lambda_y > 1e-5]
-            lambda_spy = (lambda_sp.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
-            pval = liu_sf((hsic_scaled * n_spots).numpy(), lambda_spy.numpy())
-        else:  # "clt" or "welch"
-            S = counts.T @ counts  # (1, 1)
-            trS = torch.trace(S).item()
-            trS2 = torch.trace(S @ S).item()
-            n1 = n_spots - 1
-            mean_null = trK.item() * trS / n1
-            var_null = 2.0 * trK2.item() * trS2 / (n1**2)
-            if null_method == "clt":
-                z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
-                pval = float(_norm_dist.sf(z))
-            else:  # "welch": scaled chi-squared moment matching
-                if var_null > 0 and mean_null > 0:
-                    scale_g = var_null / (2.0 * mean_null)
-                    df_h = 2.0 * mean_null**2 / var_null
-                    pval = float(_chi2_dist.sf(hsic_scaled.item() / scale_g, df=df_h))
-                else:
-                    z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
-                    pval = float(_norm_dist.sf(z))
+        if null_method == "liu":
+            feature_cumulants = _feature_cumulants_from_data(counts)
+            pval = _hsic_liu_pvalue(
+                float(hsic_scaled),
+                kernel_cumulants,
+                feature_cumulants,
+                n_spots,
+            )
+        else:  # "welch"
+            feature_cumulants = _feature_cumulants_from_data(counts)
+            pval = _hsic_welch_pvalue(
+                float(hsic_scaled),
+                kernel_cumulants,
+                feature_cumulants,
+                n_spots,
+            )
 
         hsic_list.append(hsic_scaled / (n_spots - 1) ** 2)  # HSIC statistic
         pvals_list.append(pval)

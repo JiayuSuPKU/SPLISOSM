@@ -30,6 +30,11 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 
 from splisosm.kernel import FFTKernel  # noqa: F401 — re-export for backward compat
+from splisosm._hsic_null import (
+    _cumulants_from_eigenvalues,
+    _feature_cumulants_from_data,
+    _hsic_liu_pvalue,
+)
 from splisosm.kernel_gpr import (
     FFTKernelOp,
     FFTKernelGPR,
@@ -201,7 +206,7 @@ def _sv_worker_fft(
     raster_layer: Any,
     iso_names: list[str],
     kernel: FFTKernel,
-    kernel_eigvals: np.ndarray,
+    kernel_cumulants: dict[int, float],
     method: Literal["hsic-ir", "hsic-ic", "hsic-gc"],
     ratio_transformation: str,
 ) -> tuple[float, float]:
@@ -237,23 +242,19 @@ def _sv_worker_fft(
     stat = hsic_scaled / ((kernel.n_grid - 1) ** 2)
 
     y_flat = y_cube.reshape(kernel.n_grid, -1)
-    gram = y_flat.T @ y_flat
-
-    if not np.isfinite(gram).all():
+    if not np.isfinite(y_flat).all():
         return stat, 1.0
 
-    try:
-        lambda_y = np.linalg.eigvalsh(gram)
-    except np.linalg.LinAlgError:
+    feature_cumulants = _feature_cumulants_from_data(y_flat)
+    if feature_cumulants[2] <= 0.0 or kernel_cumulants[2] <= 0.0:
         return stat, 1.0
 
-    lambda_y = lambda_y[lambda_y > 1e-8]
-
-    if lambda_y.size == 0 or kernel_eigvals.size == 0:
-        return stat, 1.0
-
-    lambda_mix = (kernel_eigvals[:, None] * lambda_y[None, :]).reshape(-1)
-    pvalue = float(liu_sf(hsic_scaled * kernel.n_grid, lambda_mix))
+    pvalue = _hsic_liu_pvalue(
+        hsic_scaled,
+        kernel_cumulants,
+        feature_cumulants,
+        kernel.n_grid,
+    )
     return stat, pvalue
 
 
@@ -380,6 +381,7 @@ class SplisosmFFT:
 
         self.sp_kernel: FFTKernel | None = None
         self._kernel_eigvals: np.ndarray | None = None
+        self._kernel_cumulants: dict[int, float] | None = None
         self._raster_key: str | None = None
         self._raster_layer: Any | None = None
 
@@ -652,6 +654,7 @@ class SplisosmFFT:
         )
         eigvals = self.sp_kernel.eigenvalues()
         self._kernel_eigvals = eigvals[eigvals > 1e-8]
+        self._kernel_cumulants = _cumulants_from_eigenvalues(eigvals)
 
         # --- Process design_mtx: store as properly-structured AnnData table ---
         import scipy.sparse as _sp
@@ -785,7 +788,6 @@ class SplisosmFFT:
 
         if n_jobs == -1:
             n_jobs = os.cpu_count() or 1
-
         # Auto-coordinate FFT workers with joblib n_jobs to prevent thread
         # oversubscription: scipy.fft.fft2 spawns `workers` threads internally,
         # so total threads = n_jobs × workers without this cap.
@@ -803,7 +805,7 @@ class SplisosmFFT:
                 self._raster_layer,
                 iso_names,
                 self.sp_kernel,
-                self._kernel_eigvals,
+                self._kernel_cumulants,
                 method,
                 ratio_transformation,
             )
@@ -818,6 +820,7 @@ class SplisosmFFT:
             "pvalue": pvals_np,
             "pvalue_adj": false_discovery_control(pvals_np),
             "method": method,
+            "null_method": "liu",
             "use_perm_null": False,
         }
 

@@ -4,9 +4,12 @@ from splisosm.hyptest_fft import SplisosmFFT
 
 __all__ = ["SplisosmNP", "SplisosmGLMM", "SplisosmFFT", "__version__"]
 
-from importlib.metadata import version, PackageNotFoundError
-
 try:
-    __version__ = version("splisosm")
-except PackageNotFoundError:
-    __version__ = "unknown"
+    from ._version import __version__
+except ImportError:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        __version__ = version("splisosm")
+    except PackageNotFoundError:
+        __version__ = "unknown"

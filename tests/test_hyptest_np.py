@@ -637,7 +637,7 @@ class TestSplisosmNP(unittest.TestCase):
             min_bin_pct=0.0,
             filter_single_iso_genes=False,
         )
-        for null_method in ["eig", "clt", "welch", "perm"]:
+        for null_method in ["liu", "welch", "perm"]:
             with self.subTest(null_method=null_method):
                 configs = (
                     {"n_perms_per_gene": 50, "perm_batch_size": 10}
@@ -683,7 +683,7 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertTrue(np.all(res["pvalue"] <= 1))
 
     def test_sv_nan_filling_none_uses_per_gene_kernel_moments(self):
-        """trace/welch/perm nulls with nan_filling='none' must use per-gene K.
+        """liu/welch/perm nulls with nan_filling='none' must use per-gene K.
 
         The `hsic-ir + nan_filling='none'` branch builds a gene-specific
         double-centred kernel submatrix (dropping NaN spots).  The null
@@ -705,7 +705,7 @@ class TestSplisosmNP(unittest.TestCase):
             X[np.ix_(mask, iso_idx)] = 0.0
         adata.layers["counts"] = X
 
-        for null_method in ("clt", "welch", "perm"):
+        for null_method in ("liu", "welch", "perm"):
             with self.subTest(null_method=null_method):
                 model = SplisosmNP()
                 model.setup_data(
@@ -736,9 +736,8 @@ class TestSplisosmNP(unittest.TestCase):
                 self.assertTrue(np.all(res["pvalue"] >= 0))
                 self.assertTrue(np.all(res["pvalue"] <= 1))
 
-    def test_sv_null_method_trace_alias_deprecated(self):
-        """`null_method='trace'` is a deprecated alias for `'clt'`: same results
-        plus a DeprecationWarning."""
+    def test_sv_null_method_aliases_deprecated(self):
+        """Legacy null names are mapped to canonical Liu/Welch names."""
         model = SplisosmNP()
         model.setup_data(
             adata=self.adata,
@@ -750,32 +749,40 @@ class TestSplisosmNP(unittest.TestCase):
             min_bin_pct=0.0,
             filter_single_iso_genes=False,
         )
-        # Canonical name: no warning.
-        res_clt = model.test_spatial_variability(
+        res_liu = model.test_spatial_variability(
             method="hsic-ir",
-            null_method="clt",
+            null_method="liu",
+            print_progress=False,
+            return_results=True,
+        )
+        res_welch = model.test_spatial_variability(
+            method="hsic-ir",
+            null_method="welch",
             print_progress=False,
             return_results=True,
         )
 
-        # Deprecated alias: same numerics + DeprecationWarning.
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            res_trace = model.test_spatial_variability(
-                method="hsic-ir",
-                null_method="trace",
-                print_progress=False,
-                return_results=True,
-            )
-        dep = [
-            w
-            for w in caught
-            if issubclass(w.category, DeprecationWarning) and "trace" in str(w.message)
-        ]
-        self.assertTrue(len(dep) >= 1, "expected DeprecationWarning for 'trace'")
-        self.assertEqual(res_trace["null_method"], "clt")
-        np.testing.assert_allclose(res_trace["statistic"], res_clt["statistic"])
-        np.testing.assert_allclose(res_trace["pvalue"], res_clt["pvalue"])
+        for alias, canonical, expected in (
+            ("eig", "liu", res_liu),
+            ("clt", "welch", res_welch),
+            ("trace", "welch", res_welch),
+        ):
+            with self.subTest(alias=alias):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    res_alias = model.test_spatial_variability(
+                        method="hsic-ir",
+                        null_method=alias,
+                        print_progress=False,
+                        return_results=True,
+                    )
+                dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+                self.assertTrue(len(dep) >= 1, f"expected warning for {alias!r}")
+                self.assertEqual(res_alias["null_method"], canonical)
+                np.testing.assert_allclose(
+                    res_alias["statistic"], expected["statistic"]
+                )
+                np.testing.assert_allclose(res_alias["pvalue"], expected["pvalue"])
 
     def test_sv_perm_batch_size_config(self):
         """perm_batch_size in null_configs should be respected."""
@@ -1175,11 +1182,11 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertGreater(rho, 0.9, f"Spearman rank correlation={rho:.3f} too low")
 
     def test_null_methods_agreement(self):
-        """eig, trace, welch and perm null methods should yield broadly similar p-value ranks.
+        """Liu, Welch and perm null methods should yield broadly similar p-value ranks.
 
-        We run all four methods on the same data and check pairwise Spearman rank
-        correlations on –log10(p).  The three asymptotic methods (eig/trace/welch)
-        should agree tightly (ρ > 0.9); each asymptotic method vs. the permutation
+        We run all methods on the same data and check pairwise Spearman rank
+        correlations on –log10(p).  The two asymptotic methods should agree
+        tightly (ρ > 0.9); each asymptotic method vs. the permutation
         null should agree moderately (ρ > 0.6), allowing for the discrete, noisy
         nature of a permutation p-value with a finite number of permutations.
         """
@@ -1197,7 +1204,7 @@ class TestSplisosmNP(unittest.TestCase):
         )
 
         pvals = {}
-        for null_method in ("eig", "clt", "welch", "perm"):
+        for null_method in ("liu", "welch", "perm"):
             null_configs = (
                 {"n_perms_per_gene": 2000, "perm_batch_size": 100}
                 if null_method == "perm"
@@ -1216,11 +1223,8 @@ class TestSplisosmNP(unittest.TestCase):
 
         # Thresholds: asymptotic methods should agree tightly; perm is noisier.
         thresholds = {
-            ("eig", "clt"): 0.90,
-            ("eig", "welch"): 0.90,
-            ("clt", "welch"): 0.90,
-            ("eig", "perm"): 0.70,
-            ("clt", "perm"): 0.70,
+            ("liu", "welch"): 0.90,
+            ("liu", "perm"): 0.70,
             ("welch", "perm"): 0.70,
         }
         for (m1, m2), thr in thresholds.items():
@@ -1232,8 +1236,8 @@ class TestSplisosmNP(unittest.TestCase):
                     f"Spearman ρ({m1}, {m2}) = {rho:.3f} < {thr} — null methods disagree too much",
                 )
 
-    def test_eig_lowrank_vs_fullrank_agreement(self):
-        """Low-rank eig (approx_rank=20) should give p-value ranks consistent with full-rank eig.
+    def test_liu_lowrank_vs_fullrank_agreement(self):
+        """Low-rank Liu should give p-value ranks consistent with full-rank Liu.
 
         This is a regression test for the scale-mismatch bug where approx_rank < n_spots
         caused the test stat (full kernel) and the Liu null (rank-k eigenvalues) to be on
@@ -1254,14 +1258,14 @@ class TestSplisosmNP(unittest.TestCase):
 
         res_full = model.test_spatial_variability(
             method="hsic-ir",
-            null_method="eig",
+            null_method="liu",
             null_configs={},
             print_progress=False,
             return_results=True,
         )
         res_lowrank = model.test_spatial_variability(
             method="hsic-ir",
-            null_method="eig",
+            null_method="liu",
             null_configs={"approx_rank": 20},
             print_progress=False,
             return_results=True,
@@ -1273,7 +1277,7 @@ class TestSplisosmNP(unittest.TestCase):
         # Regression: low-rank must NOT produce all-zero p-values
         self.assertFalse(
             np.all(pv_lowrank == 0.0),
-            "Low-rank eig produced all p-values == 0 (scale-mismatch bug regression)",
+            "Low-rank Liu produced all p-values == 0 (scale-mismatch bug regression)",
         )
 
         # Rank correlation should be high
@@ -1284,8 +1288,48 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertGreater(
             rho,
             0.85,
-            f"Spearman ρ(full-rank, low-rank eig) = {rho:.3f} — approximation too inaccurate",
+            f"Spearman ρ(full-rank, low-rank Liu) = {rho:.3f} — approximation too inaccurate",
         )
+
+    def test_sv_asymptotic_nulls_accept_probe_budget(self):
+        """SV asymptotic nulls accept a shared Hutchinson probe budget."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+
+        res = model.test_spatial_variability(
+            method="hsic-ir",
+            null_method="liu",
+            null_configs={"n_probes": 8},
+            n_jobs=1,
+            print_progress=False,
+            return_results=True,
+        )
+
+        self.assertEqual(res["statistic"].shape, (model.n_genes,))
+        self.assertTrue(np.all(np.isfinite(res["pvalue"])))
+        self.assertTrue(np.all((res["pvalue"] >= 0.0) & (res["pvalue"] <= 1.0)))
+
+        res = model.test_spatial_variability(
+            method="hsic-ir",
+            null_method="welch",
+            null_configs={
+                "n_probes": 8,
+            },
+            n_jobs=1,
+            print_progress=False,
+            return_results=True,
+        )
+        self.assertEqual(res["statistic"].shape, (model.n_genes,))
+        self.assertTrue(np.all(np.isfinite(res["pvalue"])))
+        self.assertTrue(np.all((res["pvalue"] >= 0.0) & (res["pvalue"] <= 1.0)))
 
     def test_init_kernel_hyperparams(self):
         """k_neighbors, rho, standardize_cov passed to __init__ should be used in setup_data."""
@@ -1705,12 +1749,12 @@ class TestParallelNP(unittest.TestCase):
     # Spatial variability: n_jobs=1 vs n_jobs=2
     # ------------------------------------------------------------------
 
-    def test_sv_parallel_eig_hsic_ir(self):
-        """SV with hsic-ir + eig null: n_jobs=1 and n_jobs=2 give identical results."""
+    def test_sv_parallel_liu_hsic_ir(self):
+        """SV with hsic-ir + Liu null: n_jobs=1 and n_jobs=2 give identical results."""
         for n_jobs in [1, 2]:
             model = self._setup_model(self.adata)
             model.test_spatial_variability(
-                method="hsic-ir", null_method="eig", n_jobs=n_jobs, print_progress=False
+                method="hsic-ir", null_method="liu", n_jobs=n_jobs, print_progress=False
             )
             if n_jobs == 1:
                 ref = model._sv_test_results
@@ -1728,13 +1772,13 @@ class TestParallelNP(unittest.TestCase):
                     err_msg="SV pvalue differs between n_jobs=1 and n_jobs=2",
                 )
 
-    def test_sv_parallel_clt_null(self):
-        """SV with hsic-ir + clt null: parallel results are identical."""
+    def test_sv_parallel_welch_null(self):
+        """SV with hsic-ir + Welch null: parallel results are identical."""
         for n_jobs in [1, 2]:
             model = self._setup_model(self.adata)
             model.test_spatial_variability(
                 method="hsic-ir",
-                null_method="clt",
+                null_method="welch",
                 n_jobs=n_jobs,
                 print_progress=False,
             )

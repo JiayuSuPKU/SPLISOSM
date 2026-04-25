@@ -13,6 +13,7 @@ __all__ = [
     "log_prob_fastmvn",
     "log_prob_fastmvn_batched",
     "liu_sf",
+    "liu_sf_from_cumulants",
 ]
 
 try:
@@ -491,7 +492,6 @@ def liu_sf(
     kurtosis
         If True, uses kurtosis matching proposed in :cite:`lee2012optimal`; otherwise uses the original
         skewness matching :cite:`liu2009new`.
-
     Returns
     -------
     numpy.ndarray
@@ -501,12 +501,57 @@ def liu_sf(
     -----
     From https://github.com/limix/chiscore/blob/master/chiscore/_liu.py
     """
+    coeffs = _liu_prepare(
+        lambs,
+        dofs=dofs,
+        deltas=deltas,
+        kurtosis=kurtosis,
+    )
+    return _liu_apply(t, coeffs)
+
+
+def liu_sf_from_cumulants(
+    t: ArrayLike,
+    cumulants: dict[int, float],
+    kurtosis: bool = False,
+) -> np.ndarray:
+    """Compute Liu p-values from spectral cumulants.
+
+    Parameters
+    ----------
+    t
+        Observed test statistic value(s).
+    cumulants
+        Mapping ``{1: c1, 2: c2, 3: c3, 4: c4}``, where
+        ``cp = trace(K**p)`` for the chi-squared mixture weights.
+    kurtosis
+        If True, uses the kurtosis-matching edge-case branch.
+    Returns
+    -------
+    numpy.ndarray
+        P-values computed as ``Pr(X > t)``.
+    """
+    return _liu_apply(
+        t,
+        _liu_prepare_from_cumulants(
+            cumulants,
+            kurtosis=kurtosis,
+        ),
+    )
+
+
+def _liu_prepare(
+    lambs: ArrayLike,
+    dofs: Optional[ArrayLike] = None,
+    deltas: Optional[ArrayLike] = None,
+    kurtosis: bool = False,
+) -> dict[str, float]:
+    """Precompute Liu shifted-chi-squared coefficients from eigenvalues."""
     if dofs is None:
         dofs = np.ones_like(lambs)
     if deltas is None:
         deltas = np.zeros_like(lambs)
 
-    t = np.asarray(t, float)
     lambs = np.asarray(lambs, float)
     dofs = np.asarray(dofs, float)
     deltas = np.asarray(deltas, float)
@@ -514,17 +559,42 @@ def liu_sf(
     lambs = {i: lambs**i for i in range(1, 5)}
 
     c = {
-        i: np.sum(lambs[i] * dofs) + i * np.sum(lambs[i] * deltas) for i in range(1, 5)
+        i: float(np.sum(lambs[i] * dofs) + i * np.sum(lambs[i] * deltas))
+        for i in range(1, 5)
     }
+    return _liu_prepare_from_cumulants(c, kurtosis=kurtosis)
+
+
+def _liu_prepare_from_cumulants(
+    cumulants: dict[int, float],
+    kurtosis: bool = False,
+) -> dict[str, float]:
+    """Precompute Liu shifted-chi-squared coefficients from cumulants."""
+    c = {i: float(cumulants.get(i, 0.0)) for i in range(1, 5)}
+
+    if c[2] <= _DELTA or not np.isfinite(c[2]):
+        return {
+            "mu_q": float(c[1]),
+            "sigma_q": 0.0,
+            "mu_x": 1.0,
+            "sigma_x": np.sqrt(2.0),
+            "dof_x": 1.0,
+            "delta_x": 0.0,
+        }
 
     s1 = c[3] / (np.sqrt(c[2]) ** 3 + _DELTA)
     s2 = c[4] / (c[2] ** 2 + _DELTA)
 
     s12 = s1**2
     if s12 > s2:
-        a = 1 / (s1 - np.sqrt(s12 - s2))
-        delta_x = s1 * a**3 - a**2
-        dof_x = a**2 - 2 * delta_x
+        denom = s1 - np.sqrt(s12 - s2)
+        if abs(denom) < _DELTA:
+            delta_x = 0.0
+            dof_x = 1 / (s2 + _DELTA)
+        else:
+            a = 1 / denom
+            delta_x = s1 * a**3 - a**2
+            dof_x = a**2 - 2 * delta_x
     else:
         delta_x = 0
         if kurtosis:
@@ -534,15 +604,29 @@ def liu_sf(
             a = 1 / (s1 + _DELTA)
             dof_x = 1 / (s12 + _DELTA)
 
-    mu_q = c[1]
-    sigma_q = np.sqrt(2 * c[2])
+    dof_x = max(float(dof_x), _DELTA)
+    delta_x = max(float(delta_x), 0.0)
+
+    var_q = 2.0 * c[2]
 
     mu_x = dof_x + delta_x
     sigma_x = np.sqrt(2 * (dof_x + 2 * delta_x))
 
-    t_star = (t - mu_q) / (sigma_q + _DELTA)
-    tfinal = t_star * sigma_x + mu_x
+    return {
+        "mu_q": float(c[1]),
+        "sigma_q": float(np.sqrt(max(var_q, 0.0))),
+        "mu_x": float(mu_x),
+        "sigma_x": float(sigma_x),
+        "dof_x": float(dof_x),
+        "delta_x": float(delta_x),
+    }
 
-    q = ncx2.sf(tfinal, dof_x, np.maximum(delta_x, 1e-9))
 
-    return q
+def _liu_apply(t: ArrayLike, coeffs: dict[str, float]) -> np.ndarray:
+    """Apply cached Liu coefficients to one or more statistics."""
+    t = np.asarray(t, float)
+    if coeffs["sigma_q"] <= _DELTA:
+        return np.where(t > coeffs["mu_q"] + _DELTA, 0.0, 1.0)
+    t_star = (t - coeffs["mu_q"]) / (coeffs["sigma_q"] + _DELTA)
+    tfinal = t_star * coeffs["sigma_x"] + coeffs["mu_x"]
+    return ncx2.sf(tfinal, coeffs["dof_x"], max(coeffs["delta_x"], 1e-9))

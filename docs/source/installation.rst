@@ -79,10 +79,9 @@ To use this functionality, ensure that the conda environment where SPLISOSM is i
    # (1) moment-matching Welch-Satterthwaite approximation (no eigen-decomposition)
    test_results = run_hsic_gc(gene_counts, coordinates, null_method="welch")
 
-   # (2) or restrict eigenvalue null to the top-k eigenvalues
+   # (2) or restrict the Liu null to the top-k eigenvalues
    test_results = run_hsic_gc(
        gene_counts, coordinates, 
-       null_method="eig",
+       null_method="liu",
        null_configs={"approx_rank": 100}
    )
-

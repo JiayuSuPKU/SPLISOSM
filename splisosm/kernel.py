@@ -26,6 +26,17 @@ class Kernel(ABC):
     def __init__(self) -> None:
         """Initialize kernel-specific state."""
 
+    @property
+    def n(self) -> int:
+        """Number of observations represented by the kernel.
+
+        Returns
+        -------
+        int
+            Kernel dimension.
+        """
+        return int(self._n)
+
     @abstractmethod
     def realization(self) -> torch.Tensor:
         """Return the realized dense kernel matrix.
@@ -88,6 +99,24 @@ class Kernel(ABC):
         """
 
     @abstractmethod
+    def Kx(self, x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+        """Apply the effective kernel operator to a vector or dense matrix.
+
+        The effective operator is the same one used by :meth:`xtKx`; for
+        kernels constructed with ``centering=True`` this is ``H K H``.
+
+        Parameters
+        ----------
+        x
+            Array of shape ``(n_spots,)`` or ``(n_spots, n_vectors)``.
+
+        Returns
+        -------
+        np.ndarray or torch.Tensor
+            Kernel product with the same shape and array backend as ``x``.
+        """
+
+    @abstractmethod
     def xtKx_approx(self, x: torch.Tensor, k: int | None = None) -> torch.Tensor:
         """Compute ``x^T K_k x`` using a rank-``k`` approximation.
 
@@ -140,6 +169,28 @@ class IdentityKernel(Kernel):
             self.Q: torch.Tensor = torch.sparse_coo_tensor(
                 _idx, _val, (n_spots, n_spots)
             )
+
+    def Kx(self, x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+        """Apply ``I`` or ``H`` to ``x``."""
+        is_torch = isinstance(x, torch.Tensor)
+        if is_torch:
+            arr = x.detach().cpu().numpy()
+            dtype = x.dtype
+            device = x.device
+        else:
+            arr = np.asarray(x)
+            dtype = None
+            device = None
+
+        out = np.asarray(arr, dtype=float)
+        if out.shape[0] != self._n:
+            raise ValueError(f"Expected first dimension {self._n}, got {out.shape[0]}.")
+        if self._centering:
+            axis = 0 if out.ndim > 1 else None
+            out = out - out.mean(axis=axis, keepdims=out.ndim > 1)
+        if is_torch:
+            return torch.as_tensor(out, dtype=dtype, device=device)
+        return out
 
     def realization(self) -> torch.Tensor:
         """Return ``I`` (or ``H = I - (1/n) 1 1^T`` when ``centering=True``)."""
@@ -528,6 +579,33 @@ class SpatialCovKernel(Kernel):
             self._lu = splu(self.inv_cov)
         return self._lu
 
+    @staticmethod
+    def _as_numpy_2d(x: np.ndarray | torch.Tensor) -> tuple[np.ndarray, bool]:
+        """Return a float64 ``(n, m)`` array and whether the input was 1-D."""
+        if isinstance(x, torch.Tensor):
+            arr = x.detach().cpu().numpy()
+        else:
+            arr = np.asarray(x)
+        squeeze = arr.ndim == 1
+        if squeeze:
+            arr = arr[:, None]
+        if arr.ndim != 2:
+            raise ValueError("`x` must have shape (n_spots,) or (n_spots, n_vectors).")
+        return np.asarray(arr, dtype=np.float64), squeeze
+
+    @staticmethod
+    def _restore_array_type(
+        out: np.ndarray,
+        template: np.ndarray | torch.Tensor,
+        squeeze: bool,
+    ) -> np.ndarray | torch.Tensor:
+        """Restore shape/backend after an internal numpy calculation."""
+        if squeeze:
+            out = out[:, 0]
+        if isinstance(template, torch.Tensor):
+            return torch.as_tensor(out, dtype=template.dtype, device=template.device)
+        return out
+
     def _hutchinson_trace(
         self, squared: bool, n_vectors: int = 30, seed: int = 0
     ) -> float:
@@ -653,6 +731,36 @@ class SpatialCovKernel(Kernel):
             xtQ = x.t() @ self.Q
             return xtQ @ xtQ.t()
         return self.xtKx_exact(x)
+
+    def Kx(self, x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+        """Apply ``K`` or ``H K H`` to ``x``.
+
+        Parameters
+        ----------
+        x
+            Dense vector or matrix with first dimension ``n_spots``.
+
+        Returns
+        -------
+        np.ndarray or torch.Tensor
+            Kernel product with the same shape/backend as ``x``.
+        """
+        arr, squeeze = self._as_numpy_2d(x)
+        if arr.shape[0] != self._n:
+            raise ValueError(f"Expected first dimension {self._n}, got {arr.shape[0]}.")
+
+        if self._centering:
+            arr = arr - arr.mean(axis=0, keepdims=True)
+
+        if self.K_sp is not None:
+            out = self.K_sp.numpy().astype(np.float64, copy=False) @ arr
+        else:
+            out = self._get_lu().solve(arr)
+
+        if self._centering:
+            out = out - out.mean(axis=0, keepdims=True)
+
+        return self._restore_array_type(out, x, squeeze)
 
     def xtKx_exact(self, x: torch.Tensor) -> torch.Tensor:
         """Compute ``x^T K x`` exactly, bypassing any cached low-rank factor.
@@ -901,6 +1009,7 @@ class FFTKernel(Kernel):
         self.ny, self.nx = int(shape[0]), int(shape[1])
         self.dy, self.dx = float(spacing[0]), float(spacing[1])
         self.n_grid = self.ny * self.nx
+        self._n = self.n_grid
         self.neighbor_degree = int(neighbor_degree)
         self.rho = min(float(rho), 0.99)
         self.workers = workers
@@ -987,6 +1096,67 @@ class FFTKernel(Kernel):
         weighted = np.sum(power * self._spectrum_2d[:, :, None], axis=(0, 1))
         q = weighted / (self.n_grid)
         return float(q[0]) if q.size == 1 else q
+
+    def Kx(self, x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+        """Apply the FFT kernel to flat or grid-shaped input.
+
+        Parameters
+        ----------
+        x
+            Input with shape ``(n_grid,)``, ``(n_grid, m)``, ``(ny, nx)``,
+            or ``(ny, nx, m)``.
+
+        Returns
+        -------
+        np.ndarray or torch.Tensor
+            Kernel product with the same shape/backend as ``x``.
+        """
+        is_torch = isinstance(x, torch.Tensor)
+        if is_torch:
+            arr = x.detach().cpu().numpy()
+            dtype = x.dtype
+            device = x.device
+        else:
+            arr = np.asarray(x)
+            dtype = None
+            device = None
+
+        original_shape = arr.shape
+        arr = np.asarray(arr, dtype=float)
+
+        if arr.ndim == 1:
+            if arr.size != self.n_grid:
+                raise ValueError(f"Expected length {self.n_grid}, got {arr.size}.")
+            cube = arr.reshape(self.ny, self.nx, 1)
+        elif arr.ndim == 2 and arr.shape == (self.ny, self.nx):
+            cube = arr[:, :, None]
+        elif arr.ndim == 2 and arr.shape[0] == self.n_grid:
+            cube = arr.reshape(self.ny, self.nx, arr.shape[1])
+        elif arr.ndim == 3 and arr.shape[:2] == (self.ny, self.nx):
+            cube = arr
+        else:
+            raise ValueError(
+                "`x` must have shape (n_grid,), (n_grid, m), (ny, nx), or (ny, nx, m)."
+            )
+
+        x_hat = scipy.fft.fft2(cube, axes=(0, 1), workers=self.workers)
+        out = np.real(
+            scipy.fft.ifft2(
+                x_hat * self._spectrum_2d[:, :, None],
+                axes=(0, 1),
+                workers=self.workers,
+            )
+        )
+        if len(original_shape) == 1:
+            out = out.reshape(self.n_grid)
+        elif len(original_shape) == 2 and original_shape == (self.ny, self.nx):
+            out = out[:, :, 0]
+        elif len(original_shape) == 2:
+            out = out.reshape(self.n_grid, original_shape[1])
+
+        if is_torch:
+            return torch.as_tensor(out, dtype=dtype, device=device)
+        return out
 
     def xtKx_approx(self, x, k: int | None = None):
         """Same as :meth:`xtKx` (FFT is already exact for periodic grids)."""

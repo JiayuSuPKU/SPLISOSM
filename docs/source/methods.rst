@@ -120,69 +120,54 @@ Null distribution
 ~~~~~~~~~~~~~~~~~~
 
 To compute p-values, we need to compute the distribution of :math:`\widehat{\mathrm{HSIC}}` under the null hypothesis of no spatial variability.
-Four methods are available via the ``null_method`` argument to :meth:`~splisosm.SplisosmNP.test_spatial_variability`.
+Three methods are available via the ``null_method`` argument to :meth:`~splisosm.SplisosmNP.test_spatial_variability`.
 
-.. _null-eig:
+.. _null-liu:
 
-**1. Liu's approximation of chi-square mixture (default)**: ``null_method='eig'``
+**1. Liu's approximation of chi-square mixture (default)**: ``null_method='liu'``
 
 Let :math:`Q = \mathrm{tr}(Y^\top K Y) = (n-1)^2 \widehat{\mathrm{HSIC}}` denote the unnormalised HSIC V-statistic,
+write :math:`m=n-1` for the dimension of the centred spot space,
 with :math:`\lambda_1^K \geq \cdots \geq \lambda_n^K` the eigenvalues of :math:`K` and
 :math:`\lambda_1^Y \geq \cdots \geq \lambda_p^Y` those of :math:`Y^\top Y`.
 Under the null, :math:`Q` asymptotically follows a weighted sum of independent :math:`\chi^2_{1}` variables,
 
 .. math::
 
-   Q \;\overset{d}{\approx}\; \frac{1}{n} \sum_{i=1}^{n} \sum_{j=1}^{p} \lambda_i^K \, \lambda_j^Y \; Z_{ij}, \qquad Z_{ij} \overset{\text{iid}}{\sim} \chi^2_{1},
+   Q \;\overset{d}{\approx}\; \frac{1}{n-1} \sum_{i=1}^{n} \sum_{j=1}^{p} \lambda_i^K \, \lambda_j^Y \; Z_{ij}, \qquad Z_{ij} \overset{\text{iid}}{\sim} \chi^2_{1},
 
 where the double sum runs over all pairs of spatial and response eigenvalues.
-:cite:`liu2009new` propose an efficient three-moment matching scheme (skewness matching) to approximate the tail probability of this mixture with a scaled and shifted chi-squared variable.
-See :func:`splisosm.likelihood.liu_sf` for implementation details.
+SPLISOSM evaluates :cite:t:`liu2009new` from the first four cumulants
+:math:`c_r = \mathrm{tr}(K^r)\mathrm{tr}((Y^\top Y)^r)/(n-1)^r`, so it does not need to materialize the full pairwise eigenvalue product.
+See :func:`splisosm.likelihood.liu_sf_from_cumulants` for implementation details.
 
 .. note::
 
-   - Full eigen-decomposition of :math:`K` is :math:`O(n^3)` and is not feasible for large datasets.  
-     For :math:`n > 5000`, we approximate the kernel via a low-rank approximation using the top-:math:`r` eigenvalues/vectors.  
-     The approximation is controlled by ``approx_rank`` in ``null_configs``, with default :math:`\lceil 4\sqrt{n} \rceil` when :math:`n > 5000`.
-   - When ``nan_filling='mean'`` (default), the spatial eigenvalues are cached after the first gene and reused for all subsequent genes.
-
-.. _null-clt:
-
-**2. Moment-matching normal approximation (CLT)**: ``null_method='clt'``
-
-.. note::
-
-   The previous name ``null_method='trace'`` is retained as a deprecated
-   alias and will emit a ``DeprecationWarning``.  The canonical name is
-   now ``'clt'``, which better disambiguates this moment-matching normal
-   approximation from :ref:`welch <null-welch>` (the Welch–Satterthwaite
-   scaled chi-squared that shares the same matrix traces).
-
-Alternatively, we may use the first two moments of the null distribution to compute p-values (i.e., via Central Limit Theorem),
-which requires only :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)`.
-Taking moments of the :math:`\chi^2_1` mixture above gives
-
-.. math::
-
-   \mu_0 &= \mathbb{E}[Q] = \frac{1}{n}\,\mathrm{tr}(K)\,\mathrm{tr}(Y^\top Y), \\[4pt]
-   \sigma_0^2 &= \mathrm{Var}(Q) = \frac{2}{n^2}\,\mathrm{tr}(K^2)\,\mathrm{tr}\!\bigl((Y^\top Y)^2\bigr).
-
-The p-value is :math:`\Phi^c\!\left(\frac{Q - \mu_0}{\sigma_0}\right)`, where :math:`\Phi^c` is the standard normal survival function.
-Note that for non-Gaussian data :math:`Y`, the null variance is off by a kurtosis factor, which we omit for brevity.
-
-.. note::
-
-   - Since the CLT approximation requires no eigen-decomposition, it is the fastest and most scalable option while being slightly less accurate for a heavy-tailed null.
-   - As the sample size increases, the approximation becomes more accurate, and the test is generally well-calibrated for large :math:`n`.
-   - For implicit kernels (where only the sparse precision matrix :math:`M=K^{-1}` is stored), :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` are estimated via the **Hutchinson stochastic trace estimator** using 30 Rademacher probing vectors.
+   - The previous name ``null_method='eig'`` is retained as a deprecated alias
+     and will emit a ``DeprecationWarning``.
+   - Full eigen-decomposition of :math:`K` is :math:`O(n^3)` and is not feasible for large datasets.
+     For implicit CAR kernels with no realised dense covariance, SPLISOSM estimates :math:`\mathrm{tr}(K^r)` with Hutchinson Rademacher probes by default.
+     Use ``null_configs={"n_probes": m}`` to control that budget, or ``null_configs={"approx_rank": r}`` to force a rank-*r* spatial approximation.
+   - Exact :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` are substituted automatically only for dense or spectral kernels where those traces are analytic/exact.  Implicit CAR kernels keep Hutchinson estimates because only the sparse precision is stored.
+   - When ``nan_filling='mean'`` (default), the spatial cumulants are cached once and reused for all subsequent genes.
 
 .. _null-welch:
 
-**3. Welch-Satterthwaite scaled chi-squared approximation**: ``null_method='welch'``
+**2. Welch-Satterthwaite scaled chi-squared approximation**: ``null_method='welch'``
 
-With all positive eigenvalues, the chi-squared mixture null can also be approximated by the `Welch-Satterthwaite method <https://en.wikipedia.org/wiki/Welch%E2%80%93Satterthwaite_equation>`_, 
+Alternatively, we may use only the first two moments of the null distribution,
+which requires :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` but not
+higher cumulants or a full eigendecomposition.  Taking moments of the
+:math:`\chi^2_1` mixture above gives
+
+.. math::
+
+   \mu_0 &= \mathbb{E}[Q] = \frac{1}{m}\,\mathrm{tr}(K)\,\mathrm{tr}(Y^\top Y), \\[4pt]
+   \sigma_0^2 &= \mathrm{Var}(Q) = \frac{2}{m^2}\,\mathrm{tr}(K^2)\,\mathrm{tr}\!\bigl((Y^\top Y)^2\bigr).
+
+With all positive eigenvalues, the chi-squared mixture null can be approximated by the `Welch-Satterthwaite method <https://en.wikipedia.org/wiki/Welch%E2%80%93Satterthwaite_equation>`_,
 using one scaled chi-squared variable :math:`g \, \chi^2_h` with scale parameter :math:`g` and degrees of freedom :math:`h`. 
-The parameters are chosen to match the first two moments of the null :math:`(\mu_0, \sigma_0^2)` (same as in the :ref:`clt <null-clt>` method).
+The parameters are chosen to match the first two moments of the null :math:`(\mu_0, \sigma_0^2)`.
 
 .. math::
 
@@ -192,19 +177,22 @@ and the p-value is :math:`\mathbb{P}\!\left(\chi^2_h \geq Q/g\right)`.
 
 .. note::
 
-   - Same cost as ``null_method='clt'`` (only :math:`\mathrm{tr}(K)` and
-     :math:`\mathrm{tr}(K^2)` are needed), but typically more accurate in the
-     right tail because the null under H₀ is a weighted sum of
-     :math:`\chi^2_1` variables rather than Gaussian.  In practice its
-     p-values are close to the :ref:`eig <null-eig>` (Liu) reference while
-     remaining as cheap as the :ref:`clt <null-clt>` method.
-   - Recommended when ``null_method='eig'`` is too slow for the dataset
+   - The retired ``null_method='clt'`` and ``null_method='trace'`` names are
+     retained as deprecated aliases and automatically use this Welch
+     approximation.
+   - Only :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` are needed,
+     but Welch is typically more accurate in the right tail than a normal
+     moment match because the null under H₀ is a weighted sum of
+     :math:`\chi^2_1` variables.  In practice its p-values are close to the
+     :ref:`liu <null-liu>` reference while remaining very cheap.
+   - Recommended when ``null_method='liu'`` is too slow for the dataset
      (e.g., very large :math:`n` with no FFT grid) but a reliable right-tail
      calibration is still needed.
+   - For implicit kernels (where only the sparse precision matrix :math:`M=K^{-1}` is stored), :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` are estimated via the **Hutchinson stochastic trace estimator** using 60 Rademacher probing vectors by default.  Use ``null_configs={"n_probes": m}`` to control this budget.
 
 .. _null-perm:
 
-**4. Batched permutation test**: ``null_method='perm'``
+**3. Batched permutation test**: ``null_method='perm'``
 
 Generates a null distribution by repeatedly permuting the rows of :math:`Y` (breaking the spatial structure) and recomputing :math:`\mathrm{tr}(Y_\pi^\top K Y_\pi)` for each permutation :math:`\pi`.
 
@@ -414,27 +402,27 @@ Summary
      - SplisosmNP / FFT
      - Isoform ratios
      - None
-     - ``eig`` [#fft]_ / ``clt`` / ``welch`` / ``perm``
+     - ``liu`` [#fft]_ / ``welch`` / ``perm``
    * - HSIC-GC (SVE)
      - SplisosmNP / FFT
      - Gene counts
      - None
-     - ``eig`` [#fft]_ / ``clt`` / ``welch`` / ``perm``
+     - ``liu`` [#fft]_ / ``welch`` / ``perm``
    * - HSIC-IC
      - SplisosmNP / FFT
      - Isoform counts
      - None
-     - ``eig`` [#fft]_ / ``clt`` / ``welch`` / ``perm``
+     - ``liu`` [#fft]_ / ``welch`` / ``perm``
    * - DU (unconditional)
      - SplisosmNP / FFT
      - Isoform ratios
      - None
-     - ``eig``
+     - ``liu``
    * - DU (GP-conditional)
      - SplisosmNP / FFT
      - Isoform ratios
      - GP spatial residualisation
-     - ``eig``
+     - ``liu``
    * - DU (GLM score)
      - SplisosmGLMM
      - Isoform counts
@@ -446,4 +434,4 @@ Summary
      - GRF random effect
      - Chi-squared (score)
 
-.. [#fft] :class:`~splisosm.SplisosmFFT` does not take a ``null_method`` parameter; ``'eig'`` is the default and only option for FFT-accelerated tests, since the full kernel spectrum is efficiently computed via FFT.
+.. [#fft] :class:`~splisosm.SplisosmFFT` does not take a ``null_method`` parameter; ``'liu'`` is the default and only option for FFT-accelerated tests, since the full kernel spectrum is efficiently computed via FFT.

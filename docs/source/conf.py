@@ -4,7 +4,21 @@ from importlib.metadata import PackageNotFoundError, metadata
 from pathlib import Path
 import tomllib
 
+
 # -- Project information
+def _load_dynamic_version(pyproject_path: Path, fallback: str) -> str:
+    """Load a setuptools-scm version when docs are built from source."""
+    try:
+        from setuptools_scm import get_version
+    except ImportError:
+        return fallback
+
+    try:
+        return get_version(root=pyproject_path.parent, fallback_version=fallback)
+    except Exception:
+        return fallback
+
+
 def _load_project_info() -> tuple[str, str, str]:
     """Load (name, author, version) from installed metadata or pyproject.toml."""
     try:
@@ -16,7 +30,15 @@ def _load_project_info() -> tuple[str, str, str]:
             pyproject = tomllib.load(f)
         project_cfg = pyproject.get("project", {})
         name = project_cfg.get("name", "splisosm")
-        version = project_cfg.get("version", "0.0.0")
+        fallback_version = (
+            pyproject.get("tool", {})
+            .get("setuptools_scm", {})
+            .get("fallback_version", "0.0.0")
+        )
+        version = project_cfg.get("version") or _load_dynamic_version(
+            pyproject_path,
+            fallback_version,
+        )
         authors = project_cfg.get("authors", [])
         author = (
             authors[0].get("name", "")
@@ -60,8 +82,8 @@ autoapi_ignore = ['**/.ipynb_checkpoints/*', '**/*-checkpoint.py']
 autoapi_options = [
     'members',
     'undoc-members',
-    'show-inheritance', 
-    'show-module-summary', 
+    'show-inheritance',
+    'show-module-summary',
 ]
 autoapi_member_order = 'groupwise'
 

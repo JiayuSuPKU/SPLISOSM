@@ -1,7 +1,16 @@
 import unittest
+import numpy as np
 import torch
 
+from splisosm._hsic_null import (
+    _hsic_null_mean_var,
+    _hutchinson_cumulants,
+    _kernel_cumulants_for_null,
+)
+from splisosm.kernel import SpatialCovKernel
 from splisosm.likelihood import (
+    liu_sf,
+    liu_sf_from_cumulants,
     log_prob_fastmvn,
     log_prob_fastmvn_batched,
     log_prob_fastmult,
@@ -177,6 +186,91 @@ class TestLikelihood(unittest.TestCase):
             torch.allclose(log_prob_before, log_prob_after),
             "Multivariate normal log-likelihood changed after perturbation on masked values",
         )
+
+    def test_liu_cumulants_match_eigenvalue_call(self):
+        lambs = np.array([2.5, 1.0, 0.25, 0.1], dtype=float)
+        cumulants = {p: float(np.sum(lambs**p)) for p in (1, 2, 3, 4)}
+        t = np.array([0.5, 3.0, 8.0], dtype=float)
+
+        p_from_eig = liu_sf(t, lambs)
+        p_from_cumulants = liu_sf_from_cumulants(t, cumulants)
+
+        np.testing.assert_allclose(p_from_cumulants, p_from_eig, rtol=1e-12)
+
+    def test_hsic_null_mean_var_uses_mixture_moments(self):
+        kernel_cumulants = {1: 5.0, 2: 9.0, 3: 17.0, 4: 33.0}
+        feature_cumulants = {1: 4.0, 2: 7.0, 3: 13.0, 4: 25.0}
+        n_spots = 8
+        m = n_spots - 1
+
+        mean, var = _hsic_null_mean_var(
+            kernel_cumulants,
+            feature_cumulants,
+            n_spots,
+        )
+        expected_mean = kernel_cumulants[1] * feature_cumulants[1] / m
+        expected_var = 2.0 * kernel_cumulants[2] * feature_cumulants[2] / (m**2)
+
+        self.assertAlmostEqual(mean, expected_mean)
+        self.assertAlmostEqual(var, expected_var)
+
+    def test_hutchinson_cumulants_do_not_use_implicit_car_trace(self):
+        old_threshold = SpatialCovKernel.DENSE_THRESHOLD
+        SpatialCovKernel.DENSE_THRESHOLD = 0
+        try:
+            coords = torch.tensor(
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+                dtype=torch.float32,
+            )
+            kernel = SpatialCovKernel(coords, k_neighbors=2, centering=True)
+        finally:
+            SpatialCovKernel.DENSE_THRESHOLD = old_threshold
+
+        self.assertIsNone(kernel.K_sp)
+
+        def _fail_trace(*args, **kwargs):
+            raise AssertionError("implicit CAR trace path should not be used")
+
+        kernel._hutchinson_trace = _fail_trace
+        cumulants = _hutchinson_cumulants(
+            kernel,
+            n_probes=4,
+            rng_seed=0,
+            max_power=2,
+        )
+
+        self.assertEqual(set(cumulants), {1, 2})
+        self.assertTrue(np.isfinite(cumulants[1]))
+        self.assertTrue(np.isfinite(cumulants[2]))
+
+    def test_n_probes_config_controls_welch_hutchinson_budget(self):
+        old_threshold = SpatialCovKernel.DENSE_THRESHOLD
+        SpatialCovKernel.DENSE_THRESHOLD = 0
+        try:
+            coords = torch.tensor(
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+                dtype=torch.float32,
+            )
+            kernel = SpatialCovKernel(coords, k_neighbors=2, centering=True)
+        finally:
+            SpatialCovKernel.DENSE_THRESHOLD = old_threshold
+
+        cumulants, kernel_rank = _kernel_cumulants_for_null(
+            kernel,
+            null_method="welch",
+            n_spots=4,
+            null_configs={"n_probes": 4, "rng_seed": 0},
+        )
+
+        expected = _hutchinson_cumulants(
+            kernel,
+            n_probes=4,
+            rng_seed=0,
+            max_power=2,
+        )
+        self.assertIsNone(kernel_rank)
+        np.testing.assert_allclose(cumulants[1], expected[1])
+        np.testing.assert_allclose(cumulants[2], expected[2])
 
 
 if __name__ == "__main__":

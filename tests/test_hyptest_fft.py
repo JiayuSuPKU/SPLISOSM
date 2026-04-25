@@ -358,6 +358,15 @@ class TestSplisosmFFT(unittest.TestCase):
                 self.assertTrue(np.isfinite(res["pvalue"].to_numpy()).all())
                 self.assertTrue(np.isfinite(res["pvalue_adj"].to_numpy()).all())
 
+        res_dict = model.test_spatial_variability(
+            method="hsic-ir",
+            n_jobs=1,
+            print_progress=False,
+            return_results=True,
+        )
+        self.assertEqual(res_dict["null_method"], "liu")
+        self.assertTrue(np.all(np.isfinite(res_dict["pvalue"])))
+
     def test_setup_data_filter_single_iso_genes_false(self):
         """filter_single_iso_genes=False keeps genes with only one passing isoform."""
         # The default fixture has 2 genes each with 3 probes.

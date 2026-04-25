@@ -10,8 +10,6 @@ from joblib import Parallel, delayed
 from scipy.stats import (
     ttest_ind,
     combine_pvalues,
-    norm as _norm_dist,
-    chi2 as _chi2_dist,
 )
 import numpy as np
 import scipy.sparse
@@ -28,7 +26,14 @@ from splisosm.utils import (
     run_sparkx,
 )
 from splisosm.kernel import IdentityKernel, SpatialCovKernel
-from splisosm.likelihood import liu_sf
+from splisosm._hsic_null import (
+    _dense_kernel_cumulants,
+    _feature_cumulants_from_data,
+    _hsic_liu_pvalue,
+    _hsic_welch_pvalue,
+    _kernel_cumulants_for_null,
+    _normalize_hsic_null_method,
+)
 from splisosm.kernel_gpr import (
     linear_hsic_test,
     fit_kernel_gpr,
@@ -112,17 +117,15 @@ def _sv_gene_worker_np(
     null_method: str,
     n_spots: int,
     K_sp,
-    lambda_sp: "Optional[torch.Tensor]",
-    k_eff: int,
-    trK: "Optional[torch.Tensor]",
-    trK2: "Optional[torch.Tensor]",
+    kernel_cumulants: "Optional[dict[int, float]]",
+    kernel_approx_rank: "Optional[int]",
     n_nulls: int,
     perm_batch_size: int,
 ) -> "tuple[float, float]":
     """Process a single gene for :meth:`SplisosmNP.test_spatial_variability`.
 
-    Shared objects (``K_sp``, ``lambda_sp``, ``trK``, ``trK2``) are
-    passed by reference and only read, making this safe for
+    Shared objects (``K_sp`` and ``kernel_cumulants``) are passed by
+    reference and only read, making this safe for
     ``joblib.Parallel(prefer="threads")``.
 
     Returns
@@ -140,15 +143,13 @@ def _sv_gene_worker_np(
     if method == "hsic-ir" and counts.shape[1] <= 1:
         return (0.0, 1.0)
 
-    lambda_sp_eff = lambda_sp
-    k_eff_eff = k_eff
+    kernel_cumulants_eff = kernel_cumulants
+    kernel_approx_rank_eff = kernel_approx_rank
     # By default, null-distribution inputs come from the global (already
     # double-centred) K_sp.  The `hsic-ir + nan_filling='none'` branch below
     # overrides these with per-gene values derived from K_sp_gene so that the
     # statistic and the null reference the *same* (centred) kernel submatrix.
     K_sp_null = K_sp
-    trK_eff = trK
-    trK2_eff = trK2
 
     if method == "hsic-ir" and nan_filling == "none":
         # per-gene spatial kernel: drop NaN spots and recompute K
@@ -167,17 +168,13 @@ def _sv_gene_worker_np(
 
         hsic_scaled = torch.trace(y.T @ K_sp_gene @ y)
 
-        # The passed-in null inputs (lambda_sp, trK, trK2) describe the global
+        # The passed-in null inputs describe the global
         # K_sp; with per-gene NaN filtering they no longer match the statistic.
         # Recompute them from the per-gene centred submatrix.
-        if null_method == "eig":
-            lambda_sp_eff = torch.linalg.eigvalsh(K_sp_gene)
-            lambda_sp_eff = lambda_sp_eff[lambda_sp_eff > 1e-5]
-            k_eff_eff = len(lambda_sp_eff)
-        elif null_method in ("clt", "welch"):
-            trK_eff = torch.trace(K_sp_gene)
-            trK2_eff = K_sp_gene.pow(2).sum()
-        else:  # null_method == "perm"
+        if null_method in ("liu", "welch"):
+            kernel_cumulants_eff = _dense_kernel_cumulants(K_sp_gene)
+            kernel_approx_rank_eff = None
+        else:
             # Use the per-gene centred kernel directly; `K_sp.xtKx` would apply
             # the global (wrong-shape) kernel to the NaN-filtered y_batch.
             K_sp_null = K_sp_gene
@@ -199,45 +196,30 @@ def _sv_gene_worker_np(
 
         n_spots_eff = n_spots
 
-        if null_method == "eig":
-            hsic_scaled = torch.trace(K_sp.xtKx_approx(y, k=k_eff_eff))
+        if null_method == "liu" and kernel_approx_rank_eff is not None:
+            hsic_scaled = torch.trace(K_sp.xtKx_approx(y, k=kernel_approx_rank_eff))
         else:
             hsic_scaled = torch.trace(K_sp.xtKx_exact(y))
 
     hsic_norm = float(hsic_scaled / (n_spots_eff - 1) ** 2)
 
-    if null_method == "eig":
-        try:
-            lambda_y = torch.linalg.eigvalsh(y.T @ y)
-        except torch._C._LinAlgError:
-            lambda_y = torch.linalg.eigvalsh(y.T @ y + 1e-6 * torch.eye(y.shape[1]))
-        lambda_y = lambda_y[lambda_y > 1e-5]
-        lambda_spy = (lambda_sp_eff.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
-        pval = liu_sf((hsic_scaled * n_spots_eff).numpy(), lambda_spy.numpy())
+    if null_method == "liu":
+        feature_cumulants = _feature_cumulants_from_data(y)
+        pval = _hsic_liu_pvalue(
+            float(hsic_scaled),
+            kernel_cumulants_eff,
+            feature_cumulants,
+            n_spots_eff,
+        )
 
-    elif null_method in ("clt", "welch"):
-        S = y.T @ y
-        trS = torch.trace(S).item()
-        trS2 = torch.trace(S @ S).item()
-        n1 = n_spots_eff - 1
-        mean_null = trK_eff.item() * trS / n1
-        var_null = 2.0 * trK2_eff.item() * trS2 / (n1**2)
-        if null_method == "clt":
-            # moment-matching normal (Central Limit Theorem) approximation
-            z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
-            pval = float(_norm_dist.sf(z))
-        else:
-            # Welch-Satterthwaite: match the first two moments of the chi-squared
-            # mixture null to a scaled chi-squared g * chi2(h), with
-            #   g = Var/(2 * E),  h = 2 * E^2 / Var
-            # Falls back to the CLT z-test if the variance is non-positive.
-            if var_null > 0 and mean_null > 0:
-                scale_g = var_null / (2.0 * mean_null)
-                df_h = 2.0 * mean_null**2 / var_null
-                pval = float(_chi2_dist.sf(hsic_scaled.item() / scale_g, df=df_h))
-            else:
-                z = (hsic_scaled.item() - mean_null) / (var_null**0.5 + 1e-12)
-                pval = float(_norm_dist.sf(z))
+    elif null_method == "welch":
+        feature_cumulants = _feature_cumulants_from_data(y)
+        pval = _hsic_welch_pvalue(
+            float(hsic_scaled),
+            kernel_cumulants_eff,
+            feature_cumulants,
+            n_spots_eff,
+        )
 
     else:  # null_method == "perm"
         p_isos = y.shape[1]
@@ -900,7 +882,7 @@ class SplisosmNP:
         method: Literal["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"] = "hsic-ir",
         ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
         nan_filling: Literal["mean", "none"] = "mean",
-        null_method: Literal["eig", "clt", "welch", "perm", "trace"] = "eig",
+        null_method: Literal["liu", "welch", "perm", "eig", "clt", "trace"] = "liu",
         null_configs: Optional[dict[str, Any]] = None,
         n_jobs: int = -1,
         return_results: bool = False,
@@ -929,32 +911,41 @@ class SplisosmNP:
         nan_filling : {"mean", "none"}, optional
             Strategy for NaN values in isoform ratios.
             See :func:`splisosm.utils.counts_to_ratios` for details.
-        null_method : {"eig", "clt", "welch", "perm"}, optional
+        null_method : {"liu", "welch", "perm"}, optional
             Method for computing the null distribution of the test statistic:
 
-            * ``"eig"`` (default): asymptotic chi-square mixture using kernel
-              eigenvalues; Liu's method :cite:`liu2009new`.  Supports optional
-              ``null_configs["approx_rank"]`` (int) to use only the top-k
-              eigenvalues. By default, approx_rank = np.ceil(np.sqrt(n_spots) * 4)
-              for large datasets (n_spots > 5000). Set it to None to use
-              all eigenvalues, which can be slow for large n_spots.
-            * ``"clt"``: moment-matching normal (Central Limit Theorem)
-              approximation using tr(K') and tr(K'²) of the (centred) spatial
-              kernel.  Fastest, but tail probabilities can be inaccurate when
-              the effective degrees of freedom of the chi-squared mixture is
-              small.  ``"trace"`` is accepted as a deprecated alias.
-            * ``"welch"``: Welch-Satterthwaite moment matching.  Uses the same
-              tr(K') and tr(K'²) as ``"clt"`` but approximates the null by a
-              scaled chi-squared ``g * chi2(h)`` with
-              ``g = Var/(2*E)`` and ``h = 2*E^2/Var``.  Comparable cost to
-              ``"clt"`` with more accurate right-tail p-values, typically
-              closer to the ``"eig"`` (Liu) reference.
+            * ``"liu"`` (default): asymptotic chi-square mixture using
+              cumulants with Liu's method :cite:`liu2009new`.  Exact
+              eigenvalue cumulants are used when cheap; large implicit
+              kernels use Hutchinson Rademacher trace estimates unless
+              ``null_configs["approx_rank"]`` is explicitly set.
+            * ``"welch"``: Welch-Satterthwaite moment matching.  Uses
+              tr(K') and tr(K'²) and approximates the null by a scaled
+              chi-squared ``g * chi2(h)`` with ``g = Var/(2*E)`` and
+              ``h = 2*E^2/Var``.  This replaces the old normal approximation
+              with more accurate right-tail p-values, typically closer to the
+              ``"liu"`` reference.
             * ``"perm"``: permutation-based null distribution.  Supports
               optional ``null_configs["n_perms_per_gene"]`` (default 1000),
               and ``null_configs["perm_batch_size"]`` (default 50, larger values
               lead to more memory usage) for batch-wise null statistic computation.
+            ``"eig"`` is accepted as a deprecated alias for ``"liu"``.
+            ``"clt"`` and ``"trace"`` are accepted as deprecated aliases for
+            ``"welch"``.
         null_configs : dict or None, optional
             Extra keyword arguments for the chosen ``null_method``.
+            For ``null_method="liu"``, SPLISOSM evaluates Liu's
+            approximation from cumulants instead of materializing all pairwise
+            eigenvalue products. Supported keys include:
+
+            * ``"approx_rank"``: int or None. If set, use the top-k spatial
+              eigenvalues and a rank-consistent statistic.
+            * ``"n_probes"``: int. Estimate spatial kernel cumulants with this
+              many Hutchinson Rademacher probes instead of eigenvalues. The same
+              budget is used by ``"welch"`` when the spatial kernel does not
+              expose exact ``tr(K)`` and ``tr(K^2)`` (for example implicit CAR
+              kernels). Large implicit kernels default to 60 probes when
+              ``approx_rank`` is not explicitly supplied.
         n_jobs : int, optional
             Number of parallel workers for the per-gene loop.  ``-1`` uses all
             available CPUs.  Each worker densifies one sparse count tensor
@@ -985,21 +976,8 @@ class SplisosmNP:
             )
 
         valid_methods = ["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"]
-        # Back-compat: accept the legacy "trace" alias but emit a
-        # DeprecationWarning.  The canonical name for this moment-matching
-        # normal approximation is now "clt" (Central Limit Theorem), which
-        # avoids conflating it with the Welch-Satterthwaite path (``"welch"``)
-        # that also uses matrix traces.
-        if null_method == "trace":
-            warnings.warn(
-                "null_method='trace' is deprecated; use 'clt' instead "
-                "(same moment-matching normal approximation; renamed to "
-                "disambiguate from 'welch').",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            null_method = "clt"
-        valid_null_methods = ["eig", "clt", "welch", "perm"]
+        null_method = _normalize_hsic_null_method(null_method, allow_perm=True)
+        valid_null_methods = ["liu", "welch", "perm"]
         valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
         valid_nan_filling = ["mean", "none"]
         assert (
@@ -1049,33 +1027,19 @@ class SplisosmNP:
             K_sp = self.sp_kernel  # the Kernel class object was already centered
 
             # pre-compute null distribution inputs (once, before per-gene loop)
-            lambda_sp = None
-            k_eff = 0
-            trK = None
-            trK2 = None
+            kernel_cumulants = None
+            kernel_approx_rank = None
             n_nulls = 0
             _perm_batch_size = 1
             configs = null_configs or {}
-            if null_method == "eig":
-                _rank = (
-                    np.ceil(np.sqrt(self.n_spots) * 4).astype(int)
-                    if self.n_spots > 5000
-                    else self.n_spots
+            if null_method in ("liu", "welch"):
+                kernel_cumulants, kernel_approx_rank = _kernel_cumulants_for_null(
+                    self.sp_kernel,
+                    null_method=null_method,
+                    n_spots=n_spots,
+                    null_configs=configs,
+                    dense_threshold=getattr(SpatialCovKernel, "DENSE_THRESHOLD", 5000),
                 )
-                approx_rank = configs.get("approx_rank", _rank)
-                if approx_rank is None and self.n_spots > 5000:
-                    warnings.warn(
-                        "Computing all eigenvalues for null distribution can be slow for large n_spots. "
-                        "Consider setting a small value for null_configs['approx_rank'] to use low-rank approximation.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-                lambda_sp = self.sp_kernel.eigenvalues(k=approx_rank)
-                lambda_sp = lambda_sp[lambda_sp > 1e-5]
-                k_eff = len(lambda_sp)
-            elif null_method in ("clt", "welch"):
-                trK = self.sp_kernel.trace()
-                trK2 = self.sp_kernel.square_trace()
             elif null_method == "perm":
                 n_nulls = int(configs.get("n_perms_per_gene", 1000))
                 _perm_batch_size = int(configs.get("perm_batch_size", 50))
@@ -1090,10 +1054,8 @@ class SplisosmNP:
                     null_method,
                     n_spots,
                     K_sp,
-                    lambda_sp if null_method == "eig" else None,
-                    k_eff if null_method == "eig" else 0,
-                    trK if null_method in ("clt", "welch") else None,
-                    trK2 if null_method in ("clt", "welch") else None,
+                    (kernel_cumulants if null_method in ("liu", "welch") else None),
+                    kernel_approx_rank if null_method == "liu" else None,
                     n_nulls if null_method == "perm" else 0,
                     _perm_batch_size if null_method == "perm" else 1,
                 )

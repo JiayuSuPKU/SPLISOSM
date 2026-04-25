@@ -45,9 +45,9 @@ Platform compatibility
     # moment-matching Welch-Satterthwaite approximation (faster, no eigendecomposition)
     test_results = run_hsic_gc(gene_counts, coordinates, null_method="welch")
 
-    # cap eigenvalue rank for large n (auto-capped at ceil(sqrt(n)*4) when n > 5000)
+    # control Hutchinson probes for large n, or pass approx_rank to force low-rank eigenvalues
     test_results = run_hsic_gc(
-        gene_counts, coordinates, null_configs={"approx_rank": 100}
+        gene_counts, coordinates, null_configs={"n_probes": 100}
     )
 
     # ── AnnData mode ─────────────────────────────────────────────────
@@ -106,10 +106,11 @@ Choosing a model class
   :class:`~splisosm.SplisosmNP` operates only on the :math:`n \le H \times W` observed spots recorded in the AnnData, 
   so the effective sample size and kernel matrix dimensions can differ.
 
-  3. **SplisosmNP low-rank approximation.**
-  For large datasets, :class:`~splisosm.SplisosmNP` approximates the kernel with a low-rank eigen-decomposition,
-  which can lead to slightly different p-values compared to the full-rank version. 
-  The approximation rank is controlled via ``null_configs={"approx_rank": r}``, with default :math:`r = \lceil 4\sqrt{n} \rceil` when :math:`n > 5000`.
+  3. **SplisosmNP large-kernel null approximation.**
+  For large implicit CAR kernels, :class:`~splisosm.SplisosmNP` estimates Liu null cumulants with Hutchinson Rademacher probes by default,
+  which can lead to slightly different p-values compared to a full eigendecomposition.
+  The shared probe budget is controlled via ``null_configs={"n_probes": m}`` for both Liu cumulants and Welch trace probes.
+  Use ``null_configs={"approx_rank": r}`` to force a low-rank eigen approximation.
 
   In practice, when the grid is densely observed (few missing bins) and the tissue is far
   from the grid boundary, the two classes give very similar results. 
@@ -256,4 +257,3 @@ Interpretation of Results
   - Validating predicted associations between SVP genes and RNA-binding proteins (RBPs) using external data (e.g., from CLIP-seq databases like `POSTAR3 <http://111.198.139.65/RBP.html>`_) or functional perturbation experiments.
 
   Example analyses from the SPLISOSM manuscript are available in the `SPLISOSM Paper GitHub Repository <https://github.com/JiayuSuPKU/SPLISOSM_paper/>`_.
-
