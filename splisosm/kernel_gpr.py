@@ -2417,7 +2417,7 @@ class NUFFTKernelGPR(KernelGPR):
     The backend keeps the RBF kernel implicit: FINUFFT evaluates kernel-vector
     products and conjugate gradients solve ``(K + epsilon I)`` systems.  Regular
     grids with matching ``n_modes`` use the same spectral likelihood as
-    :class:`FFTKernelGPR`; irregular grids use leading eigenpairs plus a
+    :class:`FFTKernelGPR`; irregular grids use a leading-eigenpair summary plus
     trace/trace(K^2) tail correction for marginal-likelihood fitting.
 
     Parameters
@@ -2451,7 +2451,8 @@ class NUFFTKernelGPR(KernelGPR):
     lml_exact_max_n : int
         Maximum ``n_obs`` for exact dense eigendecomposition.
     eigsh_tol : float
-        Relative tolerance for ``eigsh`` in the low-rank path.
+        Relative tolerance for ``eigsh`` in the irregular-grid eigensummary
+        path.
     period_margin : float
         Fractional padding around the coordinate bounding box before periodic
         wrapping.

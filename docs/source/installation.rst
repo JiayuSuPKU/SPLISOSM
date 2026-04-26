@@ -14,6 +14,16 @@ SPLISOSM can be installed via pip:
   # or from GitHub (latest version)
   $ pip install git+https://github.com/JiayuSuPKU/SPLISOSM.git#egg=splisosm
 
+Preview release candidates may be published on GitHub before they are uploaded
+to PyPI.  Install a preview from its tag, for example:
+
+.. code-block:: zsh
+
+  $ pip install "splisosm[sdata,gp] @ git+https://github.com/JiayuSuPKU/SPLISOSM.git@v1.2.0rc1"
+
+The v1.2.0 preview is GitHub-only; use the PyPI command above for the latest
+stable release.
+
 
 Minimal software dependencies:
 
@@ -36,7 +46,7 @@ To install these additional dependencies, you can use the following command:
 
 .. code-block:: zsh
 
-  $ pip install "splisosm[sdata, gp]"
+  $ pip install "splisosm[sdata,gp]"
 
 .. note::
 

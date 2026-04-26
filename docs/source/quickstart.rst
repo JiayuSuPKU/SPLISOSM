@@ -82,11 +82,14 @@ Summary of class features:
    </details>
 
 .. note::
-    Since ``v1.2.0``, low-rank approximation is no longer necessary for :class:`~splisosm.SplisosmNP` SV tests, 
-    because the default Liu null is evaluated from spetral cumulant estimates instead of materialising the full
-    pairwise eigenvalue product. Pass ``null_configs={"n_probes": m}`` to tune the Hutchinson Rademacher probe 
-    budget for large datasets (default is 60, smaller values may be used for faster computation). 
-    Pass ``null_configs={"approx_rank": k}`` specifically to replicate the old low-rank approximation behavior.
+    Since ``v1.2.0``, low-rank approximation is no longer necessary for
+    :class:`~splisosm.SplisosmNP` SV tests, because the default Liu null is
+    evaluated from full-rank cumulant estimates instead of materialising the
+    full pairwise eigenvalue product. Pass ``null_configs={"n_probes": m}``
+    only to tune the Hutchinson Rademacher probe budget for large implicit CAR
+    kernels. For analyses that intentionally emphasize global smooth patterns,
+    prefer a smoother full-rank CAR kernel such as ``rho=0.999`` over spatial
+    rank truncation.
 
 Inputs and outputs
 ------------------

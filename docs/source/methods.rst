@@ -148,6 +148,12 @@ See :func:`splisosm.likelihood.liu_sf_from_cumulants` for implementation details
    - Full eigen-decomposition of :math:`K` is :math:`O(n^3)` and is not feasible for large datasets.
      For implicit CAR kernels with no realised dense covariance, SPLISOSM estimates :math:`\mathrm{tr}(K^r)` with Hutchinson Rademacher probes by default.
      Use ``null_configs={"n_probes": m}`` to control that budget.
+   - Since v1.2.0, large :class:`~splisosm.SplisosmNP` SV tests use full-rank
+     cumulants by default rather than the v1.1.x low-rank spatial
+     approximation. This preserves sensitivity to both global and local spatial
+     patterns. If the analysis should intentionally emphasize global smooth
+     patterns, prefer increasing the CAR smoothness parameter (for example
+     ``rho=0.999``) instead of truncating the spatial rank.
    - When ``nan_filling='mean'`` (default), the spatial cumulants are cached once and reused for all subsequent genes.
 
 .. _null-welch:
@@ -228,8 +234,11 @@ Furthermore, the spatial eigenvalues :math:`\{\lambda_{(h,w)}^K\}` are shared ac
 
 .. note::
 
-   For irregularly spaced 2D and 3D coordinates, it is possible to compute the SV test statistic and null using a `non-uniform FFT (NUFFT) <https://en.wikipedia.org/wiki/Non-uniform_discrete_Fourier_transform>`_ approach,
-   which also scales as :math:`O(n \log n)`. SPLISOSM currently uses NUFFT for the conditional DU GP residualization backend on irregular 2-D coordinates; extending the SV CAR null to NUFFT is separate future work.
+   For irregularly spaced 2D and 3D coordinates, the SV test statistic and its null can be computed using a
+   `non-uniform FFT (NUFFT) <https://en.wikipedia.org/wiki/Non-uniform_discrete_Fourier_transform>`_ approach,
+   which also scales as :math:`O(n \log n)`. Because the current implementation is already highly efficient
+   (processing 100K spots in under a minute), extending the SV test with NUFFT is deferred to future work.
+   Please open an `issue <https://github.com/JiayuSuPKU/splisosm/issues>`_ if you are interested in this feature.
 
 Differential Isoform Usage (DU) Tests
 ---------------------------------------

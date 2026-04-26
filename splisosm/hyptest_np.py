@@ -941,10 +941,11 @@ class SplisosmNP:
             eigenvalue products. Supported keys include:
 
             * ``"n_probes"``: int. Estimate spatial kernel cumulants with this
-              many Hutchinson Rademacher probes instead of eigenvalues. The same
-              budget is used by ``"welch"`` when the spatial kernel does not
-              expose exact ``tr(K)`` and ``tr(K^2)`` (for example implicit CAR
-              kernels). Large implicit kernels default to 60 probes.
+              many Hutchinson Rademacher probes when exact eigenvalue or trace
+              cumulants are unavailable. The same budget is used by ``"welch"``
+              when the spatial kernel does not expose exact ``tr(K)`` and
+              ``tr(K^2)`` (for example implicit CAR kernels). Large implicit
+              kernels default to 60 probes.
             * ``"approx_rank"``: int or None. Advanced diagnostic override to
               use the top-k spatial eigenvalues and a rank-consistent
               statistic. This is normally unnecessary for SV tests because the
@@ -956,7 +957,7 @@ class SplisosmNP:
             to fit within available RAM.  Default ``-1``.
         return_results : bool, optional
             If ``True``, return the result dict.  Otherwise store results in
-            :attr:`sv_test_results` and return ``None``.
+            ``self._sv_test_results`` and return ``None``.
         print_progress : bool, optional
             Whether to show a progress bar.
 

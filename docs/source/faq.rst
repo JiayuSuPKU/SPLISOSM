@@ -110,7 +110,31 @@ Choosing a model class
   Low-rank approximation is no longer needed for :class:`~splisosm.SplisosmNP` SV tests because the default
   Liu path works from direct cumulants rather than the full pairwise eigenvalue product.
 
-**5. Which differential usage test method should I use: parametric or non-parametric?**
+**5. Why did SplisosmNP SV results change in v1.2.0?**
+
+  Starting in v1.2.0, :class:`~splisosm.SplisosmNP` uses Liu's approximation with
+  **full-rank spatial-kernel cumulants** by default.  In v1.1.x, large
+  ``SplisosmNP`` SV tests used a low-rank spatial approximation by default.
+  This can change p-values and the number of SVP genes passing a fixed FDR
+  threshold, although gene rankings are usually largely consistent.
+
+  At first glance, the legacy low-rank approach may appear to have higher
+  statistical power because it often identifies more SVP genes.  This difference
+  comes from a deliberate design choice: low-rank approximations prioritize
+  global, low-frequency spatial patterns, but they sacrifice sensitivity to
+  local, high-frequency patterns and can have effectively zero power for those
+  signals.  Since real spatial datasets often contain strong global patterns,
+  the low-rank test can naturally produce smaller p-values in those scenarios.
+
+  For applications that intentionally prioritize global patterns, prefer
+  adjusting the spatial kernel instead of returning to rank truncation; for
+  example, use a smoother CAR kernel such as ``SplisosmNP(rho=0.999)`` or
+  ``run_hsic_gc(..., rho=0.999)``.  This keeps the full-rank test able to
+  detect local patterns while increasing emphasis on global smooth structure.
+  Use ``null_configs={"n_probes": m}`` only to tune the stochastic cumulant
+  trace budget; it is not a low-rank approximation.
+
+**6. Which differential usage test method should I use: parametric or non-parametric?**
 
   We recommend using the non-parametric test (:class:`~splisosm.hyptest_np.SplisosmNP` with ``method='hsic-gp'``) as the default choice. It is more robust to model misspecification and generally provides better control of the false positive rate.
   The parametric test (:class:`~splisosm.hyptest_glmm.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
@@ -157,13 +181,13 @@ Choosing a model class
 Running SPLISOSM
 --------------------
 
-**6. Can I run SPLISOSM on single-cell spatial transcriptomics data?**
+**7. Can I run SPLISOSM on single-cell spatial transcriptomics data?**
 
   Yes. :class:`~splisosm.SplisosmNP` works directly on segmented single-cell data — simply pass the cell-level AnnData with spatial coordinates.
   See the :doc:`Xenium segmented single-cell tutorial <tutorials/xenium_sc_segmented>` for a worked example, and the :doc:`Feature Quantification page <txquant>` for guidance on preparing input data from Space Ranger and Xenium Ranger segmentation outputs.
 
 
-**7. Can I run SPLISOSM on a subset of cells/spots instead of the whole tissue?**
+**8. Can I run SPLISOSM on a subset of cells/spots instead of the whole tissue?**
 
   Yes. SPLISOSM can be run on any subset of cells or spots. This is useful when focusing on specific regions of interest or cell types. 
   Simply filter your AnnData object to the subset of interest before passing it to SPLISOSM. See the :doc:`Xenium segmented single-cell tutorial <tutorials/xenium_sc_segmented>` for an example.
@@ -174,7 +198,7 @@ Running SPLISOSM
   SPLISOSM will then ignore these spots in the statistical tests while still using their coordinates to build the spatial kernel.
 
 
-**8. Can I run SPLISOSM on single-cell non-spatial transcriptomics data?**
+**9. Can I run SPLISOSM on single-cell non-spatial transcriptomics data?**
 
   Yes. While SPLISOSM is designed to identify patterns associated with physical spatial coordinates, it is technically possible to run it on non-spatial single-cell RNA-seq data.
   This can be done by treating cell embeddings (e.g., PCA or UMAP coordinates) as "pseudo-spatial coordinates."
@@ -192,7 +216,7 @@ Running SPLISOSM
 Interpretation of Results
 --------------------------
 
-**9. For genes with spatially variable RNA processing (SVP), can I tell which isoforms are driving the spatial variability?**
+**10. For genes with spatially variable RNA processing (SVP), can I tell which isoforms are driving the spatial variability?**
 
   Yes and no. Isoform usage ratios are compositional, meaning they sum to one for each gene in a given spot or cell. If one isoform's usage increases in a spatial region, the usage of one or more other isoforms must decrease. For this reason, SPLISOSM's primary differential usage test (HSIC-IR) is a gene-level multivariate test that aggregates signals across all of a gene's isoforms.
 
@@ -222,7 +246,7 @@ Interpretation of Results
    This per-isoform ranking is for exploratory purposes only. The adjusted p-values from this analysis should not be considered as formal hypothesis testing, as the usage ratios of isoforms from the same gene are inherently correlated.
 
 
-**10. How many spatially variably expressed (SVE) genes or spatially variably processed (SVP) genes should I expect to find?**
+**11. How many spatially variably expressed (SVE) genes or spatially variably processed (SVP) genes should I expect to find?**
 
   The number of detected SVE/SVP genes depends on many factors, including the biological system, data quality, and sequencing depth. 
   For example, in our analyses of the adult mouse brain (Visium + ONT and Visium 3'), the number of detected SVP genes did not saturate at the sequencing depths tested. 
@@ -240,7 +264,7 @@ Interpretation of Results
    ONT-CBS1 and ONT-CBS2 are two long-read SiT (Visium-ONT) CBS samples.
    SR-Hippocampus: Slide-seqV2 hippocampus sample with higher spatial resolution but fewer UMIs per spot.
   
-**11. I have finished running SPLISOSM. What should I do next?**
+**12. I have finished running SPLISOSM. What should I do next?**
 
   After obtaining the test results from SPLISOSM, you can perform various downstream analyses to gain further biological insights. Examples include:
 

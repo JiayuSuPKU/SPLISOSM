@@ -1496,10 +1496,11 @@ def run_hsic_gc(
         ``"welch"``.
     null_configs : dict or None, optional
         Extra keyword arguments for the chosen ``null_method``. Use
-        ``"n_probes"`` to control the Hutchinson
-        budget for both ``"liu"`` cumulants and ``"welch"`` first-two-moment
-        traces when the spatial kernel has no exact trace path; implicit CAR
-        kernels default to 60 probes.
+        ``"n_probes"`` to control the Hutchinson budget for both ``"liu"``
+        cumulants and ``"welch"`` first-two-moment traces when the spatial
+        kernel has no exact trace path; implicit CAR kernels default to 60
+        probes. ``"n_probes"`` is stochastic trace control, not a low-rank
+        approximation.
     min_component_size : int, optional
         Minimum number of spots a connected component must contain to be
         retained.  Spots that belong to components smaller than this
