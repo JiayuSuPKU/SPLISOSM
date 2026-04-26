@@ -887,23 +887,11 @@ class SplisosmFFT:
         gpr_configs : dict, optional
             Nested configuration dict for the GPR objects, with optional keys
             ``'covariate'`` and/or ``'isoform'``.  Each sub-dict is forwarded to
-            :func:`splisosm.kernel_gpr.make_kernel_gpr`.  Unspecified keys use the
-            defaults from :data:`splisosm.kernel_gpr._DEFAULT_GPR_CONFIGS`::
-
-                {
-                    "covariate": {
-                        "constant_value": 1.0,
-                        "constant_value_bounds": (1e-3, 1e3),
-                        "length_scale": 1.0,
-                        "length_scale_bounds": "fixed",
-                    },
-                    "isoform": {
-                        "constant_value": 1.0,
-                        "constant_value_bounds": (1e-3, 1e3),
-                        "length_scale": 1.0,
-                        "length_scale_bounds": "fixed",
-                    },
-                }
+            the FFT GPR path.  Unspecified keys use the common GP defaults from
+            :data:`splisosm.kernel_gpr._DEFAULT_GPR_CONFIGS`: ``constant_value``,
+            ``constant_value_bounds``, ``length_scale``, and
+            ``length_scale_bounds``.  Large-n sklearn/gpytorch and NUFFT-only
+            keys in the shared defaults are ignored by this FFT path.
 
         residualize : {"cov_only", "both"}, optional
             Controls which signals are spatially residualized when

@@ -929,6 +929,7 @@ class SplisosmNP:
               optional ``null_configs["n_perms_per_gene"]`` (default 1000),
               and ``null_configs["perm_batch_size"]`` (default 50, larger values
               lead to more memory usage) for batch-wise null statistic computation.
+
             ``"eig"`` is accepted as a deprecated alias for ``"liu"``.
             ``"clt"`` and ``"trace"`` are accepted as deprecated aliases for
             ``"welch"``.
@@ -1091,7 +1092,7 @@ class SplisosmNP:
         method: Literal["hsic", "hsic-gp", "t-fisher", "t-tippett"] = "hsic-gp",
         ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
         nan_filling: Literal["mean", "none"] = "mean",
-        gpr_backend: Literal["sklearn", "gpytorch"] = "sklearn",
+        gpr_backend: Literal["sklearn", "gpytorch", "nufft", "finufft"] = "sklearn",
         gpr_configs: Optional[dict[str, Any]] = None,
         residualize: Literal["cov_only", "both"] = "cov_only",
         n_jobs: int = -1,
@@ -1137,34 +1138,23 @@ class SplisosmNP:
             See :func:`splisosm.utils.counts_to_ratios`.
         gpr_backend : str, optional
             GPR backend to use for ``method='hsic-gp'``.
-            One of ``'sklearn'`` (default) or ``'gpytorch'``.
+            One of ``'sklearn'`` (default), ``'gpytorch'``, ``'nufft'``, or
+            ``'finufft'``.  The NUFFT aliases use FINUFFT for irregular 2-D
+            coordinates with an implicit periodic RBF kernel.
             For FFT-accelerated spatial GP on regular grids use
             :class:`~splisosm.hyptest_fft.SplisosmFFT` instead.
         gpr_configs : dict, optional
             Nested configuration dict for the GPR objects, with optional keys
             ``'covariate'`` and/or ``'isoform'``.  Each sub-dict is forwarded to
             :func:`splisosm.kernel_gpr.make_kernel_gpr`.  Unspecified keys use the
-            defaults from :data:`splisosm.kernel_gpr._DEFAULT_GPR_CONFIGS`::
-
-                {
-                    "covariate": {
-                        "constant_value": 1.0,
-                        "constant_value_bounds": (1e-3, 1e3),
-                        "length_scale": 1.0,
-                        "length_scale_bounds": "fixed",
-                        "n_inducing": 5000,
-                    },
-                    "isoform": {
-                        "constant_value": 1.0,
-                        "constant_value_bounds": (1e-3, 1e3),
-                        "length_scale": 1.0,
-                        "length_scale_bounds": "fixed",
-                        "n_inducing": 5000,
-                    },
-                }
+            defaults from :data:`splisosm.kernel_gpr._DEFAULT_GPR_CONFIGS`.
+            The shared defaults include ``constant_value=1.0``,
+            ``constant_value_bounds=(1e-3, 1e3)``, ``length_scale=1.0``,
+            ``length_scale_bounds="fixed"``. Backend-irrelevant known keys are ignored by
+            :func:`splisosm.kernel_gpr.make_kernel_gpr`.
 
             ``"n_inducing"`` *(int or None)* controls the scale of spatial GP
-            fitting for each backend:
+            fitting for the dense/sparse GP backends:
 
             * **sklearn** — maximum number of observations used for
               hyperparameter fitting.  Full exact GP when ``n_obs ≤ n_inducing``
@@ -1175,6 +1165,21 @@ class SplisosmNP:
             * **gpytorch** — FITC sparse-GP inducing-point approximation with
               ``n_inducing`` points; set to ``None`` for exact GP.
               Default: ``5000``.
+
+            **nufft / finufft** has additional NUFFT-specific configuration options
+            for the RBF-GP fitting. See
+            :class:`splisosm.kernel_gpr.NUFFTKernelGPR` for a full list of
+            arguments and recommended defaults. Common options include:
+
+            * ``max_auto_modes`` - cap the size of the automatically inferred grid;
+            * ``lml_approx_rank`` - approximate the irregular-coordinate GP likelihoods
+              using only the leading eigenvalues and eigensummaries.
+              Ignored when the input grid is already regular (full spectrum available via FFT).
+              It costs ``O(n_obs * lml_approx_rank)`` memory and uses a
+              trace/trace(K^2)-corrected tail for the omitted spectrum.  In
+              practice, ranks around ``32``-``64`` often beat same-time sklearn
+              subset fits by a wide margin; increase the rank when memory
+              permits and hyperparameter accuracy is important.
 
         residualize : {"cov_only", "both"}, optional
             Controls which signals are spatially residualized when

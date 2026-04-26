@@ -11,12 +11,15 @@ GPR-residualizer hierarchy
     - ``SklearnKernelGPR``  - sklearn backend; dense; suitable for n <= ~10,000.
     - ``GPyTorchKernelGPR`` - GPyTorch backend (optional dep); lazy tensors.
     - ``FFTKernelGPR``      - FFT-based kernel; suitable for regular grids.
+    - ``NUFFTKernelGPR``    - FINUFFT-based kernel; suitable for irregular 2-D coordinates.
 """
 
 from __future__ import annotations
 
 import warnings
 from abc import ABC, abstractmethod
+import os
+import sys
 from typing import Any, Literal, Optional, Union
 
 import numpy as np
@@ -24,6 +27,7 @@ import scipy.fft
 import scipy.sparse
 import torch
 from scipy.optimize import minimize, minimize_scalar
+from scipy.sparse.linalg import LinearOperator, cg, eigsh
 
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel as C
@@ -36,11 +40,13 @@ __all__ = [
     # "SpatialKernelOp",
     # "DenseKernelOp",
     # "FFTKernelOp",
+    # "NUFFTKernelOp",
     # GPR residualizers
     "KernelGPR",
     "SklearnKernelGPR",
     "GPyTorchKernelGPR",
     "FFTKernelGPR",
+    "NUFFTKernelGPR",
     "make_kernel_gpr",
     # HSIC utilities
     "linear_hsic_test",
@@ -394,6 +400,427 @@ class FFTKernelOp(SpatialKernelOp):
 
 
 # ---------------------------------------------------------------------------
+# NUFFT kernel operator (RBF, irregular 2-D coordinates)
+# ---------------------------------------------------------------------------
+
+_NUFFT_MACOS_THREAD_WARNED = False
+
+
+def _require_finufft() -> Any:
+    """Import FINUFFT lazily with a backend-specific error message."""
+    if sys.platform == "darwin":
+        # PyTorch and FINUFFT wheels can load separate libomp.dylib copies on
+        # macOS conda environments.  FINUFFT aborts at the first transform
+        # unless this compatibility switch is present before OpenMP init.
+        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    try:
+        import finufft
+    except ImportError as exc:
+        raise ImportError(
+            "NUFFTKernelGPR requires the optional 'finufft' package. "
+            "Install it with `pip install finufft` or SPLISOSM's GP extra."
+        ) from exc
+    return finufft
+
+
+def _safe_finufft_workers(workers: Optional[int]) -> int:
+    """Return a FINUFFT thread count that is safe with PyTorch on macOS."""
+    global _NUFFT_MACOS_THREAD_WARNED
+    if workers is not None and int(workers) < 1:
+        raise ValueError("workers must be None or a positive integer.")
+    if sys.platform == "darwin" and workers not in (None, 1):
+        if not _NUFFT_MACOS_THREAD_WARNED:
+            warnings.warn(
+                "FINUFFT with nthreads > 1 can segfault on macOS when PyTorch "
+                "and other OpenMP-linked packages are loaded. Falling back to "
+                "one FINUFFT thread; use process-level parallelism instead.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            _NUFFT_MACOS_THREAD_WARNED = True
+        return 1
+    return 1 if workers is None else int(workers)
+
+
+def _as_numpy_coords_2d(coords: torch.Tensor | np.ndarray) -> np.ndarray:
+    """Return coordinates as a float64 ``(n, 2)`` NumPy array."""
+    if isinstance(coords, torch.Tensor):
+        arr = coords.detach().cpu().numpy()
+    else:
+        arr = np.asarray(coords)
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError(
+            "NUFFTKernelGPR requires 2-D coordinates with shape (n_obs, 2); "
+            f"got shape {arr.shape}."
+        )
+    return arr
+
+
+def _mode_indices(n_modes: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """Return FINUFFT/CMCL ordered mode indices for a 2-D mode shape."""
+    ky = np.arange(-(n_modes[0] // 2), n_modes[0] - n_modes[0] // 2, dtype=float)
+    kx = np.arange(-(n_modes[1] // 2), n_modes[1] - n_modes[1] // 2, dtype=float)
+    return np.meshgrid(ky, kx, indexing="ij")
+
+
+def _regular_grid_shape_spacing(
+    coords: np.ndarray,
+) -> Optional[tuple[int, int, float, float]]:
+    """Return ``(ny, nx, dy, dx)`` when coordinates form a complete grid."""
+    uy = np.unique(coords[:, 0])
+    ux = np.unique(coords[:, 1])
+    ny, nx = len(uy), len(ux)
+    if ny * nx != coords.shape[0]:
+        return None
+
+    dy = float(np.diff(uy).mean()) if ny > 1 else 1.0
+    dx = float(np.diff(ux).mean()) if nx > 1 else 1.0
+    if ny > 1 and not np.allclose(np.diff(uy), dy, rtol=1e-4, atol=1e-8):
+        return None
+    if nx > 1 and not np.allclose(np.diff(ux), dx, rtol=1e-4, atol=1e-8):
+        return None
+    return ny, nx, dy, dx
+
+
+def _auto_nufft_modes(
+    n_obs: int,
+    span: np.ndarray,
+    period: np.ndarray,
+    max_auto_modes: Optional[int] = None,
+) -> tuple[int, int]:
+    """Choose a full effective Fourier grid from point count and aspect ratio."""
+    if max_auto_modes is not None and int(max_auto_modes) < 16:
+        raise ValueError("max_auto_modes must be None or at least 16.")
+
+    span = np.maximum(np.asarray(span, dtype=float), 1e-12)
+    period = np.maximum(np.asarray(period, dtype=float), 1e-12)
+    cell = np.sqrt(float(np.prod(span)) / max(int(n_obs), 16))
+    modes = np.maximum(4, np.ceil(period / cell).astype(int))
+
+    if max_auto_modes is not None:
+        max_modes = int(max_auto_modes)
+        mode_product = int(modes[0] * modes[1])
+        if mode_product > max_modes:
+            scale = np.sqrt(max_modes / mode_product)
+            modes = np.maximum(4, np.floor(modes * scale).astype(int))
+            # Rounding both axes down can still leave the product just above the
+            # requested cap. Trim the larger axis while preserving the minimum
+            # valid FINUFFT mode shape.
+            while int(modes[0] * modes[1]) > max_modes:
+                axis = int(np.argmax(modes))
+                modes[axis] -= 1
+                if modes[axis] < 4:
+                    raise ValueError(
+                        "max_auto_modes is too small for a valid 2-D NUFFT grid."
+                    )
+
+    return int(modes[0]), int(modes[1])
+
+
+def _normalize_nufft_modes(
+    n_modes: Optional[int | tuple[int, int]],
+    n_obs: int,
+    span: np.ndarray,
+    period: np.ndarray,
+    max_auto_modes: Optional[int],
+) -> tuple[int, int]:
+    """Validate user-supplied NUFFT mode shape or choose one automatically."""
+    if n_modes is None:
+        return _auto_nufft_modes(n_obs, span, period, max_auto_modes)
+    if isinstance(n_modes, (int, np.integer)):
+        modes = (int(n_modes), int(n_modes))
+    else:
+        if len(n_modes) != 2:
+            raise ValueError("n_modes must be an int or a length-2 tuple.")
+        modes = (int(n_modes[0]), int(n_modes[1]))
+    if modes[0] < 4 or modes[1] < 4:
+        raise ValueError("n_modes entries must be at least 4.")
+    return modes
+
+
+class NUFFTKernelOp(SpatialKernelOp):
+    """Implicit periodic RBF kernel on irregular 2-D coordinates via FINUFFT.
+
+    The operator approximates a squared-exponential kernel with periodic
+    boundary conditions over the observed coordinate bounding box.  Matrix-vector
+    products use two FINUFFT calls:
+
+    ``nonuniform points -> Fourier modes -> nonuniform points``.
+
+    The dense ``n_obs x n_obs`` kernel matrix is never formed.  Linear solves use
+    conjugate gradients against the implicit operator.
+
+    Parameters
+    ----------
+    coords : torch.Tensor or np.ndarray, shape (n_obs, 2)
+        Spatial coordinates.  Units match ``length_scale``.
+    constant_value : float
+        RBF signal variance sigma².
+    length_scale : float
+        RBF length scale in the same coordinate units.
+    n_modes : int, tuple[int, int], or None
+        Fourier mode grid.  ``None`` chooses the full effective grid from the
+        observed coordinate density, with aspect ratio matching the padded
+        periodic box.  For example, roughly square data with 1M spots and no
+        padding uses about ``(1000, 1000)`` modes before FINUFFT's internal
+        oversampling.
+    max_auto_modes : int or None
+        Optional cap on the total automatically chosen Fourier modes.  Ignored
+        when ``n_modes`` is explicit.  ``None`` uses the full effective grid.
+    nufft_eps : float
+        FINUFFT requested precision.
+    nufft_opts : dict or None
+        Extra FINUFFT options, such as ``{"upsampfac": 2.0}``. Thread count is
+        controlled by ``workers`` instead of ``nufft_opts["nthreads"]``.
+    period_margin : float
+        Fractional padding added to each side of the coordinate bounding box
+        before wrapping onto ``[-pi, pi)``.
+    cg_rtol : float
+        Relative tolerance for conjugate-gradient solves.
+    cg_maxiter : int or None
+        Maximum CG iterations.
+    workers : int or None
+        FINUFFT thread count passed as ``nthreads``.  ``None`` uses one
+        FINUFFT thread, which avoids OpenMP runtime conflicts on common macOS
+        PyTorch/conda stacks.
+    """
+
+    def __init__(
+        self,
+        coords: torch.Tensor | np.ndarray,
+        constant_value: float,
+        length_scale: float,
+        n_modes: Optional[int | tuple[int, int]] = None,
+        max_auto_modes: Optional[int] = None,
+        nufft_eps: float = 1e-6,
+        nufft_opts: Optional[dict[str, Any]] = None,
+        period_margin: float = 0.5,
+        cg_rtol: float = 1e-5,
+        cg_maxiter: Optional[int] = None,
+        workers: Optional[int] = None,
+    ) -> None:
+        self._finufft = _require_finufft()
+        xy = _as_numpy_coords_2d(coords)
+        self._coords = xy
+        self._constant_value = float(constant_value)
+        self._length_scale = float(length_scale)
+        self._nufft_eps = float(nufft_eps)
+        self._nufft_opts = dict(nufft_opts or {})
+        self._period_margin = float(period_margin)
+        self._cg_rtol = float(cg_rtol)
+        self._cg_maxiter = cg_maxiter
+        self._workers = _safe_finufft_workers(workers)
+
+        if self._constant_value <= 0:
+            raise ValueError("constant_value must be positive.")
+        if self._length_scale <= 0:
+            raise ValueError("length_scale must be positive.")
+        if self._period_margin < 0:
+            raise ValueError("period_margin must be non-negative.")
+
+        span = np.ptp(xy, axis=0)
+        span = np.where(span <= 0.0, 1.0, span)
+        grid_meta = _regular_grid_shape_spacing(xy)
+        if grid_meta is None:
+            base_period = span
+        else:
+            ny, nx, dy, dx = grid_meta
+            base_period = np.array(
+                [ny * dy if ny > 1 else span[0], nx * dx if nx > 1 else span[1]],
+                dtype=float,
+            )
+
+        self._span = span
+        lo = xy.min(axis=0) - self._period_margin * span
+        self._period = base_period + 2.0 * self._period_margin * span
+        theta = 2.0 * np.pi * (xy - lo) / self._period - np.pi
+        self._theta = ((theta + np.pi) % (2.0 * np.pi)) - np.pi
+        self._theta_x = np.ascontiguousarray(self._theta[:, 0], dtype=np.float64)
+        self._theta_y = np.ascontiguousarray(self._theta[:, 1], dtype=np.float64)
+
+        self._n_modes = _normalize_nufft_modes(
+            n_modes, xy.shape[0], self._span, self._period, max_auto_modes
+        )
+        self._weights = self._compute_spectral_weights(
+            self._constant_value, self._length_scale
+        )
+
+    @property
+    def n(self) -> int:
+        """Number of observations."""
+        return self._coords.shape[0]
+
+    @property
+    def n_modes(self) -> tuple[int, int]:
+        """Fourier mode grid shape."""
+        return self._n_modes
+
+    @property
+    def spectral_weights(self) -> np.ndarray:
+        """Fourier weights whose sum equals ``constant_value``."""
+        return self._weights
+
+    @property
+    def eigenvalue_proxy(self) -> np.ndarray:
+        """FFT-style spectrum proxy for the periodic Fourier kernel."""
+        return self.n * self._weights.ravel()
+
+    def _compute_spectral_weights(
+        self, constant_value: float, length_scale: float
+    ) -> np.ndarray:
+        """Return finite-grid periodic RBF Fourier weights.
+
+        On a complete regular grid with ``n_modes == grid_shape`` and zero
+        padding these are exactly ``FFTKernelOp`` eigenvalues divided by the
+        number of grid cells, in FINUFFT's centered mode order.
+        """
+        dy, dx = self._period[0] / self._n_modes[0], self._period[1] / self._n_modes[1]
+        y = np.arange(self._n_modes[0], dtype=float) * dy
+        x = np.arange(self._n_modes[1], dtype=float) * dx
+        y = np.minimum(y, self._period[0] - y)
+        x = np.minimum(x, self._period[1] - x)
+        yy, xx = np.meshgrid(y, x, indexing="ij")
+        row = float(constant_value) * np.exp(
+            -(yy**2 + xx**2) / (2.0 * float(length_scale) ** 2)
+        )
+        lam = np.real(scipy.fft.fft2(row, workers=self._workers))
+        lam = np.maximum(lam, 0.0)
+        weights = scipy.fft.fftshift(lam) / float(np.prod(self._n_modes))
+        return weights.astype(np.float64, copy=False)
+
+    def _finufft_kwargs(self) -> dict[str, Any]:
+        opts = dict(self._nufft_opts)
+        opts["nthreads"] = self._workers
+        return opts
+
+    def _as_2d_array(self, v: torch.Tensor | np.ndarray) -> tuple[np.ndarray, bool]:
+        """Normalize an input vector/matrix to ``(n_obs, m)``."""
+        if isinstance(v, torch.Tensor):
+            arr = v.detach().cpu().numpy()
+        else:
+            arr = np.asarray(v)
+        arr = np.asarray(arr, dtype=np.float64)
+        was_1d = arr.ndim == 1
+        if was_1d:
+            arr = arr.reshape(-1, 1)
+        if arr.ndim != 2 or arr.shape[0] != self.n:
+            raise ValueError(
+                f"Input must have shape ({self.n},) or ({self.n}, m); "
+                f"got {arr.shape}."
+            )
+        return arr, was_1d
+
+    def mode_coefficients(self, v: torch.Tensor | np.ndarray) -> np.ndarray:
+        """Apply the type-1 NUFFT to one or more real-valued columns."""
+        arr, _ = self._as_2d_array(v)
+        strengths = np.ascontiguousarray(arr.T.astype(np.complex128))
+        coeff = self._finufft.nufft2d1(
+            self._theta_x,
+            self._theta_y,
+            strengths,
+            self._n_modes,
+            eps=self._nufft_eps,
+            isign=-1,
+            **self._finufft_kwargs(),
+        )
+        if coeff.ndim == 2:
+            coeff = coeff[np.newaxis, :, :]
+        return coeff
+
+    def evaluate_modes(self, coeff: np.ndarray) -> np.ndarray:
+        """Apply the type-2 NUFFT and return values as ``(n_obs, m)``."""
+        coeff = np.asarray(coeff, dtype=np.complex128)
+        if coeff.ndim == 2:
+            coeff = coeff[np.newaxis, :, :]
+        vals = self._finufft.nufft2d2(
+            self._theta_x,
+            self._theta_y,
+            np.ascontiguousarray(coeff),
+            eps=self._nufft_eps,
+            isign=1,
+            **self._finufft_kwargs(),
+        )
+        if vals.ndim == 1:
+            vals = vals[np.newaxis, :]
+        return vals.T
+
+    def matvec(self, v: torch.Tensor | np.ndarray) -> np.ndarray:
+        """Compute ``K @ v`` without materializing ``K``."""
+        _, was_1d = self._as_2d_array(v)
+        coeff = self.mode_coefficients(v)
+        out = self.evaluate_modes(coeff * self._weights[np.newaxis, :, :])
+        out = np.real(out)
+        return out[:, 0] if was_1d else out
+
+    def solve(self, v: torch.Tensor | np.ndarray, epsilon: float) -> np.ndarray:
+        """Solve ``(K + epsilon * I) u = v`` with conjugate gradients."""
+        epsilon = float(epsilon)
+        if epsilon <= 0:
+            raise ValueError("epsilon must be positive.")
+
+        rhs, was_1d = self._as_2d_array(v)
+
+        def _matvec(x: np.ndarray) -> np.ndarray:
+            return self.matvec(x) + epsilon * x
+
+        def _matmat(x: np.ndarray) -> np.ndarray:
+            return self.matvec(x) + epsilon * x
+
+        op = LinearOperator(
+            shape=(self.n, self.n),
+            matvec=_matvec,
+            matmat=_matmat,
+            dtype=np.float64,
+        )
+
+        out = np.empty_like(rhs, dtype=np.float64)
+        for j in range(rhs.shape[1]):
+            sol, info = cg(
+                op,
+                rhs[:, j],
+                rtol=self._cg_rtol,
+                atol=0.0,
+                maxiter=self._cg_maxiter,
+            )
+            if info != 0:
+                warnings.warn(
+                    "NUFFT conjugate-gradient solve did not fully converge "
+                    f"(info={info}); residuals may be approximate.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            out[:, j] = sol
+
+        return out[:, 0] if was_1d else out
+
+    def residuals(self, v: torch.Tensor | np.ndarray, epsilon: float) -> np.ndarray:
+        """Apply ``epsilon * (K + epsilon * I)^{-1} @ v``."""
+        return float(epsilon) * self.solve(v, epsilon)
+
+    def eigenvalues(self, k: Optional[int] = None) -> np.ndarray:
+        """Return an FFT-style spectral proxy, sorted descending.
+
+        Irregular coordinates do not diagonalize in the Fourier basis, so these
+        values are useful only as a rough low-rank spectrum summary.  They
+        should not be interpreted as exact eigenvalues of the sampled kernel
+        matrix.
+        """
+        evals = np.sort(self.eigenvalue_proxy)[::-1]
+        if evals.size < self.n:
+            evals = np.pad(evals, (0, self.n - evals.size))
+        return evals[:k] if k is not None else evals
+
+    def trace(self) -> float:
+        """Return the exact trace implied by the normalized kernel diagonal."""
+        return float(self.n * self._constant_value)
+
+    def square_trace(self) -> float:
+        """Return a spectral proxy for ``trace(K**2)``."""
+        return float(np.sum(self.eigenvalues() ** 2))
+
+
+# ---------------------------------------------------------------------------
 # HSIC utilities
 # ---------------------------------------------------------------------------
 
@@ -714,31 +1141,58 @@ class KernelGPR(ABC):
 # sklearn backend
 # ---------------------------------------------------------------------------
 
+_DEFAULT_GP_PARAMS = {
+    "constant_value": 1.0,
+    "constant_value_bounds": (1e-3, 1e3),
+    "length_scale": 1.0,
+    "length_scale_bounds": "fixed",
+}
+
+_DEFAULT_GPR_SCALE_PARAMS = {
+    # sklearn: subset-of-data size for hyperparameter fitting.
+    # gpytorch: FITC inducing-point count.
+    "n_inducing": 5_000,
+}
+
+_DEFAULT_NUFFT_PARAMS = {
+    "epsilon_bounds": (1e-5, 1e1),
+    "n_modes": None,
+    "max_auto_modes": None,
+    "nufft_eps": 1e-6,
+    "nufft_opts": None,
+    "lml_approx_rank": 256,
+    "lml_exact_max_n": 512,
+    "eigsh_tol": 1e-4,
+    "period_margin": 0.5,
+    "cg_rtol": 1e-5,
+    "cg_maxiter": None,
+    "workers": None,
+}
+
 _DEFAULT_GPR_CONFIGS = {
     # Covariate GPR: optimize signal amplitude via MLE; length scale fixed
-    # at 1.0 (coordinates are z-score normalized before fitting).
+    # at 1.0 because coordinates are z-score normalized before fitting.
     "covariate": {
-        "constant_value": 1.0,
-        "constant_value_bounds": (1e-3, 1e3),
-        "length_scale": 1.0,
-        "length_scale_bounds": "fixed",
-        # n_inducing: subset-of-data size limit for sklearn (not inducing-point
-        # approximation); FITC inducing-point limit for gpytorch.
-        # sklearn  — full GP when n ≤ n_inducing (or None); subset-of-data otherwise.
-        # gpytorch — FITC sparse GP when n > n_inducing; set to None for exact GP.
-        "n_inducing": 5_000,
+        **_DEFAULT_GP_PARAMS,
+        **_DEFAULT_GPR_SCALE_PARAMS,
+        **_DEFAULT_NUFFT_PARAMS,
     },
-    # Isoform GPR: same calibrated config as covariate — signal amplitude
-    # is optimized per gene via MLE.  Only used when residualize='both';
-    # the default behavior residualize='cov_only' skips this entirely.
+    # Isoform GPR: used only when residualize='both'.
     "isoform": {
-        "constant_value": 1.0,
-        "constant_value_bounds": (1e-3, 1e3),
-        "length_scale": 1.0,
-        "length_scale_bounds": "fixed",
-        "n_inducing": 5_000,
+        **_DEFAULT_GP_PARAMS,
+        **_DEFAULT_GPR_SCALE_PARAMS,
+        **_DEFAULT_NUFFT_PARAMS,
     },
 }
+
+_COMMON_GPR_KWARGS = set(_DEFAULT_GP_PARAMS)
+_SKLEARN_GPR_KWARGS = _COMMON_GPR_KWARGS | {"n_inducing"}
+_GPYTORCH_GPR_KWARGS = _COMMON_GPR_KWARGS | {"n_inducing", "n_iter", "lr", "device"}
+_FFT_GPR_KWARGS = _COMMON_GPR_KWARGS | {"epsilon_bounds", "workers"}
+_NUFFT_GPR_KWARGS = _COMMON_GPR_KWARGS | set(_DEFAULT_NUFFT_PARAMS)
+_KNOWN_GPR_KWARGS = (
+    _SKLEARN_GPR_KWARGS | _GPYTORCH_GPR_KWARGS | _FFT_GPR_KWARGS | _NUFFT_GPR_KWARGS
+)
 
 
 class SklearnKernelGPR(KernelGPR):
@@ -1953,26 +2407,777 @@ class FFTKernelGPR(KernelGPR):
 
 
 # ---------------------------------------------------------------------------
+# NUFFT GPR backend (irregular 2-D coordinates, RBF kernel)
+# ---------------------------------------------------------------------------
+
+
+class NUFFTKernelGPR(KernelGPR):
+    """FINUFFT-based GPR residualizer for irregular 2-D coordinates.
+
+    The backend keeps the RBF kernel implicit: FINUFFT evaluates kernel-vector
+    products and conjugate gradients solve ``(K + epsilon I)`` systems.  Regular
+    grids with matching ``n_modes`` use the same spectral likelihood as
+    :class:`FFTKernelGPR`; irregular grids use leading eigenpairs plus a
+    trace/trace(K^2) tail correction for marginal-likelihood fitting.
+
+    Parameters
+    ----------
+    constant_value : float
+        Initial RBF signal variance.
+    constant_value_bounds : tuple or "fixed"
+        Bounds for the signal variance. ``"fixed"`` pins it.
+    length_scale : float
+        Initial RBF length scale in coordinate units.
+    length_scale_bounds : tuple or "fixed"
+        Bounds for the length scale. ``"fixed"`` pins it.
+    epsilon_bounds : tuple[float, float]
+        Search bounds for the white-noise level.
+    n_modes : int, tuple[int, int], or None
+        Fourier mode grid.  ``None`` chooses the full effective grid from the
+        observed point count and aspect ratio.
+    max_auto_modes : int or None
+        Optional cap on automatic ``n_modes``. Ignored when ``n_modes`` is
+        explicit.
+    nufft_eps : float
+        FINUFFT requested precision.
+    nufft_opts : dict or None
+        Extra FINUFFT options, such as ``{"upsampfac": 2.0}``. Use
+        ``workers`` for thread count.
+    lml_approx_rank : int or None
+        Leading eigenpair count for irregular-grid marginal likelihoods.
+        Memory is ``O(n_obs * lml_approx_rank)``.  Ignored on compatible
+        regular grids.  ``None`` forces exact dense eigendecomposition for
+        small diagnostics.
+    lml_exact_max_n : int
+        Maximum ``n_obs`` for exact dense eigendecomposition.
+    eigsh_tol : float
+        Relative tolerance for ``eigsh`` in the low-rank path.
+    period_margin : float
+        Fractional padding around the coordinate bounding box before periodic
+        wrapping.
+    cg_rtol : float
+        Relative tolerance for conjugate-gradient solves.
+    cg_maxiter : int or None
+        Maximum CG iterations.
+    workers : int or None
+        FINUFFT thread count passed as ``nthreads``.  ``None`` uses one
+        FINUFFT thread.
+
+    Notes
+    -----
+    Requires the optional ``finufft`` package.  Results should agree exactly
+    with :class:`FFTKernelGPR` on compatible regular grids.  Compared with
+    :class:`SklearnKernelGPR`, differences near the bounding-box edges are
+    expected because this backend uses periodic boundary conditions.
+    """
+
+    def __init__(
+        self,
+        constant_value: float = 1.0,
+        constant_value_bounds: Union[tuple, str] = (1e-3, 1e3),
+        length_scale: float = 1.0,
+        length_scale_bounds: Union[tuple, str] = "fixed",
+        epsilon_bounds: tuple = (1e-5, 1e1),
+        n_modes: Optional[int | tuple[int, int]] = None,
+        max_auto_modes: Optional[int] = None,
+        nufft_eps: float = 1e-6,
+        nufft_opts: Optional[dict[str, Any]] = None,
+        lml_approx_rank: Optional[int] = 256,
+        lml_exact_max_n: int = 512,
+        eigsh_tol: float = 1e-4,
+        period_margin: float = 0.5,
+        cg_rtol: float = 1e-5,
+        cg_maxiter: Optional[int] = None,
+        workers: Optional[int] = None,
+    ) -> None:
+        _require_finufft()
+        if length_scale_bounds != "fixed":
+            if not (
+                isinstance(length_scale_bounds, (tuple, list))
+                and len(length_scale_bounds) == 2
+                and float(length_scale_bounds[0]) > 0
+                and float(length_scale_bounds[1]) > float(length_scale_bounds[0])
+            ):
+                raise ValueError(
+                    "length_scale_bounds must be 'fixed' or a 2-tuple of positive "
+                    f"floats (lo, hi) with lo < hi; got {length_scale_bounds!r}."
+                )
+        if constant_value_bounds != "fixed":
+            if not (
+                isinstance(constant_value_bounds, (tuple, list))
+                and len(constant_value_bounds) == 2
+                and float(constant_value_bounds[0]) > 0
+                and float(constant_value_bounds[1]) > float(constant_value_bounds[0])
+            ):
+                raise ValueError(
+                    "constant_value_bounds must be 'fixed' or a 2-tuple of positive "
+                    f"floats (lo, hi) with lo < hi; got {constant_value_bounds!r}."
+                )
+
+        self._constant_value = float(constant_value)
+        self._constant_value_bounds = constant_value_bounds
+        self._length_scale = float(length_scale)
+        self._length_scale_bounds = length_scale_bounds
+        self._epsilon_bounds = tuple(epsilon_bounds)
+        self._n_modes = n_modes
+        self._max_auto_modes = max_auto_modes
+        self._nufft_eps = float(nufft_eps)
+        self._nufft_opts = dict(nufft_opts or {})
+        self._lml_approx_rank = lml_approx_rank
+        self._lml_exact_max_n = int(lml_exact_max_n)
+        self._eigsh_tol = float(eigsh_tol)
+        self._period_margin = float(period_margin)
+        self._cg_rtol = float(cg_rtol)
+        self._cg_maxiter = cg_maxiter
+        self._workers = workers
+
+        self._basis_cache: Optional[tuple[tuple, NUFFTKernelOp]] = None
+        self._eig_cache: Optional[tuple[tuple, np.ndarray, np.ndarray]] = None
+        self._trace2_cache: Optional[tuple[tuple, float]] = None
+
+    @property
+    def signal_bounds_fixed(self) -> bool:
+        """True when both signal variance and length scale are fixed."""
+        return (
+            self._constant_value_bounds == "fixed"
+            and self._length_scale_bounds == "fixed"
+        )
+
+    def _mode_length_scale(self) -> float:
+        """Length scale used to choose the automatic Fourier mode grid."""
+        if self._length_scale_bounds == "fixed":
+            return self._length_scale
+        return min(self._length_scale, float(self._length_scale_bounds[0]))
+
+    def _coords_cache_key(self, coords: torch.Tensor | np.ndarray) -> tuple:
+        """Compact cache key for repeated calls on the same coordinate set."""
+        xy = _as_numpy_coords_2d(coords)
+        return (
+            xy.shape,
+            tuple(np.round(xy.min(axis=0), 12)),
+            tuple(np.round(xy.max(axis=0), 12)),
+            float(np.round(xy.sum(), 12)),
+            float(np.round(np.square(xy).sum(), 12)),
+            self._n_modes,
+            self._max_auto_modes,
+            tuple(sorted((k, repr(v)) for k, v in self._nufft_opts.items())),
+            self._period_margin,
+            self._mode_length_scale(),
+        )
+
+    def _make_op(
+        self,
+        coords: torch.Tensor | np.ndarray,
+        constant_value: float,
+        length_scale: float,
+        n_modes: Optional[tuple[int, int]] = None,
+    ) -> NUFFTKernelOp:
+        """Build a NUFFT kernel operator with shared constructor settings."""
+        return NUFFTKernelOp(
+            coords=coords,
+            constant_value=constant_value,
+            length_scale=length_scale,
+            n_modes=self._n_modes if n_modes is None else n_modes,
+            max_auto_modes=self._max_auto_modes,
+            nufft_eps=self._nufft_eps,
+            nufft_opts=self._nufft_opts,
+            period_margin=self._period_margin,
+            cg_rtol=self._cg_rtol,
+            cg_maxiter=self._cg_maxiter,
+            workers=self._workers,
+        )
+
+    def _get_basis_op(self, coords: torch.Tensor | np.ndarray) -> NUFFTKernelOp:
+        """Build/cache a unit-variance operator that fixes coords and modes."""
+        key = self._coords_cache_key(coords)
+        cache = self._basis_cache
+        if cache is not None:
+            cached_key, cached_op = cache
+            if cached_key == key:
+                return cached_op
+
+        basis_op = self._make_op(
+            coords,
+            constant_value=1.0,
+            length_scale=self._mode_length_scale(),
+            n_modes=None,
+        )
+        self._basis_cache = (key, basis_op)
+        return basis_op
+
+    @staticmethod
+    def _spectral_neg_lml(
+        lam: np.ndarray,
+        power: np.ndarray,
+        total_ss: float,
+        n: int,
+        m: int,
+        eps: float,
+    ) -> float:
+        """Approximate negative log marginal likelihood from NUFFT spectrum."""
+        lam = np.asarray(lam, dtype=float).ravel()
+        power = np.asarray(power, dtype=float).ravel()
+
+        if lam.size > n:
+            keep = np.argpartition(lam, -n)[-n:]
+            lam = lam[keep]
+            power = power[keep]
+
+        le = lam + eps
+        explained_ss = float(np.sum(power)) / n
+        missing_ss = max(float(total_ss) - explained_ss, 0.0)
+
+        logdet = float(np.sum(np.log(le)))
+        if lam.size < n:
+            logdet += (n - lam.size) * float(np.log(eps))
+
+        quad = float(np.sum(power / le)) / n + missing_ss / eps
+        return 0.5 * float(m * logdet + quad)
+
+    def _optimize_spectral(
+        self,
+        basis_op: NUFFTKernelOp,
+        power: np.ndarray,
+        total_ss: float,
+        n: int,
+        m: int,
+        coords: torch.Tensor | np.ndarray,
+    ) -> tuple[float, float, float]:
+        """Optimize ``(sigma², length_scale, eps)`` via NUFFT spectral LML."""
+        lo_e, hi_e = self._epsilon_bounds
+        ls_fixed = self._length_scale_bounds == "fixed"
+        cv_fixed = self._constant_value_bounds == "fixed"
+        n_modes = basis_op.n_modes
+
+        if ls_fixed:
+            weights0 = basis_op.spectral_weights.ravel()
+
+            if cv_fixed:
+                lam_fixed = self._constant_value * n * weights0
+
+                def neg_lml_1d(log_eps: float) -> float:
+                    return self._spectral_neg_lml(
+                        lam_fixed, power, total_ss, n, m, float(np.exp(log_eps))
+                    )
+
+                res = minimize_scalar(
+                    neg_lml_1d, bounds=(np.log(lo_e), np.log(hi_e)), method="bounded"
+                )
+                return self._constant_value, self._length_scale, float(np.exp(res.x))
+
+            lo_s, hi_s = self._constant_value_bounds
+
+            def neg_lml_2d(params: np.ndarray) -> float:
+                sigma2 = float(np.exp(params[0]))
+                eps = float(np.exp(params[1]))
+                return self._spectral_neg_lml(
+                    sigma2 * n * weights0, power, total_ss, n, m, eps
+                )
+
+            x0 = np.array([np.log(self._constant_value), np.log(np.sqrt(lo_e * hi_e))])
+            bounds_lb = [
+                (np.log(float(lo_s)), np.log(float(hi_s))),
+                (np.log(lo_e), np.log(hi_e)),
+            ]
+            res = minimize(neg_lml_2d, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
+            return float(np.exp(res.x[0])), self._length_scale, float(np.exp(res.x[1]))
+
+        lo_l, hi_l = self._length_scale_bounds
+
+        def _weights_for_length_scale(length_scale: float) -> np.ndarray:
+            tmp = self._make_op(
+                coords,
+                constant_value=1.0,
+                length_scale=length_scale,
+                n_modes=n_modes,
+            )
+            return tmp.spectral_weights.ravel()
+
+        if cv_fixed:
+            sigma2_fixed = self._constant_value
+
+            def neg_lml_3(params: np.ndarray) -> float:
+                length_scale = float(np.exp(params[0]))
+                eps = float(np.exp(params[1]))
+                weights = _weights_for_length_scale(length_scale)
+                return self._spectral_neg_lml(
+                    sigma2_fixed * n * weights, power, total_ss, n, m, eps
+                )
+
+            x0 = np.array([np.log(self._length_scale), np.log(np.sqrt(lo_e * hi_e))])
+            bounds_lb = [
+                (np.log(float(lo_l)), np.log(float(hi_l))),
+                (np.log(lo_e), np.log(hi_e)),
+            ]
+            res = minimize(neg_lml_3, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
+            return sigma2_fixed, float(np.exp(res.x[0])), float(np.exp(res.x[1]))
+
+        lo_s, hi_s = self._constant_value_bounds
+
+        def neg_lml_4(params: np.ndarray) -> float:
+            sigma2 = float(np.exp(params[0]))
+            length_scale = float(np.exp(params[1]))
+            eps = float(np.exp(params[2]))
+            weights = _weights_for_length_scale(length_scale)
+            return self._spectral_neg_lml(
+                sigma2 * n * weights, power, total_ss, n, m, eps
+            )
+
+        x0 = np.array(
+            [
+                np.log(self._constant_value),
+                np.log(self._length_scale),
+                np.log(np.sqrt(lo_e * hi_e)),
+            ]
+        )
+        bounds_lb = [
+            (np.log(float(lo_s)), np.log(float(hi_s))),
+            (np.log(float(lo_l)), np.log(float(hi_l))),
+            (np.log(lo_e), np.log(hi_e)),
+        ]
+        res = minimize(neg_lml_4, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
+        return float(np.exp(res.x[0])), float(np.exp(res.x[1])), float(np.exp(res.x[2]))
+
+    def _is_regular_fft_compatible(
+        self,
+        coords: torch.Tensor | np.ndarray,
+        basis_op: NUFFTKernelOp,
+    ) -> bool:
+        """Return whether NUFFT spectral LML is exact for the sampled grid."""
+        if self._period_margin != 0:
+            return False
+        xy = _as_numpy_coords_2d(coords)
+        meta = _regular_grid_shape_spacing(xy)
+        if meta is None:
+            return False
+        ny, nx, _, _ = meta
+        return basis_op.n_modes == (ny, nx)
+
+    @staticmethod
+    def _eigen_neg_lml(
+        evals: np.ndarray,
+        power: np.ndarray,
+        total_ss: float,
+        trace: float,
+        trace2: Optional[float],
+        n: int,
+        m: int,
+        sigma2: float,
+        eps: float,
+    ) -> float:
+        """Approximate negative LML from implicit-kernel eigenpairs."""
+        evals = np.asarray(evals, dtype=float)
+        power = np.asarray(power, dtype=float)
+        den = sigma2 * evals + eps
+        logdet = float(np.sum(np.log(den)))
+        quad = float(np.sum(power / den))
+
+        tail_count = n - evals.size
+        if tail_count > 0:
+            tail_trace = max(float(trace) - float(np.sum(evals)), 0.0)
+            residual_ss = max(float(total_ss) - float(np.sum(power)), 0.0)
+            if trace2 is None or tail_trace <= 0.0:
+                tail_eig = tail_trace / tail_count
+                tail_den = sigma2 * tail_eig + eps
+                logdet += tail_count * float(np.log(tail_den))
+                quad += residual_ss / tail_den
+            else:
+                tail_trace2 = max(float(trace2) - float(np.sum(evals**2)), 0.0)
+                min_tail_trace2 = tail_trace**2 / tail_count
+                tail_trace2 = max(tail_trace2, min_tail_trace2)
+                eff_rank = min(
+                    float(tail_count),
+                    max(1.0, tail_trace**2 / max(tail_trace2, 1e-15)),
+                )
+                tail_eig = tail_trace / eff_rank
+                tail_den = sigma2 * tail_eig + eps
+                zero_count = float(tail_count) - eff_rank
+                logdet += eff_rank * float(np.log(tail_den))
+                logdet += zero_count * float(np.log(eps))
+                # Allocate unexplained target power uniformly across the omitted
+                # eigenspace. The eigenvalue distribution still uses the
+                # trace/trace(K^2)-matched effective rank above.
+                quad += (residual_ss / tail_count) * (
+                    eff_rank / tail_den + zero_count / eps
+                )
+
+        return 0.5 * float(m * logdet + quad)
+
+    def _eig_cache_key(
+        self,
+        coords: torch.Tensor | np.ndarray,
+        length_scale: float,
+        n_modes: tuple[int, int],
+    ) -> tuple:
+        """Compact cache key for implicit eigendecompositions."""
+        return (
+            self._coords_cache_key(coords),
+            float(np.round(length_scale, 12)),
+            n_modes,
+            self._lml_approx_rank,
+            self._lml_exact_max_n,
+            self._eigsh_tol,
+        )
+
+    def _get_lml_eigendecomp(
+        self,
+        coords: torch.Tensor | np.ndarray,
+        length_scale: float,
+        n_modes: tuple[int, int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return leading eigenpairs of the unit-variance NUFFT kernel."""
+        key = self._eig_cache_key(coords, length_scale, n_modes)
+        if self._eig_cache is not None:
+            cached_key, cached_vals, cached_vecs = self._eig_cache
+            if cached_key == key:
+                return cached_vals, cached_vecs
+
+        unit_op = self._make_op(
+            coords,
+            constant_value=1.0,
+            length_scale=length_scale,
+            n_modes=n_modes,
+        )
+        n = unit_op.n
+        exact = (
+            self._lml_approx_rank is None
+            or n <= self._lml_exact_max_n
+            or self._lml_approx_rank >= n
+        )
+        if exact:
+            K = unit_op.matvec(np.eye(n))
+            K = 0.5 * (K + K.T)
+            vals, vecs = np.linalg.eigh(K)
+        else:
+            rank = max(1, min(int(self._lml_approx_rank), n - 2))
+            linop = LinearOperator(
+                shape=(n, n),
+                matvec=unit_op.matvec,
+                matmat=unit_op.matvec,
+                dtype=np.float64,
+            )
+            vals, vecs = eigsh(linop, k=rank, which="LA", tol=self._eigsh_tol)
+
+        order = np.argsort(vals)[::-1]
+        vals = np.maximum(np.asarray(vals[order], dtype=float), 0.0)
+        vecs = np.asarray(vecs[:, order], dtype=float)
+        self._eig_cache = (key, vals, vecs)
+        return vals, vecs
+
+    def _trace2_cache_key(
+        self,
+        coords: torch.Tensor | np.ndarray,
+        length_scale: float,
+        n_modes: tuple[int, int],
+    ) -> tuple:
+        """Compact cache key for unit-kernel ``trace(K^2)`` estimates."""
+        return (
+            self._coords_cache_key(coords),
+            float(np.round(length_scale, 12)),
+            n_modes,
+        )
+
+    def _get_lml_trace2(
+        self,
+        coords: torch.Tensor | np.ndarray,
+        length_scale: float,
+        n_modes: tuple[int, int],
+    ) -> float:
+        """Return ``trace(K^2)`` for the unit-variance periodic RBF kernel.
+
+        For the RBF kernel, ``K(x, x')**2`` is another RBF kernel with length
+        scale ``length_scale / sqrt(2)``. Summing its row sums gives
+        ``sum_ij K_ij**2 = trace(K^2)`` without materializing K.
+        """
+        key = self._trace2_cache_key(coords, length_scale, n_modes)
+        if self._trace2_cache is not None:
+            cached_key, cached_trace2 = self._trace2_cache
+            if cached_key == key:
+                return cached_trace2
+
+        sq_op = self._make_op(
+            coords,
+            constant_value=1.0,
+            length_scale=length_scale / np.sqrt(2.0),
+            n_modes=n_modes,
+        )
+        trace2 = float(np.sum(sq_op.matvec(np.ones(sq_op.n, dtype=np.float64))))
+        trace2 = min(max(trace2, float(sq_op.n)), float(sq_op.n) ** 2)
+        self._trace2_cache = (key, trace2)
+        return trace2
+
+    def _optimize_eigen(
+        self,
+        coords: torch.Tensor | np.ndarray,
+        Y_centered: np.ndarray,
+        n_modes: tuple[int, int],
+    ) -> tuple[float, float, float]:
+        """Optimize hyperparameters using NUFFT matvec eigensummaries."""
+        lo_e, hi_e = self._epsilon_bounds
+        ls_fixed = self._length_scale_bounds == "fixed"
+        cv_fixed = self._constant_value_bounds == "fixed"
+        n, m = Y_centered.shape
+        total_ss = float(np.sum(Y_centered**2))
+        trace = float(n)
+
+        def summary(length_scale: float) -> tuple[np.ndarray, np.ndarray, float]:
+            evals, vecs = self._get_lml_eigendecomp(coords, length_scale, n_modes)
+            coeff = vecs.T @ Y_centered
+            power = np.sum(coeff**2, axis=1)
+            trace2 = self._get_lml_trace2(coords, length_scale, n_modes)
+            return evals, power, trace2
+
+        if ls_fixed:
+            evals0, power0, trace20 = summary(self._length_scale)
+
+            if cv_fixed:
+
+                def neg_lml_1d(log_eps: float) -> float:
+                    return self._eigen_neg_lml(
+                        evals0,
+                        power0,
+                        total_ss,
+                        trace,
+                        trace20,
+                        n,
+                        m,
+                        self._constant_value,
+                        float(np.exp(log_eps)),
+                    )
+
+                res = minimize_scalar(
+                    neg_lml_1d, bounds=(np.log(lo_e), np.log(hi_e)), method="bounded"
+                )
+                return self._constant_value, self._length_scale, float(np.exp(res.x))
+
+            lo_s, hi_s = self._constant_value_bounds
+
+            def neg_lml_2d(params: np.ndarray) -> float:
+                return self._eigen_neg_lml(
+                    evals0,
+                    power0,
+                    total_ss,
+                    trace,
+                    trace20,
+                    n,
+                    m,
+                    float(np.exp(params[0])),
+                    float(np.exp(params[1])),
+                )
+
+            x0 = np.array([np.log(self._constant_value), np.log(np.sqrt(lo_e * hi_e))])
+            bounds_lb = [
+                (np.log(float(lo_s)), np.log(float(hi_s))),
+                (np.log(lo_e), np.log(hi_e)),
+            ]
+            res = minimize(neg_lml_2d, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
+            return float(np.exp(res.x[0])), self._length_scale, float(np.exp(res.x[1]))
+
+        lo_l, hi_l = self._length_scale_bounds
+
+        if cv_fixed:
+
+            def neg_lml_3(params: np.ndarray) -> float:
+                length_scale = float(np.exp(params[0]))
+                evals, power, trace2 = summary(length_scale)
+                return self._eigen_neg_lml(
+                    evals,
+                    power,
+                    total_ss,
+                    trace,
+                    trace2,
+                    n,
+                    m,
+                    self._constant_value,
+                    float(np.exp(params[1])),
+                )
+
+            x0 = np.array([np.log(self._length_scale), np.log(np.sqrt(lo_e * hi_e))])
+            bounds_lb = [
+                (np.log(float(lo_l)), np.log(float(hi_l))),
+                (np.log(lo_e), np.log(hi_e)),
+            ]
+            res = minimize(neg_lml_3, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
+            return (
+                self._constant_value,
+                float(np.exp(res.x[0])),
+                float(np.exp(res.x[1])),
+            )
+
+        lo_s, hi_s = self._constant_value_bounds
+
+        def neg_lml_4(params: np.ndarray) -> float:
+            length_scale = float(np.exp(params[1]))
+            evals, power, trace2 = summary(length_scale)
+            return self._eigen_neg_lml(
+                evals,
+                power,
+                total_ss,
+                trace,
+                trace2,
+                n,
+                m,
+                float(np.exp(params[0])),
+                float(np.exp(params[2])),
+            )
+
+        x0 = np.array(
+            [
+                np.log(self._constant_value),
+                np.log(self._length_scale),
+                np.log(np.sqrt(lo_e * hi_e)),
+            ]
+        )
+        bounds_lb = [
+            (np.log(float(lo_s)), np.log(float(hi_s))),
+            (np.log(float(lo_l)), np.log(float(hi_l))),
+            (np.log(lo_e), np.log(hi_e)),
+        ]
+        res = minimize(neg_lml_4, x0=x0, method="L-BFGS-B", bounds=bounds_lb)
+        return float(np.exp(res.x[0])), float(np.exp(res.x[1])), float(np.exp(res.x[2]))
+
+    def _fit_no_nan(
+        self,
+        coords: torch.Tensor,
+        Y: torch.Tensor,
+        basis_op: Optional[NUFFTKernelOp] = None,
+    ) -> torch.Tensor:
+        """Inner residualization assuming no NaN rows."""
+        Y2d = Y if Y.dim() == 2 else Y.unsqueeze(1)
+        Y_np = Y2d.detach().cpu().numpy().astype(np.float64, copy=False)
+        basis = basis_op if basis_op is not None else self._get_basis_op(coords)
+        regular_fft_compatible = self._is_regular_fft_compatible(coords, basis)
+        Y_fit = (
+            Y_np - np.mean(Y_np, axis=0, keepdims=True)
+            if regular_fft_compatible
+            else Y_np
+        )
+        if regular_fft_compatible:
+            coeff = basis.mode_coefficients(Y_fit)
+            power = (np.abs(coeff) ** 2).sum(axis=0)
+            sigma2, length_scale, eps = self._optimize_spectral(
+                basis,
+                power,
+                total_ss=float(np.sum(Y_fit**2)),
+                n=Y_fit.shape[0],
+                m=Y_fit.shape[1],
+                coords=coords,
+            )
+        else:
+            sigma2, length_scale, eps = self._optimize_eigen(
+                coords, Y_fit, basis.n_modes
+            )
+        signal_op = self._make_op(
+            coords,
+            constant_value=sigma2,
+            length_scale=length_scale,
+            n_modes=basis.n_modes,
+        )
+        res = signal_op.residuals(Y_fit, eps)
+        out = torch.as_tensor(res, dtype=Y2d.dtype, device=Y2d.device)
+        return out.squeeze(1) if Y.dim() == 1 else out
+
+    def fit_residuals(
+        self,
+        coords: torch.Tensor,
+        Y: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fit GP residuals for one target matrix on irregular 2-D coordinates.
+
+        Parameters
+        ----------
+        coords : torch.Tensor, shape (n_obs, 2)
+            Normalized spatial coordinates.
+        Y : torch.Tensor, shape (n_obs, m)
+            Target values; may contain NaN rows.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_obs, m)
+            Spatial residuals. NaN rows from ``Y`` are preserved as NaN.
+        """
+        Y2d = Y if Y.dim() == 2 else Y.unsqueeze(1)
+        is_nan = torch.isnan(Y2d).any(1)
+        if is_nan.any():
+            coords_c = coords[~is_nan]
+            Y_c = Y2d[~is_nan]
+            res_clean = self._fit_no_nan(coords_c, Y_c)
+            out = torch.full_like(Y2d, float("nan"))
+            out[~is_nan] = res_clean
+            return out.squeeze(1) if Y.dim() == 1 else out
+        return self._fit_no_nan(coords, Y)
+
+    def fit_residuals_batch(
+        self,
+        coords: torch.Tensor,
+        Y_list: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Residualize multiple targets while reusing coordinates and mode grid."""
+        basis = self._get_basis_op(coords)
+        results = []
+        for Y in Y_list:
+            Y2d = Y if Y.dim() == 2 else Y.unsqueeze(1)
+            is_nan = torch.isnan(Y2d).any(1)
+            if is_nan.any():
+                results.append(self.fit_residuals(coords, Y))
+            else:
+                results.append(self._fit_no_nan(coords, Y, basis_op=basis))
+        return results
+
+    def get_kernel_op(self, coords: torch.Tensor) -> NUFFTKernelOp:
+        """Return a NUFFT kernel operator using the current fixed parameters."""
+        return self._make_op(
+            coords,
+            constant_value=self._constant_value,
+            length_scale=self._length_scale,
+            n_modes=None,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 
+def _filter_gpr_kwargs(backend: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Keep kwargs relevant to ``backend`` while rejecting unknown keys."""
+    unknown = set(kwargs) - _KNOWN_GPR_KWARGS
+    if unknown:
+        raise ValueError(
+            "Unsupported GPR configuration key(s): " + ", ".join(sorted(unknown)) + "."
+        )
+
+    if backend == "sklearn":
+        allowed = _SKLEARN_GPR_KWARGS
+    elif backend == "gpytorch":
+        allowed = _GPYTORCH_GPR_KWARGS
+    elif backend == "fft":
+        allowed = _FFT_GPR_KWARGS
+    elif backend in {"nufft", "finufft"}:
+        allowed = _NUFFT_GPR_KWARGS
+    else:
+        allowed = set()
+    return {k: v for k, v in kwargs.items() if k in allowed}
+
+
 def make_kernel_gpr(
-    backend: Literal["sklearn", "gpytorch", "fft"] = "sklearn",
+    backend: Literal["sklearn", "gpytorch", "fft", "nufft", "finufft"] = "sklearn",
     **kwargs: Any,
 ) -> KernelGPR:
     """Construct a KernelGPR from a backend name.
 
     Parameters
     ----------
-    backend : {"sklearn", "gpytorch", "fft"}
-        Backend to use.  ``"fft"`` accepts the same kwargs as ``"sklearn"``
-        (``constant_value``, ``constant_value_bounds``, ``length_scale``,
-        ``length_scale_bounds``) plus ``epsilon_bounds`` and ``workers``.
-        ``n_inducing`` is supported by both ``"sklearn"`` and ``"gpytorch"``
-        with the same name (see :data:`_DEFAULT_GPR_CONFIGS`).
+    backend : {"sklearn", "gpytorch", "fft", "nufft", "finufft"}
+        Backend to use.
     **kwargs
-        Passed to the backend constructor.
+        GPR configuration.  Common keys are ``constant_value``,
+        ``constant_value_bounds``, ``length_scale``, and
+        ``length_scale_bounds``.  ``n_inducing`` is used by ``"sklearn"`` and
+        ``"gpytorch"`` only.  NUFFT-specific keys include ``n_modes``,
+        ``max_auto_modes``, ``lml_approx_rank``, ``period_margin``, and
+        conjugate-gradient / FINUFFT controls.  Backend-irrelevant known keys
+        from :data:`_DEFAULT_GPR_CONFIGS` are ignored.
 
     Returns
     -------
@@ -1983,18 +3188,19 @@ def make_kernel_gpr(
     ------
     ValueError
         If backend is not one of the supported options.
+        If an unknown configuration key is supplied.
     """
     if backend == "sklearn":
-        return SklearnKernelGPR(**kwargs)
+        return SklearnKernelGPR(**_filter_gpr_kwargs(backend, kwargs))
     if backend == "gpytorch":
-        return GPyTorchKernelGPR(**kwargs)
+        return GPyTorchKernelGPR(**_filter_gpr_kwargs(backend, kwargs))
     if backend == "fft":
-        # FFTKernelGPR operates on the full spectral grid and has no
-        # inducing-point approximation — silently drop the shared key.
-        fft_kwargs = {k: v for k, v in kwargs.items() if k != "n_inducing"}
-        return FFTKernelGPR(**fft_kwargs)
+        return FFTKernelGPR(**_filter_gpr_kwargs(backend, kwargs))
+    if backend in {"nufft", "finufft"}:
+        return NUFFTKernelGPR(**_filter_gpr_kwargs(backend, kwargs))
     raise ValueError(
-        f"Unknown backend '{backend}'. Choose from 'sklearn', 'gpytorch', 'fft'."
+        f"Unknown backend '{backend}'. Choose from 'sklearn', 'gpytorch', "
+        "'fft', 'nufft', or 'finufft'."
     )
 
 

@@ -47,7 +47,8 @@ sdata = [
 ]
 gp = [
     "gpytorch",
-    "linear-operator"
+    "linear-operator",
+    "finufft"
 ]
 docs = [
     "sphinx",
