@@ -401,12 +401,12 @@ class SplisosmFFT:
         sv_status = (
             f"Completed ({self._sv_test_results['method']})"
             if len(self._sv_test_results) > 0
-            else "NA"
+            else "N/A"
         )
         du_status = (
             f"Completed ({self._du_test_results['method']})"
             if len(self._du_test_results) > 0
-            else "NA"
+            else "N/A"
         )
         _avg_iso = (
             f"{np.mean(self.n_isos_per_gene):.1f}" if self.n_isos_per_gene else "N/A"

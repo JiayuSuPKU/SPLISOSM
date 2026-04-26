@@ -37,18 +37,12 @@ Platform compatibility
     # spatial coordinates: (n_spot, 2)
     coordinates = np.random.rand(100, 2)
 
-    # run HSIC-GC test (default: Liu's eigenvalue method for the null)
+    # run HSIC-GC test (default: Liu's cumulant approximation for the null)
+    # null_configs={"n_probes": m} controls the Hutchinson probe budget
+    # Default is 60. Use a smaller m for faster computation
     test_results = run_hsic_gc(gene_counts, coordinates)
     print(test_results['statistic'])  # test statistics, (n_gene,)
     print(test_results['pvalue'])     # p-values, (n_gene,)
-
-    # moment-matching Welch-Satterthwaite approximation (faster, no eigendecomposition)
-    test_results = run_hsic_gc(gene_counts, coordinates, null_method="welch")
-
-    # control Hutchinson probes for large n, or pass approx_rank to force low-rank eigenvalues
-    test_results = run_hsic_gc(
-        gene_counts, coordinates, null_configs={"n_probes": 100}
-    )
 
     # ── AnnData mode ─────────────────────────────────────────────────
     # adata.X or adata.layers[layer] must be a (n_spots, n_genes) count
@@ -110,12 +104,11 @@ Choosing a model class
   For large implicit CAR kernels, :class:`~splisosm.SplisosmNP` estimates Liu null cumulants with Hutchinson Rademacher probes by default,
   which can lead to slightly different p-values compared to a full eigendecomposition.
   The shared probe budget is controlled via ``null_configs={"n_probes": m}`` for both Liu cumulants and Welch trace probes.
-  Use ``null_configs={"approx_rank": r}`` to force a low-rank eigen approximation.
 
   In practice, when the grid is densely observed (few missing bins) and the tissue is far
   from the grid boundary, the two classes give very similar results. 
-  When low-rank approximation is used, :class:`~splisosm.SplisosmNP` loses sensitivity for high-frequency patterns in favor of higher power for low-frequency patterns.
-  This is a design trade-off.
+  Low-rank approximation is no longer needed for :class:`~splisosm.SplisosmNP` SV tests because the default
+  Liu path works from direct cumulants rather than the full pairwise eigenvalue product.
 
 **5. Which differential usage test method should I use: parametric or non-parametric?**
 
@@ -123,7 +116,7 @@ Choosing a model class
   The parametric test (:class:`~splisosm.hyptest_glmm.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
 
   Note that both conditional tests (``'hsic-gp'`` and ``'glmm'``) are computationally intensive and may take hours to run on large datasets. 
-  For ``'hsic-gp'``, inducing-point approximations and GPU acceleration (via the `gpytorch` backend) are available.
+  For ``'hsic-gp'``, inducing-point approximations and GPU acceleration (via the `gpytorch` backend) are available, and irregular 2-D coordinates can use the FINUFFT-backed ``gpr_backend="nufft"`` path to avoid dense GP matrices.
   For ``'glmm'``, model fitting is handled natively with PyTorch with GPU device support, and low-rank kernel approximation is also available (via ``SplisosmGLMM(approx_rank=...)``).
 
   .. code-block:: python
@@ -135,7 +128,8 @@ Choosing a model class
     model_np.test_differential_usage(
         method="hsic-gp", 
         residualize="cov_only",
-        # inducing point approximation for faster GP fitting
+        # or gpr_backend="nufft" for irregular 2-D data;
+        # tune irregular-grid NUFFT LML with {"covariate": {"lml_approx_rank": 64}}
         gpr_configs={"covariate": {"n_inducing": 1000}}
     )
 

@@ -72,7 +72,7 @@ pip install git+https://github.com/JiayuSuPKU/SPLISOSM.git#egg=splisosm
 Optional extras:
 
 ```bash
-# SpatialData input support for SplisosmFFT, + gpytorch GP backend for DU
+# SpatialData input support for SplisosmFFT, plus gpytorch/FINUFFT GP backends for DU
 pip install "splisosm[sdata,gp]"
 ```
 
@@ -116,7 +116,7 @@ res = run_hsic_gc(gene_counts, coordinates)     # or run_hsic_gc(adata=adata, sp
 
 See the [Quick Start](https://splisosm.readthedocs.io/en/latest/quickstart.html) for the
 full-defaults reference and [Statistical Methods](https://splisosm.readthedocs.io/en/latest/methods.html)
-for the underlying HSIC framework, CAR kernel, low-rank and null-distribution approximations, and the GLMM parametric alternative.
+for the underlying HSIC framework, CAR kernel, cumulant null approximations, GP backends, and the GLMM parametric alternative.
 
 ## Documentation & tutorials
 

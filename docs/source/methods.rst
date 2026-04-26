@@ -37,7 +37,7 @@ We choose the CAR kernel for the following properties:
 
 - **Sparse precision**: only the k-NN graph is stored explicitly; :math:`K` is never formed for large datasets (implicit LU-solve mode when :math:`n > 5000`).
 - **Irregular geometries**: the k-NN graph is translation-invariant and naturally handles non-grid layouts (Visium spots, single cells, segmented tissue).
-- **Graph Fourier basis**: low-rank approximation of :math:`K` is the well-studied graph Fourier basis ordered by spatial frequency.
+- **Graph Fourier basis**: eigenvectors of :math:`K` form a graph Fourier basis ordered by spatial frequency.
 - **Polynomial spectrum decay**: the eigenvalues of :math:`K` decay polynomially, which yields higher power than exponential-decay kernels for mix-frequency patterns.
 
 For general theory and the equivalence of spatial variability testing methods, see our recent work on the consistent and scalable detection of spatial patterns :cite:`su2026consistent`.
@@ -147,8 +147,7 @@ See :func:`splisosm.likelihood.liu_sf_from_cumulants` for implementation details
      and will emit a ``DeprecationWarning``.
    - Full eigen-decomposition of :math:`K` is :math:`O(n^3)` and is not feasible for large datasets.
      For implicit CAR kernels with no realised dense covariance, SPLISOSM estimates :math:`\mathrm{tr}(K^r)` with Hutchinson Rademacher probes by default.
-     Use ``null_configs={"n_probes": m}`` to control that budget, or ``null_configs={"approx_rank": r}`` to force a rank-*r* spatial approximation.
-   - Exact :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` are substituted automatically only for dense or spectral kernels where those traces are analytic/exact.  Implicit CAR kernels keep Hutchinson estimates because only the sparse precision is stored.
+     Use ``null_configs={"n_probes": m}`` to control that budget.
    - When ``nan_filling='mean'`` (default), the spatial cumulants are cached once and reused for all subsequent genes.
 
 .. _null-welch:
@@ -180,15 +179,9 @@ and the p-value is :math:`\mathbb{P}\!\left(\chi^2_h \geq Q/g\right)`.
    - The retired ``null_method='clt'`` and ``null_method='trace'`` names are
      retained as deprecated aliases and automatically use this Welch
      approximation.
-   - Only :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` are needed,
-     but Welch is typically more accurate in the right tail than a normal
-     moment match because the null under H₀ is a weighted sum of
-     :math:`\chi^2_1` variables.  In practice its p-values are close to the
-     :ref:`liu <null-liu>` reference while remaining very cheap.
-   - Recommended when ``null_method='liu'`` is too slow for the dataset
-     (e.g., very large :math:`n` with no FFT grid) but a reliable right-tail
-     calibration is still needed.
-   - For implicit kernels (where only the sparse precision matrix :math:`M=K^{-1}` is stored), :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` are estimated via the **Hutchinson stochastic trace estimator** using 60 Rademacher probing vectors by default.  Use ``null_configs={"n_probes": m}`` to control this budget.
+   - Using only the first two cumulants :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)`,
+     Welch is typically less accurate in the right tail (i.e., smaller p-values) than the 
+     :ref:`Liu approximation <null-liu>`, which uses for cumulants. In practice the difference is small.
 
 .. _null-perm:
 
@@ -235,8 +228,8 @@ Furthermore, the spatial eigenvalues :math:`\{\lambda_{(h,w)}^K\}` are shared ac
 
 .. note::
 
-   For irregularly spaced 2D and 3D coordinates, it is possible to compute the test statistic and its null using the `non-uniform FFT (NUFFT) <https://en.wikipedia.org/wiki/Non-uniform_discrete_Fourier_transform>`_ approach, 
-   which also scales as :math:`O(n \log n)`. We are working on an implementation of this method for future releases (depending on personal bandwidth).
+   For irregularly spaced 2D and 3D coordinates, it is possible to compute the SV test statistic and null using a `non-uniform FFT (NUFFT) <https://en.wikipedia.org/wiki/Non-uniform_discrete_Fourier_transform>`_ approach,
+   which also scales as :math:`O(n \log n)`. SPLISOSM currently uses NUFFT for the conditional DU GP residualization backend on irregular 2-D coordinates; extending the SV CAR null to NUFFT is separate future work.
 
 Differential Isoform Usage (DU) Tests
 ---------------------------------------
@@ -277,7 +270,7 @@ Specifically, SPLISOSM first **residualises** the covariate against a Gaussian P
 
       z = f(x) + \varepsilon, \quad f \sim \mathcal{GP}(0, k_\theta),
 
-   where :math:`k_\theta` is a 'Constant x RBF + WhiteNoise' kernel (See :class:`splisosm.kernel_gpr.SklearnKernelGPR`). A sparse inducing-point approximation is used for large datasets.
+   where :math:`k_\theta` is a 'Constant x RBF + WhiteNoise' kernel (See :class:`splisosm.kernel_gpr.SklearnKernelGPR`). Sparse inducing-point approximations and a FINUFFT-backed NUFFT backend are available for large datasets.
 
 2. **Compute covariate residuals** :math:`\tilde{Z} = Z - \hat{f}(X)`, capturing the part of covariate variation *not explained by* spatial position.
 
@@ -299,14 +292,50 @@ For flexibility, we provide optional control via the ``residualize`` argument:
 .. note::
 
    The GP fitting step is the dominant computational cost of the DU test.
-   Two backends are supported:
+   Three backend families are supported:
 
    - ``gpr_backend='sklearn'`` (default): uses ``GaussianProcessRegressor`` from sklearn with an RBF kernel and subsampled Nyström approximation.
    - ``gpr_backend='gpytorch'``: Exact or sparse GP with ``n_inducing`` inducing points.
+   - ``gpr_backend='nufft'`` / ``'finufft'`` (fastest): FINUFFT-backed implicit RBF grid-kernel for irregular 2-D coordinates, recommended for large-scale spatial data.
 
-   For very large datasets, pass ``gpr_configs={"covariate": {"n_inducing": 1000}}`` to control the number of inducing points for both backends.
-   It is possible to further scale up GP fitting using the `non-uniform FFT (NUFFT) <https://en.wikipedia.org/wiki/Non-uniform_discrete_Fourier_transform>`_ approach. 
-   We are working on an implementation of this method for future releases (depending on personal bandwidth).
+   For very large datasets, pass ``gpr_configs={"covariate": {"n_inducing": 1000}}`` to control the number of inducing points for the sklearn/gpytorch backends. 
+   For the NUFFT backend, ``max_auto_modes`` caps the automatically inferred full effective grid, and ``lml_approx_rank`` controls the irregular-grid likelihood approximation used during hyperparameter fitting.
+   See :class:`splisosm.kernel_gpr.NUFFTKernelGPR` for detailed configuration options.
+
+NUFFT backend for irregular-coordinate GP residualization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``gpr_backend='nufft'`` / ``'finufft'`` path targets irregular 2-D coordinates where dense GP matrices are too expensive. Coordinates are affinely mapped into a periodic box :math:`[-\pi,\pi)^2`, and the stationary RBF covariance is represented on a Fourier mode set :math:`\Omega` as
+
+.. math::
+
+   k_\theta(x_i, x_j)
+   \approx
+   \sigma_f^2
+   \sum_{\omega \in \Omega}
+   a_\theta(\omega)
+   \exp\{i\omega^\top(t_i - t_j)\}
+   \;+\; \sigma_\varepsilon^2 \mathbf{1}_{i=j},
+
+where :math:`t_i` are the mapped coordinates and :math:`a_\theta(\omega)` are non-negative spectral weights determined by the RBF length scale and Fourier grid spacing. With ``n_modes=None``, SPLISOSM uses the full effective Fourier grid inferred from the point count and coordinate aspect ratio; FINUFFT's internal oversampling is controlled separately via ``nufft_opts``.
+
+With this representation, we can compute the matrix-vector product in :math:`O(n \log n)` time by
+
+.. math::
+
+   K_s v \;\approx\; F_X^* \left(a_\theta \odot F_X v\right),
+
+where :math:`F_X v = \sum_i v_i \exp(-i\omega^\top t_i)` is a type-1 NUFFT and :math:`F_X^*` is the corresponding type-2 NUFFT. GP residualization solves
+
+.. math::
+
+   (K_s + \sigma_\varepsilon^2 I)\alpha = z,
+   \qquad
+   \tilde z = \sigma_\varepsilon^2 \alpha,
+
+using conjugate gradients, because :math:`K_s` is only available through NUFFT matvecs.
+
+On compatible regular grids, the same spectral representation reduces to the FFT GP path because the Fourier modes are exact eigenvectors. On irregular coordinates the nonuniform Fourier features are not orthogonal eigenvectors, so hyperparameter fitting approximates the log marginal likelihood with leading NUFFT eigensummaries plus trace and trace-square tail corrections. The ``lml_approx_rank`` parameter controls this eigensummary rank; it affects hyperparameter fitting accuracy and memory, not the Fourier grid used for each matvec. Memory scales as :math:`O(nr)` for rank ``r = lml_approx_rank`` (about 512 MB for 1M spots and ``r=64`` in float64), while the NUFFT matvecs avoid forming the :math:`n \times n` dense GP matrix.
 
 
 FFT-accelerated conditional DU test

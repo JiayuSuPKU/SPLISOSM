@@ -31,12 +31,17 @@ Minimal software dependencies:
 Additional dependencies
 -----------------------
 
-`SplisosmFFT` requires the `spatialdata` package to be installed, and `SplisosmNP`'s differential usage test optionally supports the `gpytorch` backend for Gaussian process regression. 
+`SplisosmFFT` requires the `spatialdata` package to be installed, and `SplisosmNP`'s differential usage test optionally supports `gpytorch` and `finufft` backends for Gaussian process regression.
 To install these additional dependencies, you can use the following command:
 
 .. code-block:: zsh
 
   $ pip install "splisosm[sdata, gp]"
+
+.. note::
+
+  `finufft` multi-threading on MacOS is currently suppressed due to a known OMP parallelization issue when `torch`and `finufft` are both installed. 
+  The root cause is duplicated `libomp.dylib` installations (shipped along with `torch`).
 
 For spatially variable gene expression testing, we also provide a Python wrapper, :func:`splisosm.utils.run_sparkx`, for `SPARK-X <https://xzhoulab.github.io/SPARK/04_installation/>`_.
 To use this functionality, ensure that the conda environment where SPLISOSM is installed has R (>=4.0) available in ``PATH``, and that the R package `SPARK-X <https://xzhoulab.github.io/SPARK/04_installation/>`_ is properly installed.
@@ -70,18 +75,19 @@ To use this functionality, ensure that the conda environment where SPLISOSM is i
    # spatial coordinates: (n_spot, 2)
    coordinates = np.random.rand(100, 2)
 
-   # run HSIC-GC test (default: Liu's eigenvalue method for the null)
+   # run HSIC-GC test (default: Liu's cumulant approximation for the null)
    test_results = run_hsic_gc(gene_counts, coordinates)
    print(test_results['statistic'])  # test statistics, (n_gene,)
    print(test_results['pvalue'])     # p-values, (n_gene,)
 
-   # for large datasets, you can also choose alternative null approximations via
-   # (1) moment-matching Welch-Satterthwaite approximation (no eigen-decomposition)
-   test_results = run_hsic_gc(gene_counts, coordinates, null_method="welch")
-
-   # (2) or restrict the Liu null to the top-k eigenvalues
+   # ── AnnData mode ─────────────────────────────────────────────────
+   # adata.X or adata.layers[layer] must be a (n_spots, n_genes) count
+   # matrix (dense or scipy sparse); adata.obsm[spatial_key] provides
+   # spatial coordinates.
    test_results = run_hsic_gc(
-       gene_counts, coordinates, 
-       null_method="liu",
-       null_configs={"approx_rank": 100}
+       adata=adata,           # AnnData of shape (n_spots, n_genes)
+       layer=None,            # None → use adata.X; str → use adata.layers[layer]
+       spatial_key="spatial", # key in adata.obsm for spatial coordinates
+       min_counts=1,          # optional: drop genes with fewer total counts
+       min_bin_pct=0.05,      # optional: drop genes expressed in < 5% of spots
    )

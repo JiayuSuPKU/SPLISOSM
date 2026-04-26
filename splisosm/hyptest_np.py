@@ -403,7 +403,8 @@ class SplisosmNP:
             Values close to 1 give a smoother spatial kernel.
         standardize_cov : bool, optional
             Whether to standardise the spatial covariance matrix so that its
-            diagonal entries are 1 (default ``True``).
+            diagonal entries are 1 (default ``True``).  This can reduce
+            leverage from spatial graph outliers, but it slows setup.
         """
         # Spatial kernel hyperparameters (private config — shown in __str__)
         self._k_neighbors: int = k_neighbors
@@ -917,8 +918,8 @@ class SplisosmNP:
             * ``"liu"`` (default): asymptotic chi-square mixture using
               cumulants with Liu's method :cite:`liu2009new`.  Exact
               eigenvalue cumulants are used when cheap; large implicit
-              kernels use Hutchinson Rademacher trace estimates unless
-              ``null_configs["approx_rank"]`` is explicitly set.
+              kernels use Hutchinson Rademacher trace estimates controlled
+              by ``null_configs["n_probes"]``.
             * ``"welch"``: Welch-Satterthwaite moment matching.  Uses
               tr(K') and tr(K'²) and approximates the null by a scaled
               chi-squared ``g * chi2(h)`` with ``g = Var/(2*E)`` and
@@ -939,14 +940,15 @@ class SplisosmNP:
             approximation from cumulants instead of materializing all pairwise
             eigenvalue products. Supported keys include:
 
-            * ``"approx_rank"``: int or None. If set, use the top-k spatial
-              eigenvalues and a rank-consistent statistic.
             * ``"n_probes"``: int. Estimate spatial kernel cumulants with this
               many Hutchinson Rademacher probes instead of eigenvalues. The same
               budget is used by ``"welch"`` when the spatial kernel does not
               expose exact ``tr(K)`` and ``tr(K^2)`` (for example implicit CAR
-              kernels). Large implicit kernels default to 60 probes when
-              ``approx_rank`` is not explicitly supplied.
+              kernels). Large implicit kernels default to 60 probes.
+            * ``"approx_rank"``: int or None. Advanced diagnostic override to
+              use the top-k spatial eigenvalues and a rank-consistent
+              statistic. This is normally unnecessary for SV tests because the
+              default Liu path uses direct cumulant estimates.
         n_jobs : int, optional
             Number of parallel workers for the per-gene loop.  ``-1`` uses all
             available CPUs.  Each worker densifies one sparse count tensor

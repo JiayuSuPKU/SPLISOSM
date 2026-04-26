@@ -1481,14 +1481,16 @@ def run_hsic_gc(
         Method for computing the null distribution of the test statistic:
 
         * ``"liu"`` (default): asymptotic chi-square mixture using kernel
-          cumulants with Liu's method.  Supports optional
-          ``null_configs["approx_rank"]`` (int) to restrict to the top-k
-          spatial eigenvalues, and ``null_configs["n_probes"]`` (int) to
-          estimate spatial cumulants with Hutchinson Rademacher probes.
+          cumulants with Liu's method.  Use ``null_configs["n_probes"]``
+          (int) to tune Hutchinson Rademacher probes for implicit CAR
+          cumulants.  An advanced ``null_configs["approx_rank"]`` override
+          is available for diagnostics, but is not needed for the default SV
+          path.
         * ``"welch"``: Welch-Satterthwaite scaled chi-squared approximation
           using the first two HSIC null moments.  Typically more accurate
           in the right tail than the retired normal approximation at the same
           cost.
+
         ``"eig"`` is accepted as a deprecated alias for ``"liu"``.
         ``"clt"`` and ``"trace"`` are accepted as deprecated aliases for
         ``"welch"``.
@@ -1531,6 +1533,9 @@ def run_hsic_gc(
         Minimum fraction of spots expressing a gene (count > 0).  Default 0.
     **spatial_kernel_kwargs
         Additional arguments forwarded to :class:`~splisosm.kernel.SpatialCovKernel`.
+        For example, ``standardize_cov=True`` (default) standardises the CAR
+        covariance diagonal to one, which can reduce graph-outlier leverage
+        but slows setup.
 
     Returns
     -------
