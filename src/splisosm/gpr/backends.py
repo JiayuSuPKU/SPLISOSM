@@ -29,7 +29,7 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel as C
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
-from splisosm._gpr.operators import (
+from splisosm.gpr.operators import (
     DenseKernelOp,
     FFTKernelOp,
     NUFFTKernelOp,
@@ -38,7 +38,7 @@ from splisosm._gpr.operators import (
     _regular_grid_shape_spacing,
     _require_finufft,
 )
-from splisosm._gpr.statistics import (
+from splisosm.gpr.statistics import (
     _build_rbf_cross_kernel,
     _build_rbf_kernel,
     _kernel_residuals_from_eigdecomp,
@@ -1500,8 +1500,8 @@ class NUFFTKernelGPR(KernelGPR):
     Requires ``finufft`` (optional dependency)::
 
         pip install gpytorch
-    
-    Results should agree exactly with :class:`FFTKernelGPR` on compatible regular grids.  
+
+    Results should agree exactly with :class:`FFTKernelGPR` on compatible regular grids.
     Compared with :class:`SklearnKernelGPR`, differences near the bounding-box edges are
     expected because this backend uses periodic boundary conditions.
     """

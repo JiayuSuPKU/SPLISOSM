@@ -138,7 +138,7 @@ class IsoDataset:
 
     Example
     -------
-    >>> from splisosm.dataset import IsoDataset
+    >>> from splisosm.glmm.dataset import IsoDataset
     >>> import torch
     >>> # Simulate data for 10 genes with different number of isoforms
     >>> data_3_iso = [torch.randn(100, 3) for _ in range(5)]  # 5 genes with 3 isoforms

@@ -2,15 +2,14 @@ import unittest
 import numpy as np
 import torch
 
-from splisosm._hsic_null import (
+from splisosm.utils._hsic_null import (
     _hsic_null_mean_var,
     _hutchinson_cumulants,
     _kernel_cumulants_for_null,
 )
 from splisosm.kernel import SpatialCovKernel
-from splisosm.likelihood import (
-    liu_sf,
-    liu_sf_from_cumulants,
+from splisosm.utils.stats import liu_sf, liu_sf_from_cumulants
+from splisosm.glmm.likelihood import (
     log_prob_fastmvn,
     log_prob_fastmvn_batched,
     log_prob_fastmult,

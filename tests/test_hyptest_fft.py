@@ -913,7 +913,7 @@ class TestSplisosmFFT(unittest.TestCase):
         that memory does not blow up (no n x n matrix formed).
         """
         import time
-        from splisosm._gpr import FFTKernelGPR
+        from splisosm.gpr import FFTKernelGPR
 
         # Build a 50x50 raster cube
         rng = np.random.default_rng(0)

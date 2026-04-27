@@ -17,7 +17,6 @@ from splisosm.kernel import (
     SpatialCovKernel,
     _MaskedSpatialKernel,
 )
-from splisosm.likelihood import liu_sf_from_cumulants
 
 _DELTA = 1e-10
 _EIGVAL_THRESHOLD = 1e-8
@@ -400,6 +399,8 @@ def _hsic_liu_pvalue(
     n_spots: int,
 ) -> float:
     """Compute a Liu p-value for an HSIC spatial-variability statistic."""
+    from splisosm.utils.stats import liu_sf_from_cumulants
+
     c = _hsic_mixture_cumulants(kernel_cumulants, feature_cumulants, n_spots)
     if c[2] <= _DELTA:
         return 1.0

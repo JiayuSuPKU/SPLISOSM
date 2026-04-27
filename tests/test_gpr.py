@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import torch
 
-from splisosm._gpr import (
+from splisosm.gpr import (
     DenseKernelOp,
     FFTKernelOp,
     NUFFTKernelOp,
@@ -292,7 +292,7 @@ class TestSklearnKernelGPR(unittest.TestCase):
         self.assertTrue(torch.isnan(res[:5]).all())
 
     def test_get_kernel_op(self):
-        from splisosm._gpr import DenseKernelOp
+        from splisosm.gpr import DenseKernelOp
 
         gpr = self._make_gpr_fixed()
         op = gpr.get_kernel_op(self.coords)

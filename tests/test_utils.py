@@ -12,12 +12,12 @@ import scipy.stats
 import torch
 from anndata import AnnData
 from unittest.mock import patch
-from splisosm._chunking import pack_gene_chunks
+from splisosm.io import load_visium_sp_meta
+from splisosm.utils._chunking import pack_gene_chunks
 from splisosm.utils import (
     auto_chunk_size,
     counts_to_ratios,
     false_discovery_control,
-    load_visium_sp_meta,
     add_ratio_layer,
     extract_gene_level_statistics,
     run_hsic_gc,

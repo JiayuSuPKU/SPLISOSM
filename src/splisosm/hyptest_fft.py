@@ -29,22 +29,24 @@ from anndata import AnnData
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
-from splisosm._chunking import pack_gene_chunks, resolve_chunk_size
+from splisosm.utils._chunking import pack_gene_chunks, resolve_chunk_size
 from splisosm.kernel import FFTKernel
-from splisosm._hsic_null import (
+from splisosm.utils._hsic_null import (
     _cumulants_from_eigenvalues,
     _feature_cumulants_from_data,
     _hsic_liu_pvalue,
 )
-from splisosm._gpr import (
+from splisosm.gpr import (
     FFTKernelGPR,
     _DEFAULT_GPR_CONFIGS,
 )
-from splisosm.likelihood import liu_sf
-from splisosm.utils import (
+from splisosm.utils.preprocessing import (
     compute_feature_summaries,
     counts_to_ratios,
+)
+from splisosm.utils.stats import (
     false_discovery_control,
+    liu_sf,
 )
 
 __all__ = ["SplisosmFFT"]
@@ -700,7 +702,7 @@ class SplisosmFFT:
 
         # --- Process design_mtx: store as properly-structured AnnData table ---
         import scipy.sparse as _sp
-        from splisosm.utils import _process_design_mtx
+        from splisosm.utils.preprocessing import _process_design_mtx
 
         design_key = f"_splisosm_design_{table_name}"
         if design_mtx is not None:
@@ -947,7 +949,7 @@ class SplisosmFFT:
         ratio_transformation : {"none", "clr", "ilr", "alr", "radial"}, optional
             Compositional transformation for isoform ratios.
             One of ``'none'``, ``'clr'``, ``'ilr'``, ``'alr'``, ``'radial'``
-            :cite:`park2022kernel`.  See :func:`splisosm.utils.counts_to_ratios`.
+            :cite:`park2022kernel`.  See :func:`splisosm.utils.preprocessing.counts_to_ratios`.
         gpr_configs : dict, optional
             Nested configuration dict for the GPR objects, with optional keys
             ``'covariate'`` and/or ``'isoform'``.  Each sub-dict is forwarded to

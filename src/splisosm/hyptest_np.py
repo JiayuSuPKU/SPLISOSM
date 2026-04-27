@@ -18,16 +18,18 @@ import torch
 from tqdm import tqdm
 from anndata import AnnData
 
-from splisosm.utils import (
+from splisosm.utils.preprocessing import (
     compute_feature_summaries,
     counts_to_ratios,
-    false_discovery_control,
     prepare_inputs_from_anndata,
+)
+from splisosm.utils.stats import (
+    false_discovery_control,
     run_sparkx,
 )
-from splisosm._chunking import pack_gene_chunks, resolve_chunk_size
+from splisosm.utils._chunking import pack_gene_chunks, resolve_chunk_size
 from splisosm.kernel import IdentityKernel, SpatialCovKernel, _MaskedSpatialKernel
-from splisosm._hsic_null import (
+from splisosm.utils._hsic_null import (
     _feature_cumulants_from_data,
     _hutchinson_cumulants,
     _hsic_liu_pvalue,
@@ -35,7 +37,7 @@ from splisosm._hsic_null import (
     _kernel_cumulants_for_null,
     _normalize_hsic_null_method,
 )
-from splisosm._gpr import (
+from splisosm.gpr import (
     linear_hsic_test,
     make_kernel_gpr,
     _DEFAULT_GPR_CONFIGS,
@@ -144,7 +146,7 @@ def _sparse_counts_to_ratios_centered(
 ) -> tuple[scipy.sparse.csc_matrix, np.ndarray | None]:
     """Return a centred sparse ratio matrix from sparse isoform counts.
 
-    The calculation mirrors :func:`splisosm.utils.counts_to_ratios` with
+    The calculation mirrors :func:`splisosm.utils.preprocessing.counts_to_ratios` with
     ``fill_before_transform=False``, then centres the returned ratio matrix.
     For ``nan_filling="mean"``, zero-coverage rows are filled with the
     expressed-row column mean and become exactly zero after centring.  For
@@ -852,7 +854,7 @@ class SplisosmNP:
             Annotated data matrix.  Counts are read from
             ``adata.layers[layer]`` grouped by ``group_iso_by``, and
             spatial coordinates from ``adata.obsm[spatial_key]``.
-            See :func:`splisosm.utils.prepare_inputs_from_anndata` for
+            See :func:`splisosm.utils.preprocessing.prepare_inputs_from_anndata` for
             full preprocessing details.
         spatial_key : str, optional
             Key in ``adata.obsm`` for spatial coordinates (default
@@ -1247,11 +1249,11 @@ class SplisosmNP:
             ``"spark-x"`` (SPARK-X :cite:`zhu2021spark`).
         ratio_transformation : {"none", "clr", "ilr", "alr", "radial"}, optional
             Compositional transformation applied to isoform ratios when
-            ``method="hsic-ir"``.  See :func:`splisosm.utils.counts_to_ratios`
+            ``method="hsic-ir"``.  See :func:`splisosm.utils.preprocessing.counts_to_ratios`
             and :cite:`park2022kernel` for details.
         nan_filling : {"mean", "none"}, optional
             Strategy for NaN values in isoform ratios.
-            See :func:`splisosm.utils.counts_to_ratios` for details.
+            See :func:`splisosm.utils.preprocessing.counts_to_ratios` for details.
         null_method : {"liu", "welch", "perm"}, optional
             Method for computing the null distribution of the test statistic:
 
@@ -1500,10 +1502,10 @@ class SplisosmNP:
         ratio_transformation : {"none", "clr", "ilr", "alr", "radial"}, optional
             Compositional transformation for isoform ratios.
             One of ``'none'``, ``'clr'``, ``'ilr'``, ``'alr'``, ``'radial'``
-            :cite:`park2022kernel`.  See :func:`splisosm.utils.counts_to_ratios`.
+            :cite:`park2022kernel`.  See :func:`splisosm.utils.preprocessing.counts_to_ratios`.
         nan_filling : {"mean", "none"}, optional
             How to fill NaN values in isoform ratios.  One of ``'mean'`` or ``'none'``.
-            See :func:`splisosm.utils.counts_to_ratios`.
+            See :func:`splisosm.utils.preprocessing.counts_to_ratios`.
         gpr_backend : {"sklearn", "gpytorch", "nufft", "finufft"}, optional
             GPR backend to use for ``method='hsic-gp'``.
             One of ``'sklearn'`` (default), ``'gpytorch'``, ``'nufft'``, or

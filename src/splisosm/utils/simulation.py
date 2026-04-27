@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.distributions import Multinomial, Poisson
 
-from splisosm.utils import get_cov_sp
+from splisosm.utils.preprocessing import get_cov_sp
 
 __all__ = ["simulate_isoform_counts_single_gene", "simulate_isoform_counts"]
 

@@ -10,11 +10,11 @@ import torch.nn as nn
 from torch.autograd.functional import jacobian
 from torch.distributions import Gamma, InverseGamma
 
-from splisosm.likelihood import (
+from splisosm.glmm.likelihood import (
     log_prob_fastmult_batched,
     log_prob_fastmvn_batched,
 )
-from splisosm.logger import PatienceLogger
+from splisosm.glmm.logger import PatienceLogger
 
 __all__ = ["MultinomGLM", "MultinomGLMM"]
 
@@ -120,7 +120,7 @@ class MultinomGLM(BaseModel, nn.Module):
 
     Example
     -------
-    >>> from splisosm.model import MultinomGLM
+    >>> from splisosm.glmm import MultinomGLM
     >>> import torch
     >>> # Generate synthetic data
     >>> counts = torch.randint(0, 10, (5, 100, 3))  # 5 genes, 100 spots, each 3 isoforms
@@ -888,8 +888,8 @@ class MultinomGLMM(MultinomGLM, BaseModel, nn.Module):
 
     Example
     -------
-    >>> from splisosm.model import MultinomGLMM
-    >>> from splisosm.utils import get_cov_sp
+    >>> from splisosm.glmm import MultinomGLMM
+    >>> from splisosm.utils.preprocessing import get_cov_sp
     >>> import torch
     >>> # Generate synthetic data
     >>> counts = torch.randint(0, 10, (5, 100, 3))  # 5 genes, 100 spots, each 3 isoforms

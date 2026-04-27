@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from splisosm.model import MultinomGLM, MultinomGLMM
+from splisosm.glmm.model import MultinomGLM, MultinomGLMM
 
 # ---------------------------------------------------------------------------
 # Model subclasses

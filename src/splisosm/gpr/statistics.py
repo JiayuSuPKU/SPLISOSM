@@ -9,8 +9,6 @@ from scipy.optimize import minimize_scalar
 from sklearn.gaussian_process.kernels import ConstantKernel as C
 from sklearn.gaussian_process.kernels import RBF
 
-from splisosm.likelihood import liu_sf
-
 __all__ = [
     "linear_hsic_test",
     "_build_rbf_kernel",
@@ -131,6 +129,8 @@ def linear_hsic_test(
         lambda_y = lambda_y[lambda_y > eigv_th]
 
     lambda_xy = (lambda_x.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
+    from splisosm.utils.stats import liu_sf
+
     pval = liu_sf((hsic_scaled * n).numpy(), lambda_xy.numpy())
 
     return float(hsic_scaled / (n - 1) ** 2), pval

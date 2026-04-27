@@ -1,7 +1,7 @@
 import unittest
 import torch
 import numpy as np
-from splisosm.dataset import UngroupedIsoDataset, GroupedIsoDataset, IsoDataset
+from splisosm.glmm.dataset import UngroupedIsoDataset, GroupedIsoDataset, IsoDataset
 
 
 class TestDatasets(unittest.TestCase):

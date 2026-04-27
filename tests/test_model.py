@@ -1,7 +1,7 @@
 import unittest
 import torch
-from splisosm.model import MultinomGLM, MultinomGLMM
-from splisosm.likelihood import log_prob_fastmult, log_prob_fastmvn
+from splisosm.glmm import MultinomGLM, MultinomGLMM
+from splisosm.glmm.likelihood import log_prob_fastmult, log_prob_fastmvn
 from torch.autograd.functional import hessian
 
 

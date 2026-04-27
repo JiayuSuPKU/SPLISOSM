@@ -14,10 +14,10 @@ from splisosm.hyptest_np import (
     _quadratic_columns_exact,
     _sparse_counts_to_ratios_centered,
 )
-from splisosm._hsic_null import _feature_cumulants_from_data
+from splisosm.utils._hsic_null import _feature_cumulants_from_data
 from splisosm.kernel import SpatialCovKernel
 from splisosm.utils import counts_to_ratios
-from splisosm.simulation import simulate_isoform_counts
+from splisosm.utils.simulation import simulate_isoform_counts
 
 
 def get_simulation_data(n_genes=2, n_isos=3, n_spots_per_dim=20):
@@ -1780,7 +1780,7 @@ class TestSplisosmNP(unittest.TestCase):
 
     def test_linear_hsic_sparse_X_matches_dense(self):
         """linear_hsic_test with sparse X gives same result as dense X."""
-        from splisosm._gpr import linear_hsic_test
+        from splisosm.gpr import linear_hsic_test
 
         np.random.seed(42)
         n, p, q = 100, 2, 4

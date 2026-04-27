@@ -8,9 +8,9 @@ import numpy as np
 import scipy.sparse
 import pandas as pd
 from anndata import AnnData
-from splisosm.model import MultinomGLMM
+from splisosm.glmm import MultinomGLMM
 
-from splisosm.simulation import simulate_isoform_counts
+from splisosm.utils.simulation import simulate_isoform_counts
 
 from splisosm.hyptest_glmm import (
     IsoFullModel,

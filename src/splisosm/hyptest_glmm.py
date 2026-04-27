@@ -16,15 +16,15 @@ import torch.multiprocessing as mp
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
-from splisosm.utils import (
+from splisosm.utils.preprocessing import (
     compute_feature_summaries,
-    false_discovery_control,
     prepare_inputs_from_anndata,
 )
-from splisosm.dataset import IsoDataset
+from splisosm.utils.stats import false_discovery_control
+from splisosm.glmm.dataset import IsoDataset
 from splisosm.kernel import IdentityKernel, SpatialCovKernel
-from splisosm.model import MultinomGLM
-from splisosm._glmm_workers import (
+from splisosm.glmm import MultinomGLM
+from splisosm.glmm.workers import (
     IsoFullModel,
     IsoNullNoSpVar,
     _fit_model_one_gene,
@@ -57,7 +57,7 @@ class _FittedGeneState:
 class SplisosmGLMM:
     """Parametric spatial isoform statistical modeling using GLMM.
 
-    This is a convenience class that wraps around the :class:`splisosm.model.MultinomGLMM`
+    This is a convenience class that wraps around the :class:`splisosm.glmm.MultinomGLMM`
     for batched model fitting and spatial variability and differential usage testing.
 
     Examples
@@ -207,7 +207,7 @@ class SplisosmGLMM:
 
         See also
         --------
-        :class:`splisosm.model.MultinomGLMM` for more details on the model configurations.
+        :class:`splisosm.glmm.MultinomGLMM` for more details on the model configurations.
         """
         # specify the model type to fit
         assert model_type in ["glmm-full", "glmm-null", "glm"]
@@ -887,7 +887,7 @@ class SplisosmGLMM:
 
         See also
         --------
-        :func:`splisosm.model.MultinomGLMM.fit` for fitting a single model.
+        :func:`splisosm.glmm.MultinomGLMM.fit` for fitting a single model.
         """
 
         if batch_size > 1 and not self._group_gene_by_n_iso:
@@ -1002,7 +1002,7 @@ class SplisosmGLMM:
         models: list of fitted models
             - ``model_type='glmm-full'``: list[splisosm.hyptest_glmm.IsoFullModel]
             - ``model_type='glmm-null'``: list[splisosm.hyptest_glmm.IsoNullNoSpVar]
-            - ``model_type='glm'``: list[splisosm.model.MultinomGLM]
+            - ``model_type='glm'``: list[splisosm.glmm.MultinomGLM]
         """
         key = self._model_key_for_type()
         return [
@@ -1102,7 +1102,7 @@ class SplisosmGLMM:
         the exact row order of ``self._filtered_adata.var``.  This holds
         because :meth:`setup_data` builds per-gene count tensors by slicing
         ``filtered_adata`` isoforms in their ``var`` row order (via
-        ``groupby(sort=False)``), and :meth:`~splisosm.model.MultinomGLM.get_isoform_ratio`
+        ``groupby(sort=False)``), and :meth:`~splisosm.glmm.MultinomGLM.get_isoform_ratio`
         returns ratios in the same column order as the input counts.
 
         Parameters
