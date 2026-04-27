@@ -1286,7 +1286,7 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             with_design_mtx=False,
             refit_null=False,
         )
-        model._sv_llr_perm_stats = torch.zeros(model.n_genes)
+        model._sv_llr_perm_stats = torch.zeros(1, model.n_genes)
 
         with patch("builtins.print") as print_mock:
             model.test_spatial_variability(
@@ -1296,6 +1296,54 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
             )
 
         print_mock.assert_any_call("Using cached permutation results...")
+
+    def test_sv_permutation_stats_are_stored_by_permutation_and_gene(self):
+        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 1})
+        model.n_genes = 2
+        model.n_spots = 4
+
+        with (
+            patch.object(
+                model,
+                "_permutation_fit_configs",
+                return_value=(False, False, 1),
+            ),
+            patch.object(
+                model,
+                "_run_one_sv_permutation",
+                side_effect=[torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])],
+            ),
+        ):
+            model._fit_sv_llr_perm(n_perms=2, print_progress=False)
+
+        self.assertEqual(model._sv_llr_perm_stats.shape, (2, 2))
+        torch.testing.assert_close(
+            model._sv_llr_perm_stats,
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        )
+
+    def test_sv_permutation_pvalues_are_gene_specific_and_finite(self):
+        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 1})
+        model.n_genes = 3
+        model.n_isos_per_gene = [2, 2, 1]
+        model._sv_llr_perm_stats = torch.tensor(
+            [
+                [9.0, 100.0, 0.0],
+                [11.0, 0.5, 0.0],
+                [1.0, 0.25, 0.0],
+            ]
+        )
+
+        pvals = model._sv_llr_pvalues(
+            torch.tensor([10.0, 1.0, 0.0]),
+            torch.ones(3),
+            use_perm_null=True,
+            n_perms_per_gene=None,
+            print_progress=False,
+            perm_kwargs={},
+        )
+
+        torch.testing.assert_close(pvals, torch.tensor([0.5, 0.5, 1.0]))
 
     def test_differential_usage_error_paths(self):
         local_adata = _make_small_adata(self.counts_list, self.coords, self.design_mtx)

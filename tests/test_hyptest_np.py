@@ -13,9 +13,10 @@ from splisosm.hyptest.np import (
     _prepare_np_response,
     _quadratic_columns_exact,
     _sparse_counts_to_ratios_centered,
+    _sv_gene_worker_np,
 )
 from splisosm.utils.hsic import _feature_cumulants_from_data
-from splisosm.kernel import SpatialCovKernel
+from splisosm.kernel import IdentityKernel, SpatialCovKernel
 from splisosm.utils import counts_to_ratios
 from splisosm.utils.simulation import simulate_isoform_counts
 
@@ -1823,6 +1824,55 @@ class TestSplisosmNP(unittest.TestCase):
 
         self.assertAlmostEqual(hsic_dense, hsic_sparse, places=4)
         self.assertAlmostEqual(pval_dense, pval_sparse, places=4)
+
+    def test_linear_hsic_sparse_X_matches_dense_without_centering(self):
+        """Sparse-X null eigenvalues honor centering=False."""
+        from splisosm.utils.hsic import linear_hsic_test
+
+        rng = np.random.default_rng(7)
+        n, p, q = 80, 3, 2
+        X_np = rng.poisson(1.5, size=(n, p)).astype(np.float32)
+        Y = torch.from_numpy(
+            rng.normal(loc=2.0, scale=1.0, size=(n, q)).astype(np.float32)
+        )
+
+        hsic_dense, pval_dense = linear_hsic_test(
+            torch.from_numpy(X_np), Y, centering=False
+        )
+        hsic_sparse, pval_sparse = linear_hsic_test(
+            scipy.sparse.csr_matrix(X_np), Y, centering=False
+        )
+
+        self.assertAlmostEqual(hsic_dense, hsic_sparse, places=4)
+        self.assertAlmostEqual(pval_dense, pval_sparse, places=4)
+
+    def test_sv_perm_null_uses_finite_empirical_pvalue(self):
+        """Permutation SV p-values should not be exactly zero for finite nulls."""
+        counts = torch.tensor(
+            [
+                [10.0, 1.0],
+                [9.0, 2.0],
+                [1.0, 8.0],
+                [2.0, 9.0],
+                [3.0, 7.0],
+            ]
+        )
+        n_nulls = 5
+        _, pval = _sv_gene_worker_np(
+            counts,
+            method="hsic-ir",
+            ratio_transformation="none",
+            nan_filling="mean",
+            null_method="perm",
+            n_spots=counts.shape[0],
+            K_sp=IdentityKernel(counts.shape[0], centering=True),
+            kernel_cumulants=None,
+            kernel_approx_rank=None,
+            n_nulls=n_nulls,
+            perm_batch_size=n_nulls,
+        )
+
+        self.assertGreaterEqual(pval, 1.0 / (n_nulls + 1))
 
     def test_differential_usage_sparse_design_matrix(self):
         """All four DU methods work with a sparse design matrix.

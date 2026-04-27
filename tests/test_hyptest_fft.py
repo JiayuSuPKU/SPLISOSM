@@ -368,6 +368,22 @@ class TestSplisosmFFT(unittest.TestCase):
         self.assertEqual(res_dict["null_method"], "liu")
         self.assertTrue(np.all(np.isfinite(res_dict["pvalue"])))
 
+    def test_spatial_variability_n_jobs_zero_raises(self):
+        """FFT n_jobs uses shared joblib-style validation."""
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+        )
+
+        with self.assertRaises(ValueError):
+            model.test_spatial_variability(
+                method="hsic-ir", n_jobs=0, print_progress=False
+            )
+
     def test_spatial_variability_chunk_size_matches_single_channel(self):
         """FFT SV chunking matches one-channel/singleton execution."""
         model = SplisosmFFT(rho=0.9, neighbor_degree=1)
@@ -643,6 +659,14 @@ class TestSplisosmFFT(unittest.TestCase):
             model_cont.test_differential_usage(method="t-fisher", n_jobs=1)
         with self.assertRaises(ValueError):
             model_cont.test_differential_usage(method="t-tippett", n_jobs=1)
+
+        for bad_design in [
+            np.ones((adata.n_obs, 1), dtype=float),
+            np.full((adata.n_obs, 1), np.nan, dtype=float),
+        ]:
+            model_bad = self._setup_model(design_mtx=bad_design)
+            with self.assertRaises(ValueError):
+                model_bad.test_differential_usage(method="t-fisher", n_jobs=1)
 
     def test_setup_data_with_design_mtx(self):
         """design_mtx passed to setup_data is stored as AnnData in sdata."""

@@ -240,6 +240,7 @@ def linear_hsic_test(
     # ── Sparse-X path ─────────────────────────────────────────────────────
     if X_is_sparse:
         X_sp = X.tocsr()
+        Y = Y.detach().cpu()
         if centering:
             Y = Y - Y.mean(0)
 
@@ -251,11 +252,12 @@ def linear_hsic_test(
         ).T  # (n_y, n_x)
         hsic_scaled = YcTX.pow(2).sum()
 
-        # X_c.T @ X_c = X.T @ X - n * mean_X.outer(mean_X)
-        X_mean = np.asarray(X_sp.mean(axis=0), dtype=np.float32).ravel()
-        XcTXc = torch.from_numpy(
-            X_sp.T.dot(X_sp).toarray().astype(np.float32) - n * np.outer(X_mean, X_mean)
-        )
+        XTX = X_sp.T.dot(X_sp).toarray().astype(np.float32)
+        if centering:
+            # X_c.T @ X_c = X.T @ X - n * mean_X.outer(mean_X)
+            X_mean = np.asarray(X_sp.mean(axis=0), dtype=np.float32).ravel()
+            XTX = XTX - n * np.outer(X_mean, X_mean)
+        XcTXc = torch.from_numpy(XTX)
         lambda_x = torch.linalg.eigvalsh(XcTXc)
         lambda_x = lambda_x[lambda_x > eigv_th]
         lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
@@ -275,9 +277,12 @@ def linear_hsic_test(
         lambda_y = lambda_y[lambda_y > eigv_th]
 
     lambda_xy = (lambda_x.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
-    pval = liu_sf((hsic_scaled * n).numpy(), lambda_xy.numpy())
+    pval = liu_sf(
+        (hsic_scaled * n).detach().cpu().numpy(),
+        lambda_xy.detach().cpu().numpy(),
+    )
 
-    return float(hsic_scaled / (n - 1) ** 2), pval
+    return float(hsic_scaled / (n - 1) ** 2), float(pval)
 
 
 def _cumulants_from_eigenvalues(

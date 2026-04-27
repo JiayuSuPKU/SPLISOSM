@@ -568,7 +568,7 @@ def _sv_gene_worker_np(
                 R = K_sp_null.xtKx(y_batch)
             null_stats.append(torch.diagonal(R).reshape(B, p_isos).sum(dim=1))
         null_m = torch.cat(null_stats)
-        pval = float((null_m > hsic_scaled).sum() / n_nulls)
+        pval = float((1 + (null_m >= hsic_scaled).sum()) / (n_nulls + 1))
 
     return hsic_norm, pval
 

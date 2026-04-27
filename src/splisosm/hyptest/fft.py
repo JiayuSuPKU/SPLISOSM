@@ -25,7 +25,11 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 
 from splisosm.hyptest._base import _FeatureSummaryMixin, _ResultsMixin
-from splisosm.utils._chunking import pack_gene_chunks, resolve_chunk_size
+from splisosm.utils._chunking import (
+    _resolve_n_jobs,
+    pack_gene_chunks,
+    resolve_chunk_size,
+)
 from splisosm.kernel import FFTKernel
 from splisosm.utils.hsic import (
     _cumulants_from_eigenvalues,
@@ -142,6 +146,8 @@ def _du_ttest_worker_fft(
         z_flat = z_cube.ravel()
         valid_mask = np.isfinite(z_flat)
         unique_vals = np.unique(z_flat[valid_mask])
+        if unique_vals.size != 2:
+            continue
         threshold = (unique_vals[0] + unique_vals[1]) / 2.0
         g0_mask = valid_mask & (z_flat < threshold)
         g1_mask = valid_mask & (z_flat >= threshold)
@@ -903,8 +909,7 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
 
     def _set_fft_worker_budget(self, n_jobs: int) -> int:
         """Resolve joblib workers and coordinate scipy.fft worker threads."""
-        if n_jobs == -1:
-            n_jobs = os.cpu_count() or 1
+        n_jobs = _resolve_n_jobs(n_jobs)
         self.sp_kernel.workers = max(1, (os.cpu_count() or 1) // n_jobs)
         return n_jobs
 
@@ -1062,10 +1067,10 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
                 z_res = np.nan_to_num(z_res, nan=0.0)
             else:
                 unique_vals = np.unique(z_cube[np.isfinite(z_cube)])
-                if len(unique_vals) > 2:
+                if len(unique_vals) != 2:
                     raise ValueError(
-                        f"More than two groups detected for factor "
-                        f"'{chunk_name}'. Only binary covariates "
+                        f"Expected exactly two groups for factor "
+                        f"'{chunk_name}', found {len(unique_vals)}. Only binary covariates "
                         "(exactly two distinct values) are supported for "
                         f"'{method}'."
                     )

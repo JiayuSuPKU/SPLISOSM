@@ -7,6 +7,7 @@ import torch
 import itertools
 from splisosm.utils.hsic import _hutchinson_cumulants
 from splisosm.kernel import (
+    IdentityKernel,
     Kernel,
     SpatialCovKernel,
     _MaskedSpatialKernel,
@@ -115,6 +116,33 @@ class TestSpatialCovKernel(unittest.TestCase):
         via_xtKx = torch.trace(K.xtKx(y))
         manual = torch.trace(y.T @ R @ y)
         self.assertTrue(torch.allclose(via_xtKx, manual, atol=1e-4))
+
+    def test_identity_kernel_sparse_xtkx_matches_dense(self):
+        """IdentityKernel accepts sparse RHS blocks like other kernels."""
+        x_np = np.array(
+            [
+                [1.0, 0.0, 2.0],
+                [0.0, 3.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [0.0, 5.0, 6.0],
+            ],
+            dtype=np.float32,
+        )
+        x_scipy = scipy.sparse.csr_matrix(x_np)
+        x_torch_sparse = torch.from_numpy(x_np).to_sparse()
+
+        for centering in (False, True):
+            with self.subTest(centering=centering):
+                K = IdentityKernel(x_np.shape[0], centering=centering)
+                expected = K.xtKx(torch.from_numpy(x_np))
+
+                self.assertTrue(torch.allclose(K.xtKx(x_scipy), expected, atol=1e-6))
+                self.assertTrue(
+                    torch.allclose(K.xtKx(x_torch_sparse), expected, atol=1e-6)
+                )
+                np.testing.assert_allclose(
+                    K.Kx(x_scipy), K.Kx(x_np), rtol=1e-6, atol=1e-6
+                )
 
     def test_sparse_kx_and_xtkx_match_dense(self):
         """Sparse response blocks use the same effective CAR kernel as dense blocks."""

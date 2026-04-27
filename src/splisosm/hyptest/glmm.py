@@ -1526,6 +1526,9 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
         random_seed : int, optional
             The random seed for reproducibility. Default to None.
         """
+        if n_perms < 1:
+            raise ValueError("`n_perms` must be a positive integer.")
+
         with_design_mtx, refit_null, batch_size = self._permutation_fit_configs()
 
         if random_seed is not None:  # set random seed for reproducibility
@@ -1558,7 +1561,7 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
                     )
                 )
 
-            self._sv_llr_perm_stats = torch.concat(perm_stats, dim=0)
+            self._sv_llr_perm_stats = torch.stack(perm_stats, dim=0)
 
         else:  # use multiprocessing
             if print_progress:
@@ -1571,21 +1574,33 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
                 )
 
             n_batches, data = self._batch_loader(batch_size)
-            tasks = (
-                delayed(_fit_perm_one_gene)(
-                    torch.randperm(self.n_spots),
-                    self._model_configs,
+            name_to_idx = {name: idx for idx, name in enumerate(self.gene_names)}
+            batch_infos = [
+                (
+                    [name_to_idx[name] for name in batch["gene_name"]],
                     batch["x"],
-                    self._corr_sp_eigvals,
-                    self._corr_sp_eigvecs,
-                    self._design_for_fit(with_design_mtx),
-                    refit_null=refit_null,
-                    random_seed=random_seed,
-                    device=self._device,
                 )
                 for batch in data
-                for _ in range(n_perms)
-            )
+            ]
+            task_meta = []
+            tasks = []
+            for perm_idx in range(n_perms):
+                perm = torch.randperm(self.n_spots)
+                for gene_indices, counts in batch_infos:
+                    task_meta.append((perm_idx, gene_indices))
+                    tasks.append(
+                        delayed(_fit_perm_one_gene)(
+                            perm,
+                            self._model_configs,
+                            counts,
+                            self._corr_sp_eigvals,
+                            self._corr_sp_eigvecs,
+                            self._design_for_fit(with_design_mtx),
+                            refit_null=refit_null,
+                            random_seed=random_seed,
+                            device=self._device,
+                        )
+                    )
             perm_stats = Parallel(n_jobs=n_jobs)(
                 tqdm(
                     tasks,
@@ -1594,7 +1609,10 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
                     disable=not print_progress,
                 )
             )
-            self._sv_llr_perm_stats = torch.concat(perm_stats, dim=0)
+            perm_matrix = torch.empty((n_perms, self.n_genes), dtype=torch.float32)
+            for (perm_idx, gene_indices), batch_stats in zip(task_meta, perm_stats):
+                perm_matrix[perm_idx, gene_indices] = batch_stats.detach().cpu().float()
+            self._sv_llr_perm_stats = perm_matrix
 
         if print_progress:
             print(f"Fitting finished. Time elapsed: {timer() - t_start:.2f} seconds.")
@@ -1645,7 +1663,19 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
             else:
                 print("Using cached permutation results...")
             perm = self._sv_llr_perm_stats
-            pvals = 1 - (stats[:, None] > perm[None, :]).sum(1) / len(perm)
+            if perm.ndim == 1:
+                if perm.numel() % self.n_genes != 0:
+                    raise RuntimeError(
+                        "Cached permutation statistics must have one column per gene."
+                    )
+                perm = perm.reshape(-1, self.n_genes)
+            if perm.shape[1] != self.n_genes:
+                raise RuntimeError(
+                    "Cached permutation statistics must have shape "
+                    "(n_perms, n_genes)."
+                )
+            perm = perm.to(dtype=stats.dtype, device=stats.device)
+            pvals = (1 + (perm >= stats[None, :]).sum(dim=0)) / (perm.shape[0] + 1)
         else:
             pvals = torch.tensor(1 - chi2.cdf(stats.cpu(), df=dfs.cpu()))
 

@@ -187,13 +187,35 @@ class IdentityKernel(Kernel):
                 _idx, _val, (n_spots, n_spots)
             )
 
-    def Kx(self, x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+    @staticmethod
+    def _is_torch_sparse(x: object) -> bool:
+        """Return whether ``x`` is a torch sparse tensor layout."""
+        return isinstance(x, torch.Tensor) and x.layout != torch.strided
+
+    @staticmethod
+    def _torch_float_view(x: torch.Tensor) -> torch.Tensor:
+        """Return ``x`` with a floating dtype suitable for kernel algebra."""
+        if x.dtype.is_floating_point or x.dtype.is_complex:
+            return x
+        return x.to(dtype=torch.float32)
+
+    def Kx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> np.ndarray | torch.Tensor:
         """Apply ``I`` or ``H`` to ``x``."""
         is_torch = isinstance(x, torch.Tensor)
         if is_torch:
-            arr = x.detach().cpu().numpy()
+            if self._is_torch_sparse(x):
+                arr = x.to_dense().detach().cpu().numpy()
+            else:
+                arr = x.detach().cpu().numpy()
             dtype = x.dtype
             device = x.device
+        elif scipy.sparse.issparse(x):
+            arr = x.toarray()
+            dtype = None
+            device = None
         else:
             arr = np.asarray(x)
             dtype = None
@@ -215,8 +237,35 @@ class IdentityKernel(Kernel):
             return torch.eye(self._n) - torch.full((self._n, self._n), 1.0 / self._n)
         return torch.eye(self._n)
 
-    def xtKx(self, x: torch.Tensor) -> torch.Tensor:
+    def xtKx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> torch.Tensor:
         """Compute ``x^T K x`` where ``K = I`` (or ``H I H = H`` when centred)."""
+        if scipy.sparse.issparse(x):
+            if x.shape[0] != self._n:
+                raise ValueError(
+                    f"Expected first dimension {self._n}, got {x.shape[0]}."
+                )
+            if self._centering:
+                x_dense = x.toarray().astype(np.float32, copy=False)
+                x_dense = x_dense - x_dense.mean(axis=0, keepdims=True)
+                return torch.from_numpy(x_dense.T @ x_dense)
+            q = x.T @ x
+            if scipy.sparse.issparse(q):
+                q = q.toarray()
+            return torch.from_numpy(np.asarray(q, dtype=np.float32))
+
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(np.asarray(x, dtype=np.float32))
+        elif self._is_torch_sparse(x):
+            x = x.to_dense()
+
+        if x.ndim == 1:
+            x = x[:, None]
+        if x.shape[0] != self._n:
+            raise ValueError(f"Expected first dimension {self._n}, got {x.shape[0]}.")
+        x = self._torch_float_view(x)
         xc = x - x.mean(dim=0, keepdim=True) if self._centering else x
         return xc.t() @ xc
 
