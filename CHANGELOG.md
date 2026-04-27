@@ -1,126 +1,124 @@
 # Changelog
 
-## v1.2.0rc1 (2026-04-26, preview)
+## v1.2.0rc1 (2026-04-27, preview)
 
-This is a **preview release for v1.2.0**.  It is intended for GitHub release
-testing only and is not planned for PyPI upload.  Install from the tag once it
-is published:
+Preview release for v1.2.0. This release candidate is intended for GitHub
+testing and is not uploaded to PyPI.
 
 ```bash
 pip install "splisosm[sdata,gp] @ git+https://github.com/JiayuSuPKU/SPLISOSM.git@v1.2.0rc1"
 ```
 
-### Behavior changes
+### Behavioral changes
 
-**`SplisosmNP` SV null: previous default was Liu + low-rank; new default is Liu + full-rank cumulants**
+**`SplisosmNP` SV default: Liu + low-rank -> Liu + full-rank cumulants**
 
-In v1.1.x, large `SplisosmNP.test_spatial_variability()` and
-`run_hsic_gc()` analyses used `null_method="liu"` with an automatic low-rank
-spatial approximation.  Starting in v1.2.0, `null_method="liu"` remains the
-default, but SPLISOSM evaluates Liu's approximation from direct spatial-kernel
-cumulants:
+- `SplisosmNP.test_spatial_variability()` and `run_hsic_gc()` still default to
+`null_method="liu"` (previously named "eig"), but now estimate cumulants for Liu's approximation from **full-rank** spatial-kernel, avoiding eigen-decomposition and low-rank approximations. 
+- Dense/spectral kernels
+use exact traces when cheap; implicit kernels use Hutchinson Rademacher trace
+estimates. Use `null_configs={"n_probes": m}` to tune this stochastic trace
+budget. This is not a low-rank approximation.
+- To recover the previous low-rank behavior, set `null_configs={"approx_rank": k}`.
 
-- dense / spectral kernels use exact traces when they are cheap;
-- large implicit CAR kernels use Hutchinson Rademacher trace estimates;
-- `null_configs={"n_probes": m}` controls that stochastic trace budget and is
-  **not** a low-rank approximation.
+This changes the statistic and p-values for large datasets (`n>5,000`) that
+previously used automatic rank truncation. FDR hit counts may
+change compared with v1.1.1, although gene rankings are usually similar. Specifically, the old low-rank path can look more powerful because it prioritizes low-frequency structure at
+the cost of zero sensitivity to local variation. To emphasize
+global patterns in v1.2.0, prefer a smoother full-rank kernel, for example
+`rho=0.999`, rather than returning to rank truncation.
 
-This changes both the observed HSIC statistic and the null distribution for
-large `SplisosmNP` SV tests that previously relied on automatic rank
-truncation.  P-values and FDR hit counts may therefore change after upgrading,
-while gene rankings are usually largely consistent.
+Permutation p-values now use `(1 + # null >= observed) / (B + 1)`. GLMM SV
+permutation nulls are kept per gene instead of being pooled across genes.
 
-At first glance, the legacy low-rank approach may appear to have higher
-statistical power because it often identifies more SVP genes.  This difference
-comes from a deliberate design choice:
+### Performance and memory
 
-- low-rank approximations prioritize global, low-frequency spatial patterns but
-  sacrifice sensitivity, yielding effectively zero power, for local,
-  high-frequency patterns;
-- because real-world data often contains global spatial patterns, the low-rank
-  test can naturally produce smaller p-values in those scenarios.
+Expect significant runtime and memory improvements for large datasets due to:
 
-For applications that intentionally prioritize global patterns, we recommend
-adjusting the spatial kernel rather than returning to rank truncation.  For
-example, use a smoother CAR kernel such as `SplisosmNP(rho=0.999)` or
-`run_hsic_gc(..., rho=0.999)`.  This preserves the full-rank test's ability to
-detect local patterns, albeit with reduced local-pattern power, and gives
-greater flexibility across a wider range of spatial variation.
+- Memory-aware automatic feature chunking to reduce overhead and improve speed.
+- Sparse-preserving algrebra for kernel operations.
+- Joblib-based parallelism for the stand-alone `run_hsic_gc()` function.
 
-The explicit `null_configs={"approx_rank": k}` override remains available as an
-advanced diagnostic / legacy-reproduction option, but it is no longer
-recommended as the default large-data SV path.
+Estimated impact compared with v1.1.1; exact gains depend on sparsity, isoform
+counts per gene, `n_jobs`, and the spatial kernel.
 
-### Speed and memory improvements
-
-- **Full-rank Liu SV without full eigendecomposition**.  A direct full-rank
-  Liu calibration by eigendecomposing an `n x n` spatial kernel costs
-  `O(n^3)` time and `O(n^2)` memory.  One float64 dense kernel alone is about
-  80 GB at 100K spots and about 8 TB at 1M spots, before eigenvectors or
-  temporary eigensolver work arrays.  For large implicit CAR kernels, v1.2.0
-  instead estimates the needed trace cumulants with Hutchinson Rademacher
-  probes.  With `m = n_probes`, Liu's four cumulants use two kernel
-  applications per probe and cost roughly `O(m * cost(Kx))`; the batched probe
-  work arrays scale as `O(nm)` memory.  At 1M spots and `m=60`, three float64
-  `n x m` probe/result arrays are about 1.4 GB plus sparse graph/precision
-  storage, and the spatial cumulants are cached across genes when
-  `nan_filling="mean"` (default).
-- **NUFFT GP versus sklearn GP**.  Exact sklearn GP residualization forms a
-  dense `n x n` kernel (`O(n^2)` memory) and uses dense GP linear algebra
-  (`O(n^3)` time).  The sklearn large-data fallback reduces hyperparameter
-  fitting to `O(M^3)` time and `O(M^2)` memory on a sampled
-  `M = n_inducing` subset, but hyperparameters are learned from that subset and
-  prediction back to all observations still costs `O(nM)` kernel work.  The new
-  FINUFFT backend keeps the RBF kernel implicit: each matrix-vector product is
-  approximately `O((n + q) log q)` for `q` Fourier modes, conjugate gradients
-  avoid dense solves, and irregular-grid hyperparameter fitting stores only
-  `O(nr)` leading eigensummary vectors for `r = lml_approx_rank`.  At 1M spots
-  and `r=64`, those vectors are about 512 MB in float64, compared with about
-  8 TB for a single dense `n x n` sklearn-size kernel.
+- **`SplisosmNP` SV**:
+  - v1.1.1's default large-data Liu path cached a rank
+    `k = ceil(4 * sqrt(n_spots))` eigensummary. Storing both eigenvectors and
+    the weighted low-rank factor costs about `2 * n_spots * k * 4` bytes:
+    roughly 1.0 GB at 100K spots and 32 GB at 1M spots, before eigensolver
+    work arrays.
+  - v1.2.0's default `n_probes=60` cumulant path uses about
+    `3 * n_spots * n_probes * 8` bytes for batched probe/result arrays:
+    roughly 144 MB at 100K spots and 1.4 GB at 1M spots, plus sparse
+    graph/precision storage. That is about 7x lower memory at 100K spots and
+    more than 20x lower at 1M spots for the null-calibration state.
+  - Null setup replaces thousands of Lanczos eigenvectors at million-spot scale
+    with `2 * n_probes` kernel applications. The observed statistic is now
+    full-rank, so per-gene work can be heavier than the old low-rank shortcut,
+    but sparse reductions and 32-column chunks reduce dispatch and solver
+    overhead. Kernel calls drop from one per gene to about
+    `ceil(total_response_columns / 32)`: up to 32x fewer calls for `hsic-gc`
+    and usually about 8-16x fewer calls for 2-4 isoforms per gene.
+- **`SplisosmFFT` SV**:
+  - v1.1.1 formed a per-gene product spectrum
+    `lambda_spatial x lambda_response`. This temporary costs about
+    `8 * n_grid * rank(response)` bytes per gene: about 24 MB at a 1M-cell grid
+    for a 3-dimensional response, or 80 MB for a 10-dimensional response.
+    v1.2.0 uses cumulants instead, so the null calculation is effectively
+    constant memory per gene after the FFT spectrum is cached.
+  - FFT spatial statistics are packed by response channel. The number of FFT
+    kernel calls drops from one per gene to about
+    `ceil(total_response_channels / 32)`, with the same 32x (`hsic-gc`) or
+    8-16x (typical multi-isoform genes) call-count reduction. The automatic
+    chunk cap keeps live FFT work arrays under the 2 GiB per-worker budget; at
+    a 1M-cell grid and 32 channels the estimate is about 1.5 GB.
 
 ### New features
 
-- **FINUFFT-backed NUFFT GPR backend** for `SplisosmNP.test_differential_usage(method="hsic-gp")`.
-  Use `gpr_backend="nufft"` or `"finufft"` for large irregular 2-D coordinates
-  to avoid dense GP matrices during spatial residualization.
-- **NUFFT GP hyperparameter fitting from spectral / eigensummary likelihoods**.
-  The new `gpr_configs={"covariate": {"lml_approx_rank": r}}` option controls
-  the irregular-grid log-marginal-likelihood eigensummary rank.  It affects
-  GP hyperparameter fitting accuracy and memory, not the Fourier grid used for
-  NUFFT matvecs.  `n_modes` sets an explicit Fourier grid and
-  `max_auto_modes` caps the automatically inferred full effective grid.
-- **Shared cumulant infrastructure** for multivariate HSIC SV tests.  Liu
-  p-values are now computed from the first four product-kernel cumulants rather
-  than by materializing all pairwise spatial/response eigenvalue products.
-- **Welch alias simplification**: retired `null_method="clt"` and
-  `null_method="trace"` inputs are automatically routed to `"welch"` with
-  deprecation warnings.  The previous `null_method="eig"` name is routed to
-  `"liu"`.
+- FINUFFT-backed NUFFT GP backend for
+  `SplisosmNP.test_differential_usage(method="hsic-gp")` on large irregular
+  2-D coordinates. Faster, more memory-efficient, and more accurate than the default Sklearn backend. Use `gpr_backend="nufft"` or `"finufft"`.
+- New NUFFT controls: `n_modes`, `max_auto_modes`, and
+  `gpr_configs={"covariate": {"lml_approx_rank": r}}`.
+- Sparse-aware, response-column chunked SV tests for `SplisosmNP`,
+  `SplisosmFFT`, and `run_hsic_gc`; `chunk_size="auto"` caps NP and FFT chunks
+  at 32 response columns/channels.
+- `run_hsic_gc()` now accepts `n_jobs`.
+- `hsic-ir` with `nan_filling="none"` uses a masked implicit spatial kernel
+  instead of materializing dense per-gene spatial submatrices.
+- Deprecated null aliases are routed automatically: `eig` -> `liu`, and
+  `clt` / `trace` -> `welch`.
 
-### Documentation
+### Fixes
 
-- Quickstart, FAQ, installation, methods, README, and tutorial notebooks now
-  describe `liu + cumulants` as the default SV null path and clarify that
-  `null_configs={"n_probes": m}` tunes stochastic trace estimates rather than
-  low-rank approximation.
-- Added FAQ guidance explaining why full-rank v1.2.0 SV results may differ
-  from legacy low-rank v1.1.x results, and why increasing `rho` is the
-  recommended way to emphasize global patterns while retaining local-pattern
-  support.
-- Added a methods section summarizing the FINUFFT NUFFT GP backend, including
-  the implicit Fourier matvec, conjugate-gradient residual solve, and
-  `lml_approx_rank` tail-corrected eigensummary.
-- Added configuration-reference entries for `standardize_cov`,
-  `min_component_size`, NUFFT GPR, and `lml_approx_rank`.
+- GLMM SV permutation calibration now compares each gene with its own
+  permutation null.
+- FFT DU t-tests reject constant or all-NaN binary covariates during
+  validation.
+- FFT `n_jobs=0` now receives the shared input-validation error.
+- Sparse linear HSIC keeps null eigenvalues consistent with `centering=False`.
+
+### Docs and API
+
+- Quickstart, FAQ, installation, methods, README, API pages, and tutorial text
+  now describe the full-rank cumulant SV default and clarify that `n_probes`
+  is trace-estimation control, not low-rank approximation.
+- Added NUFFT GP methods/API documentation, including `lml_approx_rank`.
+- Reorganized API docs into Core API and Advanced Options.
+- Moved the package to a `src/splisosm` layout and grouped advanced helpers
+  under `splisosm.gpr`, `splisosm.utils`, `splisosm.io`, `splisosm.glmm`, and
+  `splisosm.hyptest`. Main imports such as
+  `from splisosm import SplisosmNP, SplisosmFFT, SplisosmGLMM` are unchanged.
+- Tutorial notebooks were refreshed for the preview release.
 
 ### Testing
 
-- Added and extended unit tests for Liu cumulant p-values, `SplisosmNP` /
-  `run_hsic_gc` null-method routing, `n_probes` semantics, NUFFT GP matvecs,
-  regular-grid agreement with FFT GP, and irregular-coordinate agreement with
-  sklearn GP at comparable budgets.
-- Rebuilt the Sphinx documentation and refreshed tutorial notebooks for the
-  preview version.
+- Added and extended tests for cumulant Liu p-values, SV chunking and sparse
+  paths, `run_hsic_gc` parallelism, NUFFT GP agreement, public API imports, and
+  removal of old internal import paths.
+- Sphinx docs, local links, package build, and tutorial outputs were refreshed
+  for the preview release.
 
 ## v1.1.1 (2026-04-20)
 
