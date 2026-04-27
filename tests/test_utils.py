@@ -281,6 +281,34 @@ class TestUtils(unittest.TestCase):
         )
         self.assertEqual(res_chunk["chunk_size"], 32)
 
+    def test_run_hsic_gc_n_jobs_matches_serial(self):
+        """Parallel HSIC-GC chunks match serial execution."""
+        np.random.seed(102)
+        n_spots, n_genes = 55, 8
+        counts = np.random.poisson(1.2, size=(n_spots, n_genes)).astype(np.float32)
+        counts[counts < 2] = 0
+        coords = np.random.rand(n_spots, 2).astype(np.float32)
+        counts_sp = scipy.sparse.csr_matrix(counts)
+
+        res_serial = run_hsic_gc(counts_sp, coords, chunk_size=2, n_jobs=1)
+        res_parallel = run_hsic_gc(counts_sp, coords, chunk_size=2, n_jobs=2)
+        np.testing.assert_allclose(
+            res_serial["statistic"],
+            res_parallel["statistic"],
+            rtol=1e-5,
+            atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            res_serial["pvalue"], res_parallel["pvalue"], rtol=1e-5, atol=1e-8
+        )
+
+    def test_run_hsic_gc_n_jobs_zero_raises(self):
+        """n_jobs follows joblib-style validation and disallows zero."""
+        counts = np.ones((12, 3), dtype=np.float32)
+        coords = np.random.rand(12, 2).astype(np.float32)
+        with self.assertRaises(ValueError):
+            run_hsic_gc(counts, coords, n_jobs=0)
+
     def test_run_hsic_gc_anndata_mode(self):
         """AnnData mode loads adata.X / adata.layers[layer] as gene-level counts."""
         np.random.seed(1)

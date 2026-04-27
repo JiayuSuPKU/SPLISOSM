@@ -6,6 +6,7 @@ import warnings
 from typing import Any, Optional, Literal
 from scipy.sparse.csgraph import connected_components as _connected_components
 
+from joblib import Parallel, delayed
 import numpy as np
 from numpy.typing import ArrayLike
 import scipy.sparse
@@ -13,7 +14,12 @@ from tqdm import tqdm
 import pandas as pd
 import torch
 from anndata import AnnData
-from splisosm._chunking import auto_chunk_size, pack_gene_chunks, resolve_chunk_size
+from splisosm._chunking import (
+    _resolve_n_jobs,
+    auto_chunk_size,
+    pack_gene_chunks,
+    resolve_chunk_size,
+)
 from splisosm._hsic_null import (
     _feature_cumulants_from_data,
     _hsic_liu_pvalue,
@@ -1420,12 +1426,72 @@ def run_sparkx(
     return sv_sparkx
 
 
+def _run_hsic_gc_chunk_worker(
+    counts_gene: np.ndarray | scipy.sparse.spmatrix,
+    chunk: list[int],
+    *,
+    is_scipy_sparse: bool,
+    K_sp: Any,
+    null_method: Literal["liu", "welch"],
+    kernel_cumulants: dict[int, float],
+    kernel_approx_rank: Optional[int],
+    n_spots: int,
+) -> list[tuple[int, float, float]]:
+    """Compute HSIC-GC statistics and p-values for one gene-column chunk."""
+    cols = np.asarray(chunk, dtype=int)
+    if is_scipy_sparse:
+        response_block = counts_gene[:, cols]
+        q_input = response_block
+    else:
+        response_block = np.asarray(counts_gene[:, cols], dtype=np.float64)
+        q_input = torch.from_numpy(response_block.astype(np.float32, copy=False))
+
+    # When Liu uses an explicit low-rank diagnostic override, keep the observed
+    # statistic on the same rank-k scale as the null cumulants.
+    if null_method == "liu" and kernel_approx_rank is not None:
+        q_mat = K_sp.xtKx_approx(q_input, k=kernel_approx_rank)
+    else:
+        q_mat = K_sp.xtKx_exact(q_input)
+
+    if isinstance(q_mat, torch.Tensor):
+        q_cols = torch.diagonal(q_mat).detach().cpu().numpy().astype(float)
+    elif scipy.sparse.issparse(q_mat):
+        q_cols = np.asarray(q_mat.diagonal(), dtype=float)
+    else:
+        q_cols = np.diag(np.asarray(q_mat, dtype=float))
+
+    results: list[tuple[int, float, float]] = []
+    for local_idx, gene_idx in enumerate(cols):
+        hsic_scaled = float(q_cols[local_idx])
+        counts_col = response_block[:, local_idx : local_idx + 1]
+        feature_cumulants = _feature_cumulants_from_data(counts_col, centered=False)
+
+        if null_method == "liu":
+            pval = _hsic_liu_pvalue(
+                hsic_scaled,
+                kernel_cumulants,
+                feature_cumulants,
+                n_spots,
+            )
+        else:  # "welch"
+            pval = _hsic_welch_pvalue(
+                hsic_scaled,
+                kernel_cumulants,
+                feature_cumulants,
+                n_spots,
+            )
+
+        results.append((int(gene_idx), hsic_scaled / (n_spots - 1) ** 2, pval))
+    return results
+
+
 def run_hsic_gc(
     counts_gene: "np.ndarray | torch.Tensor | None" = None,
     coordinates: "np.ndarray | torch.Tensor | None" = None,
     null_method: Literal["liu", "welch", "eig", "clt", "trace"] = "liu",
     null_configs: Optional[dict[str, Any]] = None,
     chunk_size: int | Literal["auto"] = "auto",
+    n_jobs: int = 1,
     min_component_size: int = 1,
     adata: "AnnData | None" = None,
     layer: "str | None" = None,
@@ -1474,6 +1540,11 @@ def run_hsic_gc(
         spatial-kernel application. ``"auto"`` (default) estimates a
         memory-safe cap from a 2 GiB live-memory budget and caps the result
         at 32 columns for per-feature runtime.
+    n_jobs : int, optional
+        Number of joblib workers for chunked gene-level HSIC computation.
+        ``1`` (default) runs serially.  Use ``-1`` to use all available CPUs.
+        Threads are preferred so the sparse spatial kernel and count matrix
+        can be shared without large pickled copies.
     min_component_size : int, optional
         Minimum number of spots a connected component must contain to be
         retained.  Spots that belong to components smaller than this
@@ -1747,75 +1818,35 @@ def run_hsic_gc(
         counts_gene = np.asarray(counts_gene, dtype=np.float64)
         n_spots, n_genes = counts_gene.shape
 
+    effective_n_jobs = _resolve_n_jobs(n_jobs)
     column_cap = resolve_chunk_size(
         chunk_size,
         n_observations=n_spots,
         backend="np",
-        n_jobs=1,
+        n_jobs=effective_n_jobs,
         dtype_bytes=8,
     )
     gene_chunks = pack_gene_chunks([1] * n_genes, column_cap)
     hsic_arr = np.empty(n_genes, dtype=float)
     pvals_arr = np.empty(n_genes, dtype=float)
 
-    for chunk in tqdm(gene_chunks, desc="Genes", total=len(gene_chunks)):
-        cols = np.asarray(chunk, dtype=int)
-        if is_scipy_sparse:
-            sparse_block = counts_gene[:, cols]
-            dense_block = sparse_block.toarray().astype(np.float64, copy=False)
-        else:
-            sparse_block = None
-            dense_block = np.asarray(counts_gene[:, cols], dtype=np.float64)
-
-        # Compute HSIC test statistic.
-        # When `liu` null is used with an explicit low rank, use the
-        # rank-k projection so the stat and the Liu null cumulants are
-        # on the same (rank-k) scale — preventing the p=0 scale-mismatch bug.
-        # Otherwise fall back to the exact full-kernel quadratic form.
-        if null_method == "liu" and kernel_approx_rank is not None:
-            q_input = (
-                sparse_block
-                if sparse_block is not None
-                else torch.from_numpy(dense_block.astype(np.float32, copy=False))
-            )
-            q_mat = K_sp.xtKx_approx(q_input, k=kernel_approx_rank)
-        else:
-            q_input = (
-                sparse_block
-                if sparse_block is not None
-                else torch.from_numpy(dense_block.astype(np.float32, copy=False))
-            )
-            q_mat = K_sp.xtKx_exact(q_input)
-        if isinstance(q_mat, torch.Tensor):
-            q_cols = torch.diagonal(q_mat).detach().cpu().numpy().astype(float)
-        elif scipy.sparse.issparse(q_mat):
-            q_cols = np.asarray(q_mat.diagonal(), dtype=float)
-        else:
-            q_cols = np.diag(np.asarray(q_mat, dtype=float))
-
-        centered_block = dense_block - dense_block.mean(axis=0, keepdims=True)
-        for local_idx, gene_idx in enumerate(cols):
-            hsic_scaled = float(q_cols[local_idx])
-            counts = centered_block[:, local_idx : local_idx + 1]
-            feature_cumulants = _feature_cumulants_from_data(counts)
-
-            if null_method == "liu":
-                pval = _hsic_liu_pvalue(
-                    hsic_scaled,
-                    kernel_cumulants,
-                    feature_cumulants,
-                    n_spots,
-                )
-            else:  # "welch"
-                pval = _hsic_welch_pvalue(
-                    hsic_scaled,
-                    kernel_cumulants,
-                    feature_cumulants,
-                    n_spots,
-                )
-
-            hsic_arr[gene_idx] = hsic_scaled / (n_spots - 1) ** 2
-            pvals_arr[gene_idx] = pval
+    chunk_results = Parallel(n_jobs=effective_n_jobs, prefer="threads")(
+        delayed(_run_hsic_gc_chunk_worker)(
+            counts_gene,
+            chunk,
+            is_scipy_sparse=is_scipy_sparse,
+            K_sp=K_sp,
+            null_method=null_method,
+            kernel_cumulants=kernel_cumulants,
+            kernel_approx_rank=kernel_approx_rank,
+            n_spots=n_spots,
+        )
+        for chunk in tqdm(gene_chunks, desc="Genes", total=len(gene_chunks))
+    )
+    for chunk_result in chunk_results:
+        for gene_idx, statistic, pvalue in chunk_result:
+            hsic_arr[gene_idx] = statistic
+            pvals_arr[gene_idx] = pvalue
 
     sv_test_results = {
         "statistic": hsic_arr,
