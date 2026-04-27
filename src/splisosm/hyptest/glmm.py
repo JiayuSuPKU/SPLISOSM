@@ -22,8 +22,8 @@ from splisosm.utils.preprocessing import (
 )
 from splisosm.utils.stats import false_discovery_control
 from splisosm.glmm.dataset import IsoDataset
+from splisosm.glmm.glm import MultinomGLM
 from splisosm.kernel import IdentityKernel, SpatialCovKernel
-from splisosm.glmm import MultinomGLM
 from splisosm.glmm.workers import (
     IsoFullModel,
     IsoNullNoSpVar,

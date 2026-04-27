@@ -10,25 +10,29 @@ or residualizing custom response matrices.
 
 from __future__ import annotations
 
-from splisosm.gpr.base import KernelGPR
 from splisosm.gpr.config import _DEFAULT_GPR_CONFIGS
 from splisosm.gpr.factory import make_kernel_gpr
-from splisosm.gpr.fft import FFTKernelGPR
-from splisosm.gpr.gpytorch import GPyTorchKernelGPR
-from splisosm.gpr.nufft import NUFFTKernelGPR
-from splisosm.gpr.operators import (
-    DenseKernelOp,
-    FFTKernelOp,
-    NUFFTKernelOp,
-    SpatialKernelOp,
-)
-from splisosm.gpr.sklearn import (
-    SklearnKernelGPR,
-    _build_rbf_cross_kernel,
-    _build_rbf_kernel,
-    _kernel_residuals_from_eigdecomp,
-)
-from splisosm.utils.hsic import linear_hsic_test
+
+_LAZY_EXPORTS = {
+    "KernelGPR": ("splisosm.gpr.base", "KernelGPR"),
+    "SklearnKernelGPR": ("splisosm.gpr.sklearn", "SklearnKernelGPR"),
+    "GPyTorchKernelGPR": ("splisosm.gpr.gpytorch", "GPyTorchKernelGPR"),
+    "FFTKernelGPR": ("splisosm.gpr.fft", "FFTKernelGPR"),
+    "NUFFTKernelGPR": ("splisosm.gpr.nufft", "NUFFTKernelGPR"),
+    "SpatialKernelOp": ("splisosm.gpr.operators", "SpatialKernelOp"),
+    "DenseKernelOp": ("splisosm.gpr.operators", "DenseKernelOp"),
+    "FFTKernelOp": ("splisosm.gpr.operators", "FFTKernelOp"),
+    "NUFFTKernelOp": ("splisosm.gpr.operators", "NUFFTKernelOp"),
+    "_build_rbf_kernel": ("splisosm.gpr.sklearn", "_build_rbf_kernel"),
+    "_build_rbf_cross_kernel": (
+        "splisosm.gpr.sklearn",
+        "_build_rbf_cross_kernel",
+    ),
+    "_kernel_residuals_from_eigdecomp": (
+        "splisosm.gpr.sklearn",
+        "_kernel_residuals_from_eigdecomp",
+    ),
+}
 
 __all__ = [
     "SpatialKernelOp",
@@ -41,9 +45,25 @@ __all__ = [
     "FFTKernelGPR",
     "NUFFTKernelGPR",
     "make_kernel_gpr",
-    "linear_hsic_test",
     "_DEFAULT_GPR_CONFIGS",
     "_build_rbf_kernel",
     "_build_rbf_cross_kernel",
     "_kernel_residuals_from_eigdecomp",
 ]
+
+
+def __getattr__(name: str) -> object:
+    """Lazily import backend classes and helper functions on first access."""
+    if name in _LAZY_EXPORTS:
+        from importlib import import_module
+
+        module_name, attr_name = _LAZY_EXPORTS[name]
+        attr = getattr(import_module(module_name), attr_name)
+        globals()[name] = attr
+        return attr
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Return public names for interactive completion."""
+    return sorted(set(globals()) | set(__all__))

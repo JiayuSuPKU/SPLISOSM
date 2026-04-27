@@ -12,7 +12,6 @@ from splisosm.gpr import (
     FFTKernelOp,
     NUFFTKernelOp,
     SpatialKernelOp,
-    linear_hsic_test,
     _build_rbf_kernel,
     _DEFAULT_GPR_CONFIGS,
     _kernel_residuals_from_eigdecomp,
@@ -25,6 +24,7 @@ from splisosm.gpr import (
     SklearnKernelGPR,
     make_kernel_gpr,
 )
+from splisosm.utils.hsic import linear_hsic_test
 
 
 def _make_coords(n: int = 50, d: int = 2, seed: int = 0) -> torch.Tensor:

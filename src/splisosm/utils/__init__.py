@@ -25,8 +25,6 @@ from splisosm.utils.simulation import (
 )
 from splisosm.utils.stats import (
     false_discovery_control,
-    liu_sf,
-    liu_sf_from_cumulants,
     run_hsic_gc,
     run_sparkx,
 )
@@ -43,8 +41,6 @@ __all__ = [
     "auto_chunk_size",
     "run_sparkx",
     "run_hsic_gc",
-    "liu_sf",
-    "liu_sf_from_cumulants",
     "simulate_isoform_counts_single_gene",
     "simulate_isoform_counts",
 ]

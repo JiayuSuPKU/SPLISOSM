@@ -139,7 +139,7 @@ Under the null, :math:`Q` asymptotically follows a weighted sum of independent :
 where the double sum runs over all pairs of spatial and response eigenvalues.
 SPLISOSM evaluates :cite:t:`liu2009new` from the first four cumulants
 :math:`c_r = \mathrm{tr}(K^r)\mathrm{tr}((Y^\top Y)^r)/(n-1)^r`, so it does not need to materialize the full pairwise eigenvalue product.
-See :func:`splisosm.utils.stats.liu_sf_from_cumulants` for implementation details.
+See :func:`splisosm.utils.hsic.liu_sf_from_cumulants` for implementation details.
 
 .. note::
 

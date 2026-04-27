@@ -3,39 +3,27 @@
 from __future__ import annotations
 
 import warnings
-from typing import Any, Optional, Literal
+from typing import TYPE_CHECKING, Any, Optional, Literal
 from scipy.sparse.csgraph import connected_components as _connected_components
 
-from joblib import Parallel, delayed
 import numpy as np
 from numpy.typing import ArrayLike
 import scipy.sparse
 import torch
-from anndata import AnnData
-from tqdm import tqdm
+
 from splisosm.utils._chunking import (
     _resolve_n_jobs,
     pack_gene_chunks,
     resolve_chunk_size,
 )
-from splisosm.utils.hsic import (
-    _feature_cumulants_from_data,
-    _hsic_liu_pvalue,
-    _hsic_welch_pvalue,
-    _kernel_cumulants_for_null,
-    _normalize_hsic_null_method,
-    linear_hsic_test,
-    liu_sf,
-    liu_sf_from_cumulants,
-)
+
+if TYPE_CHECKING:
+    from anndata import AnnData
 
 __all__ = [
     "false_discovery_control",
     "run_hsic_gc",
     "run_sparkx",
-    "linear_hsic_test",
-    "liu_sf",
-    "liu_sf_from_cumulants",
 ]
 
 
@@ -234,6 +222,12 @@ def _run_hsic_gc_chunk_worker(
     n_spots: int,
 ) -> list[tuple[int, float, float]]:
     """Compute HSIC-GC statistics and p-values for one gene-column chunk."""
+    from splisosm.utils.hsic import (
+        _feature_cumulants_from_data,
+        _hsic_liu_pvalue,
+        _hsic_welch_pvalue,
+    )
+
     cols = np.asarray(chunk, dtype=int)
     if is_scipy_sparse:
         response_block = counts_gene[:, cols]
@@ -529,6 +523,9 @@ def _compute_hsic_gc_chunked_results(
     n_jobs: int,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Execute HSIC-GC statistics in response-column chunks."""
+    from joblib import Parallel, delayed
+    from tqdm import tqdm
+
     effective_n_jobs = _resolve_n_jobs(n_jobs)
     column_cap = resolve_chunk_size(
         chunk_size,
@@ -673,6 +670,11 @@ def run_hsic_gc(
         - ``'null_method'``: the value of *null_method*.
         - ``'n_spots'``: number of spots after component filtering.
     """
+
+    from splisosm.utils.hsic import (
+        _kernel_cumulants_for_null,
+        _normalize_hsic_null_method,
+    )
 
     spatial_kernel_kwargs = dict(spatial_kernel_kwargs)
     counts_gene, coordinates, adj_prebuilt = _prepare_hsic_gc_inputs(

@@ -49,14 +49,13 @@ def test_curated_helper_modules_import():
         counts_to_ratios,
         prepare_inputs_from_anndata,
     )
+    from splisosm.utils.hsic import linear_hsic_test, liu_sf_from_cumulants
+    from splisosm.utils.simulation import simulate_isoform_counts
     from splisosm.utils.stats import (
         false_discovery_control,
-        linear_hsic_test,
-        liu_sf_from_cumulants,
         run_hsic_gc,
         run_sparkx,
     )
-    from splisosm.utils.simulation import simulate_isoform_counts
 
     assert callable(counts_to_ratios)
     assert callable(add_ratio_layer)
@@ -96,6 +95,15 @@ def test_utils_reexports_curated_helpers():
     assert callable(simulate_isoform_counts)
 
 
+def test_gpr_facade_does_not_reexport_hsic_helpers():
+    """HSIC helpers live under splisosm.utils.hsic, not the GPR namespace."""
+    import splisosm.gpr
+
+    assert "linear_hsic_test" not in splisosm.gpr.__all__
+    with pytest.raises(AttributeError):
+        getattr(splisosm.gpr, "linear_hsic_test")
+
+
 def test_removed_internal_module_paths_are_not_importable():
     """Moved private/internal modules are cleaned up instead of facaded."""
     removed_modules = [
@@ -114,6 +122,7 @@ def test_optional_imports_stay_lazy_for_core_namespaces():
     """Core imports should not require optional FFT/GPR backends."""
     code = """
 import builtins
+import sys
 
 blocked = {"spatialdata", "spatialdata_io", "gpytorch", "finufft"}
 original_import = builtins.__import__
@@ -128,6 +137,29 @@ builtins.__import__ = guarded_import
 import splisosm
 from splisosm import SplisosmGLMM, SplisosmNP
 import splisosm.gpr
+
+for module_name in (
+    "splisosm.gpr.base",
+    "splisosm.gpr.operators",
+    "splisosm.gpr.sklearn",
+    "splisosm.gpr.gpytorch",
+    "splisosm.gpr.fft",
+    "splisosm.gpr.nufft",
+):
+    assert module_name not in sys.modules
+
+from splisosm.gpr import make_kernel_gpr
+
+for module_name in (
+    "splisosm.gpr.base",
+    "splisosm.gpr.operators",
+    "splisosm.gpr.sklearn",
+    "splisosm.gpr.gpytorch",
+    "splisosm.gpr.fft",
+    "splisosm.gpr.nufft",
+):
+    assert module_name not in sys.modules
+
 from splisosm.gpr import GPyTorchKernelGPR, NUFFTKernelGPR, make_kernel_gpr
 
 assert SplisosmNP.__name__ == "SplisosmNP"
@@ -138,3 +170,27 @@ assert NUFFTKernelGPR.__name__ == "NUFFTKernelGPR"
 """
     env = {**os.environ, "PYTHONPATH": os.path.abspath("src")}
     subprocess.run([sys.executable, "-c", code], check=True, env=env)
+
+
+def test_stats_import_does_not_import_hsic():
+    """Stats imports should not pull in HSIC helpers."""
+    code = """
+import sys
+
+assert "splisosm.utils.hsic" not in sys.modules
+
+from splisosm.utils.stats import false_discovery_control
+
+assert false_discovery_control.__name__ == "false_discovery_control"
+assert "splisosm.utils.hsic" not in sys.modules
+"""
+    env = {**os.environ, "PYTHONPATH": os.path.abspath("src")}
+    subprocess.run([sys.executable, "-c", code], check=True, env=env)
+
+
+def test_utils_facade_eagerly_reexports_helpers():
+    """The convenience utils namespace uses straightforward eager imports."""
+    import splisosm.utils
+
+    assert splisosm.utils.counts_to_ratios.__name__ == "counts_to_ratios"
+    assert splisosm.utils.false_discovery_control.__name__ == "false_discovery_control"

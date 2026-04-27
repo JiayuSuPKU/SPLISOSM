@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from splisosm.gpr.base import KernelGPR
 from splisosm.gpr.config import (
     _FFT_GPR_KWARGS,
     _GPYTORCH_GPR_KWARGS,
@@ -12,10 +11,9 @@ from splisosm.gpr.config import (
     _NUFFT_GPR_KWARGS,
     _SKLEARN_GPR_KWARGS,
 )
-from splisosm.gpr.fft import FFTKernelGPR
-from splisosm.gpr.gpytorch import GPyTorchKernelGPR
-from splisosm.gpr.nufft import NUFFTKernelGPR
-from splisosm.gpr.sklearn import SklearnKernelGPR
+
+if TYPE_CHECKING:
+    from splisosm.gpr.base import KernelGPR
 
 __all__ = ["make_kernel_gpr"]
 
@@ -39,6 +37,30 @@ def _filter_gpr_kwargs(backend: str, kwargs: dict[str, Any]) -> dict[str, Any]:
     else:
         allowed = set()
     return {k: v for k, v in kwargs.items() if k in allowed}
+
+
+def _backend_class(backend: str) -> type["KernelGPR"]:
+    """Import and return only the backend class selected by the caller."""
+    if backend == "sklearn":
+        from splisosm.gpr.sklearn import SklearnKernelGPR
+
+        return SklearnKernelGPR
+    if backend == "gpytorch":
+        from splisosm.gpr.gpytorch import GPyTorchKernelGPR
+
+        return GPyTorchKernelGPR
+    if backend == "fft":
+        from splisosm.gpr.fft import FFTKernelGPR
+
+        return FFTKernelGPR
+    if backend in {"nufft", "finufft"}:
+        from splisosm.gpr.nufft import NUFFTKernelGPR
+
+        return NUFFTKernelGPR
+    raise ValueError(
+        f"Unknown backend '{backend}'. Choose from 'sklearn', 'gpytorch', "
+        "'fft', 'nufft', or 'finufft'."
+    )
 
 
 def make_kernel_gpr(
@@ -71,15 +93,5 @@ def make_kernel_gpr(
         If backend is not one of the supported options.
         If an unknown configuration key is supplied.
     """
-    if backend == "sklearn":
-        return SklearnKernelGPR(**_filter_gpr_kwargs(backend, kwargs))
-    if backend == "gpytorch":
-        return GPyTorchKernelGPR(**_filter_gpr_kwargs(backend, kwargs))
-    if backend == "fft":
-        return FFTKernelGPR(**_filter_gpr_kwargs(backend, kwargs))
-    if backend in {"nufft", "finufft"}:
-        return NUFFTKernelGPR(**_filter_gpr_kwargs(backend, kwargs))
-    raise ValueError(
-        f"Unknown backend '{backend}'. Choose from 'sklearn', 'gpytorch', "
-        "'fft', 'nufft', or 'finufft'."
-    )
+    cls = _backend_class(backend)
+    return cls(**_filter_gpr_kwargs(backend, kwargs))

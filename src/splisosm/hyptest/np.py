@@ -38,7 +38,8 @@ from splisosm.utils.hsic import (
     _normalize_hsic_null_method,
     linear_hsic_test,
 )
-from splisosm.gpr import make_kernel_gpr, _DEFAULT_GPR_CONFIGS
+from splisosm.gpr.config import _DEFAULT_GPR_CONFIGS
+from splisosm.gpr.factory import make_kernel_gpr
 
 __all__ = ["SplisosmNP"]
 

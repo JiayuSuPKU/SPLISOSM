@@ -1807,7 +1807,7 @@ class TestSplisosmNP(unittest.TestCase):
 
     def test_linear_hsic_sparse_X_matches_dense(self):
         """linear_hsic_test with sparse X gives same result as dense X."""
-        from splisosm.gpr import linear_hsic_test
+        from splisosm.utils.hsic import linear_hsic_test
 
         np.random.seed(42)
         n, p, q = 100, 2, 4

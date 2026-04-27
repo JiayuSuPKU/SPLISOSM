@@ -56,8 +56,8 @@ Data Preparation
 .. autofunction:: splisosm.utils.preprocessing.compute_feature_summaries
 .. autofunction:: splisosm.utils.preprocessing.auto_chunk_size
 
-Standalone Tests And Statistics
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Standalone Tests
+~~~~~~~~~~~~~~~~
 
 .. autosummary::
    :nosignatures:
@@ -65,16 +65,24 @@ Standalone Tests And Statistics
    splisosm.utils.stats.run_hsic_gc
    splisosm.utils.stats.run_sparkx
    splisosm.utils.stats.false_discovery_control
-   splisosm.utils.stats.liu_sf
-   splisosm.utils.stats.liu_sf_from_cumulants
-   splisosm.utils.stats.linear_hsic_test
 
 .. autofunction:: splisosm.utils.stats.run_hsic_gc
 .. autofunction:: splisosm.utils.stats.run_sparkx
 .. autofunction:: splisosm.utils.stats.false_discovery_control
-.. autofunction:: splisosm.utils.stats.liu_sf
-.. autofunction:: splisosm.utils.stats.liu_sf_from_cumulants
-.. autofunction:: splisosm.utils.stats.linear_hsic_test
+
+HSIC And Liu Helpers
+~~~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+   :nosignatures:
+
+   splisosm.utils.hsic.linear_hsic_test
+   splisosm.utils.hsic.liu_sf
+   splisosm.utils.hsic.liu_sf_from_cumulants
+
+.. autofunction:: splisosm.utils.hsic.linear_hsic_test
+.. autofunction:: splisosm.utils.hsic.liu_sf
+.. autofunction:: splisosm.utils.hsic.liu_sf_from_cumulants
 
 SpatialData Loaders
 -------------------

@@ -31,17 +31,15 @@ from splisosm.utils.hsic import (
     _cumulants_from_eigenvalues,
     _feature_cumulants_from_data,
     _hsic_liu_pvalue,
+    liu_sf,
 )
-from splisosm.gpr import (
-    FFTKernelGPR,
-    _DEFAULT_GPR_CONFIGS,
-)
+from splisosm.gpr.config import _DEFAULT_GPR_CONFIGS
+from splisosm.gpr.fft import FFTKernelGPR
 from splisosm.utils.preprocessing import (
     counts_to_ratios,
 )
 from splisosm.utils.stats import (
     false_discovery_control,
-    liu_sf,
 )
 
 __all__ = ["SplisosmFFT"]
