@@ -5,12 +5,20 @@ import numpy as np
 import scipy.sparse
 import pandas as pd
 from anndata import AnnData
+from unittest.mock import patch
 from splisosm.utils import run_hsic_gc
-from splisosm.hyptest_np import (
+from splisosm.hyptest.np import (
     SplisosmNP,
     _calc_ttest_differential_usage,
+    _evaluate_sv_gene_np,
+    _prepare_np_response,
+    _quadratic_columns_exact,
+    _sparse_counts_to_ratios_centered,
 )
-from splisosm.simulation import simulate_isoform_counts
+from splisosm.utils.hsic import _feature_cumulants_from_data
+from splisosm.kernel import IdentityKernel, SpatialCovKernel
+from splisosm.utils import counts_to_ratios
+from splisosm.utils.simulation import simulate_isoform_counts
 
 
 def get_simulation_data(n_genes=2, n_isos=3, n_spots_per_dim=20):
@@ -303,6 +311,24 @@ class TestSplisosmNP(unittest.TestCase):
             {"statistic", "pvalue", "pvalue_adj"}.issubset(sv_results.columns)
         )
 
+    def test_spatial_variability_n_jobs_zero_raises(self):
+        """NP SV uses shared joblib-style n_jobs validation."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+
+        with self.assertRaises(ValueError):
+            model.test_spatial_variability(
+                method="hsic-ir", n_jobs=0, print_progress=False
+            )
+
     def test_docstring_example_differential_usage_workflow(self):
         model = SplisosmNP()
         model.setup_data(
@@ -345,6 +371,154 @@ class TestSplisosmNP(unittest.TestCase):
                 sv_results = model.get_formatted_test_results("sv")
                 print(sv_results.head())
                 self.assertIn(method, str(model))
+
+    def test_spatial_variability_chunk_size_matches_single_column(self):
+        """Column-chunked NP SV matches one-column/singleton execution."""
+        adata = self.adata_10g.copy()
+        adata.layers["counts"] = scipy.sparse.csr_matrix(adata.layers["counts"])
+
+        ref = None
+        last = None
+        for chunk_size in (1, 2, "auto"):
+            model = SplisosmNP()
+            model.setup_data(
+                adata=adata,
+                layer="counts",
+                spatial_key="spatial",
+                group_iso_by="gene_symbol",
+                gene_names="gene_label",
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
+            )
+            res = model.test_spatial_variability(
+                method="hsic-ic",
+                chunk_size=chunk_size,
+                n_jobs=1,
+                return_results=True,
+                print_progress=False,
+            )
+            if ref is None:
+                ref = res
+            else:
+                np.testing.assert_allclose(
+                    res["statistic"], ref["statistic"], rtol=1e-5, atol=1e-8
+                )
+                np.testing.assert_allclose(
+                    res["pvalue"], ref["pvalue"], rtol=1e-5, atol=1e-8
+                )
+            last = res
+        self.assertLessEqual(last["chunk_size"], 32)
+
+    def test_sparse_ratio_response_matches_dense_ratio_statistic(self):
+        """Sparse HSIC-IR ratios avoid dense counts while matching dense math."""
+        counts_dense = np.array(
+            [
+                [2.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 3.0, 0.0],
+                [0.0, 4.0, 4.0],
+                [0.0, 0.0, 0.0],
+                [5.0, 0.0, 5.0],
+            ],
+            dtype=np.float32,
+        )
+        kernel = SpatialCovKernel.from_coordinates(
+            np.column_stack([np.arange(counts_dense.shape[0]), np.zeros(6)]),
+            k_neighbors=2,
+            rho=0.9,
+            centering=True,
+        )
+        counts_sparse = torch.from_numpy(counts_dense).to_sparse()
+
+        for transformation in ("none", "clr", "ilr", "alr", "radial"):
+            with self.subTest(transformation=transformation):
+                sparse_centered, nan_mask = _sparse_counts_to_ratios_centered(
+                    scipy.sparse.csr_matrix(counts_dense),
+                    transformation=transformation,
+                    nan_filling="mean",
+                )
+                self.assertIsNone(nan_mask)
+                response, is_centered = _prepare_np_response(
+                    counts_sparse,
+                    method="hsic-ir",
+                    ratio_transformation=transformation,
+                )
+                dense_ref = counts_to_ratios(
+                    torch.from_numpy(counts_dense),
+                    transformation=transformation,
+                    nan_filling="mean",
+                    fill_before_transform=False,
+                ).numpy()
+                dense_ref = dense_ref - dense_ref.mean(axis=0, keepdims=True)
+                np.testing.assert_allclose(
+                    sparse_centered.toarray(), dense_ref, atol=1e-6
+                )
+                self.assertTrue(is_centered)
+                self.assertTrue(scipy.sparse.issparse(response))
+                np.testing.assert_allclose(response.toarray(), dense_ref, atol=1e-6)
+                self.assertEqual(response[1].nnz, 0)
+                self.assertEqual(response[4].nnz, 0)
+
+                q_sparse = _quadratic_columns_exact(kernel, response)
+                kx = np.asarray(kernel.Kx(dense_ref), dtype=float)
+                q_dense = np.sum(dense_ref * kx, axis=0)
+                np.testing.assert_allclose(q_sparse, q_dense, rtol=1e-6, atol=1e-8)
+
+    def test_sparse_counts_to_ratios_centered_nan_mask(self):
+        """Sparse ratio helper returns centered expressed rows plus NaN mask."""
+        counts_dense = np.array(
+            [
+                [3.0, 0.0],
+                [0.0, 0.0],
+                [1.0, 1.0],
+                [0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        sparse, nan_mask = _sparse_counts_to_ratios_centered(
+            scipy.sparse.csr_matrix(counts_dense),
+            transformation="none",
+            nan_filling="none",
+        )
+        np.testing.assert_array_equal(nan_mask, np.array([False, True, False, True]))
+        dense_ref = counts_to_ratios(
+            torch.from_numpy(counts_dense),
+            transformation="none",
+            nan_filling="none",
+            fill_before_transform=False,
+        )
+        keep = ~torch.isnan(dense_ref).any(1)
+        dense_ref = dense_ref[keep].numpy()
+        dense_ref = dense_ref - dense_ref.mean(axis=0, keepdims=True)
+        np.testing.assert_allclose(sparse[~nan_mask].toarray(), dense_ref, atol=1e-7)
+        self.assertEqual(sparse[nan_mask].nnz, 0)
+
+    def test_sparse_feature_cumulants_match_dense_centering(self):
+        """Sparse feature cumulants compute centered Gram without densifying rows."""
+        counts_dense = np.array(
+            [
+                [2.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 3.0, 0.0],
+                [0.0, 4.0, 4.0],
+                [5.0, 0.0, 5.0],
+            ],
+            dtype=np.float64,
+        )
+        sparse_counts = scipy.sparse.csc_matrix(counts_dense)
+        dense_centered = counts_dense - counts_dense.mean(axis=0, keepdims=True)
+        sparse_cumulants = _feature_cumulants_from_data(
+            sparse_counts,
+            centered=False,
+        )
+        dense_cumulants = _feature_cumulants_from_data(dense_centered)
+        for power in (1, 2, 3, 4):
+            self.assertAlmostEqual(
+                sparse_cumulants[power],
+                dense_cumulants[power],
+                places=5,
+            )
 
     def test_sparse_data_handling(self):
         n_spots = self.n_spots
@@ -623,6 +797,34 @@ class TestSplisosmNP(unittest.TestCase):
         sv_results = model.get_formatted_test_results("sv")
         self.assertEqual(len(sv_results), self.n_genes)
 
+    def test_sv_nan_filling_none_avoids_kernel_realization(self):
+        """The masked-kernel path should not realize a dense parent kernel."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        with patch.object(
+            model.sp_kernel,
+            "realization",
+            side_effect=AssertionError("dense realization should not be called"),
+        ):
+            res = model.test_spatial_variability(
+                method="hsic-ir",
+                nan_filling="none",
+                null_configs={"n_probes": 8},
+                return_results=True,
+                print_progress=False,
+            )
+        self.assertEqual(len(res["pvalue"]), model.n_genes)
+        self.assertTrue(np.all(np.isfinite(res["pvalue"])))
+
     def test_sv_null_methods(self):
         """All three null methods should run and return valid p-values."""
         model = SplisosmNP()
@@ -637,7 +839,7 @@ class TestSplisosmNP(unittest.TestCase):
             min_bin_pct=0.0,
             filter_single_iso_genes=False,
         )
-        for null_method in ["eig", "clt", "welch", "perm"]:
+        for null_method in ["liu", "welch", "perm"]:
             with self.subTest(null_method=null_method):
                 configs = (
                     {"n_perms_per_gene": 50, "perm_batch_size": 10}
@@ -683,7 +885,7 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertTrue(np.all(res["pvalue"] <= 1))
 
     def test_sv_nan_filling_none_uses_per_gene_kernel_moments(self):
-        """trace/welch/perm nulls with nan_filling='none' must use per-gene K.
+        """liu/welch/perm nulls with nan_filling='none' must use per-gene K.
 
         The `hsic-ir + nan_filling='none'` branch builds a gene-specific
         double-centred kernel submatrix (dropping NaN spots).  The null
@@ -705,7 +907,7 @@ class TestSplisosmNP(unittest.TestCase):
             X[np.ix_(mask, iso_idx)] = 0.0
         adata.layers["counts"] = X
 
-        for null_method in ("clt", "welch", "perm"):
+        for null_method in ("liu", "welch", "perm"):
             with self.subTest(null_method=null_method):
                 model = SplisosmNP()
                 model.setup_data(
@@ -736,9 +938,8 @@ class TestSplisosmNP(unittest.TestCase):
                 self.assertTrue(np.all(res["pvalue"] >= 0))
                 self.assertTrue(np.all(res["pvalue"] <= 1))
 
-    def test_sv_null_method_trace_alias_deprecated(self):
-        """`null_method='trace'` is a deprecated alias for `'clt'`: same results
-        plus a DeprecationWarning."""
+    def test_sv_null_method_aliases_deprecated(self):
+        """Legacy null names are mapped to canonical Liu/Welch names."""
         model = SplisosmNP()
         model.setup_data(
             adata=self.adata,
@@ -750,32 +951,40 @@ class TestSplisosmNP(unittest.TestCase):
             min_bin_pct=0.0,
             filter_single_iso_genes=False,
         )
-        # Canonical name: no warning.
-        res_clt = model.test_spatial_variability(
+        res_liu = model.test_spatial_variability(
             method="hsic-ir",
-            null_method="clt",
+            null_method="liu",
+            print_progress=False,
+            return_results=True,
+        )
+        res_welch = model.test_spatial_variability(
+            method="hsic-ir",
+            null_method="welch",
             print_progress=False,
             return_results=True,
         )
 
-        # Deprecated alias: same numerics + DeprecationWarning.
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            res_trace = model.test_spatial_variability(
-                method="hsic-ir",
-                null_method="trace",
-                print_progress=False,
-                return_results=True,
-            )
-        dep = [
-            w
-            for w in caught
-            if issubclass(w.category, DeprecationWarning) and "trace" in str(w.message)
-        ]
-        self.assertTrue(len(dep) >= 1, "expected DeprecationWarning for 'trace'")
-        self.assertEqual(res_trace["null_method"], "clt")
-        np.testing.assert_allclose(res_trace["statistic"], res_clt["statistic"])
-        np.testing.assert_allclose(res_trace["pvalue"], res_clt["pvalue"])
+        for alias, canonical, expected in (
+            ("eig", "liu", res_liu),
+            ("clt", "welch", res_welch),
+            ("trace", "welch", res_welch),
+        ):
+            with self.subTest(alias=alias):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    res_alias = model.test_spatial_variability(
+                        method="hsic-ir",
+                        null_method=alias,
+                        print_progress=False,
+                        return_results=True,
+                    )
+                dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+                self.assertTrue(len(dep) >= 1, f"expected warning for {alias!r}")
+                self.assertEqual(res_alias["null_method"], canonical)
+                np.testing.assert_allclose(
+                    res_alias["statistic"], expected["statistic"]
+                )
+                np.testing.assert_allclose(res_alias["pvalue"], expected["pvalue"])
 
     def test_sv_perm_batch_size_config(self):
         """perm_batch_size in null_configs should be respected."""
@@ -1175,11 +1384,11 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertGreater(rho, 0.9, f"Spearman rank correlation={rho:.3f} too low")
 
     def test_null_methods_agreement(self):
-        """eig, trace, welch and perm null methods should yield broadly similar p-value ranks.
+        """Liu, Welch and perm null methods should yield broadly similar p-value ranks.
 
-        We run all four methods on the same data and check pairwise Spearman rank
-        correlations on –log10(p).  The three asymptotic methods (eig/trace/welch)
-        should agree tightly (ρ > 0.9); each asymptotic method vs. the permutation
+        We run all methods on the same data and check pairwise Spearman rank
+        correlations on –log10(p).  The two asymptotic methods should agree
+        tightly (ρ > 0.9); each asymptotic method vs. the permutation
         null should agree moderately (ρ > 0.6), allowing for the discrete, noisy
         nature of a permutation p-value with a finite number of permutations.
         """
@@ -1197,7 +1406,7 @@ class TestSplisosmNP(unittest.TestCase):
         )
 
         pvals = {}
-        for null_method in ("eig", "clt", "welch", "perm"):
+        for null_method in ("liu", "welch", "perm"):
             null_configs = (
                 {"n_perms_per_gene": 2000, "perm_batch_size": 100}
                 if null_method == "perm"
@@ -1216,11 +1425,8 @@ class TestSplisosmNP(unittest.TestCase):
 
         # Thresholds: asymptotic methods should agree tightly; perm is noisier.
         thresholds = {
-            ("eig", "clt"): 0.90,
-            ("eig", "welch"): 0.90,
-            ("clt", "welch"): 0.90,
-            ("eig", "perm"): 0.70,
-            ("clt", "perm"): 0.70,
+            ("liu", "welch"): 0.90,
+            ("liu", "perm"): 0.70,
             ("welch", "perm"): 0.70,
         }
         for (m1, m2), thr in thresholds.items():
@@ -1232,8 +1438,8 @@ class TestSplisosmNP(unittest.TestCase):
                     f"Spearman ρ({m1}, {m2}) = {rho:.3f} < {thr} — null methods disagree too much",
                 )
 
-    def test_eig_lowrank_vs_fullrank_agreement(self):
-        """Low-rank eig (approx_rank=20) should give p-value ranks consistent with full-rank eig.
+    def test_liu_lowrank_vs_fullrank_agreement(self):
+        """Low-rank Liu should give p-value ranks consistent with full-rank Liu.
 
         This is a regression test for the scale-mismatch bug where approx_rank < n_spots
         caused the test stat (full kernel) and the Liu null (rank-k eigenvalues) to be on
@@ -1254,14 +1460,14 @@ class TestSplisosmNP(unittest.TestCase):
 
         res_full = model.test_spatial_variability(
             method="hsic-ir",
-            null_method="eig",
+            null_method="liu",
             null_configs={},
             print_progress=False,
             return_results=True,
         )
         res_lowrank = model.test_spatial_variability(
             method="hsic-ir",
-            null_method="eig",
+            null_method="liu",
             null_configs={"approx_rank": 20},
             print_progress=False,
             return_results=True,
@@ -1273,7 +1479,7 @@ class TestSplisosmNP(unittest.TestCase):
         # Regression: low-rank must NOT produce all-zero p-values
         self.assertFalse(
             np.all(pv_lowrank == 0.0),
-            "Low-rank eig produced all p-values == 0 (scale-mismatch bug regression)",
+            "Low-rank Liu produced all p-values == 0 (scale-mismatch bug regression)",
         )
 
         # Rank correlation should be high
@@ -1284,8 +1490,48 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertGreater(
             rho,
             0.85,
-            f"Spearman ρ(full-rank, low-rank eig) = {rho:.3f} — approximation too inaccurate",
+            f"Spearman ρ(full-rank, low-rank Liu) = {rho:.3f} — approximation too inaccurate",
         )
+
+    def test_sv_asymptotic_nulls_accept_probe_budget(self):
+        """SV asymptotic nulls accept a shared Hutchinson probe budget."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+
+        res = model.test_spatial_variability(
+            method="hsic-ir",
+            null_method="liu",
+            null_configs={"n_probes": 8},
+            n_jobs=1,
+            print_progress=False,
+            return_results=True,
+        )
+
+        self.assertEqual(res["statistic"].shape, (model.n_genes,))
+        self.assertTrue(np.all(np.isfinite(res["pvalue"])))
+        self.assertTrue(np.all((res["pvalue"] >= 0.0) & (res["pvalue"] <= 1.0)))
+
+        res = model.test_spatial_variability(
+            method="hsic-ir",
+            null_method="welch",
+            null_configs={
+                "n_probes": 8,
+            },
+            n_jobs=1,
+            print_progress=False,
+            return_results=True,
+        )
+        self.assertEqual(res["statistic"].shape, (model.n_genes,))
+        self.assertTrue(np.all(np.isfinite(res["pvalue"])))
+        self.assertTrue(np.all((res["pvalue"] >= 0.0) & (res["pvalue"] <= 1.0)))
 
     def test_init_kernel_hyperparams(self):
         """k_neighbors, rho, standardize_cov passed to __init__ should be used in setup_data."""
@@ -1385,6 +1631,33 @@ class TestSplisosmNP(unittest.TestCase):
                 min_component_size=3,
             )
         self.assertEqual(model.design_mtx.shape[0], n_kept)
+
+    def test_min_component_size_sparse_design_mtx_filtered(self):
+        """Sparse design_mtx stays sparse and is spot-filtered."""
+        import warnings as _warnings
+
+        frag_adata, n_total = self._make_fragmented_adata()
+        design = scipy.sparse.csr_matrix(
+            frag_adata.obs[["cov_1", "cov_2"]].to_numpy(dtype=np.float32)
+        )
+
+        model = SplisosmNP()
+        with _warnings.catch_warnings(record=True):
+            _warnings.simplefilter("always")
+            model.setup_data(
+                adata=frag_adata,
+                layer="counts",
+                spatial_key="spatial",
+                group_iso_by="gene_symbol",
+                design_mtx=design,
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
+                min_component_size=3,
+            )
+
+        self.assertTrue(scipy.sparse.issparse(model.design_mtx))
+        self.assertEqual(model.design_mtx.shape, (n_total - 2, 2))
 
     def test_min_component_size_1_is_noop(self):
         """min_component_size=1 (default) keeps all spots, no warning."""
@@ -1553,7 +1826,7 @@ class TestSplisosmNP(unittest.TestCase):
 
     def test_linear_hsic_sparse_X_matches_dense(self):
         """linear_hsic_test with sparse X gives same result as dense X."""
-        from splisosm.kernel_gpr import linear_hsic_test
+        from splisosm.utils.hsic import linear_hsic_test
 
         np.random.seed(42)
         n, p, q = 100, 2, 4
@@ -1569,6 +1842,55 @@ class TestSplisosmNP(unittest.TestCase):
 
         self.assertAlmostEqual(hsic_dense, hsic_sparse, places=4)
         self.assertAlmostEqual(pval_dense, pval_sparse, places=4)
+
+    def test_linear_hsic_sparse_X_matches_dense_without_centering(self):
+        """Sparse-X null eigenvalues honor centering=False."""
+        from splisosm.utils.hsic import linear_hsic_test
+
+        rng = np.random.default_rng(7)
+        n, p, q = 80, 3, 2
+        X_np = rng.poisson(1.5, size=(n, p)).astype(np.float32)
+        Y = torch.from_numpy(
+            rng.normal(loc=2.0, scale=1.0, size=(n, q)).astype(np.float32)
+        )
+
+        hsic_dense, pval_dense = linear_hsic_test(
+            torch.from_numpy(X_np), Y, centering=False
+        )
+        hsic_sparse, pval_sparse = linear_hsic_test(
+            scipy.sparse.csr_matrix(X_np), Y, centering=False
+        )
+
+        self.assertAlmostEqual(hsic_dense, hsic_sparse, places=4)
+        self.assertAlmostEqual(pval_dense, pval_sparse, places=4)
+
+    def test_sv_perm_null_uses_finite_empirical_pvalue(self):
+        """Permutation SV p-values should not be exactly zero for finite nulls."""
+        counts = torch.tensor(
+            [
+                [10.0, 1.0],
+                [9.0, 2.0],
+                [1.0, 8.0],
+                [2.0, 9.0],
+                [3.0, 7.0],
+            ]
+        )
+        n_nulls = 5
+        _, pval = _evaluate_sv_gene_np(
+            counts,
+            method="hsic-ir",
+            ratio_transformation="none",
+            nan_filling="mean",
+            null_method="perm",
+            n_spots=counts.shape[0],
+            K_sp=IdentityKernel(counts.shape[0], centering=True),
+            kernel_cumulants=None,
+            kernel_approx_rank=None,
+            n_nulls=n_nulls,
+            perm_batch_size=n_nulls,
+        )
+
+        self.assertGreaterEqual(pval, 1.0 / (n_nulls + 1))
 
     def test_differential_usage_sparse_design_matrix(self):
         """All four DU methods work with a sparse design matrix.
@@ -1705,12 +2027,12 @@ class TestParallelNP(unittest.TestCase):
     # Spatial variability: n_jobs=1 vs n_jobs=2
     # ------------------------------------------------------------------
 
-    def test_sv_parallel_eig_hsic_ir(self):
-        """SV with hsic-ir + eig null: n_jobs=1 and n_jobs=2 give identical results."""
+    def test_sv_parallel_liu_hsic_ir(self):
+        """SV with hsic-ir + Liu null: n_jobs=1 and n_jobs=2 give identical results."""
         for n_jobs in [1, 2]:
             model = self._setup_model(self.adata)
             model.test_spatial_variability(
-                method="hsic-ir", null_method="eig", n_jobs=n_jobs, print_progress=False
+                method="hsic-ir", null_method="liu", n_jobs=n_jobs, print_progress=False
             )
             if n_jobs == 1:
                 ref = model._sv_test_results
@@ -1728,13 +2050,13 @@ class TestParallelNP(unittest.TestCase):
                     err_msg="SV pvalue differs between n_jobs=1 and n_jobs=2",
                 )
 
-    def test_sv_parallel_clt_null(self):
-        """SV with hsic-ir + clt null: parallel results are identical."""
+    def test_sv_parallel_welch_null(self):
+        """SV with hsic-ir + Welch null: parallel results are identical."""
         for n_jobs in [1, 2]:
             model = self._setup_model(self.adata)
             model.test_spatial_variability(
                 method="hsic-ir",
-                null_method="clt",
+                null_method="welch",
                 n_jobs=n_jobs,
                 print_progress=False,
             )

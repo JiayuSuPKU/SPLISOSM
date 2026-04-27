@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "splisosm"
-version = "1.1.1"
+dynamic = ["version"]
 description = "Spatial isoform statistical modeling (SPLISOSM)"
 authors = [
   {name = "Jiayu Su"}
@@ -38,6 +38,7 @@ dev = [
     "pytest-cov",
     "black",
     "ruff",
+    "setuptools-scm",
 ]
 sdata = [
     "spatialdata",
@@ -46,20 +47,26 @@ sdata = [
 ]
 gp = [
     "gpytorch",
-    "linear-operator"
+    "linear-operator",
+    "finufft"
 ]
 docs = [
     "sphinx",
     "jupyterlab",
     "sphinx-book-theme",
     "sphinxcontrib-bibtex",
-    "sphinx-autoapi",
     "myst-nb",
-    "myst-sphinx-gallery"
+    "myst-sphinx-gallery",
+    "setuptools-scm",
 ]
 
 [project.urls]
 repository = "https://github.com/JiayuSuPKU/SPLISOSM"
 
 [tool.setuptools]
-packages.find = {where = ["."], exclude = ["docs", "docs.*", "tests", "tests.*", "scripts", "scripts.*"]}
+package-dir = {"" = "src"}
+packages.find = {where = ["src"]}
+
+[tool.setuptools_scm]
+write_to = "src/splisosm/_version.py"
+fallback_version = "1.2.0rc1"

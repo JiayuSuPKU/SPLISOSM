@@ -1,24 +1,30 @@
-"""Unit tests for splisosm.kernel_gpr."""
+"""Unit tests for internal Gaussian-process residualization helpers."""
 
 import unittest
 import warnings
+import sys
 
 import numpy as np
 import torch
 
-from splisosm.kernel_gpr import (
+from splisosm.gpr import (
     DenseKernelOp,
     FFTKernelOp,
-    FFTKernelGPR,
+    NUFFTKernelOp,
     SpatialKernelOp,
-    SklearnKernelGPR,
-    GPyTorchKernelGPR,
-    make_kernel_gpr,
-    linear_hsic_test,
     _build_rbf_kernel,
     _DEFAULT_GPR_CONFIGS,
     _kernel_residuals_from_eigdecomp,
 )
+from splisosm.gpr import (
+    FFTKernelGPR,
+    GPyTorchKernelGPR,
+    KernelGPR,
+    NUFFTKernelGPR,
+    SklearnKernelGPR,
+    make_kernel_gpr,
+)
+from splisosm.utils.hsic import linear_hsic_test
 
 
 def _make_coords(n: int = 50, d: int = 2, seed: int = 0) -> torch.Tensor:
@@ -48,6 +54,14 @@ class TestBuildRbfKernel(unittest.TestCase):
     def test_diagonal_equals_constant_value(self):
         K = _make_rbf_kernel(n=20, constant_value=2.5)
         self.assertTrue(torch.allclose(K.diag(), torch.full((20,), 2.5), atol=1e-5))
+
+
+class TestPublicGPRFacade(unittest.TestCase):
+    def test_backend_classes_are_publicly_importable(self):
+        self.assertTrue(issubclass(SklearnKernelGPR, KernelGPR))
+        self.assertTrue(issubclass(GPyTorchKernelGPR, KernelGPR))
+        self.assertTrue(issubclass(FFTKernelGPR, KernelGPR))
+        self.assertTrue(issubclass(NUFFTKernelGPR, KernelGPR))
 
 
 class TestDenseKernelOp(unittest.TestCase):
@@ -278,7 +292,7 @@ class TestSklearnKernelGPR(unittest.TestCase):
         self.assertTrue(torch.isnan(res[:5]).all())
 
     def test_get_kernel_op(self):
-        from splisosm.kernel_gpr import DenseKernelOp
+        from splisosm.gpr import DenseKernelOp
 
         gpr = self._make_gpr_fixed()
         op = gpr.get_kernel_op(self.coords)
@@ -369,6 +383,19 @@ class TestMakeKernelGPR(unittest.TestCase):
         with self.assertRaises(ValueError):
             make_kernel_gpr("nonexistent_backend")
 
+    def test_nufft_backend_import_guard_or_instance(self):
+        if _FINUFFT_AVAILABLE:
+            gpr = make_kernel_gpr(
+                "nufft",
+                constant_value_bounds="fixed",
+                length_scale_bounds="fixed",
+                n_modes=(16, 16),
+            )
+            self.assertIsInstance(gpr, NUFFTKernelGPR)
+        else:
+            with self.assertRaises(ImportError):
+                make_kernel_gpr("nufft")
+
     def test_default_configs_structure(self):
         self.assertIn("covariate", _DEFAULT_GPR_CONFIGS)
         self.assertIn("isoform", _DEFAULT_GPR_CONFIGS)
@@ -377,9 +404,26 @@ class TestMakeKernelGPR(unittest.TestCase):
             "constant_value_bounds",
             "length_scale",
             "length_scale_bounds",
+            "n_inducing",
+            "n_modes",
+            "max_auto_modes",
+            "lml_approx_rank",
+            "period_margin",
+            "cg_rtol",
         ):
             self.assertIn(key, _DEFAULT_GPR_CONFIGS["covariate"])
             self.assertIn(key, _DEFAULT_GPR_CONFIGS["isoform"])
+
+    def test_make_kernel_gpr_filters_shared_defaults(self):
+        cfg = _DEFAULT_GPR_CONFIGS["covariate"]
+        self.assertIsInstance(make_kernel_gpr("sklearn", **cfg), SklearnKernelGPR)
+        self.assertIsInstance(make_kernel_gpr("fft", **cfg), FFTKernelGPR)
+        if _FINUFFT_AVAILABLE:
+            self.assertIsInstance(make_kernel_gpr("nufft", **cfg), NUFFTKernelGPR)
+
+    def test_make_kernel_gpr_rejects_unknown_config_key(self):
+        with self.assertRaises(ValueError):
+            make_kernel_gpr("sklearn", does_not_exist=True)
 
 
 def _make_regular_grid_coords(ny: int = 15, nx: int = 20) -> torch.Tensor:
@@ -565,7 +609,7 @@ class TestFFTKernelGPR(unittest.TestCase):
         covar_config = _DEFAULT_GPR_CONFIGS["covariate"]
         z = torch.randn(n, 1)
 
-        gpr_sk = SklearnKernelGPR(**covar_config)
+        gpr_sk = make_kernel_gpr("sklearn", **covar_config)
         z_sk = gpr_sk.fit_residuals(self.coords, z)
 
         gpr_fft = FFTKernelGPR(
@@ -659,6 +703,243 @@ try:
     _GPYTORCH_AVAILABLE = True
 except ImportError:
     _GPYTORCH_AVAILABLE = False
+
+try:
+    import finufft as _finufft_check  # noqa: F401
+
+    _FINUFFT_AVAILABLE = True
+except ImportError:
+    _FINUFFT_AVAILABLE = False
+
+
+@unittest.skipUnless(_FINUFFT_AVAILABLE, "finufft not installed")
+class TestNUFFTKernelGPR(unittest.TestCase):
+    """Tests for the FINUFFT-backed irregular-coordinate GPR backend."""
+
+    def setUp(self):
+        torch.manual_seed(12)
+        np.random.seed(12)
+        n = 80
+        coords = torch.rand(n, 2) * 2.0 - 1.0
+        coords[:, 1] += 0.15 * torch.sin(coords[:, 0] * 3.0)
+        self.coords = (coords - coords.mean(0)) / coords.std(0)
+        signal = torch.sin(self.coords[:, 0] * 1.4) + torch.cos(self.coords[:, 1] * 1.1)
+        self.Y = signal.unsqueeze(1) + 0.15 * torch.randn(n, 1)
+
+    def test_operator_solve_matches_dense_periodic_kernel(self):
+        n = 35
+        coords = self.coords[:n]
+        op = NUFFTKernelOp(
+            coords,
+            constant_value=1.2,
+            length_scale=0.8,
+            n_modes=(24, 24),
+            cg_rtol=1e-9,
+            period_margin=0.15,
+        )
+        eye = np.eye(n)
+        K = op.matvec(eye)
+        Y = self.Y[:n].numpy()
+        eps = 0.2
+        res_dense = eps * np.linalg.solve(K + eps * np.eye(n), Y)
+        res_nufft = op.residuals(Y, eps)
+        np.testing.assert_allclose(res_nufft, res_dense, atol=5e-5, rtol=5e-4)
+
+    def test_fit_residuals_shape_and_nan_handling(self):
+        Y = self.Y.clone()
+        Y[3] = float("nan")
+        gpr = NUFFTKernelGPR(
+            constant_value=1.0,
+            constant_value_bounds="fixed",
+            length_scale=0.8,
+            length_scale_bounds="fixed",
+            n_modes=(24, 24),
+        )
+        res = gpr.fit_residuals(self.coords, Y)
+        self.assertEqual(res.shape, Y.shape)
+        self.assertTrue(torch.isnan(res[3]).all())
+        self.assertFalse(torch.isnan(res[0]).any())
+
+    def test_eigen_lml_tail_moment_matches_average_tail_when_unskewed(self):
+        evals = np.array([4.0, 2.0])
+        power = np.array([1.5, 0.5])
+        n = 6
+        total_ss = 5.0
+        trace = 12.0
+        tail_trace = trace - evals.sum()
+        tail_count = n - evals.size
+        trace2 = float(np.sum(evals**2) + tail_trace**2 / tail_count)
+
+        no_moment = NUFFTKernelGPR._eigen_neg_lml(
+            evals,
+            power,
+            total_ss,
+            trace,
+            None,
+            n,
+            1,
+            sigma2=1.3,
+            eps=0.2,
+        )
+        moment = NUFFTKernelGPR._eigen_neg_lml(
+            evals,
+            power,
+            total_ss,
+            trace,
+            trace2,
+            n,
+            1,
+            sigma2=1.3,
+            eps=0.2,
+        )
+        self.assertAlmostEqual(moment, no_moment, places=10)
+
+    def test_make_kernel_gpr_nufft(self):
+        gpr = make_kernel_gpr(
+            "nufft",
+            constant_value=1.0,
+            constant_value_bounds="fixed",
+            length_scale=0.8,
+            length_scale_bounds="fixed",
+            n_modes=(24, 24),
+        )
+        self.assertIsInstance(gpr, NUFFTKernelGPR)
+
+    def test_auto_modes_use_full_effective_grid(self):
+        y = torch.arange(25, dtype=torch.float32)
+        x = torch.arange(40, dtype=torch.float32)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        coords = torch.stack([yy.ravel(), xx.ravel()], dim=1)
+        op = NUFFTKernelOp(
+            coords,
+            constant_value=1.0,
+            length_scale=2.0,
+            period_margin=0.0,
+        )
+        self.assertGreaterEqual(op.n_modes[0] * op.n_modes[1], coords.shape[0])
+        self.assertGreaterEqual(op.n_modes[0], 20)
+        self.assertGreaterEqual(op.n_modes[1], 35)
+
+    def test_max_auto_modes_caps_full_effective_grid(self):
+        y = torch.arange(30, dtype=torch.float32)
+        x = torch.arange(50, dtype=torch.float32)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        coords = torch.stack([yy.ravel(), xx.ravel()], dim=1)
+        op = NUFFTKernelOp(
+            coords,
+            constant_value=1.0,
+            length_scale=2.0,
+            max_auto_modes=128,
+        )
+        self.assertLessEqual(op.n_modes[0] * op.n_modes[1], 128)
+
+    def test_workers_clamped_on_macos(self):
+        if sys.platform != "darwin":
+            self.skipTest("FINUFFT worker clamping is macOS-specific.")
+        op = NUFFTKernelOp(
+            self.coords[:20],
+            constant_value=1.0,
+            length_scale=0.8,
+            n_modes=(16, 16),
+            workers=2,
+        )
+        self.assertEqual(op._workers, 1)
+        out = op.matvec(np.ones(20))
+        self.assertEqual(out.shape, (20,))
+
+    def test_regular_grid_operator_matches_fft(self):
+        coords = _make_regular_grid_coords(ny=12, nx=16)
+        uy = torch.unique(coords[:, 0])
+        ux = torch.unique(coords[:, 1])
+        dy = float(torch.diff(uy).mean())
+        dx = float(torch.diff(ux).mean())
+        op_fft = FFTKernelOp(
+            ny=12,
+            nx=16,
+            dy=dy,
+            dx=dx,
+            constant_value=1.0,
+            length_scale=1.0,
+        )
+        op_nufft = NUFFTKernelOp(
+            coords,
+            constant_value=1.0,
+            length_scale=1.0,
+            n_modes=(12, 16),
+            period_margin=0.0,
+            nufft_eps=1e-12,
+        )
+        rng = np.random.default_rng(0)
+        V = rng.normal(size=(coords.shape[0], 3))
+        np.testing.assert_allclose(
+            op_nufft.matvec(V),
+            op_fft.matvec(V),
+            atol=5e-6,
+            rtol=5e-6,
+        )
+
+    def test_regular_grid_nufft_gpr_matches_fft(self):
+        coords = _make_regular_grid_coords(ny=12, nx=16)
+        n = coords.shape[0]
+        torch.manual_seed(123)
+        Y = torch.column_stack(
+            (
+                torch.sin(coords[:, 0] * 1.3) + 0.1 * torch.randn(n),
+                torch.cos(coords[:, 1] * 1.1) + 0.1 * torch.randn(n),
+            )
+        )
+        cfg = dict(
+            constant_value=1.0,
+            constant_value_bounds=(1e-3, 1e3),
+            length_scale=1.0,
+            length_scale_bounds="fixed",
+        )
+        res_fft = FFTKernelGPR(**cfg).fit_residuals(coords, Y)
+        res_nufft = NUFFTKernelGPR(
+            **cfg,
+            n_modes=(12, 16),
+            period_margin=0.0,
+            nufft_eps=1e-12,
+            cg_rtol=1e-10,
+        ).fit_residuals(coords, Y)
+        torch.testing.assert_close(res_nufft, res_fft, atol=1e-6, rtol=1e-5)
+
+    def test_nufft_sklearn_residual_agreement(self):
+        cfg = dict(
+            constant_value=1.0,
+            constant_value_bounds=(1e-3, 1e3),
+            length_scale=0.8,
+            length_scale_bounds="fixed",
+        )
+        gpr_sk = SklearnKernelGPR(**cfg, n_inducing=None)
+        res_sk = gpr_sk.fit_residuals(self.coords, self.Y)
+
+        gpr_nufft = NUFFTKernelGPR(
+            **cfg,
+            n_modes=(64, 64),
+            period_margin=0.5,
+            nufft_eps=1e-8,
+            cg_rtol=1e-8,
+        )
+        res_nufft = gpr_nufft.fit_residuals(self.coords, self.Y)
+
+        r = float(
+            np.corrcoef(res_sk.squeeze().numpy(), res_nufft.squeeze().numpy())[0, 1]
+        )
+        relerr = float(
+            np.linalg.norm((res_sk - res_nufft).numpy())
+            / max(np.linalg.norm(res_sk.numpy()), 1e-12)
+        )
+        self.assertGreater(
+            r,
+            0.999,
+            f"Pearson r between NUFFT and sklearn residuals: {r:.3f}",
+        )
+        self.assertLess(
+            relerr,
+            0.01,
+            f"Relative residual error between NUFFT and sklearn: {relerr:.3f}",
+        )
 
 
 class TestSklearnKernelGPRLargeN(unittest.TestCase):

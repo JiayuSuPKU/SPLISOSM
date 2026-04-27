@@ -2,10 +2,11 @@ import unittest
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from anndata import AnnData
 
-import splisosm.hyptest_fft as hyptest_fft
-from splisosm.hyptest_fft import FFTKernel, SplisosmFFT
+import splisosm.hyptest.fft as hyptest_fft
+from splisosm.hyptest.fft import FFTKernel, SplisosmFFT
 
 
 class _SpatialDataStub:
@@ -194,11 +195,11 @@ class TestSplisosmFFT(unittest.TestCase):
     def setUp(self):
         self.table_name = "isoform_table"
         self.sdata = _build_test_sdata(table_name=self.table_name)
-        self._old_sd = hyptest_fft.sd
-        hyptest_fft.sd = _SpatialDataModuleStub()
+        self._old_require_spatialdata = hyptest_fft._require_spatialdata
+        hyptest_fft._require_spatialdata = lambda: _SpatialDataModuleStub()
 
     def tearDown(self):
-        hyptest_fft.sd = self._old_sd
+        hyptest_fft._require_spatialdata = self._old_require_spatialdata
 
     def test_setup_data(self):
         model = SplisosmFFT(rho=0.9, neighbor_degree=1)
@@ -282,7 +283,7 @@ class TestSplisosmFFT(unittest.TestCase):
         adata.var_names = ["isoA0", "isoA1", "isoB0", "isoB1"]
         adata.var["gene_symbol"] = ["gA", "gA", "gB", "gB"]
 
-        from splisosm.hyptest_fft import SplisosmFFT
+        from splisosm.hyptest.fft import SplisosmFFT
 
         sdata = _SpatialDataStub(table_name="tbl", adata=adata)
         model = SplisosmFFT()
@@ -357,6 +358,62 @@ class TestSplisosmFFT(unittest.TestCase):
                 self.assertTrue(np.isfinite(res["statistic"].to_numpy()).all())
                 self.assertTrue(np.isfinite(res["pvalue"].to_numpy()).all())
                 self.assertTrue(np.isfinite(res["pvalue_adj"].to_numpy()).all())
+
+        res_dict = model.test_spatial_variability(
+            method="hsic-ir",
+            n_jobs=1,
+            print_progress=False,
+            return_results=True,
+        )
+        self.assertEqual(res_dict["null_method"], "liu")
+        self.assertTrue(np.all(np.isfinite(res_dict["pvalue"])))
+
+    def test_spatial_variability_n_jobs_zero_raises(self):
+        """FFT n_jobs uses shared joblib-style validation."""
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+        )
+
+        with self.assertRaises(ValueError):
+            model.test_spatial_variability(
+                method="hsic-ir", n_jobs=0, print_progress=False
+            )
+
+    def test_spatial_variability_chunk_size_matches_single_channel(self):
+        """FFT SV chunking matches one-channel/singleton execution."""
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+        )
+
+        ref = model.test_spatial_variability(
+            method="hsic-ic",
+            chunk_size=1,
+            n_jobs=1,
+            print_progress=False,
+            return_results=True,
+        )
+        res = model.test_spatial_variability(
+            method="hsic-ic",
+            chunk_size="auto",
+            n_jobs=1,
+            print_progress=False,
+            return_results=True,
+        )
+        np.testing.assert_allclose(
+            res["statistic"], ref["statistic"], rtol=1e-6, atol=1e-8
+        )
+        np.testing.assert_allclose(res["pvalue"], ref["pvalue"], rtol=1e-6, atol=1e-8)
+        self.assertLessEqual(res["chunk_size"], 32)
 
     def test_setup_data_filter_single_iso_genes_false(self):
         """filter_single_iso_genes=False keeps genes with only one passing isoform."""
@@ -603,6 +660,14 @@ class TestSplisosmFFT(unittest.TestCase):
         with self.assertRaises(ValueError):
             model_cont.test_differential_usage(method="t-tippett", n_jobs=1)
 
+        for bad_design in [
+            np.ones((adata.n_obs, 1), dtype=float),
+            np.full((adata.n_obs, 1), np.nan, dtype=float),
+        ]:
+            model_bad = self._setup_model(design_mtx=bad_design)
+            with self.assertRaises(ValueError):
+                model_bad.test_differential_usage(method="t-fisher", n_jobs=1)
+
     def test_setup_data_with_design_mtx(self):
         """design_mtx passed to setup_data is stored as AnnData in sdata."""
         adata = self.sdata.tables[self.table_name]
@@ -628,6 +693,31 @@ class TestSplisosmFFT(unittest.TestCase):
         self.assertEqual(model.design_mtx.shape, (adata.n_obs, 2))
         # The design table is registered in sdata
         self.assertIn(model._design_table_name, self.sdata.tables)
+
+    def test_setup_data_with_sparse_design_mtx(self):
+        """Sparse design_mtx is preserved in the generated design table."""
+        adata = self.sdata.tables[self.table_name]
+        rows = np.arange(0, adata.n_obs, 3)
+        cols = rows % 2
+        design = sp.csr_matrix(
+            (np.ones(len(rows), dtype=np.float32), (rows, cols)),
+            shape=(adata.n_obs, 2),
+        )
+
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+            design_mtx=design,
+            covariate_names=["sparse_A", "sparse_B"],
+        )
+
+        self.assertEqual(model.n_factors, 2)
+        self.assertTrue(sp.issparse(model.design_mtx.X))
+        self.assertEqual(model.design_mtx.shape, (adata.n_obs, 2))
 
     def test_setup_data_design_mtx_from_obs_columns(self):
         """design_mtx specified as obs column names is extracted from adata.obs."""
@@ -785,7 +875,7 @@ class TestSplisosmFFT(unittest.TestCase):
         should be rank-correlated (Spearman rho > 0 on combined null+signal).
         """
         from scipy.stats import spearmanr
-        from splisosm.hyptest_np import SplisosmNP
+        from splisosm.hyptest.np import SplisosmNP
 
         adata = self.sdata.tables[self.table_name]
         rng = np.random.default_rng(42)
@@ -873,7 +963,7 @@ class TestSplisosmFFT(unittest.TestCase):
         that memory does not blow up (no n x n matrix formed).
         """
         import time
-        from splisosm.kernel_gpr import FFTKernelGPR
+        from splisosm.gpr import FFTKernelGPR
 
         # Build a 50x50 raster cube
         rng = np.random.default_rng(0)

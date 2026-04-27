@@ -1,7 +1,7 @@
 import unittest
 import torch
 
-from splisosm.simulation import (
+from splisosm.utils.simulation import (
     _sample_multinom_sp_single_gene,
     simulate_isoform_counts_single_gene,
     simulate_isoform_counts,

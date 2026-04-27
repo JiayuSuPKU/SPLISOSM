@@ -30,7 +30,7 @@ SPLISOSM is platform-agnostic. Confirmed-compatible data types include:
 | Long-read ST           | 10x Visium / Visium HD + ONT                           | Full-length transcript isoform  |
 | Short-read 3′ ST       | 10x Visium / Visium HD (fresh-frozen), Slide-seqV2     | TREND peak (alt. polyadenylation) |
 | Short-read targeted ST | 10x Visium (CytAssist) / Visium HD FFPE, Flex          | Exon/junction probe usage       |
-| In situ targeted ST    | 10x Xenium Prime 5K                                    | Codeword (exon/junction probe)  |
+| In situ targeted ST    | 10x Xenium Prime 5K, 10x Atera                         | Codeword (exon/junction probe)  |
 
 SPLISOSM does **not** perform isoform quantification itself. See the
 [Feature Quantification guide](https://splisosm.readthedocs.io/en/latest/txquant.html)
@@ -72,7 +72,7 @@ pip install git+https://github.com/JiayuSuPKU/SPLISOSM.git#egg=splisosm
 Optional extras:
 
 ```bash
-# SpatialData input support for SplisosmFFT, + gpytorch GP backend for DU
+# SpatialData input support for SplisosmFFT, plus gpytorch/FINUFFT GP backends for DU
 pip install "splisosm[sdata,gp]"
 ```
 
@@ -116,7 +116,7 @@ res = run_hsic_gc(gene_counts, coordinates)     # or run_hsic_gc(adata=adata, sp
 
 See the [Quick Start](https://splisosm.readthedocs.io/en/latest/quickstart.html) for the
 full-defaults reference and [Statistical Methods](https://splisosm.readthedocs.io/en/latest/methods.html)
-for the underlying HSIC framework, CAR kernel, low-rank and null-distribution approximations, and the GLMM parametric alternative.
+for the underlying HSIC framework, CAR kernel, cumulant null approximations, GP backends, and the GLMM parametric alternative.
 
 ## Documentation & tutorials
 

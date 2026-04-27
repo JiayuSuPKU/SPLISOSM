@@ -37,7 +37,7 @@ We choose the CAR kernel for the following properties:
 
 - **Sparse precision**: only the k-NN graph is stored explicitly; :math:`K` is never formed for large datasets (implicit LU-solve mode when :math:`n > 5000`).
 - **Irregular geometries**: the k-NN graph is translation-invariant and naturally handles non-grid layouts (Visium spots, single cells, segmented tissue).
-- **Graph Fourier basis**: low-rank approximation of :math:`K` is the well-studied graph Fourier basis ordered by spatial frequency.
+- **Graph Fourier basis**: eigenvectors of :math:`K` form a graph Fourier basis ordered by spatial frequency.
 - **Polynomial spectrum decay**: the eigenvalues of :math:`K` decay polynomially, which yields higher power than exponential-decay kernels for mix-frequency patterns.
 
 For general theory and the equivalence of spatial variability testing methods, see our recent work on the consistent and scalable detection of spatial patterns :cite:`su2026consistent`.
@@ -120,69 +120,63 @@ Null distribution
 ~~~~~~~~~~~~~~~~~~
 
 To compute p-values, we need to compute the distribution of :math:`\widehat{\mathrm{HSIC}}` under the null hypothesis of no spatial variability.
-Four methods are available via the ``null_method`` argument to :meth:`~splisosm.SplisosmNP.test_spatial_variability`.
+Three methods are available via the ``null_method`` argument to :meth:`~splisosm.SplisosmNP.test_spatial_variability`.
 
-.. _null-eig:
+.. _null-liu:
 
-**1. Liu's approximation of chi-square mixture (default)**: ``null_method='eig'``
+**1. Liu's approximation of chi-square mixture (default)**: ``null_method='liu'``
 
 Let :math:`Q = \mathrm{tr}(Y^\top K Y) = (n-1)^2 \widehat{\mathrm{HSIC}}` denote the unnormalised HSIC V-statistic,
+write :math:`m=n-1` for the dimension of the centred spot space,
 with :math:`\lambda_1^K \geq \cdots \geq \lambda_n^K` the eigenvalues of :math:`K` and
 :math:`\lambda_1^Y \geq \cdots \geq \lambda_p^Y` those of :math:`Y^\top Y`.
 Under the null, :math:`Q` asymptotically follows a weighted sum of independent :math:`\chi^2_{1}` variables,
 
 .. math::
 
-   Q \;\overset{d}{\approx}\; \frac{1}{n} \sum_{i=1}^{n} \sum_{j=1}^{p} \lambda_i^K \, \lambda_j^Y \; Z_{ij}, \qquad Z_{ij} \overset{\text{iid}}{\sim} \chi^2_{1},
+   Q \;\overset{d}{\approx}\; \frac{1}{n-1} \sum_{i=1}^{n} \sum_{j=1}^{p} \lambda_i^K \, \lambda_j^Y \; Z_{ij}, \qquad Z_{ij} \overset{\text{iid}}{\sim} \chi^2_{1},
 
 where the double sum runs over all pairs of spatial and response eigenvalues.
-:cite:`liu2009new` propose an efficient three-moment matching scheme (skewness matching) to approximate the tail probability of this mixture with a scaled and shifted chi-squared variable.
-See :func:`splisosm.likelihood.liu_sf` for implementation details.
+SPLISOSM evaluates :cite:t:`liu2009new` from the first four cumulants
+:math:`c_r = \mathrm{tr}(K^r)\mathrm{tr}((Y^\top Y)^r)/(n-1)^r`, so it does not need to materialize the full pairwise eigenvalue product.
+See :func:`splisosm.utils.hsic.liu_sf_from_cumulants` for implementation details.
 
 .. note::
 
-   - Full eigen-decomposition of :math:`K` is :math:`O(n^3)` and is not feasible for large datasets.  
-     For :math:`n > 5000`, we approximate the kernel via a low-rank approximation using the top-:math:`r` eigenvalues/vectors.  
-     The approximation is controlled by ``approx_rank`` in ``null_configs``, with default :math:`\lceil 4\sqrt{n} \rceil` when :math:`n > 5000`.
-   - When ``nan_filling='mean'`` (default), the spatial eigenvalues are cached after the first gene and reused for all subsequent genes.
-
-.. _null-clt:
-
-**2. Moment-matching normal approximation (CLT)**: ``null_method='clt'``
-
-.. note::
-
-   The previous name ``null_method='trace'`` is retained as a deprecated
-   alias and will emit a ``DeprecationWarning``.  The canonical name is
-   now ``'clt'``, which better disambiguates this moment-matching normal
-   approximation from :ref:`welch <null-welch>` (the Welch–Satterthwaite
-   scaled chi-squared that shares the same matrix traces).
-
-Alternatively, we may use the first two moments of the null distribution to compute p-values (i.e., via Central Limit Theorem),
-which requires only :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)`.
-Taking moments of the :math:`\chi^2_1` mixture above gives
-
-.. math::
-
-   \mu_0 &= \mathbb{E}[Q] = \frac{1}{n}\,\mathrm{tr}(K)\,\mathrm{tr}(Y^\top Y), \\[4pt]
-   \sigma_0^2 &= \mathrm{Var}(Q) = \frac{2}{n^2}\,\mathrm{tr}(K^2)\,\mathrm{tr}\!\bigl((Y^\top Y)^2\bigr).
-
-The p-value is :math:`\Phi^c\!\left(\frac{Q - \mu_0}{\sigma_0}\right)`, where :math:`\Phi^c` is the standard normal survival function.
-Note that for non-Gaussian data :math:`Y`, the null variance is off by a kurtosis factor, which we omit for brevity.
-
-.. note::
-
-   - Since the CLT approximation requires no eigen-decomposition, it is the fastest and most scalable option while being slightly less accurate for a heavy-tailed null.
-   - As the sample size increases, the approximation becomes more accurate, and the test is generally well-calibrated for large :math:`n`.
-   - For implicit kernels (where only the sparse precision matrix :math:`M=K^{-1}` is stored), :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` are estimated via the **Hutchinson stochastic trace estimator** using 30 Rademacher probing vectors.
+   - The previous name ``null_method='eig'`` is retained as a deprecated alias
+     and will emit a ``DeprecationWarning``.
+   - Full eigen-decomposition of :math:`K` is :math:`O(n^3)` and is not feasible for large datasets.
+     For implicit CAR kernels with no realised dense covariance, SPLISOSM estimates :math:`\mathrm{tr}(K^r)` with Hutchinson Rademacher probes by default.
+     Use ``null_configs={"n_probes": m}`` to control that budget.
+   - Since v1.2.0, large :class:`~splisosm.SplisosmNP` SV tests use full-rank
+     cumulants by default rather than the v1.1.x low-rank spatial
+     approximation. This preserves sensitivity to both global and local spatial
+     patterns. If the analysis should intentionally emphasize global smooth
+     patterns, prefer increasing the CAR smoothness parameter (for example
+     ``rho=0.999``) instead of truncating the spatial rank.
+   - When ``nan_filling='mean'`` (default), the spatial cumulants are cached once and reused for all subsequent genes.
+   - When ``nan_filling='none'`` for HSIC-IR, SPLISOSM drops zero-coverage
+     spots per gene and applies a masked implicit spatial kernel.  This avoids
+     dense parent-kernel realization, but per-gene masked cumulants must still
+     be estimated and the path is slower than mean filling.
 
 .. _null-welch:
 
-**3. Welch-Satterthwaite scaled chi-squared approximation**: ``null_method='welch'``
+**2. Welch-Satterthwaite scaled chi-squared approximation**: ``null_method='welch'``
 
-With all positive eigenvalues, the chi-squared mixture null can also be approximated by the `Welch-Satterthwaite method <https://en.wikipedia.org/wiki/Welch%E2%80%93Satterthwaite_equation>`_, 
+Alternatively, we may use only the first two moments of the null distribution,
+which requires :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)` but not
+higher cumulants or a full eigendecomposition.  Taking moments of the
+:math:`\chi^2_1` mixture above gives
+
+.. math::
+
+   \mu_0 &= \mathbb{E}[Q] = \frac{1}{m}\,\mathrm{tr}(K)\,\mathrm{tr}(Y^\top Y), \\[4pt]
+   \sigma_0^2 &= \mathrm{Var}(Q) = \frac{2}{m^2}\,\mathrm{tr}(K^2)\,\mathrm{tr}\!\bigl((Y^\top Y)^2\bigr).
+
+With all positive eigenvalues, the chi-squared mixture null can be approximated by the `Welch-Satterthwaite method <https://en.wikipedia.org/wiki/Welch%E2%80%93Satterthwaite_equation>`_,
 using one scaled chi-squared variable :math:`g \, \chi^2_h` with scale parameter :math:`g` and degrees of freedom :math:`h`. 
-The parameters are chosen to match the first two moments of the null :math:`(\mu_0, \sigma_0^2)` (same as in the :ref:`clt <null-clt>` method).
+The parameters are chosen to match the first two moments of the null :math:`(\mu_0, \sigma_0^2)`.
 
 .. math::
 
@@ -192,21 +186,21 @@ and the p-value is :math:`\mathbb{P}\!\left(\chi^2_h \geq Q/g\right)`.
 
 .. note::
 
-   - Same cost as ``null_method='clt'`` (only :math:`\mathrm{tr}(K)` and
-     :math:`\mathrm{tr}(K^2)` are needed), but typically more accurate in the
-     right tail because the null under H₀ is a weighted sum of
-     :math:`\chi^2_1` variables rather than Gaussian.  In practice its
-     p-values are close to the :ref:`eig <null-eig>` (Liu) reference while
-     remaining as cheap as the :ref:`clt <null-clt>` method.
-   - Recommended when ``null_method='eig'`` is too slow for the dataset
-     (e.g., very large :math:`n` with no FFT grid) but a reliable right-tail
-     calibration is still needed.
+   - The retired ``null_method='clt'`` and ``null_method='trace'`` names are
+     retained as deprecated aliases and automatically use this Welch
+     approximation.
+   - Using only the first two cumulants :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)`,
+     Welch is typically less accurate in the right tail (small p-values) than
+     the :ref:`Liu approximation <null-liu>`, which uses four cumulants.
+     In practice the difference is often small.
 
 .. _null-perm:
 
-**4. Batched permutation test**: ``null_method='perm'``
+**3. Batched permutation test**: ``null_method='perm'``
 
 Generates a null distribution by repeatedly permuting the rows of :math:`Y` (breaking the spatial structure) and recomputing :math:`\mathrm{tr}(Y_\pi^\top K Y_\pi)` for each permutation :math:`\pi`.
+P-values use the finite-permutation correction
+:math:`(1 + \#\{Q_\pi \ge Q_{\mathrm{obs}}\}) / (B + 1)`.
 
 To avoid :math:`O(n^2)` memory, SPLISOSM batches :math:`B` permutations into a single :math:`(n, Bp)` matrix and calls :meth:`~splisosm.kernel.SpatialCovKernel.xtKx` once per batch.
 Per-permutation traces are recovered as diagonal blocks of the :math:`(Bp, Bp)` result matrix without materialising the full kernel.
@@ -247,8 +241,9 @@ Furthermore, the spatial eigenvalues :math:`\{\lambda_{(h,w)}^K\}` are shared ac
 
 .. note::
 
-   For irregularly spaced 2D and 3D coordinates, it is possible to compute the test statistic and its null using the `non-uniform FFT (NUFFT) <https://en.wikipedia.org/wiki/Non-uniform_discrete_Fourier_transform>`_ approach, 
-   which also scales as :math:`O(n \log n)`. We are working on an implementation of this method for future releases (depending on personal bandwidth).
+   For irregular coordinates, use :class:`~splisosm.SplisosmNP` for SV tests.
+   The FINUFFT backend described below is currently used for GP residualization
+   in conditional DU tests, not for the SV spatial kernel.
 
 Differential Isoform Usage (DU) Tests
 ---------------------------------------
@@ -289,12 +284,13 @@ Specifically, SPLISOSM first **residualises** the covariate against a Gaussian P
 
       z = f(x) + \varepsilon, \quad f \sim \mathcal{GP}(0, k_\theta),
 
-   where :math:`k_\theta` is a 'Constant x RBF + WhiteNoise' kernel (See :class:`splisosm.kernel_gpr.SklearnKernelGPR`). A sparse inducing-point approximation is used for large datasets.
+   where :math:`k_\theta` is a ``Constant x RBF + WhiteNoise`` kernel. SPLISOSM provides dense sklearn, GPyTorch, FFT, and FINUFFT-backed NUFFT GP backends for different data geometries and scales.
 
 2. **Compute covariate residuals** :math:`\tilde{Z} = Z - \hat{f}(X)`, capturing the part of covariate variation *not explained by* spatial position.
 
 3. **Test** :math:`\widehat{\mathrm{HSIC}}(\tilde{Z},\, Y)` using the rank-1 linear covariate kernel :math:`K_{\tilde{Z}} = \tilde{Z}\tilde{Z}^\top` and a similar linear kernel :math:`K_Y = Y Y^\top` for the response.
-   Since both kernels are low-rank, the null distribution can be efficiently computed via the eigenvalue method.
+   Since both kernels are low-rank, the Liu null can be computed from the
+   nonzero covariate and response eigenvalues.
 
 .. note::
 
@@ -311,14 +307,50 @@ For flexibility, we provide optional control via the ``residualize`` argument:
 .. note::
 
    The GP fitting step is the dominant computational cost of the DU test.
-   Two backends are supported:
+   Three backend families are supported:
 
-   - ``gpr_backend='sklearn'`` (default): uses ``GaussianProcessRegressor`` from sklearn with an RBF kernel and subsampled Nyström approximation.
-   - ``gpr_backend='gpytorch'``: Exact or sparse GP with ``n_inducing`` inducing points.
+   - ``gpr_backend='sklearn'`` (default): dense sklearn ``GaussianProcessRegressor`` with optional subset-of-data hyperparameter fitting.
+   - ``gpr_backend='gpytorch'``: exact or FITC sparse GP with ``n_inducing`` inducing points and optional GPU support.
+   - ``gpr_backend='nufft'`` / ``'finufft'``: FINUFFT-backed implicit RBF grid-kernel for irregular 2-D coordinates, recommended for large-scale spatial data.
 
-   For very large datasets, pass ``gpr_configs={"covariate": {"n_inducing": 1000}}`` to control the number of inducing points for both backends.
-   It is possible to further scale up GP fitting using the `non-uniform FFT (NUFFT) <https://en.wikipedia.org/wiki/Non-uniform_discrete_Fourier_transform>`_ approach. 
-   We are working on an implementation of this method for future releases (depending on personal bandwidth).
+   For sklearn and gpytorch, pass ``gpr_configs={"covariate": {"n_inducing": 1000}}`` to control the subset or inducing-point budget.
+   For the NUFFT backend, ``max_auto_modes`` caps the automatically inferred full effective grid, and ``lml_approx_rank`` controls the irregular-grid likelihood approximation used during hyperparameter fitting.
+   These options are passed through ``gpr_configs``; see :meth:`splisosm.SplisosmNP.test_differential_usage` for the user-facing configuration table and :doc:`api/gpr` for backend class details.
+
+NUFFT backend for irregular-coordinate GP residualization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``gpr_backend='nufft'`` / ``'finufft'`` path targets irregular 2-D coordinates where dense GP matrices are too expensive. Coordinates are affinely mapped into a periodic box :math:`[-\pi,\pi)^2`, and the stationary RBF covariance is represented on a Fourier mode set :math:`\Omega` as
+
+.. math::
+
+   k_\theta(x_i, x_j)
+   \approx
+   \sigma_f^2
+   \sum_{\omega \in \Omega}
+   a_\theta(\omega)
+   \exp\{i\omega^\top(t_i - t_j)\}
+   \;+\; \sigma_\varepsilon^2 \mathbf{1}_{i=j},
+
+where :math:`t_i` are the mapped coordinates and :math:`a_\theta(\omega)` are non-negative spectral weights determined by the RBF length scale and Fourier grid spacing. With ``n_modes=None``, SPLISOSM uses the full effective Fourier grid inferred from the point count and coordinate aspect ratio; FINUFFT's internal oversampling is controlled separately via ``nufft_opts``.
+
+With this representation, we can compute the matrix-vector product in :math:`O(n \log n)` time by
+
+.. math::
+
+   K_s v \;\approx\; F_X^* \left(a_\theta \odot F_X v\right),
+
+where :math:`F_X v = \sum_i v_i \exp(-i\omega^\top t_i)` is a type-1 NUFFT and :math:`F_X^*` is the corresponding type-2 NUFFT. GP residualization solves
+
+.. math::
+
+   (K_s + \sigma_\varepsilon^2 I)\alpha = z,
+   \qquad
+   \tilde z = \sigma_\varepsilon^2 \alpha,
+
+using conjugate gradients, because :math:`K_s` is only available through NUFFT matvecs.
+
+On compatible regular grids, the same spectral representation reduces to the FFT GP path because the Fourier modes are exact eigenvectors. On irregular coordinates the nonuniform Fourier features are not orthogonal eigenvectors, so hyperparameter fitting approximates the log marginal likelihood with leading NUFFT eigensummaries plus trace and trace-square tail corrections. The ``lml_approx_rank`` parameter controls this eigensummary rank; it affects hyperparameter fitting accuracy and memory, not the Fourier grid used for each matvec. Memory scales as :math:`O(nr)` for rank ``r = lml_approx_rank`` (about 512 MB for 1M spots and ``r=64`` in float64), while the NUFFT matvecs avoid forming the :math:`n \times n` dense GP matrix.
 
 
 FFT-accelerated conditional DU test
@@ -374,7 +406,7 @@ and :math:`U = (u_1, \ldots, u_n)^\top \in \mathbb{R}^{n \times q}` stacks the p
 
 .. note::
 
-   The SV test (H₀: :math:`\theta = 0`) is implemented as a likelihood ratio test (LRT) in :func:`~splisosm.SplisosmGLMM.test_spatial_variability`. 
+   The SV test (H₀: :math:`\theta = 0`) is implemented as a likelihood ratio test (LRT) in :meth:`~splisosm.SplisosmGLMM.test_spatial_variability`.
    However, it is not well-calibrated due to technical challenges in model fitting. 
    The equivalent score test version also takes a quadratic form similar to the HSIC test statistic but with spot-specific adjustments. 
    See :cite:`su2026consistent` for detailed analysis.
@@ -383,7 +415,7 @@ and :math:`U = (u_1, \ldots, u_n)^\top \in \mathbb{R}^{n \times q}` stacks the p
 For DU testing, we use a **score test** comparing coefficient gradients at the null model (no fixed-effect covariates, :math:`\beta = 0`), which avoids fitting the full model for each covariate.
 However, it still requires estimating nuisance parameters (intercept :math:`b`, total variance :math:`\sigma^2`, and spatial variance proportion :math:`\theta`).
 To compute the maximum likelihood estimates, we approximate the marginal likelihood via **Laplace's method** at the mode of the random effects.
-See :class:`splisosm.model.MultinomGLMM` for implementation details.
+See :class:`splisosm.glmm.MultinomGLMM` for implementation details.
 
 Compared to :class:`~splisosm.SplisosmNP`, the GLMM approach:
 
@@ -414,27 +446,27 @@ Summary
      - SplisosmNP / FFT
      - Isoform ratios
      - None
-     - ``eig`` [#fft]_ / ``clt`` / ``welch`` / ``perm``
+     - ``liu`` [#fft]_ / ``welch`` / ``perm``
    * - HSIC-GC (SVE)
      - SplisosmNP / FFT
      - Gene counts
      - None
-     - ``eig`` [#fft]_ / ``clt`` / ``welch`` / ``perm``
+     - ``liu`` [#fft]_ / ``welch`` / ``perm``
    * - HSIC-IC
      - SplisosmNP / FFT
      - Isoform counts
      - None
-     - ``eig`` [#fft]_ / ``clt`` / ``welch`` / ``perm``
+     - ``liu`` [#fft]_ / ``welch`` / ``perm``
    * - DU (unconditional)
      - SplisosmNP / FFT
      - Isoform ratios
      - None
-     - ``eig``
+     - ``liu``
    * - DU (GP-conditional)
      - SplisosmNP / FFT
      - Isoform ratios
      - GP spatial residualisation
-     - ``eig``
+     - ``liu``
    * - DU (GLM score)
      - SplisosmGLMM
      - Isoform counts
@@ -446,4 +478,4 @@ Summary
      - GRF random effect
      - Chi-squared (score)
 
-.. [#fft] :class:`~splisosm.SplisosmFFT` does not take a ``null_method`` parameter; ``'eig'`` is the default and only option for FFT-accelerated tests, since the full kernel spectrum is efficiently computed via FFT.
+.. [#fft] :class:`~splisosm.SplisosmFFT` does not take a ``null_method`` parameter; ``'liu'`` is the default and only option for FFT-accelerated tests, since the full kernel spectrum is efficiently computed via FFT.

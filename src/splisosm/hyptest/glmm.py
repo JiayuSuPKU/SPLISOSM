@@ -12,19 +12,19 @@ import numpy as np
 from scipy.stats import chi2
 import torch
 from anndata import AnnData
-import torch.multiprocessing as mp
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
-from splisosm.utils import (
-    compute_feature_summaries,
-    false_discovery_control,
+from splisosm.hyptest._base import _FeatureSummaryMixin, _ResultsMixin
+from splisosm.utils._chunking import _resolve_n_jobs
+from splisosm.utils.preprocessing import (
     prepare_inputs_from_anndata,
 )
-from splisosm.dataset import IsoDataset
+from splisosm.utils.stats import _empirical_permutation_pvalue, false_discovery_control
+from splisosm.glmm.dataset import IsoDataset
+from splisosm.glmm.glm import MultinomGLM
 from splisosm.kernel import IdentityKernel, SpatialCovKernel
-from splisosm.model import MultinomGLM
-from splisosm._glmm_workers import (
+from splisosm.glmm.workers import (
     IsoFullModel,
     IsoNullNoSpVar,
     _fit_model_one_gene,
@@ -54,10 +54,10 @@ class _FittedGeneState:
     n_isos: int
 
 
-class SplisosmGLMM:
+class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
     """Parametric spatial isoform statistical modeling using GLMM.
 
-    This is a convenience class that wraps around the :class:`splisosm.model.MultinomGLMM`
+    This is a convenience class that wraps around the :class:`splisosm.glmm.MultinomGLMM`
     for batched model fitting and spatial variability and differential usage testing.
 
     Examples
@@ -207,10 +207,12 @@ class SplisosmGLMM:
 
         See also
         --------
-        :class:`splisosm.model.MultinomGLMM` for more details on the model configurations.
+        :class:`splisosm.glmm.MultinomGLMM` for more details on the model configurations.
         """
         # specify the model type to fit
-        assert model_type in ["glmm-full", "glmm-null", "glm"]
+        valid_model_types = ["glmm-full", "glmm-null", "glm"]
+        if model_type not in valid_model_types:
+            raise ValueError(f"Invalid model type. Must be one of {valid_model_types}.")
         self._model_type = model_type
 
         self._model_configs = {
@@ -336,6 +338,151 @@ class SplisosmGLMM:
             raise RuntimeError("Data not initialised. Call setup_data() first.")
         return self._filtered_adata
 
+    def _store_anndata_setup(
+        self,
+        adata: AnnData,
+        layer: str,
+        group_iso_by: str,
+        filtered_adata: AnnData,
+    ) -> None:
+        """Store AnnData provenance and reset feature-summary caches."""
+        self.adata = adata
+        self._setup_input_mode = "anndata"
+        self._filtered_adata = filtered_adata
+        self._counts_layer = layer
+        self._group_iso_by = group_iso_by
+        self._gene_summary = None
+        self._isoform_summary = None
+
+    def _store_dataset(
+        self,
+        data: list[torch.Tensor],
+        gene_names: list[str],
+        group_gene_by_n_iso: bool,
+        coordinates: Optional[torch.Tensor],
+    ) -> None:
+        """Build and store the per-gene dataset used by fitting."""
+        dataset = IsoDataset(data, gene_names, group_gene_by_n_iso)
+        self.n_genes = dataset.n_genes
+        self.n_spots = dataset.n_spots
+        self.n_isos_per_gene = dataset.n_isos_per_gene
+        self.gene_names = dataset.gene_names
+        self._dataset = dataset
+        self._group_gene_by_n_iso = group_gene_by_n_iso
+        self._coordinates = coordinates
+
+    def _resolve_spatial_rank(self, n_spots: int) -> Optional[int]:
+        """Resolve the number of spatial eigenvectors retained for GLMM fitting."""
+        if self._approx_rank is _APPROX_RANK_AUTO:
+            return (
+                None
+                if n_spots <= SpatialCovKernel.DENSE_THRESHOLD
+                else int(np.ceil(np.sqrt(n_spots) * 4))
+            )
+        if self._approx_rank is None:
+            if n_spots > SpatialCovKernel.DENSE_THRESHOLD:
+                warnings.warn(
+                    f"approx_rank=None forces a full eigendecomposition of a "
+                    f"{n_spots}×{n_spots} matrix which may be very slow and "
+                    f"memory-intensive.  Consider omitting approx_rank (auto) "
+                    f"or passing a positive integer.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            return None
+        return min(int(self._approx_rank), n_spots)
+
+    def _setup_spatial_kernel(
+        self,
+        coordinates: Optional[torch.Tensor],
+        adj_matrix: Optional[Any],
+    ) -> None:
+        """Build spatial kernel/eigenpairs according to the configured model type."""
+        n_spots = self.n_spots
+        if self._model_type == "glm":
+            self.sp_kernel = None
+            self._corr_sp_eigvals = None
+            self._corr_sp_eigvecs = None
+            return
+
+        if self._model_type == "glmm-null":
+            self.sp_kernel = IdentityKernel(n_spots)
+            self._corr_sp_eigvals = torch.ones(1)
+            self._corr_sp_eigvecs = torch.full((n_spots, 1), 1.0 / np.sqrt(n_spots))
+            return
+
+        kernel_kwargs = dict(
+            rho=self._kernel_rho,
+            standardize_cov=self._kernel_standardize_cov,
+            centering=False,
+        )
+        kernel = SpatialCovKernel(
+            coords=None if adj_matrix is not None else coordinates,
+            adj_matrix=adj_matrix,
+            k_neighbors=None if adj_matrix is not None else self._kernel_k_neighbors,
+            **kernel_kwargs,
+        )
+        k = self._resolve_spatial_rank(n_spots)
+        kernel.eigenvalues(k=k)
+        self.sp_kernel = kernel
+        self._corr_sp_eigvals = kernel.K_eigvals if k is None else kernel.K_eigvals[:k]
+        self._corr_sp_eigvecs = (
+            kernel.K_eigvecs if k is None else kernel.K_eigvecs[:, :k]
+        )
+
+    def _store_design_matrix(
+        self,
+        resolved_design: Optional[Any],
+        resolved_cov_names: Optional[list[str]],
+    ) -> None:
+        """Store dense torch design matrix expected by GLMM fitting."""
+        if resolved_design is None:
+            self.n_factors = 0
+            self.design_mtx = None
+            self.covariate_names = None
+            return
+
+        import scipy.sparse as _sp
+
+        if _sp.issparse(resolved_design):
+            resolved_design = resolved_design.toarray()
+        design_mtx_t = torch.from_numpy(np.asarray(resolved_design, dtype=np.float32))
+        if design_mtx_t.dim() == 1:
+            design_mtx_t = design_mtx_t.unsqueeze(1)
+        if design_mtx_t.shape[0] != self.n_spots:
+            raise ValueError(
+                f"Design matrix row count ({design_mtx_t.shape[0]}) must "
+                f"match number of spots ({self.n_spots}) after filtering."
+            )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            for idx in torch.where(design_mtx_t.std(dim=0) < 1e-5)[0]:
+                cov_name = (
+                    resolved_cov_names[int(idx)]
+                    if resolved_cov_names is not None
+                    else str(idx.item())
+                )
+                warnings.warn(
+                    f"Covariate '{cov_name}' has near-zero variance "
+                    "(std < 1e-5). Consider removing it.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        self.n_factors = design_mtx_t.shape[1]
+        self.design_mtx = design_mtx_t
+        self.covariate_names = resolved_cov_names
+
+    def _move_setup_tensors_to_device(self) -> None:
+        """Move spatial eigenpairs and the design matrix onto the configured device."""
+        device = torch.device(self._device)
+        if self._corr_sp_eigvals is not None:
+            self._corr_sp_eigvals = self._corr_sp_eigvals.to(device)
+            self._corr_sp_eigvecs = self._corr_sp_eigvecs.to(device)
+        if self.design_mtx is not None:
+            self.design_mtx = self.design_mtx.to(device)
+
     def setup_data(
         self,
         adata: AnnData,
@@ -441,157 +588,11 @@ class SplisosmGLMM:
             return_filtered_anndata=True,
         )
 
-        self.adata = adata
-        self._setup_input_mode = "anndata"
-        self._filtered_adata = filtered_adata
-        self._counts_layer = layer
-        self._group_iso_by = group_iso_by
-
-        # Build dataset (handles grouping by n_isos for batching)
-        _dataset = IsoDataset(data, resolved_gene_names, group_gene_by_n_iso)
-        self.n_genes, self.n_spots, self.n_isos_per_gene = (
-            _dataset.n_genes,
-            _dataset.n_spots,
-            _dataset.n_isos_per_gene,
-        )
-        self.gene_names = _dataset.gene_names
-        self._dataset = _dataset
-        self._group_gene_by_n_iso = group_gene_by_n_iso
-        self._coordinates = coordinates
-
-        # Build spatial kernel only when the model actually uses spatial random effects.
-        # For 'glm' there are no random effects at all.
-        # For 'glmm-null' the spatial variance is fixed at 0 (theta = -inf), so the
-        # kernel cancels out.  We use a rank-1 dummy covariance (constant vector scaled
-        # to unit norm) which, combined with theta = 0, gives the exact identity
-        # covariance C = σ²I via the low-rank Woodbury formula.
-        n_spots = self.n_spots
-
-        if self._model_type == "glm":
-            # No spatial random effects — eigvals/eigvecs are not used.
-            self.sp_kernel = None
-            self._corr_sp_eigvals = None
-            self._corr_sp_eigvecs = None
-
-        elif self._model_type == "glmm-null":
-            # Spatial variance is always zero in the null model (theta → 0).
-            # Use IdentityKernel; extract rank-1 dummy eigenpairs for the
-            # Woodbury formula: C = σ²I regardless of eigenvectors.
-            self.sp_kernel = IdentityKernel(n_spots)
-            self._corr_sp_eigvals = torch.ones(1)  # (1,)
-            self._corr_sp_eigvecs = torch.full(
-                (n_spots, 1), 1.0 / np.sqrt(n_spots)
-            )  # dummy vector of (n_spots, 1), not really used
-
-        else:
-            # model_type == "glmm-full" — build the real spatial kernel.
-            _kernel_kwargs = dict(
-                rho=self._kernel_rho,
-                standardize_cov=self._kernel_standardize_cov,
-                centering=False,
-            )
-            if adj_matrix is not None:
-                _kernel = SpatialCovKernel(
-                    coords=None,
-                    adj_matrix=adj_matrix,
-                    **_kernel_kwargs,
-                )
-            else:
-                _kernel = SpatialCovKernel(
-                    coords=coordinates,
-                    adj_matrix=None,
-                    k_neighbors=self._kernel_k_neighbors,
-                    **_kernel_kwargs,
-                )
-
-            # Determine the effective number of eigenvectors to retain.
-            if self._approx_rank is _APPROX_RANK_AUTO:
-                # Auto-select: full rank for small grids, truncated for large ones.
-                k = (
-                    None
-                    if n_spots <= SpatialCovKernel.DENSE_THRESHOLD
-                    else int(np.ceil(np.sqrt(n_spots) * 4))
-                )
-            elif self._approx_rank is None:
-                # User explicitly requested full rank.
-                if n_spots > SpatialCovKernel.DENSE_THRESHOLD:
-                    warnings.warn(
-                        f"approx_rank=None forces a full eigendecomposition of a "
-                        f"{n_spots}×{n_spots} matrix which may be very slow and "
-                        f"memory-intensive.  Consider omitting approx_rank (auto) "
-                        f"or passing a positive integer.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-                k = None
-            else:
-                k = min(int(self._approx_rank), n_spots)
-
-            # Trigger eigendecomposition via SpatialCovKernel (numpy eigh / eigsh).
-            _kernel.eigenvalues(k=k)
-            # Store the kernel object (for inspection / save-load)
-            self.sp_kernel = _kernel
-            if k is None:
-                self._corr_sp_eigvals = _kernel.K_eigvals  # (n_spots,)
-                self._corr_sp_eigvecs = _kernel.K_eigvecs  # (n_spots, n_spots)
-            else:
-                self._corr_sp_eigvals = _kernel.K_eigvals[:k]  # (k,)
-                self._corr_sp_eigvecs = _kernel.K_eigvecs[:, :k]  # (n_spots, k)
-
-        # Process design matrix.
-        # GLMM fitting requires dense torch tensors, so sparse design matrices are
-        # densified here (unlike SplisosmNP which keeps them sparse).
-        if resolved_design is not None:
-            import scipy.sparse as _sp
-
-            if _sp.issparse(resolved_design):
-                resolved_design = resolved_design.toarray()
-            design_mtx_t = torch.from_numpy(
-                np.asarray(resolved_design, dtype=np.float32)
-            )
-            if design_mtx_t.dim() == 1:
-                design_mtx_t = design_mtx_t.unsqueeze(1)
-            n_factors = design_mtx_t.shape[1]
-
-            if design_mtx_t.shape[0] != self.n_spots:
-                raise ValueError(
-                    f"Design matrix row count ({design_mtx_t.shape[0]}) must "
-                    f"match number of spots ({self.n_spots}) after filtering."
-                )
-
-            # Check for constant/zero-variance covariates
-            with warnings.catch_warnings():
-                warnings.simplefilter("always")
-                cov_stds = design_mtx_t.std(dim=0)
-                zero_var_indices = torch.where(cov_stds < 1e-5)[0]
-                for idx in zero_var_indices:
-                    _cname = (
-                        resolved_cov_names[idx]
-                        if resolved_cov_names is not None
-                        else str(idx.item())
-                    )
-                    warnings.warn(
-                        f"Covariate '{_cname}' has near-zero variance "
-                        "(std < 1e-5). Consider removing it.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-
-            self.n_factors = n_factors
-            self.design_mtx = design_mtx_t
-            self.covariate_names = resolved_cov_names
-        else:
-            self.n_factors = 0
-            self.design_mtx = None
-            self.covariate_names = None
-
-        # Move spatial eigenpairs and design matrix to the target device
-        _dev = torch.device(self._device)
-        if self._corr_sp_eigvals is not None:
-            self._corr_sp_eigvals = self._corr_sp_eigvals.to(_dev)
-            self._corr_sp_eigvecs = self._corr_sp_eigvecs.to(_dev)
-        if self.design_mtx is not None:
-            self.design_mtx = self.design_mtx.to(_dev)
+        self._store_anndata_setup(adata, layer, group_iso_by, filtered_adata)
+        self._store_dataset(data, resolved_gene_names, group_gene_by_n_iso, coordinates)
+        self._setup_spatial_kernel(coordinates, adj_matrix)
+        self._store_design_matrix(resolved_design, resolved_cov_names)
+        self._move_setup_tensors_to_device()
 
     def _setup_from_prebuilt(
         self,
@@ -666,27 +667,11 @@ class SplisosmGLMM:
         with_design_mtx = self._model_configs.get("fitting_configs", {}).get(
             "with_design_mtx", False
         )
-        design = self.design_mtx if with_design_mtx else None
-
-        if model_key == "glm":
-            model = MultinomGLM()
-            model.setup_data(counts, design_mtx=design, device=self._device)
-        else:
-            if model_key == "glmm-full":
-                model = IsoFullModel(**self._model_configs)
-            elif model_key == "glmm-null":
-                model = IsoNullNoSpVar(**self._model_configs)
-            else:
-                raise ValueError(f"Invalid model key {model_key!r}.")
-            model.setup_data(
-                counts,
-                design_mtx=design,
-                corr_sp_eigvals=self._corr_sp_eigvals,
-                corr_sp_eigvecs=self._corr_sp_eigvecs,
-                device=self._device,
-            )
-
-        # Load fitted parameters (strict=False because buffers are not in state_dict)
+        model = self._new_model_for_counts(
+            counts,
+            model_type=model_key,
+            design_mtx=self._design_for_fit(with_design_mtx),
+        )
         model.load_state_dict(state.state_dict, strict=False)
         return model
 
@@ -701,155 +686,176 @@ class SplisosmGLMM:
             return "glm"
         raise ValueError(f"Invalid model type {mt!r}.")
 
-    # ------------------------------------------------------------------
-    # Feature summaries
-    # ------------------------------------------------------------------
+    def _resolve_fit_n_jobs(self, n_jobs: int) -> int:
+        """Resolve CPU worker count and enforce non-CPU serial fitting."""
+        n_jobs = _resolve_n_jobs(n_jobs)
+        if n_jobs > 1 and self._device != "cpu":
+            warnings.warn(
+                f"Parallel fitting (n_jobs={n_jobs}) is not supported for "
+                f"device={self._device!r}. Falling back to n_jobs=1.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return 1
+        return n_jobs
 
-    def _compute_feature_summaries(self, print_progress: bool = True) -> None:
-        """Compute and cache both gene-level and isoform-level summaries."""
-        if self._filtered_adata is None:
-            raise RuntimeError("Data is not initialized. Call setup_data() first.")
-        if self._gene_summary is not None and self._isoform_summary is not None:
-            return
-        self._gene_summary, self._isoform_summary = compute_feature_summaries(
-            self._filtered_adata,
-            self.gene_names,
-            layer=self._counts_layer,
-            group_iso_by=self._group_iso_by,
-            print_progress=print_progress,
+    def _design_for_fit(self, with_design_mtx: bool) -> Optional[torch.Tensor]:
+        """Return the design matrix for fitting when requested."""
+        return self.design_mtx if with_design_mtx else None
+
+    def _batch_loader(self, batch_size: int):
+        """Return ``(n_batches, dataloader)`` for a fitting pass."""
+        n_batches = sum(1 for _ in self._dataset.get_dataloader(batch_size=batch_size))
+        return n_batches, self._dataset.get_dataloader(batch_size=batch_size)
+
+    def _new_model_for_counts(
+        self,
+        counts: torch.Tensor,
+        *,
+        model_type: Optional[str] = None,
+        design_mtx: Optional[torch.Tensor] = None,
+    ):
+        """Construct and setup a GLM/GLMM for one batch of gene counts."""
+        model_type = model_type or self._model_type
+        if model_type == "glm":
+            model = MultinomGLM()
+            model.setup_data(counts, design_mtx=design_mtx, device=self._device)
+            return model
+        if model_type == "glmm-full":
+            model = IsoFullModel(**self._model_configs)
+        elif model_type == "glmm-null":
+            model = IsoNullNoSpVar(**self._model_configs)
+        else:
+            raise ValueError(f"Invalid model type {model_type}.")
+        model.setup_data(
+            counts,
+            design_mtx=design_mtx,
+            corr_sp_eigvals=self._corr_sp_eigvals,
+            corr_sp_eigvecs=self._corr_sp_eigvecs,
+            device=self._device,
         )
+        return model
 
-    def extract_feature_summary(
+    def _print_fit_start(
         self,
-        level: Literal["gene", "isoform"] = "gene",
-        print_progress: bool = True,
-    ) -> pd.DataFrame:
-        """Compute filtered feature-level summary statistics.
-
-        Gene-level statistics are aggregated across all isoforms that passed
-        the filters applied in :meth:`setup_data`.  Isoform-level statistics
-        are computed per isoform and augmented onto the corresponding rows of
-        ``adata.var``.
-
-        Results are cached: repeated calls with the same ``level`` return the
-        cached :class:`pandas.DataFrame` without recomputation.
-
-        Parameters
-        ----------
-        level
-            Summary granularity.
-            ``'gene'``: one row per gene.
-            ``'isoform'``: one row per isoform that passed filtering.
-        print_progress
-            Whether to show a progress bar.
-
-        Returns
-        -------
-        pandas.DataFrame
-            For ``level='gene'``, the index is the gene display name and the
-            columns are:
-
-            - ``'n_isos'``: int. Number of isoforms retained after filtering.
-            - ``'perplexity'``: float. Effective number of isoforms based on
-              the marginal isoform usage entropy.
-            - ``'pct_bin_on'``: float. Fraction of spots with non-zero total
-              gene counts.
-            - ``'count_avg'``: float. Mean per-spot total count for the gene.
-            - ``'count_std'``: float. Std of per-spot total count for the gene.
-
-            For ``level='isoform'``, the index is the isoform name (matching
-            ``adata.var_names``) and the columns are the original ``adata.var``
-            columns plus:
-
-            - ``'pct_bin_on'``: float. Fraction of spots with count > 0.
-            - ``'count_total'``: float. Total counts across all spots.
-            - ``'count_avg'``: float. Mean count per spot.
-            - ``'count_std'``: float. Std of count per spot.
-            - ``'ratio_total'``: float. Fraction of total gene counts
-              attributable to this isoform.
-            - ``'ratio_avg'``: float. Mean per-spot isoform usage ratio
-              (computed over spots with non-zero gene coverage).
-            - ``'ratio_std'``: float. Std of per-spot isoform usage ratio
-              (computed over spots with non-zero gene coverage).
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`setup_data` has not been called.
-        ValueError
-            If ``level`` is not ``'gene'`` or ``'isoform'``.
-        """
-        if self._filtered_adata is None:
-            raise RuntimeError("Data is not initialized. Call setup_data() first.")
-        if level not in {"gene", "isoform"}:
-            raise ValueError("`level` must be one of 'gene' or 'isoform'.")
-
-        self._compute_feature_summaries(print_progress=print_progress)
-
-        if level == "gene":
-            return self._gene_summary
-        return self._isoform_summary
-
-    def get_formatted_test_results(
-        self,
-        test_type: Literal["sv", "du"],
-        with_gene_summary: bool = False,
-    ) -> pd.DataFrame:
-        """Get the formatted test results as data frame.
-
-        Parameters
-        ----------
-        test_type : {"sv", "du"}
-            Type of test results to retrieve.
-        with_gene_summary : bool, optional
-            If ``True``, append gene-level summary statistics from
-            :meth:`extract_feature_summary`.
-
-        Returns
-        -------
-        pandas.DataFrame
-            Formatted test results.
-        """
-        if test_type not in {"sv", "du"}:
-            raise ValueError("test_type must be 'sv' or 'du'.")
-        if test_type == "sv":
-            if len(self._sv_test_results) == 0:
-                raise ValueError(
-                    "No spatial variability results. Run test_spatial_variability() first."
-                )
-            df = pd.DataFrame(
-                {
-                    "gene": self.gene_names,
-                    "statistic": self._sv_test_results["statistic"],
-                    "pvalue": self._sv_test_results["pvalue"],
-                    "pvalue_adj": self._sv_test_results["pvalue_adj"],
-                }
+        *,
+        label: str,
+        n_jobs: int,
+        batch_size: int,
+        print_progress: bool,
+    ) -> None:
+        """Print standard GLMM fitting progress preamble."""
+        if not print_progress:
+            return
+        if n_jobs == 1:
+            print(
+                f"{label} with single core for {self.n_genes} genes "
+                f"(batch_size={batch_size})."
             )
         else:
-            if len(self._du_test_results) == 0:
-                raise ValueError(
-                    "No differential usage results. Run test_differential_usage() first."
-                )
-            covariate_names = (
-                self.covariate_names
-                if self.covariate_names is not None and len(self.covariate_names) > 0
-                else [f"factor_{i}" for i in range(self.n_factors)]
+            print(
+                f"{label} with {n_jobs} cores for {self.n_genes} genes "
+                f"(batch_size={batch_size})."
             )
-            df = pd.DataFrame(
-                {
-                    "gene": np.repeat(self.gene_names, self.n_factors),
-                    "covariate": np.tile(covariate_names, self.n_genes),
-                    "statistic": self._du_test_results["statistic"].reshape(-1),
-                    "pvalue": self._du_test_results["pvalue"].reshape(-1),
-                    "pvalue_adj": self._du_test_results["pvalue_adj"].reshape(-1),
-                }
+            print(
+                "Note: the progress bar is updated before each fitting, rather than when it finishes."
             )
 
-        if with_gene_summary:
-            gene_df = self.extract_feature_summary(level="gene", print_progress=False)
-            df = df.merge(gene_df, left_on="gene", right_index=True, how="left")
+    def _fit_single_batch_model(
+        self,
+        counts: torch.Tensor,
+        *,
+        with_design_mtx: bool,
+        quiet: bool,
+        random_seed: Optional[int],
+    ):
+        """Fit the configured model for one batch in-process."""
+        model = self._new_model_for_counts(
+            counts, design_mtx=self._design_for_fit(with_design_mtx)
+        )
+        model.fit(quiet=quiet, verbose=False, random_seed=random_seed)
+        return model
 
-        return df
+    def _rebuild_batch_model_from_params(
+        self,
+        counts: torch.Tensor,
+        pars: dict[str, torch.Tensor],
+        *,
+        with_design_mtx: bool,
+    ):
+        """Reconstruct a fitted batch model from parameters returned by a worker."""
+        model = self._new_model_for_counts(
+            counts, design_mtx=self._design_for_fit(with_design_mtx)
+        )
+        model.update_params_from_dict(pars)
+        return model
+
+    def _fit_null_full_batch(
+        self,
+        counts: torch.Tensor,
+        *,
+        refit_null: bool,
+        with_design_mtx: bool,
+        quiet: bool,
+        random_seed: Optional[int],
+    ) -> tuple[Any, Any]:
+        """Fit one null/full SV model pair in-process."""
+        null = self._new_model_for_counts(
+            counts,
+            model_type="glmm-null",
+            design_mtx=self._design_for_fit(with_design_mtx),
+        )
+        null.fit(quiet=quiet, verbose=False, random_seed=random_seed)
+        full = IsoFullModel.from_trained_null_no_sp_var_model(null)
+        full.fit(quiet=quiet, verbose=False, random_seed=random_seed)
+
+        if refit_null:
+            null_refit = IsoNullNoSpVar.from_trained_full_model(full)
+            null_refit.fit(quiet=quiet, verbose=False, random_seed=random_seed)
+            if null_refit().mean() > null().mean():
+                null = null_refit
+            if null().mean() > full().mean():
+                full_refit = IsoFullModel.from_trained_null_no_sp_var_model(null)
+                full_refit.fit(quiet=quiet, verbose=False, random_seed=random_seed)
+                if full_refit().mean() > full().mean():
+                    full = full_refit
+        return null, full
+
+    def _rebuild_null_full_from_params(
+        self,
+        counts: torch.Tensor,
+        null_pars: dict[str, torch.Tensor],
+        full_pars: dict[str, torch.Tensor],
+        *,
+        with_design_mtx: bool,
+    ) -> tuple[Any, Any]:
+        """Reconstruct fitted null/full batch models from worker parameters."""
+        null = self._new_model_for_counts(
+            counts,
+            model_type="glmm-null",
+            design_mtx=self._design_for_fit(with_design_mtx),
+        )
+        null.update_params_from_dict(null_pars)
+        full = IsoFullModel.from_trained_null_no_sp_var_model(null)
+        full.update_params_from_dict(full_pars)
+        return null, full
+
+    def _store_fitted_states(
+        self,
+        model_key: str,
+        fitted_models: list[Any],
+        *,
+        batch_size: int,
+        with_design_mtx: bool,
+    ) -> None:
+        """Ungroup fitted batch models if needed and store lightweight states."""
+        if batch_size > 1:
+            fitted_models = self._ungroup_fitted_models(
+                fitted_models, batch_size, with_design_mtx
+            )
+        self._fitted_states[model_key] = [
+            self._extract_gene_state(model) for model in fitted_models
+        ]
 
     def fit(
         self,
@@ -887,7 +893,7 @@ class SplisosmGLMM:
 
         See also
         --------
-        :func:`splisosm.model.MultinomGLMM.fit` for fitting a single model.
+        :func:`splisosm.glmm.MultinomGLMM.fit` for fitting a single model.
         """
 
         if batch_size > 1 and not self._group_gene_by_n_iso:
@@ -1000,9 +1006,9 @@ class SplisosmGLMM:
         Returns
         -------
         models: list of fitted models
-            - ``model_type='glmm-full'``: list[splisosm.hyptest_glmm.IsoFullModel]
-            - ``model_type='glmm-null'``: list[splisosm.hyptest_glmm.IsoNullNoSpVar]
-            - ``model_type='glm'``: list[splisosm.model.MultinomGLM]
+            - ``model_type='glmm-full'``: list[splisosm.hyptest.glmm.IsoFullModel]
+            - ``model_type='glmm-null'``: list[splisosm.hyptest.glmm.IsoNullNoSpVar]
+            - ``model_type='glm'``: list[splisosm.glmm.MultinomGLM]
         """
         key = self._model_key_for_type()
         return [
@@ -1102,7 +1108,7 @@ class SplisosmGLMM:
         the exact row order of ``self._filtered_adata.var``.  This holds
         because :meth:`setup_data` builds per-gene count tensors by slicing
         ``filtered_adata`` isoforms in their ``var`` row order (via
-        ``groupby(sort=False)``), and :meth:`~splisosm.model.MultinomGLM.get_isoform_ratio`
+        ``groupby(sort=False)``), and :meth:`~splisosm.glmm.MultinomGLM.get_isoform_ratio`
         returns ratios in the same column order as the input counts.
 
         Parameters
@@ -1184,7 +1190,10 @@ class SplisosmGLMM:
                 batch["x"],
                 batch["gene_name"],
             )
-            assert b_n_isos[0] == grouped_m.n_isos
+            if b_n_isos[0] != grouped_m.n_isos:
+                raise RuntimeError(
+                    "Fitted model isoform count does not match the grouped batch."
+                )
 
             # add the gene names to the list
             gene_names_ungroupped.extend(b_gene_names)
@@ -1210,32 +1219,9 @@ class SplisosmGLMM:
                     b_counts = b_counts.to_dense()
                 _g_counts = b_counts[_g : (_g + 1), ...]  # (1, n_spots, b_n_isos)
                 _g_pars = {k: v[_g : (_g + 1), ...] for k, v in pars.items()}
-
-                # initialize and setup the model
-                if self._model_type == "glm":
-                    model = MultinomGLM()
-                    model.setup_data(
-                        _g_counts,
-                        design_mtx=self.design_mtx if with_design_mtx else None,
-                        device=self._device,
-                    )
-                else:
-                    if self._model_type == "glmm-full":
-                        model = IsoFullModel(**self._model_configs)
-                    elif self._model_type == "glmm-null":
-                        model = IsoNullNoSpVar(**self._model_configs)
-                    else:
-                        raise ValueError(f"Invalid model type {self._model_type}.")
-
-                    model.setup_data(
-                        _g_counts,
-                        design_mtx=self.design_mtx if with_design_mtx else None,
-                        corr_sp_eigvals=self._corr_sp_eigvals,
-                        corr_sp_eigvecs=self._corr_sp_eigvecs,
-                        device=self._device,
-                    )
-
-                # update model parameters
+                model = self._new_model_for_counts(
+                    _g_counts, design_mtx=self._design_for_fit(with_design_mtx)
+                )
                 model.update_params_from_dict(_g_pars)
                 fitted_models_ungrouped.append(model)
 
@@ -1272,149 +1258,71 @@ class SplisosmGLMM:
         random_seed : int, optional
             The random seed for reproducibility. Default to None.
         """
-        # empty existing models before the new run
         fitted_models = []
-
-        # decide whether to use multiprocessing
-        n_jobs = mp.cpu_count() if n_jobs == -1 else n_jobs
-        if n_jobs > 1 and self._device != "cpu":
-            warnings.warn(
-                f"Parallel fitting (n_jobs={n_jobs}) is not supported for "
-                f"device={self._device!r}. Falling back to n_jobs=1.",
-                UserWarning,
-                stacklevel=2,
-            )
-            n_jobs = 1
-
-        # start timer
+        n_jobs = self._resolve_fit_n_jobs(n_jobs)
         t_start = timer()
-
-        # extract the dataloader
-        n_batches = sum(1 for _ in self._dataset.get_dataloader(batch_size=batch_size))
-        data = self._dataset.get_dataloader(batch_size=batch_size)
+        n_batches, data = self._batch_loader(batch_size)
+        self._print_fit_start(
+            label="Fitting",
+            n_jobs=n_jobs,
+            batch_size=batch_size,
+            print_progress=print_progress,
+        )
 
         if n_jobs == 1:  # use single core
-            if print_progress:
-                print(
-                    f"Fitting with single core for {self.n_genes} genes (batch_size={batch_size})."
-                )
-
-            # iterate over genes and fit the selected model
             for batch in tqdm(
                 data, desc="Fitting", total=n_batches, disable=not print_progress
             ):
-                _, b_counts, _ = (batch["n_isos"], batch["x"], batch["gene_name"])
-
-                # initialize and setup the model
-                if self._model_type == "glm":
-                    model = MultinomGLM()
-                    model.setup_data(
-                        b_counts,
-                        design_mtx=self.design_mtx if with_design_mtx else None,
-                        device=self._device,
+                fitted_models.append(
+                    self._fit_single_batch_model(
+                        batch["x"],
+                        with_design_mtx=with_design_mtx,
+                        quiet=quiet,
+                        random_seed=random_seed,
                     )
-                else:
-                    if self._model_type == "glmm-full":
-                        model = IsoFullModel(**self._model_configs)
-                    elif self._model_type == "glmm-null":
-                        model = IsoNullNoSpVar(**self._model_configs)
-                    else:
-                        raise ValueError(f"Invalid model type {self._model_type}.")
-                    model.setup_data(
-                        b_counts,
-                        design_mtx=self.design_mtx if with_design_mtx else None,
-                        corr_sp_eigvals=self._corr_sp_eigvals,
-                        corr_sp_eigvecs=self._corr_sp_eigvecs,
-                        device=self._device,
-                    )
-
-                # fit the model
-                model.fit(quiet=quiet, verbose=False, random_seed=random_seed)
-                fitted_models.append(model)
+                )
         else:
-            if print_progress:
-                print(
-                    f"Fitting with {n_jobs} cores for {self.n_genes} genes (batch_size={batch_size})."
-                )
-                print(
-                    "Note: the progress bar is updated before each fitting, rather than when it finishes."
-                )
-
-            # Prepare tasks with delayed to ensure they're ready for parallel execution
-            tasks_gen = (
+            tasks = (
                 delayed(_fit_model_one_gene)(
                     self._model_configs,
                     self._model_type,
                     batch["x"],
                     self._corr_sp_eigvals,
                     self._corr_sp_eigvecs,
-                    self.design_mtx if with_design_mtx else None,
+                    self._design_for_fit(with_design_mtx),
                     quiet,
                     random_seed,
                     self._device,
                 )
                 for batch in data
             )
-
             fitted_pars = Parallel(n_jobs=n_jobs)(
                 tqdm(
-                    tasks_gen,
+                    tasks,
                     desc="Fitting",
                     total=n_batches,
                     disable=not print_progress,
                 )
             )
-
-            # convert the fitted parameters to models
             for batch, pars in zip(
                 self._dataset.get_dataloader(batch_size=batch_size), fitted_pars
             ):
-                # unwrap the batch
-                b_counts = batch["x"]
-
-                # initialize and setup the model
-                if self._model_type == "glm":
-                    model = MultinomGLM()
-                    model.setup_data(
-                        b_counts,
-                        design_mtx=self.design_mtx if with_design_mtx else None,
-                        device=self._device,
+                fitted_models.append(
+                    self._rebuild_batch_model_from_params(
+                        batch["x"], pars, with_design_mtx=with_design_mtx
                     )
-                else:
-                    if self._model_type == "glmm-full":
-                        model = IsoFullModel(**self._model_configs)
-                    elif self._model_type == "glmm-null":
-                        model = IsoNullNoSpVar(**self._model_configs)
-                    else:
-                        raise ValueError(f"Invalid model type {self._model_type}.")
-                    model.setup_data(
-                        b_counts,
-                        design_mtx=self.design_mtx if with_design_mtx else None,
-                        corr_sp_eigvals=self._corr_sp_eigvals,
-                        corr_sp_eigvecs=self._corr_sp_eigvecs,
-                        device=self._device,
-                    )
+                )
 
-                # update model parameters
-                model.update_params_from_dict(pars)
-                fitted_models.append(model)
-
-        # ungroup the fitted models to match the original gene names
-        if batch_size > 1:
-            fitted_models = self._ungroup_fitted_models(
-                fitted_models, batch_size, with_design_mtx
-            )
-
-        # extract lightweight state and discard full model objects
-        key = self._model_key_for_type()
-        self._fitted_states[key] = [self._extract_gene_state(m) for m in fitted_models]
+        self._store_fitted_states(
+            self._model_key_for_type(),
+            fitted_models,
+            batch_size=batch_size,
+            with_design_mtx=with_design_mtx,
+        )
         del fitted_models
 
-        # stop timer
-        t_end = timer()
-
         if print_progress:
-            print(f"Fitting finished. Time elapsed: {t_end - t_start:.2f} seconds.")
+            print(f"Fitting finished. Time elapsed: {timer() - t_start:.2f} seconds.")
 
     def _fit_null_full_sv(
         self,
@@ -1447,103 +1355,39 @@ class SplisosmGLMM:
         random_seed : int, optional
             The random seed for reproducibility. Default to None.
         """
-        # empty existing models before the new run
         fitted_null_models_sv = []
         fitted_full_models = []
-
-        # decide whether to use multiprocessing
-        n_jobs = mp.cpu_count() if n_jobs == -1 else n_jobs
-        if n_jobs > 1 and self._device != "cpu":
-            warnings.warn(
-                f"Parallel fitting (n_jobs={n_jobs}) is not supported for "
-                f"device={self._device!r}. Falling back to n_jobs=1.",
-                UserWarning,
-                stacklevel=2,
-            )
-            n_jobs = 1
-
-        # start timer
+        n_jobs = self._resolve_fit_n_jobs(n_jobs)
         t_start = timer()
+        n_batches, data = self._batch_loader(batch_size)
+        self._print_fit_start(
+            label="Fitting",
+            n_jobs=n_jobs,
+            batch_size=batch_size,
+            print_progress=print_progress,
+        )
 
-        # extract the dataloader
-        n_batches = sum(1 for _ in self._dataset.get_dataloader(batch_size=batch_size))
-        data = self._dataset.get_dataloader(batch_size=batch_size)
-
-        if n_jobs == 1:  # use single core
-            if print_progress:
-                print(
-                    f"Fitting with single core for {self.n_genes} genes (batch_size={batch_size})."
-                )
-
-            # iterate over genes and fit the selected model
+        if n_jobs == 1:
             for batch in tqdm(
                 data, desc="Fitting", total=n_batches, disable=not print_progress
             ):
-                _, b_counts, _ = (batch["n_isos"], batch["x"], batch["gene_name"])
-
-                # fit the null model
-                null = IsoNullNoSpVar(**self._model_configs)
-                null.setup_data(
-                    b_counts,
-                    design_mtx=self.design_mtx if with_design_mtx else None,
-                    corr_sp_eigvals=self._corr_sp_eigvals,
-                    corr_sp_eigvecs=self._corr_sp_eigvecs,
-                    device=self._device,
+                null, full = self._fit_null_full_batch(
+                    batch["x"],
+                    refit_null=refit_null,
+                    with_design_mtx=with_design_mtx,
+                    quiet=quiet,
+                    random_seed=random_seed,
                 )
-                null.fit(quiet=quiet, verbose=False, random_seed=random_seed)
-
-                # fit the full model from the null
-                full = IsoFullModel.from_trained_null_no_sp_var_model(null)
-                full.fit(quiet=quiet, verbose=False, random_seed=random_seed)
-
-                # refit the null model if needed
-                if refit_null:
-                    null_refit = IsoNullNoSpVar.from_trained_full_model(full)
-                    null_refit.fit(
-                        quiet=quiet,
-                        verbose=False,
-                        random_seed=random_seed,
-                    )
-
-                    # update the null if larger log-likelihood
-                    if (
-                        null_refit().mean() > null().mean()
-                    ):  # null() returns shape of (n_genes,)
-                        null = null_refit
-
-                    # refit the full model from the null if likelihood decreases
-                    if null().mean() > full().mean():
-                        full_refit = IsoFullModel.from_trained_null_no_sp_var_model(
-                            null
-                        )
-                        full_refit.fit(
-                            quiet=quiet,
-                            verbose=False,
-                            random_seed=random_seed,
-                        )
-                        if full_refit().mean() > full().mean():
-                            full = full_refit
-
                 fitted_null_models_sv.append(null)
                 fitted_full_models.append(full)
-
-        else:  # use multiprocessing
-            if print_progress:
-                print(
-                    f"Fitting with {n_jobs} cores for {self.n_genes} genes (batch_size={batch_size})."
-                )
-                print(
-                    "Note: the progress bar is updated before each fitting, rather than when it finishes."
-                )
-
-            # Prepare tasks with delayed to ensure they're ready for parallel execution
-            tasks_gen = (
+        else:
+            tasks = (
                 delayed(_fit_null_full_sv_one_gene)(
                     self._model_configs,
                     batch["x"],
                     self._corr_sp_eigvals,
                     self._corr_sp_eigvecs,
-                    self.design_mtx if with_design_mtx else None,
+                    self._design_for_fit(with_design_mtx),
                     refit_null,
                     quiet,
                     random_seed,
@@ -1551,65 +1395,171 @@ class SplisosmGLMM:
                 )
                 for batch in data
             )
-
             fitted_pars = Parallel(n_jobs=n_jobs)(
                 tqdm(
-                    tasks_gen,
+                    tasks,
                     desc="Fitting",
                     total=n_batches,
                     disable=not print_progress,
                 )
             )
-
-            # convert the fitted parameters to models
-            for batch, (n_par, f_par) in zip(
+            for batch, (null_pars, full_pars) in zip(
                 self._dataset.get_dataloader(batch_size=batch_size), fitted_pars
             ):
-                # unwrap the batch
-                b_counts = batch["x"]
-
-                # null models
-                null = IsoNullNoSpVar(**self._model_configs)
-                null.setup_data(
-                    b_counts,
-                    design_mtx=self.design_mtx if with_design_mtx else None,
-                    corr_sp_eigvals=self._corr_sp_eigvals,
-                    corr_sp_eigvecs=self._corr_sp_eigvecs,
-                    device=self._device,
+                null, full = self._rebuild_null_full_from_params(
+                    batch["x"],
+                    null_pars,
+                    full_pars,
+                    with_design_mtx=with_design_mtx,
                 )
-                # update model parameters
-                null.update_params_from_dict(n_par)
-
-                # full models
-                full = IsoFullModel.from_trained_null_no_sp_var_model(null)
-                full.update_params_from_dict(f_par)
-
                 fitted_null_models_sv.append(null)
                 fitted_full_models.append(full)
 
-        # ungroup the fitted models to match the original gene names
-        if batch_size > 1:
-            fitted_null_models_sv = self._ungroup_fitted_models(
-                fitted_null_models_sv, batch_size, with_design_mtx
-            )
-            fitted_full_models = self._ungroup_fitted_models(
-                fitted_full_models, batch_size, with_design_mtx
-            )
-
-        # extract lightweight state and discard full model objects
-        self._fitted_states["glmm-null"] = [
-            self._extract_gene_state(m) for m in fitted_null_models_sv
-        ]
-        self._fitted_states["glmm-full"] = [
-            self._extract_gene_state(m) for m in fitted_full_models
-        ]
+        self._store_fitted_states(
+            "glmm-null",
+            fitted_null_models_sv,
+            batch_size=batch_size,
+            with_design_mtx=with_design_mtx,
+        )
+        self._store_fitted_states(
+            "glmm-full",
+            fitted_full_models,
+            batch_size=batch_size,
+            with_design_mtx=with_design_mtx,
+        )
         del fitted_null_models_sv, fitted_full_models
 
-        # stop timer
-        t_end = timer()
-
         if print_progress:
-            print(f"Fitting finished. Time elapsed: {t_end - t_start:.2f} seconds.")
+            print(f"Fitting finished. Time elapsed: {timer() - t_start:.2f} seconds.")
+
+    def _permutation_fit_configs(self) -> tuple[bool, bool, int]:
+        """Return fit settings required by the SV permutation path."""
+        fitting_configs = self._model_configs["fitting_configs"]
+        try:
+            return (
+                fitting_configs["with_design_mtx"],
+                fitting_configs["refit_null"],
+                fitting_configs["batch_size"],
+            )
+        except KeyError:
+            raise ValueError(
+                "Null models not found. Please run fit() with from_null = True first."
+            ) from None
+
+    def _setup_permuted_model(
+        self,
+        perm_idx: torch.Tensor,
+        *,
+        with_design_mtx: bool,
+    ) -> "SplisosmGLMM":
+        """Create a fast-path GLMM wrapper with permuted spot order."""
+        new_design_mtx = (
+            self.design_mtx[perm_idx, :]
+            if (self.design_mtx is not None and with_design_mtx)
+            else None
+        )
+        new_model = SplisosmGLMM(**self._model_configs, device=self._device)
+        new_model._setup_from_prebuilt(
+            data=[data[perm_idx, :] for data in self._dataset.data],
+            coordinates=self._coordinates,
+            sp_kernel=self.sp_kernel,
+            corr_sp_eigvals=self._corr_sp_eigvals,
+            corr_sp_eigvecs=self._corr_sp_eigvecs,
+            design_mtx=new_design_mtx,
+            gene_names=self.gene_names,
+            group_gene_by_n_iso=self._group_gene_by_n_iso,
+            covariate_names=self.covariate_names,
+        )
+        return new_model
+
+    @staticmethod
+    def _llr_stats_from_fitted_model(model: "SplisosmGLMM") -> torch.Tensor:
+        """Calculate per-gene marginal LLR statistics from fitted null/full states."""
+        stats = []
+        for gene_idx in range(model.n_genes):
+            full_m = model._reconstruct_gene_model(gene_idx, "glmm-full")
+            null_m = model._reconstruct_gene_model(gene_idx, "glmm-null")
+            llr, _ = _calc_llr_spatial_variability(null_m, full_m)
+            stats.append(llr)
+        return torch.tensor(stats)
+
+    def _run_one_sv_permutation(
+        self,
+        *,
+        with_design_mtx: bool,
+        refit_null: bool,
+        batch_size: int,
+        random_seed: Optional[int],
+    ) -> torch.Tensor:
+        """Fit one permuted model and return its per-gene LLR statistics."""
+        new_model = self._setup_permuted_model(
+            torch.randperm(self.n_spots), with_design_mtx=with_design_mtx
+        )
+        new_model._fit_null_full_sv(
+            refit_null=refit_null,
+            n_jobs=1,
+            batch_size=batch_size,
+            quiet=True,
+            print_progress=False,
+            with_design_mtx=with_design_mtx,
+            random_seed=random_seed,
+        )
+        return self._llr_stats_from_fitted_model(new_model)
+
+    def _fit_sv_llr_perm_parallel(
+        self,
+        *,
+        n_perms: int,
+        n_jobs: int,
+        batch_size: int,
+        with_design_mtx: bool,
+        refit_null: bool,
+        random_seed: Optional[int],
+        print_progress: bool,
+    ) -> torch.Tensor:
+        """Fit batched SV permutations in parallel and return a per-gene matrix."""
+        n_batches, data = self._batch_loader(batch_size)
+        name_to_idx = {name: idx for idx, name in enumerate(self.gene_names)}
+        batch_infos = [
+            (
+                [name_to_idx[name] for name in batch["gene_name"]],
+                batch["x"],
+            )
+            for batch in data
+        ]
+
+        task_meta = []
+        tasks = []
+        for perm_idx in range(n_perms):
+            perm = torch.randperm(self.n_spots)
+            for gene_indices, counts in batch_infos:
+                task_meta.append((perm_idx, gene_indices))
+                tasks.append(
+                    delayed(_fit_perm_one_gene)(
+                        perm,
+                        self._model_configs,
+                        counts,
+                        self._corr_sp_eigvals,
+                        self._corr_sp_eigvecs,
+                        self._design_for_fit(with_design_mtx),
+                        refit_null=refit_null,
+                        random_seed=random_seed,
+                        device=self._device,
+                    )
+                )
+
+        perm_stats = Parallel(n_jobs=n_jobs)(
+            tqdm(
+                tasks,
+                desc="Permutations",
+                total=(n_batches * n_perms),
+                disable=not print_progress,
+            )
+        )
+        perm_matrix = torch.empty((n_perms, self.n_genes), dtype=torch.float32)
+        for (perm_idx, gene_indices), batch_stats in zip(task_meta, perm_stats):
+            perm_matrix[perm_idx, gene_indices] = batch_stats.detach().cpu().float()
+        return perm_matrix
 
     def _fit_sv_llr_perm(
         self,
@@ -1631,36 +1581,16 @@ class SplisosmGLMM:
         random_seed : int, optional
             The random seed for reproducibility. Default to None.
         """
-        # fit permutated data using the same null model
-        fitting_configs = self._model_configs["fitting_configs"]
+        if n_perms < 1:
+            raise ValueError("`n_perms` must be a positive integer.")
 
-        try:
-            with_design_mtx = fitting_configs["with_design_mtx"]
-            refit_null = fitting_configs["refit_null"]
-            batch_size = fitting_configs["batch_size"]
-        except KeyError:
-            raise ValueError(
-                "Null models not found. Please run fit() with from_null = True first."
-            )
+        with_design_mtx, refit_null, batch_size = self._permutation_fit_configs()
 
         if random_seed is not None:  # set random seed for reproducibility
             torch.manual_seed(random_seed)
 
-        # extract the likelihood ratio statistics from each permutation
-        _sv_llr_perm_stats = []
-
-        # decide whether to use multiprocessing
-        n_jobs = mp.cpu_count() if n_jobs == -1 else n_jobs
-        if n_jobs > 1 and self._device != "cpu":
-            warnings.warn(
-                f"Parallel fitting (n_jobs={n_jobs}) is not supported for "
-                f"device={self._device!r}. Falling back to n_jobs=1.",
-                UserWarning,
-                stacklevel=2,
-            )
-            n_jobs = 1
-
-        # start timer
+        perm_stats = []
+        n_jobs = self._resolve_fit_n_jobs(n_jobs)
         t_start = timer()
 
         if n_jobs == 1:  # use single core
@@ -1677,52 +1607,16 @@ class SplisosmGLMM:
                 total=n_perms,
                 disable=not print_progress,
             ):
-                # randomly shuffle the spatial locations
-                perm_idx = torch.randperm(self.n_spots)
-
-                # fit a new SplisosmGLMM model using pre-built tensors (fast path)
-                new_model = SplisosmGLMM(**self._model_configs, device=self._device)
-                new_design_mtx = (
-                    self.design_mtx[perm_idx, :]
-                    if (self.design_mtx is not None and with_design_mtx)
-                    else None
-                )
-                new_data = [_d[perm_idx, :] for _d in self._dataset.data]
-                new_model._setup_from_prebuilt(
-                    data=new_data,
-                    coordinates=self._coordinates,
-                    sp_kernel=self.sp_kernel,
-                    corr_sp_eigvals=self._corr_sp_eigvals,
-                    corr_sp_eigvecs=self._corr_sp_eigvecs,
-                    design_mtx=new_design_mtx,
-                    gene_names=self.gene_names,
-                    group_gene_by_n_iso=self._group_gene_by_n_iso,
-                    covariate_names=self.covariate_names,
-                )
-                new_model._fit_null_full_sv(
-                    refit_null=refit_null,
-                    n_jobs=1,
-                    batch_size=batch_size,
-                    quiet=True,
-                    print_progress=False,
-                    with_design_mtx=with_design_mtx,
-                    random_seed=random_seed,
+                perm_stats.append(
+                    self._run_one_sv_permutation(
+                        with_design_mtx=with_design_mtx,
+                        refit_null=refit_null,
+                        batch_size=batch_size,
+                        random_seed=random_seed,
+                    )
                 )
 
-                # calculate the likelihood ratio statistic
-                _sv_llr_stats = []
-                for g_idx in range(new_model.n_genes):
-                    full_m = new_model._reconstruct_gene_model(g_idx, "glmm-full")
-                    null_m = new_model._reconstruct_gene_model(g_idx, "glmm-null")
-                    # use marginal likelihood for stability
-                    llr, _ = _calc_llr_spatial_variability(null_m, full_m)
-                    _sv_llr_stats.append(llr)
-
-                _sv_llr_stats = torch.tensor(_sv_llr_stats)
-                _sv_llr_perm_stats.append(_sv_llr_stats)
-
-            # save the llr statistics from permutated data
-            self._sv_llr_perm_stats = torch.concat(_sv_llr_perm_stats, dim=0)
+            self._sv_llr_perm_stats = torch.stack(perm_stats, dim=0)
 
         else:  # use multiprocessing
             if print_progress:
@@ -1734,45 +1628,201 @@ class SplisosmGLMM:
                     "Note: the progress bar is updated before each fitting, rather than when it finishes."
                 )
 
-            # extract the dataloader
-            n_batches = sum(
-                1 for _ in self._dataset.get_dataloader(batch_size=batch_size)
+            self._sv_llr_perm_stats = self._fit_sv_llr_perm_parallel(
+                n_perms=n_perms,
+                n_jobs=n_jobs,
+                batch_size=batch_size,
+                with_design_mtx=with_design_mtx,
+                refit_null=refit_null,
+                random_seed=random_seed,
+                print_progress=print_progress,
             )
-            data = self._dataset.get_dataloader(batch_size=batch_size)
-
-            # Prepare tasks with delayed to ensure they're ready for parallel execution
-            tasks_gen = (
-                delayed(_fit_perm_one_gene)(
-                    torch.randperm(self.n_spots),
-                    self._model_configs,
-                    batch["x"],
-                    self._corr_sp_eigvals,
-                    self._corr_sp_eigvecs,
-                    self.design_mtx if with_design_mtx else None,
-                    refit_null,
-                    random_seed,
-                    self._device,
-                )
-                for batch in data
-                for _ in range(n_perms)
-            )
-
-            _sv_llr_perm_stats = Parallel(n_jobs=n_jobs)(
-                tqdm(
-                    tasks_gen,
-                    desc="Permutations",
-                    total=(n_batches * n_perms),
-                    disable=not print_progress,
-                )
-            )
-
-            self._sv_llr_perm_stats = torch.concat(_sv_llr_perm_stats, dim=0)
-
-        # stop timer
-        t_end = timer()
 
         if print_progress:
-            print(f"Fitting finished. Time elapsed: {t_end - t_start:.2f} seconds.")
+            print(f"Fitting finished. Time elapsed: {timer() - t_start:.2f} seconds.")
+
+    def _validate_sv_test(self, method: str) -> None:
+        """Validate spatial variability test state."""
+        valid_methods = ["llr"]
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
+        if len(self._fitted_states["glmm-null"]) == 0:
+            raise ValueError(
+                "Null models not found. Please run fit() with from_null = True first."
+            )
+
+    def _calc_sv_llr_stats(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate per-gene LLR statistics and degrees of freedom."""
+        stats, dfs = [], []
+        for gene_idx in range(self.n_genes):
+            if self.n_isos_per_gene[gene_idx] <= 1:
+                stats.append(torch.tensor(0.0))
+                dfs.append(torch.tensor(1))
+                continue
+            full_m = self._reconstruct_gene_model(gene_idx, "glmm-full")
+            null_m = self._reconstruct_gene_model(gene_idx, "glmm-null")
+            llr, df = _calc_llr_spatial_variability(null_m, full_m)
+            stats.append(llr)
+            dfs.append(df)
+        return torch.tensor(stats), torch.tensor(dfs)
+
+    def _sv_llr_pvalues(
+        self,
+        stats: torch.Tensor,
+        dfs: torch.Tensor,
+        *,
+        use_perm_null: bool,
+        n_perms_per_gene: Optional[int],
+        print_progress: bool,
+        perm_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        """Return SV LLR p-values from chi-square or permutation null."""
+        if use_perm_null:
+            if self._sv_llr_perm_stats is None:
+                self._fit_sv_llr_perm(
+                    n_perms=n_perms_per_gene if n_perms_per_gene is not None else 20,
+                    print_progress=print_progress,
+                    **perm_kwargs,
+                )
+            else:
+                print("Using cached permutation results...")
+            perm = self._sv_llr_perm_stats
+            if perm.ndim == 1:
+                if perm.numel() % self.n_genes != 0:
+                    raise RuntimeError(
+                        "Cached permutation statistics must have one column per gene."
+                    )
+                perm = perm.reshape(-1, self.n_genes)
+            if perm.shape[1] != self.n_genes:
+                raise RuntimeError(
+                    "Cached permutation statistics must have shape "
+                    "(n_perms, n_genes)."
+                )
+            perm = perm.to(dtype=stats.dtype, device=stats.device)
+            pvals = _empirical_permutation_pvalue(stats, perm, axis=0)
+        else:
+            pvals = torch.tensor(1 - chi2.cdf(stats.cpu(), df=dfs.cpu()))
+
+        single_iso_mask = torch.tensor(
+            [n <= 1 for n in self.n_isos_per_gene], dtype=torch.bool
+        )
+        pvals[single_iso_mask] = 1.0
+        return pvals
+
+    def _store_sv_results(
+        self,
+        stats: torch.Tensor,
+        pvals: torch.Tensor,
+        dfs: torch.Tensor,
+        *,
+        method: str,
+        use_perm_null: bool,
+    ) -> None:
+        """Store formatted SV results."""
+        self._sv_test_results = {
+            "statistic": stats.cpu().numpy(),
+            "pvalue": pvals.cpu().numpy(),
+            "df": dfs.cpu().numpy(),
+            "method": method,
+            "use_perm_null": use_perm_null,
+        }
+        self._sv_test_results["pvalue_adj"] = false_discovery_control(
+            self._sv_test_results["pvalue"]
+        )
+
+    def _validate_du_test(self, method: str) -> int:
+        """Validate differential-usage test state and return n_factors."""
+        if self.design_mtx is None:
+            raise ValueError("No design matrix is provided. Run setup_data() first.")
+        valid_methods = ["wald", "score"]
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
+        fitted_with_design = self._model_configs["fitting_configs"].get(
+            "with_design_mtx", False
+        )
+        if method == "score" and fitted_with_design:
+            raise ValueError(
+                "Design matrix is included in the fitted models. "
+                "Perhaps you want to use the wald test. Otherwise please run fit() with with_design_mtx = False."
+            )
+        if method == "wald" and not fitted_with_design:
+            raise ValueError(
+                "Design matrix is not included in the fitted models. "
+                "Perhaps you want to use the score test. Otherwise please run fit() with with_design_mtx = True."
+            )
+        return self.design_mtx.shape[1]
+
+    def _du_test_fn(self, method: str):
+        """Return the DU statistic function for the selected method."""
+        return (
+            (lambda model: _calc_score_differential_usage(model, self.design_mtx))
+            if method == "score"
+            else _calc_wald_differential_usage
+        )
+
+    def _calc_du_stats(
+        self,
+        *,
+        method: str,
+        n_factors: int,
+        print_progress: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate DU statistics and degrees of freedom for all genes."""
+        fitted_models = self.get_fitted_models()
+        if len(fitted_models) == 0:
+            suffix = (
+                "Run fit() first."
+                if method == "wald"
+                else ("Run fit(..., with_design_mtx = False) first.")
+            )
+            raise ValueError(f"Fitted full models not found. {suffix}")
+
+        stat_fn = self._du_test_fn(method)
+        stats, dfs = [], []
+        for gene_idx, model in enumerate(
+            tqdm(
+                fitted_models,
+                desc=f"DU [{method}]",
+                total=len(fitted_models),
+                disable=not print_progress,
+            )
+        ):
+            if self.n_isos_per_gene[gene_idx] <= 1:
+                stats.append(torch.zeros(n_factors))
+                dfs.append(0)
+                continue
+            stat, df = stat_fn(model)
+            stats.append(stat)
+            dfs.append(df)
+
+        stats = torch.stack(stats, dim=0).reshape(-1, n_factors)
+        dfs = torch.tensor(dfs).unsqueeze(-1).expand(-1, n_factors)
+        return stats, dfs
+
+    def _du_pvalues_from_chi2(
+        self, stats: torch.Tensor, dfs: torch.Tensor
+    ) -> torch.Tensor:
+        """Return DU chi-square p-values with single-isoform genes set to one."""
+        pvals = torch.tensor(1 - chi2.cdf(stats.cpu(), df=dfs.cpu()))
+        pvals[dfs[:, 0] == 0] = 1.0
+        return pvals
+
+    def _store_du_results(
+        self,
+        stats: torch.Tensor,
+        pvals: torch.Tensor,
+        *,
+        method: str,
+    ) -> None:
+        """Store formatted DU results."""
+        self._du_test_results = {
+            "statistic": stats.cpu(),
+            "pvalue": pvals.cpu(),
+            "method": method,
+        }
+        self._du_test_results["pvalue_adj"] = false_discovery_control(
+            self._du_test_results["pvalue"], axis=0
+        )
 
     def test_spatial_variability(
         self,
@@ -1787,7 +1837,7 @@ class SplisosmGLMM:
 
         .. caution::
             The likelihood ratio statistic is not well-calibrated for sparse data.
-            We recommend the non-parametric HSIC-based tests in :class:`splisosm.hyptest_np.SplisosmNP`
+            We recommend the non-parametric HSIC-based tests in :class:`splisosm.hyptest.np.SplisosmNP`
             for spatial variability testing.
 
         Note that the parametric and non-parametric tests are assymptotically equivalent under the null.
@@ -1819,82 +1869,29 @@ class SplisosmGLMM:
 
         See also
         --------
-        :func:`splisosm.hyptest_np.SplisosmNP.test_spatial_variability` for non-parametric tests.
+        :meth:`splisosm.SplisosmNP.test_spatial_variability` for non-parametric tests.
         """
 
-        valid_methods = ["llr"]
-        assert (
-            method in valid_methods
-        ), f"Invalid method. Must be one of {valid_methods}."
-
-        # Parametric likelihood ratio test for spatial variability. Need to fit the null and full models.
-        if len(self._fitted_states["glmm-null"]) == 0:
-            raise ValueError(
-                "Null models not found. Please run fit() with from_null = True first."
-            )
-
-        _sv_llr_stats, _sv_llr_dfs = [], []
-        # iterate over genes and calculate the likelihood ratio statistic
-        for g_idx in range(self.n_genes):
-            # Single-isoform genes cannot be tested (no usage variation)
-            if self.n_isos_per_gene[g_idx] <= 1:
-                _sv_llr_stats.append(torch.tensor(0.0))
-                _sv_llr_dfs.append(torch.tensor(1))
-                continue
-            full_m = self._reconstruct_gene_model(g_idx, "glmm-full")
-            null_m = self._reconstruct_gene_model(g_idx, "glmm-null")
-            # use marginal likelihood for stability
-            llr, df = _calc_llr_spatial_variability(null_m, full_m)
-            _sv_llr_stats.append(llr)
-            _sv_llr_dfs.append(df)
-
-        _sv_llr_stats = torch.tensor(_sv_llr_stats)
-        _sv_llr_dfs = torch.tensor(_sv_llr_dfs)
-
-        if use_perm_null:
-            # use permutation to calculate the p-value.
-            if self._sv_llr_perm_stats is None:
-                self._fit_sv_llr_perm(
-                    n_perms=n_perms_per_gene if n_perms_per_gene is not None else 20,
-                    print_progress=print_progress,
-                    **kwargs,
-                )
-            else:  # use the cached results if available
-                print("Using cached permutation results...")
-
-            _sv_llr_perm = self._sv_llr_perm_stats
-            _sv_llr_pvals = 1 - (_sv_llr_stats[:, None] > _sv_llr_perm[None, :]).sum(
-                1
-            ) / len(_sv_llr_perm)
-        else:
-            # calculate the p-value using chi-square distribution
-            # move to CPU before scipy (scipy does not support non-CPU tensors)
-            _sv_llr_pvals = 1 - chi2.cdf(_sv_llr_stats.cpu(), df=_sv_llr_dfs.cpu())
-            _sv_llr_pvals = torch.tensor(_sv_llr_pvals)
-
-        # Single-isoform genes: force pval=1 (no usage variation to detect)
-        single_iso_mask = torch.tensor(
-            [n <= 1 for n in self.n_isos_per_gene], dtype=torch.bool
+        self._validate_sv_test(method)
+        stats, dfs = self._calc_sv_llr_stats()
+        pvals = self._sv_llr_pvalues(
+            stats,
+            dfs,
+            use_perm_null=use_perm_null,
+            n_perms_per_gene=n_perms_per_gene,
+            print_progress=print_progress,
+            perm_kwargs=kwargs,
         )
-        _sv_llr_pvals[single_iso_mask] = 1.0
-
-        # store the results (always on CPU for downstream pandas/numpy usage)
-        self._sv_test_results = {
-            "statistic": _sv_llr_stats.cpu().numpy(),
-            "pvalue": _sv_llr_pvals.cpu().numpy(),
-            "df": _sv_llr_dfs.cpu().numpy(),
-            "method": method,
-            "use_perm_null": use_perm_null,
-        }
-
-        # calculate adjusted p-values
-        self._sv_test_results["pvalue_adj"] = false_discovery_control(
-            self._sv_test_results["pvalue"]
+        self._store_sv_results(
+            stats,
+            pvals,
+            dfs,
+            method=method,
+            use_perm_null=use_perm_null,
         )
-
-        # return results
         if return_results:
             return self._sv_test_results
+        return None
 
     def test_differential_usage(
         self,
@@ -1904,12 +1901,12 @@ class SplisosmGLMM:
     ) -> Optional[dict[str, Any]]:
         """Parametric test for spatial isoform differential usage.
 
-        Before running this function, the design matrix must be set up using :func:`setup_data`.
+        Before running this function, the design matrix must be set up using :meth:`setup_data`.
         Each column of the design matrix corresponds to a covariate to test for differential association
         with the isoform usage ratios of each gene.
         Test statistics and p-values are computed per (gene, covariate) pair separately.
 
-        Similar to :func:`splisosm.hyptest_np.SplisosmNP.test_differential_usage`, here we also support two types of association tests but **implicitly**:
+        Similar to :meth:`splisosm.SplisosmNP.test_differential_usage`, here we also support two types of association tests but **implicitly**:
 
         - Unconditional (when ``model_type='glm'``): test the unconditional association between isoform usage ratios and the covariate of interest (H_0: ``beta`` = 0).
         - Conditional (when ``model_type='glmm-full'``): test for association (H_0: ``beta`` = 0) conditioned on the spatial random effect.
@@ -1939,130 +1936,17 @@ class SplisosmGLMM:
             If `return_results` is True, returns dict with test statistics and p-values.
             Otherwise, returns None and stores results in self._du_test_results.
         """
-        if self.design_mtx is None:
-            raise ValueError("No design matrix is provided. Run setup_data() first.")
-
-        n_spots, n_factors = self.design_mtx.shape
-
-        # check the validity of the specified method and transformation
-        valid_methods = ["wald", "score"]
-        assert (
-            method in valid_methods
-        ), f"Invalid method. Must be one of {valid_methods}."
-
-        if method == "score":  # Score test
-            # extract the fitted full models
-            fitted_models = self.get_fitted_models()
-            if len(fitted_models) == 0:
-                raise ValueError(
-                    "Fitted full models not found. Run fit(..., with_design_mtx = False) first."
-                )
-            if self._model_configs["fitting_configs"]["with_design_mtx"]:
-                raise ValueError(
-                    "Design matrix is included in the fitted models. "
-                    "Perhaps you want to use the wald test. Otherwise please run fit() with with_design_mtx = False."
-                )
-
-            _du_score_stats, _du_score_dfs = [], []
-            # iterate over genes and calculate the score statistic
-            for g_idx, m in enumerate(
-                tqdm(
-                    fitted_models,
-                    desc=f"DU [{method}]",
-                    total=len(fitted_models),
-                    disable=not print_progress,
-                )
-            ):
-                # Single-isoform genes: no differential usage possible
-                if self.n_isos_per_gene[g_idx] <= 1:
-                    _du_score_stats.append(torch.zeros(n_factors))
-                    _du_score_dfs.append(0)
-                    continue
-                score_stat, score_df = _calc_score_differential_usage(
-                    m, self.design_mtx
-                )
-                _du_score_stats.append(score_stat)
-                _du_score_dfs.append(score_df)
-
-            _du_score_stats = torch.stack(_du_score_stats, dim=0).reshape(
-                -1, n_factors
-            )  # (n_genes, n_factors)
-            _du_score_dfs = (
-                torch.tensor(_du_score_dfs).unsqueeze(-1).expand(-1, n_factors)
-            )  # (n_genes, n_factors)
-
-            # calculate the p-value using chi-square distribution
-            # move to CPU before scipy (scipy does not support non-CPU tensors)
-            _du_score_pvals = 1 - chi2.cdf(
-                _du_score_stats.cpu(), df=_du_score_dfs.cpu()
-            )
-            _du_score_pvals = torch.tensor(_du_score_pvals)
-            # Single-isoform genes (df=0): force pval=1 (no usage variation)
-            single_iso_mask = _du_score_dfs[:, 0] == 0
-            _du_score_pvals[single_iso_mask] = 1.0
-
-            # store the results (always on CPU for downstream pandas/numpy usage)
-            self._du_test_results = {
-                "statistic": _du_score_stats.cpu(),  # (n_genes, n_factors)
-                "pvalue": _du_score_pvals.cpu(),  # (n_genes, n_factors)
-                "method": method,
-            }
-
-        else:  # method == 'wald', Wald test (anti-conservative)
-            # extract the fitted full models
-            fitted_models = self.get_fitted_models()
-            if len(fitted_models) == 0:
-                raise ValueError("Fitted full models not found. Run fit() first.")
-            if not self._model_configs["fitting_configs"]["with_design_mtx"]:
-                raise ValueError(
-                    "Design matrix is not included in the fitted models. "
-                    "Perhaps you want to use the score test. Otherwise please run fit() with with_design_mtx = True."
-                )
-
-            _du_wald_stats, _du_wald_dfs = [], []
-            # iterate over genes and calculate the Wald statistic
-            for g_idx, m in enumerate(
-                tqdm(
-                    fitted_models,
-                    desc=f"DU [{method}]",
-                    total=len(fitted_models),
-                    disable=not print_progress,
-                )
-            ):
-                if self.n_isos_per_gene[g_idx] <= 1:
-                    _du_wald_stats.append(torch.zeros(n_factors))
-                    _du_wald_dfs.append(0)
-                    continue
-                wald_stat, wald_df = _calc_wald_differential_usage(m)
-                _du_wald_stats.append(wald_stat)
-                _du_wald_dfs.append(wald_df)
-
-            _du_wald_stats = torch.stack(_du_wald_stats, dim=0).reshape(
-                -1, n_factors
-            )  # (n_genes, n_factors)
-            _du_wald_dfs = (
-                torch.tensor(_du_wald_dfs).unsqueeze(-1).expand(-1, n_factors)
-            )  # (n_genes, n_factors)
-
-            # calculate the p-value using chi-square distribution
-            # move to CPU before scipy (scipy does not support non-CPU tensors)
-            _du_wald_pvals = 1 - chi2.cdf(_du_wald_stats.cpu(), df=_du_wald_dfs.cpu())
-            _du_wald_pvals = torch.tensor(_du_wald_pvals)
-            single_iso_mask = _du_wald_dfs[:, 0] == 0
-            _du_wald_pvals[single_iso_mask] = 1.0
-
-            # store the results (always on CPU for downstream pandas/numpy usage)
-            self._du_test_results = {
-                "statistic": _du_wald_stats.cpu(),  # (n_genes, n_factors)
-                "pvalue": _du_wald_pvals.cpu(),  # (n_genes, n_factors)
-                "method": method,
-            }
-
-        # calculate adjusted p-values (independently for each factor)
-        self._du_test_results["pvalue_adj"] = false_discovery_control(
-            self._du_test_results["pvalue"], axis=0
+        n_factors = self._validate_du_test(method)
+        stats, dfs = self._calc_du_stats(
+            method=method,
+            n_factors=n_factors,
+            print_progress=print_progress,
         )
-
-        # return the results if needed
+        self._store_du_results(
+            stats,
+            self._du_pvalues_from_chi2(stats, dfs),
+            method=method,
+        )
         if return_results:
             return self._du_test_results
+        return None

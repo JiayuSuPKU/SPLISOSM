@@ -59,6 +59,7 @@ __pycache__/
 .vscode
 
 *.egg-info
+src/splisosm/_version.py
 
 # notebook checkpoints
 .ipynb_checkpoints
@@ -80,3 +81,6 @@ dist/
 # claude code
 CLAUDE.md
 .claude/
+
+# codex
+AGENTS.md

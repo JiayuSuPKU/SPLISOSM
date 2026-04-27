@@ -26,6 +26,17 @@ class Kernel(ABC):
     def __init__(self) -> None:
         """Initialize kernel-specific state."""
 
+    @property
+    def n(self) -> int:
+        """Number of observations represented by the kernel.
+
+        Returns
+        -------
+        int
+            Kernel dimension.
+        """
+        return int(self._n)
+
     @abstractmethod
     def realization(self) -> torch.Tensor:
         """Return the realized dense kernel matrix.
@@ -37,13 +48,18 @@ class Kernel(ABC):
         """
 
     @abstractmethod
-    def xtKx(self, x: torch.Tensor) -> torch.Tensor:
+    def xtKx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> torch.Tensor:
         """Compute the quadratic form ``x^T K x``.
 
         Parameters
         ----------
-        x : torch.Tensor
-            Input matrix of shape ``(n_spots, d)``.
+        x
+            Input matrix of shape ``(n_spots, d)``. Implementations may
+            support dense NumPy arrays, dense/sparse torch tensors, and scipy
+            sparse matrices.
 
         Returns
         -------
@@ -88,7 +104,35 @@ class Kernel(ABC):
         """
 
     @abstractmethod
-    def xtKx_approx(self, x: torch.Tensor, k: int | None = None) -> torch.Tensor:
+    def Kx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> np.ndarray | torch.Tensor:
+        """Apply the effective kernel operator to a vector or dense matrix.
+
+        The effective operator is the same one used by :meth:`xtKx`; for
+        kernels constructed with ``centering=True`` this is ``H K H``.
+
+        Parameters
+        ----------
+        x
+            Array of shape ``(n_spots,)`` or ``(n_spots, n_vectors)``.
+            Implementations may also accept sparse matrices.
+
+        Returns
+        -------
+        np.ndarray or torch.Tensor
+            Kernel product with the same shape and array backend as ``x``.
+            Sparse inputs generally return dense outputs because ``K x`` is
+            dense for spatial covariance kernels.
+        """
+
+    @abstractmethod
+    def xtKx_approx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+        k: int | None = None,
+    ) -> torch.Tensor:
         """Compute ``x^T K_k x`` using a rank-``k`` approximation.
 
         Implementations must use only the top-``k`` eigenvalues/vectors and
@@ -97,8 +141,10 @@ class Kernel(ABC):
 
         Parameters
         ----------
-        x : torch.Tensor
-            Input matrix of shape ``(n_spots, d)``.
+        x
+            Input matrix of shape ``(n_spots, d)``. Implementations may
+            support dense NumPy arrays, dense/sparse torch tensors, and scipy
+            sparse matrices.
         k : int or None
             Number of leading eigenvalues to include.  ``None`` uses all
             available eigenvalues (full-rank approximation).
@@ -141,14 +187,85 @@ class IdentityKernel(Kernel):
                 _idx, _val, (n_spots, n_spots)
             )
 
+    @staticmethod
+    def _is_torch_sparse(x: object) -> bool:
+        """Return whether ``x`` is a torch sparse tensor layout."""
+        return isinstance(x, torch.Tensor) and x.layout != torch.strided
+
+    @staticmethod
+    def _torch_float_view(x: torch.Tensor) -> torch.Tensor:
+        """Return ``x`` with a floating dtype suitable for kernel algebra."""
+        if x.dtype.is_floating_point or x.dtype.is_complex:
+            return x
+        return x.to(dtype=torch.float32)
+
+    def Kx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> np.ndarray | torch.Tensor:
+        """Apply ``I`` or ``H`` to ``x``."""
+        is_torch = isinstance(x, torch.Tensor)
+        if is_torch:
+            if self._is_torch_sparse(x):
+                arr = x.to_dense().detach().cpu().numpy()
+            else:
+                arr = x.detach().cpu().numpy()
+            dtype = x.dtype
+            device = x.device
+        elif scipy.sparse.issparse(x):
+            arr = x.toarray()
+            dtype = None
+            device = None
+        else:
+            arr = np.asarray(x)
+            dtype = None
+            device = None
+
+        out = np.asarray(arr, dtype=float)
+        if out.shape[0] != self._n:
+            raise ValueError(f"Expected first dimension {self._n}, got {out.shape[0]}.")
+        if self._centering:
+            axis = 0 if out.ndim > 1 else None
+            out = out - out.mean(axis=axis, keepdims=out.ndim > 1)
+        if is_torch:
+            return torch.as_tensor(out, dtype=dtype, device=device)
+        return out
+
     def realization(self) -> torch.Tensor:
         """Return ``I`` (or ``H = I - (1/n) 1 1^T`` when ``centering=True``)."""
         if self._centering:
             return torch.eye(self._n) - torch.full((self._n, self._n), 1.0 / self._n)
         return torch.eye(self._n)
 
-    def xtKx(self, x: torch.Tensor) -> torch.Tensor:
+    def xtKx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> torch.Tensor:
         """Compute ``x^T K x`` where ``K = I`` (or ``H I H = H`` when centred)."""
+        if scipy.sparse.issparse(x):
+            if x.shape[0] != self._n:
+                raise ValueError(
+                    f"Expected first dimension {self._n}, got {x.shape[0]}."
+                )
+            if self._centering:
+                x_dense = x.toarray().astype(np.float32, copy=False)
+                x_dense = x_dense - x_dense.mean(axis=0, keepdims=True)
+                return torch.from_numpy(x_dense.T @ x_dense)
+            q = x.T @ x
+            if scipy.sparse.issparse(q):
+                q = q.toarray()
+            return torch.from_numpy(np.asarray(q, dtype=np.float32))
+
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(np.asarray(x, dtype=np.float32))
+        elif self._is_torch_sparse(x):
+            x = x.to_dense()
+
+        if x.ndim == 1:
+            x = x[:, None]
+        if x.shape[0] != self._n:
+            raise ValueError(f"Expected first dimension {self._n}, got {x.shape[0]}.")
+        x = self._torch_float_view(x)
         xc = x - x.mean(dim=0, keepdim=True) if self._centering else x
         return xc.t() @ xc
 
@@ -528,6 +645,84 @@ class SpatialCovKernel(Kernel):
             self._lu = splu(self.inv_cov)
         return self._lu
 
+    @staticmethod
+    def _is_torch_sparse(x: object) -> bool:
+        """Return whether ``x`` is a torch sparse tensor layout."""
+        if not isinstance(x, torch.Tensor):
+            return False
+        sparse_layouts = {
+            getattr(torch, name)
+            for name in (
+                "sparse_coo",
+                "sparse_csr",
+                "sparse_csc",
+                "sparse_bsr",
+                "sparse_bsc",
+            )
+            if hasattr(torch, name)
+        }
+        return x.layout in sparse_layouts
+
+    @staticmethod
+    def _as_numpy_2d(x: np.ndarray | torch.Tensor) -> tuple[np.ndarray, bool]:
+        """Return a float64 ``(n, m)`` array and whether the input was 1-D."""
+        if isinstance(x, torch.Tensor):
+            if SpatialCovKernel._is_torch_sparse(x):
+                arr = x.to_dense().detach().cpu().numpy()
+            else:
+                arr = x.detach().cpu().numpy()
+        else:
+            arr = np.asarray(x)
+        squeeze = arr.ndim == 1
+        if squeeze:
+            arr = arr[:, None]
+        if arr.ndim != 2:
+            raise ValueError("`x` must have shape (n_spots,) or (n_spots, n_vectors).")
+        return np.asarray(arr, dtype=np.float64), squeeze
+
+    @staticmethod
+    def _restore_array_type(
+        out: np.ndarray,
+        template: np.ndarray | torch.Tensor,
+        squeeze: bool,
+    ) -> np.ndarray | torch.Tensor:
+        """Restore shape/backend after an internal numpy calculation."""
+        if squeeze:
+            out = out[:, 0]
+        if isinstance(template, torch.Tensor):
+            dtype = (
+                template.dtype
+                if template.dtype.is_floating_point or template.dtype.is_complex
+                else torch.float32
+            )
+            return torch.as_tensor(out, dtype=dtype, device=template.device)
+        return out
+
+    @staticmethod
+    def _torch_float_view(x: torch.Tensor) -> torch.Tensor:
+        """Return ``x`` with a floating dtype suitable for kernel algebra."""
+        if x.dtype.is_floating_point or x.dtype.is_complex:
+            return x
+        return x.to(dtype=torch.float32)
+
+    def _apply_numpy_2d(self, arr: np.ndarray) -> np.ndarray:
+        """Apply the effective kernel to a dense float64 ``(n, m)`` array."""
+        if arr.shape[0] != self._n:
+            raise ValueError(f"Expected first dimension {self._n}, got {arr.shape[0]}.")
+
+        if self._centering:
+            arr = arr - arr.mean(axis=0, keepdims=True)
+
+        if self.K_sp is not None:
+            out = self.K_sp.numpy().astype(np.float64, copy=False) @ arr
+        else:
+            out = self._get_lu().solve(arr)
+
+        if self._centering:
+            out = out - out.mean(axis=0, keepdims=True)
+
+        return np.asarray(out, dtype=np.float64)
+
     def _hutchinson_trace(
         self, squared: bool, n_vectors: int = 30, seed: int = 0
     ) -> float:
@@ -619,7 +814,10 @@ class SpatialCovKernel(Kernel):
             K -= K.mean(axis=1, keepdims=True)
         return torch.from_numpy(0.5 * (K + K.T))
 
-    def xtKx(self, x: torch.Tensor) -> torch.Tensor:
+    def xtKx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> torch.Tensor:
         """Compute ``x^T K x`` using the cached low-rank factor when available.
 
         When :attr:`Q` has been populated (by a prior :meth:`eigenvalues` call)
@@ -637,8 +835,10 @@ class SpatialCovKernel(Kernel):
 
         Parameters
         ----------
-        x : torch.Tensor
-            Input matrix of shape ``(n_spots, d)``.
+        x
+            Input matrix of shape ``(n_spots, d)``. Dense NumPy arrays,
+            dense/sparse torch tensors, and scipy sparse matrices are
+            supported.
 
         Returns
         -------
@@ -650,11 +850,53 @@ class SpatialCovKernel(Kernel):
         xtKx_exact : Always uses the exact path (dense multiply or LU solve).
         """
         if self.Q is not None:
-            xtQ = x.t() @ self.Q
+            Q = self.Q
+            if scipy.sparse.issparse(x):
+                xtQ = x.T @ Q.detach().cpu().numpy()
+                xtQ = torch.from_numpy(np.asarray(xtQ, dtype=np.float32))
+            elif self._is_torch_sparse(x):
+                x = self._torch_float_view(x)
+                xtQ = torch.sparse.mm(
+                    x.transpose(0, 1), Q.to(dtype=x.dtype, device=x.device)
+                )
+            elif isinstance(x, np.ndarray):
+                xtQ = torch.from_numpy(np.asarray(x, dtype=np.float32)).t() @ Q
+            else:
+                xtQ = x.t() @ Q.to(dtype=x.dtype, device=x.device)
             return xtQ @ xtQ.t()
         return self.xtKx_exact(x)
 
-    def xtKx_exact(self, x: torch.Tensor) -> torch.Tensor:
+    def Kx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> np.ndarray | torch.Tensor:
+        """Apply ``K`` or ``H K H`` to ``x``.
+
+        Parameters
+        ----------
+        x
+            Vector or matrix with first dimension ``n_spots``. Dense NumPy,
+            dense/sparse torch, and scipy sparse inputs are supported.
+
+        Returns
+        -------
+        np.ndarray or torch.Tensor
+            Kernel product. SciPy sparse inputs return a dense ``np.ndarray``;
+            torch inputs return a dense ``torch.Tensor`` on the original device.
+        """
+        if scipy.sparse.issparse(x):
+            arr = x.toarray().astype(np.float64, copy=False)
+            out = self._apply_numpy_2d(arr)
+            return out
+
+        arr, squeeze = self._as_numpy_2d(x)
+        out = self._apply_numpy_2d(arr)
+        return self._restore_array_type(out, x, squeeze)
+
+    def xtKx_exact(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> torch.Tensor:
         """Compute ``x^T K x`` exactly, bypassing any cached low-rank factor.
 
         Always uses the full kernel:
@@ -671,8 +913,11 @@ class SpatialCovKernel(Kernel):
 
         Parameters
         ----------
-        x : torch.Tensor
-            Input matrix of shape ``(n_spots, d)``.
+        x
+            Input matrix of shape ``(n_spots, d)``. Dense NumPy arrays,
+            dense/sparse torch tensors, and scipy sparse matrices are
+            supported. Sparse inputs keep the left factor sparse while the
+            kernel product ``K x`` is dense.
 
         Returns
         -------
@@ -683,21 +928,49 @@ class SpatialCovKernel(Kernel):
         --------
         xtKx : Uses cached Q (low-rank approximation) when available.
         """
+        if scipy.sparse.issparse(x):
+            if x.shape[0] != self._n:
+                raise ValueError(
+                    f"Expected first dimension {self._n}, got {x.shape[0]}."
+                )
+            kx = np.asarray(self.Kx(x), dtype=np.float64)
+            q = x.T @ kx
+            if scipy.sparse.issparse(q):
+                q = q.toarray()
+            return torch.from_numpy(np.asarray(q, dtype=np.float32))
+
+        if self._is_torch_sparse(x):
+            if x.shape[0] != self._n:
+                raise ValueError(
+                    f"Expected first dimension {self._n}, got {x.shape[0]}."
+                )
+            x = self._torch_float_view(x)
+            kx = self.Kx(x)
+            return torch.sparse.mm(x.transpose(0, 1), kx).to(dtype=torch.float32)
+
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(np.asarray(x, dtype=np.float32))
+
         # Dense: direct multiply (always exact regardless of Q).
         if self.K_sp is not None:
-            return x.t() @ self.K_sp @ x
+            K = self.K_sp.to(dtype=x.dtype, device=x.device)
+            return x.t() @ K @ x
 
         # Implicit: sparse LU solve.  When ``_centering=True`` the effective
         # kernel is HKH, so column-centre x first: x_c = Hx, then
         # x^T (HKH) x = x_c^T K x_c  (H is symmetric idempotent).
         lu = self._get_lu()
-        x_np = x.numpy().astype(np.float64)
+        x_np = x.detach().cpu().numpy().astype(np.float64)
         if self._centering:
             x_np = x_np - x_np.mean(axis=0, keepdims=True)
         u = lu.solve(x_np)  # shape (n, d)
         return torch.from_numpy((x_np.T @ u).astype(np.float32))
 
-    def xtKx_approx(self, x: torch.Tensor, k: int | None = None) -> torch.Tensor:
+    def xtKx_approx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+        k: int | None = None,
+    ) -> torch.Tensor:
         """Compute ``x^T K_k x`` via the top-``k`` low-rank factor.
 
         Calls :meth:`eigenvalues` to ensure :attr:`Q` is populated for at
@@ -707,8 +980,10 @@ class SpatialCovKernel(Kernel):
 
         Parameters
         ----------
-        x : torch.Tensor
-            Input matrix of shape ``(n_spots, d)``.
+        x
+            Input matrix of shape ``(n_spots, d)``. Dense NumPy arrays,
+            dense/sparse torch tensors, and scipy sparse matrices are
+            supported.
         k : int or None
             Number of leading eigenvalues to include.  ``None`` uses all
             available eigenvalues (populates the full Q first).
@@ -720,7 +995,18 @@ class SpatialCovKernel(Kernel):
         """
         self.eigenvalues(k=k)  # ensures Q is populated to at least rank k
         Q_k = self.Q if k is None else self.Q[:, :k]
-        xtQ = x.t() @ Q_k
+        if scipy.sparse.issparse(x):
+            xtQ = x.T @ Q_k.detach().cpu().numpy()
+            xtQ = torch.from_numpy(np.asarray(xtQ, dtype=np.float32))
+        elif self._is_torch_sparse(x):
+            x = self._torch_float_view(x)
+            xtQ = torch.sparse.mm(
+                x.transpose(0, 1), Q_k.to(dtype=x.dtype, device=x.device)
+            )
+        elif isinstance(x, np.ndarray):
+            xtQ = torch.from_numpy(np.asarray(x, dtype=np.float32)).t() @ Q_k
+        else:
+            xtQ = x.t() @ Q_k.to(dtype=x.dtype, device=x.device)
         return xtQ @ xtQ.t()
 
     def eigenvalues(self, k: int | None = None) -> torch.Tensor:
@@ -852,6 +1138,215 @@ class SpatialCovKernel(Kernel):
         return torch.tensor(self._hutchinson_trace(squared=True), dtype=torch.float32)
 
 
+class _MaskedSpatialKernel(Kernel):
+    """Subset kernel operator without materializing the parent dense kernel.
+
+    This represents ``H_s S K_eff S.T H_s`` where ``S`` selects the retained
+    spots, ``H_s`` centres over the retained subset, and ``K_eff`` is the
+    effective operator exposed by the base kernel.  If the base kernel was
+    constructed with ``centering=True``, ``K_eff`` is already ``H K H``.
+    """
+
+    base_kernel: Kernel
+    keep_mask: np.ndarray
+    keep_idx: np.ndarray
+    Q: torch.Tensor | None
+    K_eigvals: torch.Tensor | None
+    K_eigvecs: torch.Tensor | None
+
+    def __init__(self, base_kernel: Kernel, keep_mask: np.ndarray) -> None:
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+        if keep_mask.ndim != 1:
+            raise ValueError("`keep_mask` must be a one-dimensional boolean array.")
+        if keep_mask.size != int(base_kernel.n):
+            raise ValueError(
+                f"Expected keep_mask length {int(base_kernel.n)}, got {keep_mask.size}."
+            )
+        self.base_kernel = base_kernel
+        self.keep_mask = keep_mask
+        self.keep_idx = np.flatnonzero(keep_mask)
+        self._n = int(self.keep_idx.size)
+        self._rank = self._n
+        self._centering = True
+        self.Q = None
+        self.K_eigvals = None
+        self.K_eigvecs = None
+
+    def shape(self) -> tuple[int, int]:
+        """Return kernel shape ``(n_kept_spots, n_kept_spots)``."""
+        return (self._n, self._n)
+
+    def rank(self) -> int:
+        """Return effective rank of the masked representation."""
+        return self._rank
+
+    @staticmethod
+    def _as_numpy_2d(
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> tuple[np.ndarray, bool]:
+        """Return a float64 ``(n, m)`` array and whether input was 1-D."""
+        if scipy.sparse.issparse(x):
+            arr = x.toarray()
+        elif isinstance(x, torch.Tensor):
+            if SpatialCovKernel._is_torch_sparse(x):
+                arr = x.to_dense().detach().cpu().numpy()
+            else:
+                arr = x.detach().cpu().numpy()
+        else:
+            arr = np.asarray(x)
+        squeeze = arr.ndim == 1
+        if squeeze:
+            arr = arr[:, None]
+        if arr.ndim != 2:
+            raise ValueError("`x` must have shape (n_spots,) or (n_spots, n_vectors).")
+        return np.asarray(arr, dtype=np.float64), squeeze
+
+    @staticmethod
+    def _restore_array_type(
+        out: np.ndarray,
+        template: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+        squeeze: bool,
+    ) -> np.ndarray | torch.Tensor:
+        """Restore shape/backend after an internal numpy calculation."""
+        if squeeze:
+            out = out[:, 0]
+        if isinstance(template, torch.Tensor):
+            dtype = (
+                template.dtype
+                if template.dtype.is_floating_point or template.dtype.is_complex
+                else torch.float32
+            )
+            return torch.as_tensor(out, dtype=dtype, device=template.device)
+        return out
+
+    def _apply_numpy_2d(self, arr: np.ndarray) -> np.ndarray:
+        """Apply ``H_s S K_eff S.T H_s`` to a dense float64 block."""
+        if arr.shape[0] != self._n:
+            raise ValueError(f"Expected first dimension {self._n}, got {arr.shape[0]}.")
+
+        arr = arr - arr.mean(axis=0, keepdims=True)
+        full = np.zeros((int(self.base_kernel.n), arr.shape[1]), dtype=np.float64)
+        full[self.keep_idx, :] = arr
+        out = np.asarray(self.base_kernel.Kx(full), dtype=np.float64)[self.keep_idx, :]
+        out = out - out.mean(axis=0, keepdims=True)
+        return out
+
+    def Kx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> np.ndarray | torch.Tensor:
+        """Apply the masked, subset-centred effective kernel to ``x``."""
+        arr, squeeze = self._as_numpy_2d(x)
+        out = self._apply_numpy_2d(arr)
+        return self._restore_array_type(out, x, squeeze)
+
+    def xtKx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> torch.Tensor:
+        """Compute ``x.T @ K_mask @ x`` using cached ``Q`` when available."""
+        if self.Q is not None:
+            Q = self.Q
+            if scipy.sparse.issparse(x):
+                xtQ = x.T @ Q.detach().cpu().numpy()
+                xtQ = torch.from_numpy(np.asarray(xtQ, dtype=np.float32))
+            elif SpatialCovKernel._is_torch_sparse(x):
+                x = SpatialCovKernel._torch_float_view(x)
+                xtQ = torch.sparse.mm(
+                    x.transpose(0, 1), Q.to(dtype=x.dtype, device=x.device)
+                )
+            elif isinstance(x, np.ndarray):
+                xtQ = torch.from_numpy(np.asarray(x, dtype=np.float32)).t() @ Q
+            else:
+                xtQ = x.t() @ Q.to(dtype=x.dtype, device=x.device)
+            return xtQ @ xtQ.t()
+        return self.xtKx_exact(x)
+
+    def xtKx_exact(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    ) -> torch.Tensor:
+        """Compute ``x.T @ K_mask @ x`` exactly from the masked operator."""
+        if scipy.sparse.issparse(x):
+            if x.shape[0] != self._n:
+                raise ValueError(
+                    f"Expected first dimension {self._n}, got {x.shape[0]}."
+                )
+            kx = np.asarray(self.Kx(x), dtype=np.float64)
+            q = x.T @ kx
+            if scipy.sparse.issparse(q):
+                q = q.toarray()
+            return torch.from_numpy(np.asarray(q, dtype=np.float32))
+
+        if SpatialCovKernel._is_torch_sparse(x):
+            if x.shape[0] != self._n:
+                raise ValueError(
+                    f"Expected first dimension {self._n}, got {x.shape[0]}."
+                )
+            x = SpatialCovKernel._torch_float_view(x)
+            kx = self.Kx(x)
+            return torch.sparse.mm(x.transpose(0, 1), kx).to(dtype=torch.float32)
+
+        arr, _ = self._as_numpy_2d(x)
+        kx = np.asarray(self.Kx(arr), dtype=np.float64)
+        return torch.from_numpy((arr.T @ kx).astype(np.float32))
+
+    def xtKx_approx(
+        self,
+        x: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+        k: int | None = None,
+    ) -> torch.Tensor:
+        """Compute ``x.T @ K_mask,k @ x`` from the top masked eigenvectors."""
+        self.eigenvalues(k=k)
+        Q_k = self.Q if k is None else self.Q[:, :k]
+        if scipy.sparse.issparse(x):
+            xtQ = x.T @ Q_k.detach().cpu().numpy()
+            xtQ = torch.from_numpy(np.asarray(xtQ, dtype=np.float32))
+        elif SpatialCovKernel._is_torch_sparse(x):
+            x = SpatialCovKernel._torch_float_view(x)
+            xtQ = torch.sparse.mm(
+                x.transpose(0, 1), Q_k.to(dtype=x.dtype, device=x.device)
+            )
+        elif isinstance(x, np.ndarray):
+            xtQ = torch.from_numpy(np.asarray(x, dtype=np.float32)).t() @ Q_k
+        else:
+            xtQ = x.t() @ Q_k.to(dtype=x.dtype, device=x.device)
+        return xtQ @ xtQ.t()
+
+    def realization(self) -> torch.Tensor:
+        """Return the dense masked kernel matrix."""
+        eye = np.eye(self._n, dtype=np.float64)
+        K = np.asarray(self.Kx(eye), dtype=np.float64)
+        K = 0.5 * (K + K.T)
+        return torch.from_numpy(K.astype(np.float32))
+
+    def eigenvalues(self, k: int | None = None) -> torch.Tensor:
+        """Return masked-kernel eigenvalues in descending order."""
+        if self.K_eigvals is None:
+            K = self.realization().numpy()
+            eigvals, eigvecs = np.linalg.eigh(K)
+            idx = eigvals.argsort()[::-1]
+            eigvals = eigvals[idx].astype(np.float32)
+            eigvecs = eigvecs[:, idx].astype(np.float32)
+            self.K_eigvals = torch.from_numpy(eigvals)
+            self.K_eigvecs = torch.from_numpy(eigvecs)
+            pos = self.K_eigvals > 0
+            self.Q = self.K_eigvecs[:, pos] * self.K_eigvals[pos].sqrt()[None, :]
+            self._rank = int(pos.sum())
+        if k is None:
+            return self.K_eigvals
+        return self.K_eigvals[: min(int(k), len(self.K_eigvals))]
+
+    def trace(self) -> torch.Tensor:
+        """Return ``tr(K_mask)``."""
+        return torch.trace(self.realization())
+
+    def square_trace(self) -> torch.Tensor:
+        """Return ``tr(K_mask^2)``."""
+        K = self.realization()
+        return K.pow(2).sum()
+
+
 class FFTKernel(Kernel):
     """FFT-based spatial kernel on a periodic 2D raster grid.
 
@@ -901,6 +1396,7 @@ class FFTKernel(Kernel):
         self.ny, self.nx = int(shape[0]), int(shape[1])
         self.dy, self.dx = float(spacing[0]), float(spacing[1])
         self.n_grid = self.ny * self.nx
+        self._n = self.n_grid
         self.neighbor_degree = int(neighbor_degree)
         self.rho = min(float(rho), 0.99)
         self.workers = workers
@@ -987,6 +1483,67 @@ class FFTKernel(Kernel):
         weighted = np.sum(power * self._spectrum_2d[:, :, None], axis=(0, 1))
         q = weighted / (self.n_grid)
         return float(q[0]) if q.size == 1 else q
+
+    def Kx(self, x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+        """Apply the FFT kernel to flat or grid-shaped input.
+
+        Parameters
+        ----------
+        x
+            Input with shape ``(n_grid,)``, ``(n_grid, m)``, ``(ny, nx)``,
+            or ``(ny, nx, m)``.
+
+        Returns
+        -------
+        np.ndarray or torch.Tensor
+            Kernel product with the same shape/backend as ``x``.
+        """
+        is_torch = isinstance(x, torch.Tensor)
+        if is_torch:
+            arr = x.detach().cpu().numpy()
+            dtype = x.dtype
+            device = x.device
+        else:
+            arr = np.asarray(x)
+            dtype = None
+            device = None
+
+        original_shape = arr.shape
+        arr = np.asarray(arr, dtype=float)
+
+        if arr.ndim == 1:
+            if arr.size != self.n_grid:
+                raise ValueError(f"Expected length {self.n_grid}, got {arr.size}.")
+            cube = arr.reshape(self.ny, self.nx, 1)
+        elif arr.ndim == 2 and arr.shape == (self.ny, self.nx):
+            cube = arr[:, :, None]
+        elif arr.ndim == 2 and arr.shape[0] == self.n_grid:
+            cube = arr.reshape(self.ny, self.nx, arr.shape[1])
+        elif arr.ndim == 3 and arr.shape[:2] == (self.ny, self.nx):
+            cube = arr
+        else:
+            raise ValueError(
+                "`x` must have shape (n_grid,), (n_grid, m), (ny, nx), or (ny, nx, m)."
+            )
+
+        x_hat = scipy.fft.fft2(cube, axes=(0, 1), workers=self.workers)
+        out = np.real(
+            scipy.fft.ifft2(
+                x_hat * self._spectrum_2d[:, :, None],
+                axes=(0, 1),
+                workers=self.workers,
+            )
+        )
+        if len(original_shape) == 1:
+            out = out.reshape(self.n_grid)
+        elif len(original_shape) == 2 and original_shape == (self.ny, self.nx):
+            out = out[:, :, 0]
+        elif len(original_shape) == 2:
+            out = out.reshape(self.n_grid, original_shape[1])
+
+        if is_torch:
+            return torch.as_tensor(out, dtype=dtype, device=device)
+        return out
 
     def xtKx_approx(self, x, k: int | None = None):
         """Same as :meth:`xtKx` (FFT is already exact for periodic grids)."""

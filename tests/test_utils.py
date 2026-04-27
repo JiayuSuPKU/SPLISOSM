@@ -12,15 +12,16 @@ import scipy.stats
 import torch
 from anndata import AnnData
 from unittest.mock import patch
+from splisosm.io import load_visium_sp_meta
+from splisosm.utils._chunking import pack_gene_chunks
 from splisosm.utils import (
+    auto_chunk_size,
     counts_to_ratios,
     false_discovery_control,
-    load_visium_sp_meta,
     add_ratio_layer,
     extract_gene_level_statistics,
     run_hsic_gc,
     run_sparkx,
-    _index_rows_sparse_coo,
 )
 
 
@@ -245,6 +246,69 @@ class TestUtils(unittest.TestCase):
             res_np["statistic"], res_torch_sparse["statistic"], rtol=1e-4
         )
 
+    def test_auto_chunk_size_and_gene_packing(self):
+        """Auto chunking caps response columns and keeps genes whole."""
+        self.assertEqual(auto_chunk_size(100, backend="np"), 32)
+        self.assertEqual(auto_chunk_size(100, backend="fft"), 32)
+        self.assertEqual(
+            auto_chunk_size(
+                1_000_000,
+                backend="fft",
+                memory_budget=64 * (1 << 20),
+            ),
+            1,
+        )
+
+        chunks = pack_gene_chunks([3, 4, 40, 2, 30], 32)
+        self.assertEqual(chunks, [[0, 1], [2], [3, 4]])
+
+    def test_run_hsic_gc_chunk_size_matches_single_column(self):
+        """Chunked HSIC-GC matches one-column execution for sparse input."""
+        np.random.seed(101)
+        n_spots, n_genes = 60, 7
+        counts = np.random.poisson(1.0, size=(n_spots, n_genes)).astype(np.float32)
+        counts[counts < 2] = 0
+        coords = np.random.rand(n_spots, 2).astype(np.float32)
+        counts_sp = scipy.sparse.csr_matrix(counts)
+
+        res_one = run_hsic_gc(counts_sp, coords, chunk_size=1)
+        res_chunk = run_hsic_gc(counts_sp, coords, chunk_size=32)
+        np.testing.assert_allclose(
+            res_one["statistic"], res_chunk["statistic"], rtol=1e-5, atol=1e-8
+        )
+        np.testing.assert_allclose(
+            res_one["pvalue"], res_chunk["pvalue"], rtol=1e-5, atol=1e-8
+        )
+        self.assertEqual(res_chunk["chunk_size"], 32)
+
+    def test_run_hsic_gc_n_jobs_matches_serial(self):
+        """Parallel HSIC-GC chunks match serial execution."""
+        np.random.seed(102)
+        n_spots, n_genes = 55, 8
+        counts = np.random.poisson(1.2, size=(n_spots, n_genes)).astype(np.float32)
+        counts[counts < 2] = 0
+        coords = np.random.rand(n_spots, 2).astype(np.float32)
+        counts_sp = scipy.sparse.csr_matrix(counts)
+
+        res_serial = run_hsic_gc(counts_sp, coords, chunk_size=2, n_jobs=1)
+        res_parallel = run_hsic_gc(counts_sp, coords, chunk_size=2, n_jobs=2)
+        np.testing.assert_allclose(
+            res_serial["statistic"],
+            res_parallel["statistic"],
+            rtol=1e-5,
+            atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            res_serial["pvalue"], res_parallel["pvalue"], rtol=1e-5, atol=1e-8
+        )
+
+    def test_run_hsic_gc_n_jobs_zero_raises(self):
+        """n_jobs follows joblib-style validation and disallows zero."""
+        counts = np.ones((12, 3), dtype=np.float32)
+        coords = np.random.rand(12, 2).astype(np.float32)
+        with self.assertRaises(ValueError):
+            run_hsic_gc(counts, coords, n_jobs=0)
+
     def test_run_hsic_gc_anndata_mode(self):
         """AnnData mode loads adata.X / adata.layers[layer] as gene-level counts."""
         np.random.seed(1)
@@ -299,10 +363,20 @@ class TestUtils(unittest.TestCase):
         counts_np = np.random.randint(0, 5, size=(n_spots, n_genes)).astype(np.float32)
         coords_np = np.random.rand(n_spots, 2).astype(np.float32)
 
-        res_eig = run_hsic_gc(counts_np, coords_np, null_method="eig")
-        res_clt = run_hsic_gc(counts_np, coords_np, null_method="clt")
+        res_liu = run_hsic_gc(counts_np, coords_np, null_method="liu")
+        res_welch = run_hsic_gc(counts_np, coords_np, null_method="welch")
+        res_welch_dir = run_hsic_gc(
+            counts_np,
+            coords_np,
+            null_method="welch",
+            null_configs={"n_probes": 8},
+        )
 
-        for res, nm in [(res_eig, "eig"), (res_clt, "clt")]:
+        for res, nm in [
+            (res_liu, "liu"),
+            (res_welch, "welch"),
+            (res_welch_dir, "welch"),
+        ]:
             self.assertEqual(res["null_method"], nm)
             self.assertEqual(len(res["pvalue"]), n_genes)
             self.assertTrue(np.all(res["pvalue"] >= 0) and np.all(res["pvalue"] <= 1))
@@ -311,13 +385,13 @@ class TestUtils(unittest.TestCase):
 
         # Statistics must be identical (same kernel, same counts; only null differs)
         np.testing.assert_allclose(
-            res_eig["statistic"], res_clt["statistic"], rtol=1e-5
+            res_liu["statistic"], res_welch["statistic"], rtol=1e-5
         )
 
         # P-value rankings should agree between methods
-        rho, _ = scipy.stats.spearmanr(res_eig["pvalue"], res_clt["pvalue"])
+        rho, _ = scipy.stats.spearmanr(res_liu["pvalue"], res_welch["pvalue"])
         self.assertGreater(
-            rho, 0.9, f"Spearman r of p-values between eig and clt was only {rho:.3f}"
+            rho, 0.9, f"Spearman r of p-values between Liu and Welch was only {rho:.3f}"
         )
 
         # Invalid null method
@@ -678,39 +752,6 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(len(out["pvalue"]), 2)
 
 
-class TestIndexRowsSparseCoo(unittest.TestCase):
-    def test_correctness(self):
-        """_index_rows_sparse_coo must match dense row indexing without densifying."""
-        torch.manual_seed(0)
-        n, m = 20, 5
-        mask = torch.rand(n, m) < 0.3
-        dense = torch.randn(n, m) * mask.float()
-        sparse = dense.to_sparse()
-        keep_indices = np.array([0, 3, 7, 11, 15, 19], dtype=np.int64)
-        result = _index_rows_sparse_coo(sparse, keep_indices)
-        self.assertEqual(result.shape, torch.Size([len(keep_indices), m]))
-        torch.testing.assert_close(result.to_dense(), dense[keep_indices])
-
-    def test_uncoalesced(self):
-        """Helper must handle uncoalesced (duplicate-index) COO tensors."""
-        indices = torch.tensor([[0, 0, 1, 2], [0, 0, 1, 2]], dtype=torch.long)
-        values = torch.tensor([1.0, 2.0, 3.0, 4.0])
-        t = torch.sparse_coo_tensor(indices, values, size=(4, 3))
-        self.assertFalse(t.is_coalesced())
-        keep_indices = np.array([0, 2], dtype=np.int64)
-        result = _index_rows_sparse_coo(t, keep_indices)
-        torch.testing.assert_close(
-            result.to_dense(), t.coalesce().to_dense()[keep_indices]
-        )
-
-    def test_empty_keep(self):
-        """Keeping zero rows yields an empty sparse tensor."""
-        t = torch.eye(5).to_sparse()
-        result = _index_rows_sparse_coo(t, np.array([], dtype=np.int64))
-        self.assertEqual(result.shape, torch.Size([0, 5]))
-        self.assertEqual(result.to_dense().numel(), 0)
-
-
 class TestRunHsicGc(unittest.TestCase):
     """Comprehensive tests for run_hsic_gc — matrix mode and AnnData mode."""
 
@@ -756,7 +797,7 @@ class TestRunHsicGc(unittest.TestCase):
         ):
             self.assertIn(key, res)
         self.assertEqual(res["method"], "hsic-gc")
-        self.assertEqual(res["null_method"], "eig")
+        self.assertEqual(res["null_method"], "liu")
         self.assertEqual(res["n_spots"], counts.shape[0])
         self.assertEqual(len(res["statistic"]), counts.shape[1])
         self.assertTrue(np.all(res["pvalue"] >= 0))
@@ -787,34 +828,41 @@ class TestRunHsicGc(unittest.TestCase):
         res_sp = run_hsic_gc(torch.from_numpy(counts).to_sparse(), coords)
         np.testing.assert_allclose(res_np["statistic"], res_sp["statistic"], rtol=1e-4)
 
-    def test_matrix_mode_null_method_clt(self):
-        """'clt' null method returns valid p-values and same statistic as 'eig'."""
+    def test_matrix_mode_null_method_welch(self):
+        """'welch' null method returns valid p-values and same statistic as Liu."""
         counts, coords = self._make_matrix_inputs()
-        res_eig = run_hsic_gc(counts, coords, null_method="eig")
-        res_clt = run_hsic_gc(counts, coords, null_method="clt")
-        self.assertEqual(res_clt["null_method"], "clt")
+        res_liu = run_hsic_gc(counts, coords, null_method="liu")
+        res_welch = run_hsic_gc(counts, coords, null_method="welch")
+        self.assertEqual(res_welch["null_method"], "welch")
         np.testing.assert_allclose(
-            res_eig["statistic"], res_clt["statistic"], rtol=1e-5
+            res_liu["statistic"], res_welch["statistic"], rtol=1e-5
         )
-        self.assertTrue(np.all(res_clt["pvalue"] >= 0))
-        self.assertTrue(np.all(res_clt["pvalue"] <= 1))
+        self.assertTrue(np.all(res_welch["pvalue"] >= 0))
+        self.assertTrue(np.all(res_welch["pvalue"] <= 1))
 
-    def test_matrix_mode_null_method_trace_alias_deprecated(self):
-        """'trace' is accepted as a deprecated alias for 'clt'."""
+    def test_matrix_mode_null_method_aliases_deprecated(self):
+        """Legacy null names are mapped to canonical Liu/Welch names."""
         counts, coords = self._make_matrix_inputs()
-        res_clt = run_hsic_gc(counts, coords, null_method="clt")
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            res_trace = run_hsic_gc(counts, coords, null_method="trace")
-        dep = [
-            w
-            for w in caught
-            if issubclass(w.category, DeprecationWarning) and "trace" in str(w.message)
-        ]
-        self.assertTrue(len(dep) >= 1, "expected DeprecationWarning for 'trace'")
-        self.assertEqual(res_trace["null_method"], "clt")
-        np.testing.assert_allclose(res_trace["statistic"], res_clt["statistic"])
-        np.testing.assert_allclose(res_trace["pvalue"], res_clt["pvalue"])
+        expected = {
+            "eig": run_hsic_gc(counts, coords, null_method="liu"),
+            "clt": run_hsic_gc(counts, coords, null_method="welch"),
+            "trace": run_hsic_gc(counts, coords, null_method="welch"),
+        }
+        canonical = {"eig": "liu", "clt": "welch", "trace": "welch"}
+        for alias in ("eig", "clt", "trace"):
+            with self.subTest(alias=alias):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    res_alias = run_hsic_gc(counts, coords, null_method=alias)
+                dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+                self.assertTrue(len(dep) >= 1, f"expected warning for {alias!r}")
+                self.assertEqual(res_alias["null_method"], canonical[alias])
+                np.testing.assert_allclose(
+                    res_alias["statistic"], expected[alias]["statistic"]
+                )
+                np.testing.assert_allclose(
+                    res_alias["pvalue"], expected[alias]["pvalue"]
+                )
 
     def test_matrix_mode_invalid_null_method(self):
         """Invalid null_method raises ValueError."""

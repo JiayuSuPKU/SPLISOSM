@@ -1,9 +1,7 @@
-"""Likelihood functions and pvalue-approximation utilities."""
+"""GLMM likelihood functions."""
 
 import numpy as np
 from typing import Optional
-from numpy.typing import ArrayLike
-from scipy.stats import ncx2
 import torch
 
 __all__ = [
@@ -12,7 +10,6 @@ __all__ = [
     "log_prob_fastdm",
     "log_prob_fastmvn",
     "log_prob_fastmvn_batched",
-    "liu_sf",
 ]
 
 try:
@@ -462,87 +459,3 @@ def log_prob_fastmvn_batched(
     )
 
     return log_prob
-
-
-def liu_sf(
-    t: ArrayLike,
-    lambs: ArrayLike,
-    dofs: Optional[ArrayLike] = None,
-    deltas: Optional[ArrayLike] = None,
-    kurtosis: bool = False,
-) -> np.ndarray:
-    """Compute p-values for weighted sums of chi-squared variables using the Liu approximation.
-
-    Let :math:`X = \\sum_{i=1}^{d} \\lambda_i * \\chi^2(h_i, \\delta_i)` be a linear combination of
-    `d` chi-squared random variables, each with degree of freedom :math:`h_i` and noncentrality
-    :math:`\\delta_i`, this function approximates :math:``Pr(X > t)`` using the
-    Liu moment-matching approach :cite:`liu2009new`.
-
-    Parameters
-    ----------
-    t
-        Shape (n,), observed test statistic.
-    lambs
-        Shape (d,), weights of each chi-squared component.
-    dofs
-        Shape (d,), degrees of freedom for each component. Defaults to all ones.
-    deltas
-        Shape (d,), noncentrality parameters for each component. Defaults to all zeros.
-    kurtosis
-        If True, uses kurtosis matching proposed in :cite:`lee2012optimal`; otherwise uses the original
-        skewness matching :cite:`liu2009new`.
-
-    Returns
-    -------
-    numpy.ndarray
-        P-values of shape (n,) computed as ``Pr(X > t)``.
-
-    Notes
-    -----
-    From https://github.com/limix/chiscore/blob/master/chiscore/_liu.py
-    """
-    if dofs is None:
-        dofs = np.ones_like(lambs)
-    if deltas is None:
-        deltas = np.zeros_like(lambs)
-
-    t = np.asarray(t, float)
-    lambs = np.asarray(lambs, float)
-    dofs = np.asarray(dofs, float)
-    deltas = np.asarray(deltas, float)
-
-    lambs = {i: lambs**i for i in range(1, 5)}
-
-    c = {
-        i: np.sum(lambs[i] * dofs) + i * np.sum(lambs[i] * deltas) for i in range(1, 5)
-    }
-
-    s1 = c[3] / (np.sqrt(c[2]) ** 3 + _DELTA)
-    s2 = c[4] / (c[2] ** 2 + _DELTA)
-
-    s12 = s1**2
-    if s12 > s2:
-        a = 1 / (s1 - np.sqrt(s12 - s2))
-        delta_x = s1 * a**3 - a**2
-        dof_x = a**2 - 2 * delta_x
-    else:
-        delta_x = 0
-        if kurtosis:
-            a = 1 / np.sqrt(s2)
-            dof_x = 1 / s2
-        else:
-            a = 1 / (s1 + _DELTA)
-            dof_x = 1 / (s12 + _DELTA)
-
-    mu_q = c[1]
-    sigma_q = np.sqrt(2 * c[2])
-
-    mu_x = dof_x + delta_x
-    sigma_x = np.sqrt(2 * (dof_x + 2 * delta_x))
-
-    t_star = (t - mu_q) / (sigma_q + _DELTA)
-    tfinal = t_star * sigma_x + mu_x
-
-    q = ncx2.sf(tfinal, dof_x, np.maximum(delta_x, 1e-9))
-
-    return q

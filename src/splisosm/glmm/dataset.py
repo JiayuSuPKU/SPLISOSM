@@ -61,12 +61,10 @@ class UngroupedIsoDataset(Dataset):
             data_g.shape[1] for data_g in data
         ]  # number of isoforms for each gene
         self.gene_names = gene_names
-        assert (
-            len(self.gene_names) == self.n_genes
-        ), "Gene names must match the number of genes."
-        assert (
-            min(self.n_isos_per_gene) > 1
-        ), "At least two isoforms are required for each gene."
+        if len(self.gene_names) != self.n_genes:
+            raise ValueError("Gene names must match the number of genes.")
+        if min(self.n_isos_per_gene) <= 1:
+            raise ValueError("At least two isoforms are required for each gene.")
 
         self.data = data
 
@@ -103,9 +101,8 @@ class GroupedIsoDataset(Dataset):
             List of gene names.
         """
         self.n_genes, self.n_spots, self.n_isos = data.shape
-        assert (
-            len(gene_names) == self.n_genes
-        ), "Gene names must match the number of genes."
+        if len(gene_names) != self.n_genes:
+            raise ValueError("Gene names must match the number of genes.")
 
         self.data = data
         self.gene_names = gene_names
@@ -138,7 +135,7 @@ class IsoDataset:
 
     Example
     -------
-    >>> from splisosm.dataset import IsoDataset
+    >>> from splisosm.glmm.dataset import IsoDataset
     >>> import torch
     >>> # Simulate data for 10 genes with different number of isoforms
     >>> data_3_iso = [torch.randn(100, 3) for _ in range(5)]  # 5 genes with 3 isoforms
@@ -201,12 +198,10 @@ class IsoDataset:
             if gene_names is not None
             else [f"gene_{str(i + 1).zfill(5)}" for i in range(self.n_genes)]
         )
-        assert (
-            len(self.gene_names) == self.n_genes
-        ), "Gene names must match the number of genes."
-        assert (
-            min(self.n_isos_per_gene) > 1
-        ), "At least two isoforms are required for each gene."
+        if len(self.gene_names) != self.n_genes:
+            raise ValueError("Gene names must match the number of genes.")
+        if min(self.n_isos_per_gene) <= 1:
+            raise ValueError("At least two isoforms are required for each gene.")
 
         # convert numpy.array to torch.tensor float if not already
         _data = [

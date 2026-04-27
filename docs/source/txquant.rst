@@ -30,7 +30,7 @@ The table below summarizes the supported ST platforms, the type of isoform featu
      - Exon/junction probe
      - Space Ranger output directly (``raw_probe_bc_matrix.h5``)
    * - **In situ targeted**
-     - 10x Xenium Prime 5K
+     - 10x Xenium Prime 5K, 10x Atera
      - Exon/junction probe (codeword)
      - Xenium Ranger output directly (``transcripts.zarr.zip``)
 
@@ -450,6 +450,7 @@ Data can be analyzed at single-cell resolution (segmented cells) or on spatially
 Tested platform:
 
 - 10x Xenium Prime 5K
+- 10x Atera
 
 Given Xenium Ranger output, the following code creates a binned ``SpatialData`` object with codeword-level counts (from ``transcripts.zarr.zip``):
 

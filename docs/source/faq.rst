@@ -22,12 +22,12 @@ Platform compatibility
 
 **2. I am not interested in isoform-level analysis. Can I use SPLISOSM for gene-level spatial variability testing?**
 
-  Yes. The gene-level spatial variability test, *HSIC-GC*, is also available as a standalone function, :func:`splisosm.utils.run_hsic_gc`.
+  Yes. The gene-level spatial variability test, *HSIC-GC*, is also available as a standalone function, :func:`splisosm.utils.stats.run_hsic_gc`.
   It can be used as a drop-in replacement for other spatial gene expression analysis tools like SPARK-X.
 
   .. code-block:: python
 
-    from splisosm.utils import run_hsic_gc
+    from splisosm.utils.stats import run_hsic_gc
     import numpy as np
 
     # ── matrix mode ──────────────────────────────────────────────────
@@ -37,18 +37,12 @@ Platform compatibility
     # spatial coordinates: (n_spot, 2)
     coordinates = np.random.rand(100, 2)
 
-    # run HSIC-GC test (default: Liu's eigenvalue method for the null)
-    test_results = run_hsic_gc(gene_counts, coordinates)
+    # run HSIC-GC test (default: Liu's cumulant approximation for the null)
+    # null_configs={"n_probes": m} controls the Hutchinson probe budget
+    # Default is 60. Use a smaller m for faster computation
+    test_results = run_hsic_gc(gene_counts, coordinates, n_jobs=-1)
     print(test_results['statistic'])  # test statistics, (n_gene,)
     print(test_results['pvalue'])     # p-values, (n_gene,)
-
-    # moment-matching Welch-Satterthwaite approximation (faster, no eigendecomposition)
-    test_results = run_hsic_gc(gene_counts, coordinates, null_method="welch")
-
-    # cap eigenvalue rank for large n (auto-capped at ceil(sqrt(n)*4) when n > 5000)
-    test_results = run_hsic_gc(
-        gene_counts, coordinates, null_configs={"approx_rank": 100}
-    )
 
     # ── AnnData mode ─────────────────────────────────────────────────
     # adata.X or adata.layers[layer] must be a (n_spots, n_genes) count
@@ -60,6 +54,7 @@ Platform compatibility
         spatial_key="spatial",
         min_counts=1,      # optional: drop genes with fewer total counts
         min_bin_pct=0.05,  # optional: drop genes expressed in < 5% of spots
+        n_jobs=-1,         # optional: parallelize gene chunks
     )
 
 Choosing a model class
@@ -71,7 +66,7 @@ Choosing a model class
 
   - :class:`~splisosm.SplisosmNP` — **non-parametric HSIC tests** using a sparse CAR spatial kernel.
     Supports both SV and DU testing, works on arbitrary geometries (irregular spots, single cells,
-    segmented tissue), and accepts ``AnnData`` or raw tensor inputs.
+    segmented tissue), and accepts ``AnnData`` input.
     *Recommended default for most datasets.*
 
   - :class:`~splisosm.SplisosmFFT` — **FFT-accelerated HSIC tests** on **regular grids** (Visium HD,
@@ -97,8 +92,8 @@ Choosing a model class
   :class:`~splisosm.SplisosmFFT` treats the grid as periodic (block-circulant kernel), which means bins at
   opposite edges of the grid are treated as spatial neighbours. 
   In contrast, :class:`~splisosm.SplisosmNP` builds a k-NN graph from the actual coordinates and has no wrap-around. 
-  Note that in most cases, the tissue does not occupy the entire grid; the periodic assumption
-  holds since the boundary bins are mostly unobserved (zero-padded).
+  The boundary effect is usually small when tissue occupies the interior of a
+  larger zero-padded grid.
 
   2. **Rasterisation and zero-padding.**
   :class:`~splisosm.SplisosmFFT` operates on the full :math:`H \times W` raster grid.  Unobserved bins
@@ -106,36 +101,63 @@ Choosing a model class
   :class:`~splisosm.SplisosmNP` operates only on the :math:`n \le H \times W` observed spots recorded in the AnnData, 
   so the effective sample size and kernel matrix dimensions can differ.
 
-  3. **SplisosmNP low-rank approximation.**
-  For large datasets, :class:`~splisosm.SplisosmNP` approximates the kernel with a low-rank eigen-decomposition,
-  which can lead to slightly different p-values compared to the full-rank version. 
-  The approximation rank is controlled via ``null_configs={"approx_rank": r}``, with default :math:`r = \lceil 4\sqrt{n} \rceil` when :math:`n > 5000`.
+  3. **SplisosmNP large-kernel null approximation.**
+  For large implicit CAR kernels, :class:`~splisosm.SplisosmNP` estimates Liu null cumulants with Hutchinson Rademacher probes by default,
+  which can lead to slightly different p-values compared to a full eigendecomposition.
+  The shared probe budget is controlled via ``null_configs={"n_probes": m}`` for both Liu cumulants and Welch trace probes.
 
   In practice, when the grid is densely observed (few missing bins) and the tissue is far
   from the grid boundary, the two classes give very similar results. 
-  When low-rank approximation is used, :class:`~splisosm.SplisosmNP` loses sensitivity for high-frequency patterns in favor of higher power for low-frequency patterns.
-  This is a design trade-off.
+  Low-rank approximation is no longer needed for :class:`~splisosm.SplisosmNP` SV tests because the default
+  Liu path works from direct cumulants rather than the full pairwise eigenvalue product.
 
-**5. Which differential usage test method should I use: parametric or non-parametric?**
+**5. Why did SplisosmNP SV results change in v1.2.0?**
 
-  We recommend using the non-parametric test (:class:`~splisosm.hyptest_np.SplisosmNP` with ``method='hsic-gp'``) as the default choice. It is more robust to model misspecification and generally provides better control of the false positive rate.
-  The parametric test (:class:`~splisosm.hyptest_glmm.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
+  Starting in v1.2.0, :class:`~splisosm.SplisosmNP` uses Liu's approximation with
+  **full-rank spatial-kernel cumulants** by default.  In v1.1.x, large
+  ``SplisosmNP`` SV tests used a low-rank spatial approximation by default.
+  This can change p-values and the number of SVP genes passing a fixed FDR
+  threshold, although gene rankings are usually largely consistent.
+
+  At first glance, the legacy low-rank approach may appear to have higher
+  statistical power because it often identifies more SVP genes.  This happens
+  because low-rank approximations keep broad, low-frequency spatial patterns
+  and drop finer local variation.  Since real spatial datasets often contain
+  strong global patterns, the low-rank test can naturally produce smaller
+  p-values in those scenarios.
+
+  For applications that intentionally prioritize global patterns, prefer
+  adjusting the spatial kernel instead of returning to rank truncation; for
+  example, use a smoother CAR kernel such as ``SplisosmNP(rho=0.999)`` or
+  ``run_hsic_gc(..., rho=0.999)``.  This keeps the full-rank test able to
+  detect local patterns while increasing emphasis on global smooth structure.
+  Use ``null_configs={"n_probes": m}`` only to tune the stochastic cumulant
+  trace budget; it is not a low-rank approximation.
+
+**6. Which differential usage test method should I use: parametric or non-parametric?**
+
+  We recommend using the non-parametric test (:class:`~splisosm.SplisosmNP` with ``method='hsic-gp'``) as the default choice. It is more robust to model misspecification and generally provides better control of the false positive rate.
+  The parametric test (:class:`~splisosm.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
 
   Note that both conditional tests (``'hsic-gp'`` and ``'glmm'``) are computationally intensive and may take hours to run on large datasets. 
-  For ``'hsic-gp'``, inducing-point approximations and GPU acceleration (via the `gpytorch` backend) are available.
+  For ``'hsic-gp'``, irregular 2-D coordinates can use the FINUFFT-backed
+  ``gpr_backend="nufft"`` path to avoid dense GP matrices.  The sklearn and
+  gpytorch backends also support subset or inducing-point controls via
+  ``n_inducing``. See :doc:`api/gpr` for backend-specific options.
   For ``'glmm'``, model fitting is handled natively with PyTorch with GPU device support, and low-rank kernel approximation is also available (via ``SplisosmGLMM(approx_rank=...)``).
 
   .. code-block:: python
 
-    from splisosm.hyptest_np import SplisosmNP
+    from splisosm import SplisosmNP
 
     model_np = SplisosmNP()
     model_np.setup_data(...)
     model_np.test_differential_usage(
         method="hsic-gp", 
         residualize="cov_only",
-        # inducing point approximation for faster GP fitting
-        gpr_configs={"covariate": {"n_inducing": 1000}}
+        # recommended for large irregular 2-D data
+        gpr_backend="nufft",
+        gpr_configs={"covariate": {"lml_approx_rank": 64}},
     )
 
   Alternatively, consider the faster unconditional tests (``'hsic'`` or ``'glm'``). While they do not account for spatial autocorrelation and may be anti-conservative (inflated false-positive rate),
@@ -143,8 +165,7 @@ Choosing a model class
 
   .. code-block:: python
 
-    from splisosm.hyptest_np import SplisosmNP
-    from splisosm.hyptest_glmm import SplisosmGLMM
+    from splisosm import SplisosmGLMM, SplisosmNP
 
     # non-parametric DU test (unconditional)
     model_np = SplisosmNP()
@@ -162,13 +183,13 @@ Choosing a model class
 Running SPLISOSM
 --------------------
 
-**6. Can I run SPLISOSM on single-cell spatial transcriptomics data?**
+**7. Can I run SPLISOSM on single-cell spatial transcriptomics data?**
 
   Yes. :class:`~splisosm.SplisosmNP` works directly on segmented single-cell data — simply pass the cell-level AnnData with spatial coordinates.
   See the :doc:`Xenium segmented single-cell tutorial <tutorials/xenium_sc_segmented>` for a worked example, and the :doc:`Feature Quantification page <txquant>` for guidance on preparing input data from Space Ranger and Xenium Ranger segmentation outputs.
 
 
-**7. Can I run SPLISOSM on a subset of cells/spots instead of the whole tissue?**
+**8. Can I run SPLISOSM on a subset of cells/spots instead of the whole tissue?**
 
   Yes. SPLISOSM can be run on any subset of cells or spots. This is useful when focusing on specific regions of interest or cell types. 
   Simply filter your AnnData object to the subset of interest before passing it to SPLISOSM. See the :doc:`Xenium segmented single-cell tutorial <tutorials/xenium_sc_segmented>` for an example.
@@ -179,7 +200,7 @@ Running SPLISOSM
   SPLISOSM will then ignore these spots in the statistical tests while still using their coordinates to build the spatial kernel.
 
 
-**8. Can I run SPLISOSM on single-cell non-spatial transcriptomics data?**
+**9. Can I run SPLISOSM on single-cell non-spatial transcriptomics data?**
 
   Yes. While SPLISOSM is designed to identify patterns associated with physical spatial coordinates, it is technically possible to run it on non-spatial single-cell RNA-seq data.
   This can be done by treating cell embeddings (e.g., PCA or UMAP coordinates) as "pseudo-spatial coordinates."
@@ -197,7 +218,7 @@ Running SPLISOSM
 Interpretation of Results
 --------------------------
 
-**9. For genes with spatially variable RNA processing (SVP), can I tell which isoforms are driving the spatial variability?**
+**10. For genes with spatially variable RNA processing (SVP), can I tell which isoforms are driving the spatial variability?**
 
   Yes and no. Isoform usage ratios are compositional, meaning they sum to one for each gene in a given spot or cell. If one isoform's usage increases in a spatial region, the usage of one or more other isoforms must decrease. For this reason, SPLISOSM's primary differential usage test (HSIC-IR) is a gene-level multivariate test that aggregates signals across all of a gene's isoforms.
 
@@ -205,7 +226,8 @@ Interpretation of Results
 
   .. code-block:: python
 
-    from splisosm.utils import counts_to_ratios, run_hsic_gc
+    from splisosm.utils.preprocessing import counts_to_ratios
+    from splisosm.utils.stats import run_hsic_gc
     import numpy as np
 
     # example data
@@ -227,7 +249,7 @@ Interpretation of Results
    This per-isoform ranking is for exploratory purposes only. The adjusted p-values from this analysis should not be considered as formal hypothesis testing, as the usage ratios of isoforms from the same gene are inherently correlated.
 
 
-**10. How many spatially variably expressed (SVE) genes or spatially variably processed (SVP) genes should I expect to find?**
+**11. How many spatially variably expressed (SVE) genes or spatially variably processed (SVP) genes should I expect to find?**
 
   The number of detected SVE/SVP genes depends on many factors, including the biological system, data quality, and sequencing depth. 
   For example, in our analyses of the adult mouse brain (Visium + ONT and Visium 3'), the number of detected SVP genes did not saturate at the sequencing depths tested. 
@@ -245,7 +267,7 @@ Interpretation of Results
    ONT-CBS1 and ONT-CBS2 are two long-read SiT (Visium-ONT) CBS samples.
    SR-Hippocampus: Slide-seqV2 hippocampus sample with higher spatial resolution but fewer UMIs per spot.
   
-**11. I have finished running SPLISOSM. What should I do next?**
+**12. I have finished running SPLISOSM. What should I do next?**
 
   After obtaining the test results from SPLISOSM, you can perform various downstream analyses to gain further biological insights. Examples include:
 
@@ -256,4 +278,3 @@ Interpretation of Results
   - Validating predicted associations between SVP genes and RNA-binding proteins (RBPs) using external data (e.g., from CLIP-seq databases like `POSTAR3 <http://111.198.139.65/RBP.html>`_) or functional perturbation experiments.
 
   Example analyses from the SPLISOSM manuscript are available in the `SPLISOSM Paper GitHub Repository <https://github.com/JiayuSuPKU/SPLISOSM_paper/>`_.
-

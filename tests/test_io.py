@@ -1,4 +1,3 @@
-import importlib.util
 import sys
 import tempfile
 import types
@@ -11,12 +10,25 @@ import pandas as pd
 import scipy.sparse
 from anndata import AnnData
 
-_IO_PATH = Path(__file__).resolve().parents[1] / "splisosm" / "io.py"
-_IO_SPEC = importlib.util.spec_from_file_location("splisosm_io_test_module", _IO_PATH)
-if _IO_SPEC is None or _IO_SPEC.loader is None:
-    raise RuntimeError(f"Could not load module spec for {_IO_PATH}")
-io_mod = importlib.util.module_from_spec(_IO_SPEC)
-_IO_SPEC.loader.exec_module(io_mod)
+from splisosm.io import load_visium_probe, load_visium_sp_meta
+from splisosm.io import load_visiumhd_probe, load_xenium_codeword
+from splisosm.io import visium_hd as io_visium_hd
+from splisosm.io import xenium as io_xenium
+
+io_mod = types.SimpleNamespace(
+    load_visium_probe=load_visium_probe,
+    load_visium_sp_meta=load_visium_sp_meta,
+    load_visiumhd_probe=load_visiumhd_probe,
+    load_xenium_codeword=load_xenium_codeword,
+    _normalize_visiumhd_bin_name=io_visium_hd._normalize_visiumhd_bin_name,
+    _aggregate_visiumhd_probe_counts=io_visium_hd._aggregate_visiumhd_probe_counts,
+    _xenium_locate_outs_path=io_xenium._xenium_locate_outs_path,
+    _format_resolution_bin_name=io_xenium._format_resolution_bin_name,
+    _format_resolution_obs_token=io_xenium._format_resolution_obs_token,
+    _format_resolution_shape_name=io_xenium._format_resolution_shape_name,
+    _chunk_to_codeword_triplets=io_xenium._chunk_to_codeword_triplets,
+    pd=io_visium_hd.pd,
+)
 
 load_visiumhd_probe = io_mod.load_visiumhd_probe
 load_xenium_codeword = io_mod.load_xenium_codeword

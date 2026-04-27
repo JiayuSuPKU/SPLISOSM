@@ -23,9 +23,10 @@ Welcome
 .. toctree::
    :maxdepth: 2
    :hidden:
-   :caption: API Reference
+   :caption: API
 
-   autoapi/splisosm/index
+   api/index
+   api/advanced
    refs
 
 .. toctree::
@@ -89,8 +90,8 @@ Given feature quantification, SPLISOSM supports two types of statistical analyse
   These tests are *multivariate*, aggregating signals across all isoforms of a gene. That is, we evaluate whether the *joint distribution* of
   isoform quantities varies across space (SV) or is associated with covariates (DU), yielding one test per gene or per gene-covariate pair.
 
-Building on the `Hilbert-Schmidt Independence Criterion (HSIC) <https://www.gatsby.ucl.ac.uk/~gretton/papers/GreBouSmoSch05.pdf>`_ framework for kernel-based association testing, 
-SPLISOSM achieves provably higher statistical power in sparse data while delivering well-calibrated, permutation-free p-values. 
+Building on the `Hilbert-Schmidt Independence Criterion (HSIC) <https://www.gatsby.ucl.ac.uk/~gretton/papers/GreBouSmoSch05.pdf>`_ framework for kernel-based association testing,
+SPLISOSM is designed for sparse isoform data and provides fast asymptotic p-values without routine permutation sampling.
 
 .. image:: ../img/splisosm_method.jpg
    :alt: Method
@@ -102,6 +103,8 @@ Reference
 ---------
 
 :cite:`su2026mapping` Su, Jiayu, et al. "Mapping isoforms and regulatory mechanisms from spatial transcriptomics data with SPLISOSM." Nature Biotechnology (2026): 1-12. `link to paper <https://www.nature.com/articles/s41587-025-02965-6>`_
+
+:cite:`su2026consistent` Su, Jiayu, et al. "On the consistent and scalable detection of spatial patterns." `arXiv:2602.02825 (2026) <https://arxiv.org/pdf/2602.02825>`_.
 
 Frequently Asked Questions
 --------------------------

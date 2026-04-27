@@ -37,28 +37,28 @@ Summary of class features:
      - Input type
      - Geometry
      - Speed
-     - Low-rank approximation
+     - Large-data controls
    * - :class:`~splisosm.SplisosmNP`
      - ✓
      - ✓
      - AnnData
      - any
      - fast
-     - optional via ``null_configs={"approx_rank": k}`` for SV, and ``gpr_configs={"covariate": {"n_inducing": m}}`` for DU.
+     - SV uses 32-column chunks; for DU on large irregular 2-D data, use the NUFFT GPR backend.
    * - :class:`~splisosm.SplisosmFFT`
      - ✓
      - ✓
      - SpatialData
      - grid only
      - fastest
-     - N/A (FFT-based; no eigendecomposition)
+     - N/A
    * - :class:`~splisosm.SplisosmGLMM`
      - ⚠️
      - ✓
      - AnnData
      - any
      - slow
-     - optional via ``approx_rank=k`` at ``SplisosmGLMM()`` construction time.
+     - optional via ``approx_rank=k`` at construction time.
 
 .. note::
 
@@ -80,6 +80,16 @@ Summary of class features:
 .. raw:: html
 
    </details>
+
+.. note::
+    Since ``v1.2.0``, low-rank approximation is no longer necessary for
+    :class:`~splisosm.SplisosmNP` SV tests, because the default Liu null is
+    evaluated from full-rank cumulant estimates instead of materialising the
+    full pairwise eigenvalue product. Pass ``null_configs={"n_probes": m}``
+    only to tune the Hutchinson Rademacher probe budget for large implicit CAR
+    kernels. For analyses that intentionally emphasize global smooth patterns,
+    prefer a smoother full-rank CAR kernel such as ``rho=0.999`` over spatial
+    rank truncation.
 
 Inputs and outputs
 ------------------
@@ -114,7 +124,7 @@ object whose table follows the same conventions, plus rasterisation metadata:
 
 See the :doc:`Feature Quantification page <txquant>` for platform-specific
 loaders and preprocessing recipes, and
-:func:`splisosm.utils.prepare_inputs_from_anndata` for parsing details.
+:func:`splisosm.utils.preprocessing.prepare_inputs_from_anndata` for parsing details.
 
 Setting up a model
 ~~~~~~~~~~~~~~~~~~
@@ -202,16 +212,6 @@ All classes share the same output convention, accessed via
 
 Both include a Benjamini-Hochberg adjusted ``pvalue_adj`` column. For DU tests, the adjustment is performed per covariate across tested genes.
 
-.. note::
-    Since ``v1.1.0``, the ``approx_rank`` argument was moved out of ``setup_data``:
-
-    * **SplisosmNP** — pass ``null_configs={"approx_rank": k}`` to
-      :meth:`~splisosm.SplisosmNP.test_spatial_variability` to cap the eigenvalue
-      rank used for the HSIC null distribution.
-    * **SplisosmGLMM** — pass ``approx_rank=k`` to :class:`~splisosm.SplisosmGLMM`
-      at construction time to control the low-rank spatial kernel approximation.
-    * **SplisosmFFT** uses FFT-based convolutions instead of eigendecomposition and
-      does not support ``approx_rank`` or ``null_configs``.
 
 
 Example data
@@ -288,8 +288,8 @@ SPLISOSM tests for statistical independence between isoform expression and spati
        method="hsic-ir",          # 'hsic-ir' | 'hsic-gc' | 'hsic-ic' | 'spark-x'
        ratio_transformation="none",  # 'none' | 'clr' | 'ilr' | 'alr'
        nan_filling="mean",           # if 'none', use only non-zero spots per gene (slow)
-       null_method="eig",            # 'eig' (Liu) | 'clt' (normal approx) | 'welch' (scaled chi²) | 'perm'
-       null_configs=None,            # e.g. {"approx_rank": 20} to cap eigenvalues
+       null_method="liu",            # 'liu' (default) | 'welch' (scaled chi²) | 'perm'
+       null_configs=None,            # e.g. {"n_probes": 60} for implicit CAR traces
        n_jobs=-1,                    # gene-level parallelism; -1 = all CPUs
        print_progress=True,
    )
@@ -360,7 +360,7 @@ SPLISOSM tests for statistical independence between isoform expression and spati
 Testing for differential isoform usage (DU)
 --------------------------------------------
 
-DU tests identify genes whose isoform usage is associated with a covariate (e.g., spatial domain, RBP expression), conditioned on spatial correlation.
+DU tests identify genes whose isoform usage is associated with a covariate (e.g., spatial domain, RBP expression), optionally after removing spatial autocorrelation.
 
 **SplisosmNP** (non-parametric, HSIC-based)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -413,8 +413,8 @@ Uses Gaussian process regression (GPR) to remove spatial autocorrelation.
        ratio_transformation="none",   # 'none' | 'clr' | 'ilr' | 'alr'
        nan_filling="mean",            # if 'none', use only non-zero spots per gene (slow)
        residualize="cov_only",        # 'cov_only' (faster) | 'both' (more conservative)
-       gpr_backend="sklearn",         # 'sklearn' | 'gpytorch' (FITC sparse GP with GPU)
-       gpr_configs=None,              # e.g. {"covariate": {"n_inducing": 500}}
+       gpr_backend="sklearn",         # 'sklearn' | 'gpytorch' | 'nufft'/'finufft'
+       gpr_configs=None,              # e.g. {"covariate": {"lml_approx_rank": 64}} for NUFFT
        n_jobs=-1,                     # gene-level parallelism; -1 = all CPUs
        print_progress=True,
    )
@@ -583,24 +583,39 @@ adjust them only when you hit performance or accuracy limits.
      - Trade-off
    * - **Ratio transformation**
      - ``ratio_transformation=`` in ``test_spatial_variability`` / ``test_differential_usage``
-     - ``"none"`` (no compositional constraint)
+     - ``"none"`` (raw usage ratios)
      - log-based transformations (``"clr"``, ``"ilr"``, ``"alr"``) require pseudocounts to handle zero ratios; 
        ``"radial"`` is not calibrated. Performance of ``"none"`` is better in most cases.
    * - **SV null approximation**
      - ``null_method=`` in ``test_spatial_variability`` / ``run_hsic_gc``
-     - ``"eig"`` (Liu's chi-square mixture)
-     - ``"clt"`` (moment-matching normal) and ``"welch"`` (Welch–Satterthwaite
-       scaled chi-squared) both avoid eigendecomposition — fastest for very large
-       *n*.  ``"welch"`` is typically more accurate in the right tail than
-       ``"clt"`` at the same cost.  ``"perm"`` uses permutation; slowest but
-       assumption-free.  (``"trace"`` is a deprecated alias for ``"clt"``.)
-   * - **SV null low-rank** (when ``null_method="eig"``)
-     - ``null_configs={"approx_rank": k}`` in ``test_spatial_variability`` /
-       ``run_hsic_gc``
-     - Auto: full rank when ``n_spots ≤ 5000``, else ``⌈4√n⌉``
-     - Restricts test statistic and null computation to the top-*k* eigenvalues; 
-       significant speedup for large *n* with potential power loss for high-frequency patterns 
-       (usually rare in real spatial data).
+     - ``"liu"`` (Liu's chi-square mixture)
+     - ``"welch"`` (Welch–Satterthwaite scaled chi-squared) only uses the first two
+       cumulants (fastest for very large *n*).  ``"perm"``
+       uses permutation; slowest but assumption-free.  Deprecated aliases are
+       mapped automatically: ``"eig"`` → ``"liu"``, ``"clt"`` / ``"trace"`` →
+       ``"welch"``.
+   * - **Cumulant probes**
+     - ``null_configs={"n_probes": m}``
+     - ``60``
+     - ``n_probes`` controls Hutchinson Rademacher trace estimates used by
+       Liu (four cumulants) and Welch (two cumulants). Use smaller values to 
+       speed up large datasets at the cost of approximation accuracy.
+   * - **SV response chunking**
+     - ``chunk_size=`` in ``test_spatial_variability`` / ``run_hsic_gc``
+     - ``"auto"`` (up to 32 response columns)
+     - Batches multiple genes into one spatial-kernel application while
+       keeping each gene intact.  The cap is in response columns, not genes:
+       ``hsic-gc`` contributes one column per gene, whereas multi-isoform
+       ``hsic-ir`` / ``hsic-ic`` genes consume multiple columns.  A single
+       gene wider than the cap is processed alone.
+   * - **Outlier spot control**
+     - ``standardize_cov=`` at construction and ``min_component_size=`` at ``setup_data``;
+       for ``run_hsic_gc``, pass ``standardize_cov`` and ``min_component_size`` directly
+     - ``standardize_cov=True``, ``min_component_size=1``
+     - Covariance standardisation gives all spots the same kernel diagonal,
+       reducing influence from spatial graph outliers (e.g., tiny disconnected tissue fragments), 
+       but it also slows setup. Alternatively, ``min_component_size > 1`` filters out small
+       connected components in a data-driven manner.
    * - **Conditional DU test** (``method="hsic-gp"``)
      - ``residualize=`` in ``test_differential_usage``
      - ``"cov_only"``
@@ -611,25 +626,41 @@ adjust them only when you hit performance or accuracy limits.
    * - **GPR backend** (DU, ``method="hsic-gp"``)
      - ``gpr_backend=`` in ``test_differential_usage``
      - ``"sklearn"``
-     - ``"gpytorch"`` uses the FITC sparse-GP approximation with GPU support.  
-        Tends to be slower than ``"sklearn"`` on CPU due to overhead.
+     - ``"sklearn"`` is convenient for small to moderate data.
+       ``"gpytorch"`` uses the FITC sparse-GP approximation with GPU support.
+       For large irregular 2-D data, prefer ``"nufft"`` / ``"finufft"``,
+       which uses FINUFFT matvecs for an implicit RBF grid kernel
+       (roughly :math:`O(n \log n)`) without forming a dense GP matrix.
+       See :doc:`api/gpr` for backend class signatures and options.
    * - **GPR inducing points** (DU, ``method="hsic-gp"``)
      - ``gpr_configs={"covariate": {"n_inducing": M}}`` in
        ``test_differential_usage``
      - ``5000`` (subset-of-data for sklearn; FITC for gpytorch)
-     - Reduces GP fitting cost from O(*n*³) to O(*nM*²).
+     - For sklearn, fits hyperparameters on a subset of up to *M* observations
+       instead of all spots. For gpytorch, uses *M* FITC inducing points.
        Accuracy degrades if *M* is too small.
        Set to ``None`` for exact GP (warns when ``n_spots > 10000``).
+       This option is ignored by the NUFFT backend.
+   * - **NUFFT LML rank** (DU, ``method="hsic-gp"``)
+     - ``gpr_configs={"covariate": {"lml_approx_rank": r}}`` with
+       ``gpr_backend="nufft"``
+     - ``256`` on irregular grids; ignored on compatible regular grids
+     - Tunes the eigensummary rank used to approximate irregular-grid GP
+       log marginal likelihoods during hyperparameter fitting.  It costs
+       :math:`O(nr)` memory for rank *r* vectors (about 512 MB at 1M spots and
+       ``r=64``).  Ranks ``32``-``64`` are a practical first large-data range;
+       increase the rank when memory permits.
    * - **Parallel jobs**
-     - ``n_jobs=`` in ``test_spatial_variability`` / ``test_differential_usage``
-     - ``-1`` (all CPUs)
-     - Number of joblib workers for gene-wise computation.
+     - ``n_jobs=`` in ``test_spatial_variability`` / ``test_differential_usage`` / ``run_hsic_gc``
+     - ``-1`` for class methods; ``1`` for ``run_hsic_gc``
+     - Number of joblib workers for gene-wise or response-chunk computation.
+       In ``run_hsic_gc``, ``n_jobs=-1`` uses all available CPUs.
        Uses ``prefer="threads"`` to avoid pickling large shared objects.
        When ``gpr_backend="gpytorch"`` with ``device != "cpu"``, parallelism
        is automatically disabled (CUDA not thread-safe).
    * - **Other GPR configuration**
      - ``gpr_configs=`` in ``test_differential_usage``
-     - See :func:`test_differential_usage <splisosm.hyptest_np.SplisosmNP.test_differential_usage>` docstring for details
+     - See :func:`test_differential_usage <splisosm.SplisosmNP.test_differential_usage>` and :doc:`api/gpr` for details
      - Adjust ``constant_value_bounds`` or ``length_scale_bounds`` to tune the hyperparameter
        searching ranges.
 
@@ -668,6 +699,12 @@ adjust them only when you hit performance or accuracy limits.
      - Number of joblib workers for gene-wise HSIC computation.  Set to
        ``1`` to disable parallelism (useful when ``workers > 1`` already
        saturates the CPU).
+   * - **SV response chunking**
+     - ``chunk_size=`` in ``test_spatial_variability``
+     - ``"auto"`` (up to 32 response channels)
+     - Batches multiple genes into one FFT kernel call.  The cap is in
+       response channels, not genes; multi-isoform genes consume multiple
+       channels and oversized genes are processed alone.
    * - **DU parallel jobs**
      - ``n_jobs=`` in ``test_differential_usage``
      - ``-1`` (all CPUs)
@@ -681,7 +718,7 @@ adjust them only when you hit performance or accuracy limits.
        ratios.
    * - **Other GPR configuration**
      - ``gpr_configs=`` in ``test_differential_usage``
-     - See :func:`test_differential_usage <splisosm.hyptest_fft.SplisosmFFT.test_differential_usage>` docstring for details
+     - See :func:`test_differential_usage <splisosm.SplisosmFFT.test_differential_usage>` docstring for details
      - Adjust ``constant_value_bounds`` or ``length_scale_bounds`` to tune the hyperparameter
        searching ranges.
 
