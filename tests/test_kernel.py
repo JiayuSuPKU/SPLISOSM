@@ -1,10 +1,15 @@
 import unittest
 import warnings
+from unittest.mock import patch
 import numpy as np
+import scipy.sparse
 import torch
 import itertools
+from splisosm._hsic_null import _hutchinson_cumulants
 from splisosm.kernel import (
+    Kernel,
     SpatialCovKernel,
+    _MaskedSpatialKernel,
     _build_adj_from_coords,
 )
 from splisosm.utils import get_cov_sp
@@ -110,6 +115,93 @@ class TestSpatialCovKernel(unittest.TestCase):
         via_xtKx = torch.trace(K.xtKx(y))
         manual = torch.trace(y.T @ R @ y)
         self.assertTrue(torch.allclose(via_xtKx, manual, atol=1e-4))
+
+    def test_sparse_kx_and_xtkx_match_dense(self):
+        """Sparse response blocks use the same effective CAR kernel as dense blocks."""
+        rng = np.random.default_rng(2)
+        x_np = rng.poisson(0.4, size=(self.n_small, 4)).astype(np.float32)
+        x_np[rng.random(x_np.shape) < 0.6] = 0.0
+        x_torch = torch.from_numpy(x_np)
+        x_torch_sparse = x_torch.to_sparse()
+        x_scipy = scipy.sparse.csc_matrix(x_np)
+
+        for centering in (False, True):
+            with self.subTest(centering=centering):
+                K = SpatialCovKernel.from_coordinates(
+                    self.coords_small, centering=centering, standardize_cov=True
+                )
+
+                kx_dense = np.asarray(K.Kx(x_np), dtype=float)
+                np.testing.assert_allclose(
+                    K.Kx(x_scipy), kx_dense, rtol=1e-6, atol=1e-7
+                )
+                np.testing.assert_allclose(
+                    K.Kx(x_torch_sparse).numpy(),
+                    kx_dense,
+                    rtol=1e-6,
+                    atol=1e-7,
+                )
+
+                dense_q = K.xtKx_exact(x_torch)
+                scipy_q = K.xtKx_exact(x_scipy)
+                torch_sparse_q = K.xtKx_exact(x_torch_sparse)
+                self.assertTrue(torch.allclose(scipy_q, dense_q, rtol=1e-5, atol=1e-6))
+                self.assertTrue(
+                    torch.allclose(torch_sparse_q, dense_q, rtol=1e-5, atol=1e-6)
+                )
+
+                K.eigenvalues(k=4)
+                self.assertTrue(
+                    torch.allclose(K.xtKx(x_scipy), K.xtKx(x_torch), atol=1e-5)
+                )
+                self.assertTrue(
+                    torch.allclose(K.xtKx(x_torch_sparse), K.xtKx(x_torch), atol=1e-5)
+                )
+
+    def test_masked_spatial_kernel_matches_centered_subset(self):
+        """Masked kernel is a Kernel and matches subset centering algebra."""
+        K = SpatialCovKernel.from_coordinates(
+            self.coords_small, centering=True, standardize_cov=True
+        )
+        keep_mask = np.zeros(self.n_small, dtype=bool)
+        keep_mask[[0, 1, 2, 6, 7, 12, 18, 24]] = True
+        K_mask = _MaskedSpatialKernel(K, keep_mask)
+        self.assertIsInstance(K_mask, Kernel)
+        self.assertEqual(K_mask.shape(), (int(keep_mask.sum()), int(keep_mask.sum())))
+
+        torch.manual_seed(1)
+        y = torch.rand(int(keep_mask.sum()), 3)
+        parent_subset = K.realization()[keep_mask][:, keep_mask]
+        parent_subset = parent_subset - parent_subset.mean(dim=0, keepdim=True)
+        parent_subset = parent_subset - parent_subset.mean(dim=1, keepdim=True)
+        expected = y.t() @ parent_subset @ y
+
+        self.assertTrue(torch.allclose(K_mask.xtKx_exact(y), expected, atol=1e-5))
+        self.assertTrue(torch.allclose(K_mask.xtKx(y), expected, atol=1e-5))
+        K_mask.eigenvalues()
+        self.assertTrue(torch.allclose(K_mask.xtKx(y), expected, atol=1e-5))
+        self.assertTrue(torch.allclose(K_mask.realization(), parent_subset, atol=1e-5))
+        self.assertTrue(
+            torch.allclose(K_mask.trace(), torch.trace(parent_subset), atol=1e-5)
+        )
+        self.assertTrue(
+            torch.allclose(K_mask.square_trace(), parent_subset.pow(2).sum(), atol=1e-5)
+        )
+
+        with (
+            patch.object(
+                K_mask,
+                "trace",
+                side_effect=AssertionError("trace should stay probe-based"),
+            ),
+            patch.object(
+                K_mask,
+                "square_trace",
+                side_effect=AssertionError("square_trace should stay probe-based"),
+            ),
+        ):
+            cumulants = _hutchinson_cumulants(K_mask, n_probes=4, max_power=2)
+        self.assertEqual(set(cumulants), {1, 2})
 
     def test_eigenvalues_partial(self):
         K = SpatialCovKernel.from_coordinates(
