@@ -155,6 +155,10 @@ See :func:`splisosm.likelihood.liu_sf_from_cumulants` for implementation details
      patterns, prefer increasing the CAR smoothness parameter (for example
      ``rho=0.999``) instead of truncating the spatial rank.
    - When ``nan_filling='mean'`` (default), the spatial cumulants are cached once and reused for all subsequent genes.
+   - When ``nan_filling='none'`` for HSIC-IR, SPLISOSM drops zero-coverage
+     spots per gene and applies a masked implicit spatial kernel.  This avoids
+     dense parent-kernel realization, but per-gene masked cumulants must still
+     be estimated and the path is slower than mean filling.
 
 .. _null-welch:
 
@@ -279,7 +283,7 @@ Specifically, SPLISOSM first **residualises** the covariate against a Gaussian P
 
       z = f(x) + \varepsilon, \quad f \sim \mathcal{GP}(0, k_\theta),
 
-   where :math:`k_\theta` is a 'Constant x RBF + WhiteNoise' kernel (See :class:`splisosm.kernel_gpr.SklearnKernelGPR`). Sparse inducing-point approximations and a FINUFFT-backed NUFFT backend are available for large datasets.
+   where :math:`k_\theta` is a ``Constant x RBF + WhiteNoise`` kernel. SPLISOSM provides dense sklearn, GPyTorch, FFT, and FINUFFT-backed NUFFT GP backends for different data geometries and scales.
 
 2. **Compute covariate residuals** :math:`\tilde{Z} = Z - \hat{f}(X)`, capturing the part of covariate variation *not explained by* spatial position.
 
@@ -303,13 +307,13 @@ For flexibility, we provide optional control via the ``residualize`` argument:
    The GP fitting step is the dominant computational cost of the DU test.
    Three backend families are supported:
 
-   - ``gpr_backend='sklearn'`` (default): uses ``GaussianProcessRegressor`` from sklearn with an RBF kernel and subsampled Nyström approximation.
+   - ``gpr_backend='sklearn'`` (default): uses ``GaussianProcessRegressor`` from sklearn with an RBF kernel and optional subset-of-data hyperparameter fitting.
    - ``gpr_backend='gpytorch'``: Exact or sparse GP with ``n_inducing`` inducing points.
    - ``gpr_backend='nufft'`` / ``'finufft'`` (fastest): FINUFFT-backed implicit RBF grid-kernel for irregular 2-D coordinates, recommended for large-scale spatial data.
 
    For very large datasets, pass ``gpr_configs={"covariate": {"n_inducing": 1000}}`` to control the number of inducing points for the sklearn/gpytorch backends. 
    For the NUFFT backend, ``max_auto_modes`` caps the automatically inferred full effective grid, and ``lml_approx_rank`` controls the irregular-grid likelihood approximation used during hyperparameter fitting.
-   See :class:`splisosm.kernel_gpr.NUFFTKernelGPR` for detailed configuration options.
+   These options are passed through ``gpr_configs``; see :meth:`splisosm.SplisosmNP.test_differential_usage` for the user-facing configuration table and :doc:`gpr_api` for backend class details.
 
 NUFFT backend for irregular-coordinate GP residualization
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

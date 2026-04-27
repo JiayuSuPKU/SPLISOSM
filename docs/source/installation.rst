@@ -41,7 +41,7 @@ Minimal software dependencies:
 Additional dependencies
 -----------------------
 
-`SplisosmFFT` requires the `spatialdata` package to be installed, and `SplisosmNP`'s differential usage test optionally supports `gpytorch` and `finufft` backends for Gaussian process regression.
+`SplisosmFFT` requires the `spatialdata` package to be installed, and `SplisosmNP`'s differential usage test optionally supports `gpytorch` and `finufft` backends for Gaussian process regression. See :doc:`gpr_api` for backend-specific API details.
 To install these additional dependencies, you can use the following command:
 
 .. code-block:: zsh
@@ -86,7 +86,7 @@ To use this functionality, ensure that the conda environment where SPLISOSM is i
    coordinates = np.random.rand(100, 2)
 
    # run HSIC-GC test (default: Liu's cumulant approximation for the null)
-   test_results = run_hsic_gc(gene_counts, coordinates)
+   test_results = run_hsic_gc(gene_counts, coordinates, n_jobs=-1)
    print(test_results['statistic'])  # test statistics, (n_gene,)
    print(test_results['pvalue'])     # p-values, (n_gene,)
 
@@ -100,4 +100,5 @@ To use this functionality, ensure that the conda environment where SPLISOSM is i
        spatial_key="spatial", # key in adata.obsm for spatial coordinates
        min_counts=1,          # optional: drop genes with fewer total counts
        min_bin_pct=0.05,      # optional: drop genes expressed in < 5% of spots
+       n_jobs=-1,             # optional: parallelize gene chunks
    )

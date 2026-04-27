@@ -55,7 +55,6 @@ docs = [
     "jupyterlab",
     "sphinx-book-theme",
     "sphinxcontrib-bibtex",
-    "sphinx-autoapi",
     "myst-nb",
     "myst-sphinx-gallery",
     "setuptools-scm",

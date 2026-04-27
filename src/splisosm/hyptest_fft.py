@@ -30,14 +30,13 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 
 from splisosm._chunking import pack_gene_chunks, resolve_chunk_size
-from splisosm.kernel import FFTKernel  # noqa: F401 — re-export for backward compat
+from splisosm.kernel import FFTKernel
 from splisosm._hsic_null import (
     _cumulants_from_eigenvalues,
     _feature_cumulants_from_data,
     _hsic_liu_pvalue,
 )
-from splisosm.kernel_gpr import (
-    FFTKernelOp,
+from splisosm._gpr import (
     FFTKernelGPR,
     _DEFAULT_GPR_CONFIGS,
 )
@@ -48,7 +47,7 @@ from splisosm.utils import (
     false_discovery_control,
 )
 
-__all__ = ["FFTKernel", "FFTKernelOp", "FFTKernelGPR", "SplisosmFFT"]
+__all__ = ["SplisosmFFT"]
 
 
 def _du_worker_fft(
@@ -301,8 +300,9 @@ def _sv_chunk_worker_fft(
 class SplisosmFFT:
     """FFT-accelerated SPLISOSM model for rasterized spatial isoform testing.
 
-    The class follows the non-parametric SPLISOSM workflow but consumes a
-    SpatialData table directly and rasterizes per-gene isoform counts on demand.
+    ``SplisosmFFT`` follows the same non-parametric workflow as
+    :class:`splisosm.SplisosmNP`, but it operates on regular raster grids
+    stored in ``SpatialData`` and applies spatial kernels with FFTs.
 
     Examples
     --------
@@ -386,17 +386,18 @@ class SplisosmFFT:
         spacing: tuple[float, float] = (1.0, 1.0),
         workers: int | None = None,
     ) -> None:
-        """
+        """Initialize the FFT model.
+
         Parameters
         ----------
-        rho
-            Spatial autocorrelation coefficient for CAR kernel.
-        neighbor_degree
-            Neighbor ring degree for CAR graph construction.
-        spacing
-            Raster spacing ``(dy, dx)``.
-        workers
-            Number of FFT workers.
+        rho : float, optional
+            Spatial autocorrelation coefficient for the CAR kernel.
+        neighbor_degree : int, optional
+            Neighbor-ring degree for CAR graph construction.
+        spacing : tuple of float, optional
+            Raster spacing ``(dy, dx)`` in kernel length-scale units.
+        workers : int or None, optional
+            Number of ``scipy.fft`` worker threads. ``None`` lets SciPy choose.
         """
         self._rho = float(rho)
         self._neighbor_degree = int(neighbor_degree)
@@ -507,9 +508,9 @@ class SplisosmFFT:
         design_mtx: Optional[Union[np.ndarray, "pd.DataFrame", str, list[str]]] = None,
         covariate_names: Optional[list[str]] = None,
     ) -> None:
-        """Setup SpatialData-backed isoform data for FFT-based testing.
+        """Set up SpatialData-backed isoform data for FFT-based testing.
 
-        (bins, table_name, col_key, row_key) are passed to
+        ``bins``, ``table_name``, ``col_key``, and ``row_key`` are passed to
         :func:`spatialdata.rasterize_bins` to rasterize isoform counts.
 
         Parameters
@@ -521,9 +522,9 @@ class SplisosmFFT:
         table_name : str
             Key of the table in ``sdata.tables``.
         col_key : str
-            Column index key in ``adata.obs`` for rasterization.
+            Column-coordinate key in ``adata.obs`` for rasterization.
         row_key : str
-            Row index key in ``adata.obs`` for rasterization.
+            Row-coordinate key in ``adata.obs`` for rasterization.
         layer : str, optional
             AnnData layer that stores isoform count matrix.
         group_iso_by : str, optional
@@ -549,8 +550,8 @@ class SplisosmFFT:
             tests.  Set to ``False`` to keep single-isoform genes, e.g. when
             testing **gene-level expression variability** with
             ``test_spatial_variability(method="hsic-gc")``.
-        design_mtx : str, list[str], np.ndarray, scipy.sparse matrix, pd.DataFrame, or None
-            Design matrix specification.  Three input modes:
+        design_mtx : str, list[str], array, sparse matrix, DataFrame, or None
+            Design matrix specification. Three input modes:
 
             1. **Table name** (``str`` matching a key in ``sdata.tables``): Use the
                existing AnnData table's ``X`` as the design matrix.  Must have the
@@ -558,16 +559,16 @@ class SplisosmFFT:
             2. **Obs column names** (``str`` or ``list[str]`` not matching a table):
                Extract the named columns from the isoform table's ``adata.obs``.
                Categorical columns are one-hot encoded automatically.
-            3. **Pre-computed matrix** (ndarray, sparse, or DataFrame of shape
-               ``(n_obs, n_factors)``): Used as-is.
+            3. **Pre-computed matrix** (array, sparse matrix, or DataFrame of
+               shape ``(n_spots, n_factors)``): Used as-is.
 
-            In cases 2 and 3, the design matrix will be stored as a new AnnData table inside
-            ``sdata``. The matrix is also rasterized via :func:`spatialdata.rasterize_bins`
-            when :meth:`test_differential_usage` is called.
+            In cases 2 and 3, the design matrix is stored as a new AnnData
+            table inside ``sdata`` and rasterized when
+            :meth:`test_differential_usage` is called.
         covariate_names : list[str] or None, optional
-            Factor names. Will override inferred names.
-            If None, inferred from ``design_mtx`` column names when possible;
-            otherwise auto-generated as ``["factor_0", ...]``.
+            Factor names. These override inferred names. If ``None``, names
+            are inferred from ``design_mtx`` when possible; otherwise they are
+            generated as ``["factor_0", ...]``.
 
         Raises
         ------
@@ -576,7 +577,8 @@ class SplisosmFFT:
 
         See Also
         --------
-        :func:`splisosm.hyptest_np.SplisosmNP.setup_data` : AnnData-based setup for data with general geometry.
+        :meth:`splisosm.SplisosmNP.setup_data`
+            AnnData-based setup for data with general geometry.
 
         """
         if sd is None:
@@ -790,7 +792,7 @@ class SplisosmFFT:
         return_results: bool = False,
         print_progress: bool = True,
     ) -> Optional[dict[str, Any]]:
-        """Test for spatial variability using FFT-accelerated HSIC.
+        """Test each gene for spatial variability using FFT-accelerated HSIC.
 
         Parameters
         ----------
@@ -809,7 +811,7 @@ class SplisosmFFT:
         n_jobs : int, optional
             Number of joblib workers. ``-1`` uses all available CPUs.
         return_results : bool, optional
-            If True, return result dictionary.
+            If ``True``, return the result dictionary.
         print_progress : bool, optional
             Whether to show a progress bar.
 
@@ -820,7 +822,8 @@ class SplisosmFFT:
 
         See Also
         --------
-        :func:`splisosm.hyptest_np.SplisosmNP.test_spatial_variability`: Non-FFT version of this function for comparison.
+        :meth:`splisosm.SplisosmNP.test_spatial_variability`
+            Non-FFT implementation for arbitrary spatial geometries.
         """
         if self._adata is None or self.sp_kernel is None or self._raster_layer is None:
             raise RuntimeError("Data not initialized. Call setup_data() first.")
@@ -900,23 +903,24 @@ class SplisosmFFT:
         return_results: bool = False,
         print_progress: bool = True,
     ) -> Optional[dict[str, Any]]:
-        """Test for differential isoform usage against spatial covariate expression.
+        """Test each gene for differential isoform usage on a raster grid.
 
-        Before running this function, the design matrix must be set up using :func:`setup_data`.
-        Each column of the design matrix corresponds to a covariate to test for differential
-        association with the isoform usage ratios of each gene.
-        Test statistics and p-values are computed per (gene, covariate) pair separately.
+        Call :meth:`setup_data` with ``design_mtx`` before running this
+        method. Each design-matrix column is tested against each gene's
+        isoform usage ratios, producing one statistic and p-value per
+        ``(gene, covariate)`` pair.
 
         Four test strategies are supported, all operating on rasterized grid data
         to avoid densifying the full isoform or covariate matrix in memory:
 
         - ``"hsic-gp"`` *(default)*: spatially residualize covariates (and
-          optionally isoform ratios) with ``FFTKernelGPR``, then compute linear
-          HSIC.  Controlled by ``residualize``.
+          optionally isoform ratios) with :class:`splisosm.gpr.FFTKernelGPR`,
+          then compute linear HSIC. Controlled by ``residualize``.
         - ``"hsic"``: linear HSIC between raw centered isoform ratios and raw
-          centered covariates—no spatial residualization.
+          centered covariates, with no spatial residualization.
         - ``"t-fisher"``: per-isoform two-sample t-tests (**binary covariates
-          only**) combined by Fisher's method (chi-squared, df = 2 × n_isoforms).
+          only**) combined by Fisher's method (chi-square with
+          ``df = 2 * n_isoforms``).
         - ``"t-tippett"``: per-isoform two-sample t-tests (**binary covariates
           only**) combined by Tippett's corrected minimum p-value.
 
@@ -927,7 +931,7 @@ class SplisosmFFT:
 
         Parameters
         ----------
-        method : str, optional
+        method : {"hsic", "hsic-gp", "t-fisher", "t-tippett"}, optional
             Method for association testing:
 
             * ``"hsic"``: Unconditional HSIC test (multivariate RV coefficient).
@@ -936,13 +940,11 @@ class SplisosmFFT:
             * ``"hsic-gp"``: Conditional HSIC test.  Spatial effects are removed via
               Gaussian process regression before computing the HSIC statistic.
 
-            Or one of the T-tests (binary factors only):
-
             * ``"t-fisher"``, ``"t-tippett"``: two-sample t-test per isoform
-              (binary covariates only — exactly two distinct non-NaN values required);
+              (binary covariates only; exactly two distinct non-NaN values required);
               p-values are combined gene-wise via Fisher's chi-squared or
               Tippett's corrected minimum method.
-        ratio_transformation : str, optional
+        ratio_transformation : {"none", "clr", "ilr", "alr", "radial"}, optional
             Compositional transformation for isoform ratios.
             One of ``'none'``, ``'clr'``, ``'ilr'``, ``'alr'``, ``'radial'``
             :cite:`park2022kernel`.  See :func:`splisosm.utils.counts_to_ratios`.
@@ -950,33 +952,34 @@ class SplisosmFFT:
             Nested configuration dict for the GPR objects, with optional keys
             ``'covariate'`` and/or ``'isoform'``.  Each sub-dict is forwarded to
             the FFT GPR path.  Unspecified keys use the common GP defaults from
-            :data:`splisosm.kernel_gpr._DEFAULT_GPR_CONFIGS`: ``constant_value``,
+            SPLISOSM's backend configuration: ``constant_value``,
             ``constant_value_bounds``, ``length_scale``, and
-            ``length_scale_bounds``.  Large-n sklearn/gpytorch and NUFFT-only
-            keys in the shared defaults are ignored by this FFT path.
+            ``length_scale_bounds``. Large-n sklearn/gpytorch and NUFFT-only keys
+            in the shared defaults are ignored by this FFT path. See
+            :class:`splisosm.gpr.FFTKernelGPR` for backend-specific options.
 
         residualize : {"cov_only", "both"}, optional
             Controls which signals are spatially residualized when
             ``method="hsic-gp"``:
 
             * ``"cov_only"`` (default): residualize covariates only; test
-              HSIC(Z_res, Y_raw).  Fastest; calibration matches ``"both"``
+              ``HSIC(Z_res, Y)``. Fastest; calibration matches ``"both"``
               when covariate GPR captures most spatial confounding.
             * ``"both"``: residualize both covariates and isoform ratios.
 
         n_jobs : int, optional
             Number of parallel jobs. ``-1`` uses all available CPUs.
         print_progress : bool, optional
-            Whether to show the progress bar. Default to True.
+            Whether to show the progress bar. Default ``True``.
         return_results : bool, optional
-            Whether to return the test statistics and p-values.
-            If False, the results are stored in ``self._du_test_results``.
+            If ``True``, return the test statistics and p-values. Otherwise,
+            store results in ``self._du_test_results``.
 
         Returns
         -------
         results : dict or None
-            If ``return_results`` is True, returns dict with test statistics and
-            p-values. Otherwise, returns None and stores results in
+            If ``return_results`` is ``True``, return a dictionary with test
+            statistics and p-values. Otherwise, return ``None`` and store results in
             ``self._du_test_results``.
 
         Raises
@@ -988,7 +991,8 @@ class SplisosmFFT:
 
         See Also
         --------
-        :func:`splisosm.hyptest_np.SplisosmNP.test_differential_usage` : Non-FFT version of this function for comparison.
+        :meth:`splisosm.SplisosmNP.test_differential_usage`
+            Non-FFT implementation for arbitrary spatial geometries.
         """
         if self._adata is None or self.sp_kernel is None or self._raster_layer is None:
             raise RuntimeError("Data not initialized. Call setup_data() first.")

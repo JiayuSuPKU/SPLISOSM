@@ -600,6 +600,14 @@ adjust them only when you hit performance or accuracy limits.
      - ``n_probes`` controls Hutchinson Rademacher trace estimates used by
        Liu (four cumulants) and Welch (two cumulants). Use smaller values to 
        speed up large datasets at the cost of approximation accuracy.
+   * - **SV response chunking**
+     - ``chunk_size=`` in ``test_spatial_variability`` / ``run_hsic_gc``
+     - ``"auto"`` (up to 32 response columns)
+     - Batches multiple genes into one spatial-kernel application while
+       keeping each gene intact.  The cap is in response columns, not genes:
+       ``hsic-gc`` contributes one column per gene, whereas multi-isoform
+       ``hsic-ir`` / ``hsic-ic`` genes consume multiple columns.  A single
+       gene wider than the cap is processed alone.
    * - **Outlier spot control**
      - ``standardize_cov=`` at construction and ``min_component_size=`` at ``setup_data``;
        for ``run_hsic_gc``, pass ``standardize_cov`` and ``min_component_size`` directly
@@ -623,6 +631,7 @@ adjust them only when you hit performance or accuracy limits.
        For large irregular 2-D data, prefer ``"nufft"`` / ``"finufft"``,
        which uses FINUFFT matvecs for an implicit RBF grid kernel
        (roughly :math:`O(n \log n)`) without forming a dense GP matrix.
+       See :doc:`gpr_api` for backend class signatures and options.
    * - **GPR inducing points** (DU, ``method="hsic-gp"``)
      - ``gpr_configs={"covariate": {"n_inducing": M}}`` in
        ``test_differential_usage``
@@ -641,15 +650,16 @@ adjust them only when you hit performance or accuracy limits.
        ``r=64``).  Ranks ``32``-``64`` are a practical first large-data range;
        increase the rank when memory permits.
    * - **Parallel jobs**
-     - ``n_jobs=`` in ``test_spatial_variability`` / ``test_differential_usage``
-     - ``-1`` (all CPUs)
-     - Number of joblib workers for gene-wise computation.
+     - ``n_jobs=`` in ``test_spatial_variability`` / ``test_differential_usage`` / ``run_hsic_gc``
+     - ``-1`` for class methods; ``1`` for ``run_hsic_gc``
+     - Number of joblib workers for gene-wise or response-chunk computation.
+       In ``run_hsic_gc``, ``n_jobs=-1`` uses all available CPUs.
        Uses ``prefer="threads"`` to avoid pickling large shared objects.
        When ``gpr_backend="gpytorch"`` with ``device != "cpu"``, parallelism
        is automatically disabled (CUDA not thread-safe).
    * - **Other GPR configuration**
      - ``gpr_configs=`` in ``test_differential_usage``
-     - See :func:`test_differential_usage <splisosm.hyptest_np.SplisosmNP.test_differential_usage>` docstring for details
+     - See :func:`test_differential_usage <splisosm.hyptest_np.SplisosmNP.test_differential_usage>` and :doc:`gpr_api` for details
      - Adjust ``constant_value_bounds`` or ``length_scale_bounds`` to tune the hyperparameter
        searching ranges.
 
@@ -688,6 +698,12 @@ adjust them only when you hit performance or accuracy limits.
      - Number of joblib workers for gene-wise HSIC computation.  Set to
        ``1`` to disable parallelism (useful when ``workers > 1`` already
        saturates the CPU).
+   * - **SV response chunking**
+     - ``chunk_size=`` in ``test_spatial_variability``
+     - ``"auto"`` (up to 32 response channels)
+     - Batches multiple genes into one FFT kernel call.  The cap is in
+       response channels, not genes; multi-isoform genes consume multiple
+       channels and oversized genes are processed alone.
    * - **DU parallel jobs**
      - ``n_jobs=`` in ``test_differential_usage``
      - ``-1`` (all CPUs)

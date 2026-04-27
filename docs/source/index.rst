@@ -25,7 +25,8 @@ Welcome
    :hidden:
    :caption: API Reference
 
-   autoapi/splisosm/index
+   api
+   gpr_api
    refs
 
 .. toctree::

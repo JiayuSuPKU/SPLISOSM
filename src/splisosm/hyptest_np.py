@@ -35,18 +35,13 @@ from splisosm._hsic_null import (
     _kernel_cumulants_for_null,
     _normalize_hsic_null_method,
 )
-from splisosm.kernel_gpr import (
+from splisosm._gpr import (
     linear_hsic_test,
-    fit_kernel_gpr,
     make_kernel_gpr,
     _DEFAULT_GPR_CONFIGS,
 )
 
-__all__ = [
-    "linear_hsic_test",
-    "fit_kernel_gpr",
-    "SplisosmNP",
-]
+__all__ = ["SplisosmNP"]
 
 
 def _calc_ttest_differential_usage(
@@ -666,7 +661,12 @@ def _du_ttest_gene_worker_np(
 
 
 class SplisosmNP:
-    """Non-parametric spatial isoform statistical model.
+    """Non-parametric SPLISOSM model for arbitrary spatial geometries.
+
+    ``SplisosmNP`` works directly on spot- or cell-level coordinates and a
+    sparse CAR spatial kernel. Use :meth:`setup_data` to load an
+    :class:`~anndata.AnnData` object, then run spatial-variability (SV) or
+    differential-usage (DU) tests.
 
     Examples
     --------
@@ -840,11 +840,11 @@ class SplisosmNP:
         min_component_size: int = 1,
         skip_spatial_kernel: bool = False,
     ) -> None:
-        """Setup isoform-level spatial data for hypothesis testing.
+        """Set up isoform-level spatial data for hypothesis testing.
 
-        Extracts isoform count tensors from an AnnData object, optionally
-        filters disconnected graph components, builds a spatial covariance
-        kernel, and resolves the design matrix.
+        This method extracts isoform count tensors, optionally filters small
+        disconnected graph components, builds the spatial kernel, and resolves
+        the design matrix for DU tests.
 
         Parameters
         ----------
@@ -866,9 +866,9 @@ class SplisosmNP:
         adj_key : str or None, optional
             Key in ``adata.obsp`` for a pre-built adjacency matrix.
             When provided, it overrides the k-NN graph construction
-            from coordinates and be used directly to build the spatial kernel.
-            Also makes ``spatial_key`` optional (see above).
-            The adjacency matrix is symmetrized internally.
+            from coordinates and is used directly to build the spatial kernel.
+            It also makes ``spatial_key`` optional (see above). The adjacency
+            matrix is symmetrized internally.
         layer : str, optional
             Layer in ``adata.layers`` that stores isoform counts (default
             ``"counts"``).
@@ -878,7 +878,7 @@ class SplisosmNP:
         gene_names : str or None, optional
             Column name in ``adata.var`` used as display names for genes.
             If ``None``, the values of ``group_iso_by`` are used.
-        design_mtx : tensor, array, DataFrame, str, or list of str, optional
+        design_mtx : tensor, array, sparse matrix, DataFrame, str, or list of str, optional
             Design matrix for differential-usage tests.  Accepts an
             array/tensor/DataFrame of shape ``(n_spots, n_factors)``, a
             single obs-column name (str), or a list of obs-column names.
@@ -902,8 +902,9 @@ class SplisosmNP:
             Minimum total isoform count across spots required to retain an
             isoform (default 10).
         min_bin_pct : float, optional
-            Minimum fraction/percentage of spots where an isoform must be
-            expressed (default 0.0).
+            Minimum spot prevalence required to retain an isoform. Values in
+            ``[0, 1]`` are fractions; values in ``(1, 100]`` are percentages.
+            Default ``0.0``.
         filter_single_iso_genes : bool, optional
             Whether to remove genes with fewer than two retained isoforms
             (default ``True``).
@@ -917,8 +918,8 @@ class SplisosmNP:
             If ``True``, skip construction of the CAR spatial kernel and
             store an :class:`~splisosm.kernel.IdentityKernel` placeholder as
             ``self.sp_kernel`` instead.  Use this when only
-            :meth:`test_differential_usage` is needed (it fits custom GPR
-            to handle spatial autocorrelation).
+            :meth:`test_differential_usage` is needed; ``method="hsic-gp"``
+            fits its own GP for spatial residualization.
             Calling :meth:`test_spatial_variability` on a model set up with
             ``skip_spatial_kernel=True`` will raise a ``RuntimeError``.
             Default ``False``.
@@ -1228,15 +1229,15 @@ class SplisosmNP:
         return_results: bool = False,
         print_progress: bool = True,
     ) -> Optional[dict[str, Any]]:
-        """Test for spatial variability.
+        """Test each gene for spatial variability.
 
-        Kernel-based multivariate hypothesis testing for spatial variability in
+        The HSIC-based methods test association between a centered spatial
+        kernel and one gene-level response at a time:
 
-        - gene-level total counts (``"hsic-gc"`` or ``"spark-x"`` :cite:`zhu2021spark`)
-        - isoform usage ratios (``"hsic-ir"``)
-        - isoform counts (``"hsic-ic"``)
-
-        Test statistics and p-values are computed per gene for each gene separately.
+        - ``"hsic-ir"``: isoform usage ratios.
+        - ``"hsic-ic"``: isoform counts.
+        - ``"hsic-gc"``: gene-level total counts.
+        - ``"spark-x"``: SPARK-X gene-count test :cite:`zhu2021spark`.
 
         Parameters
         ----------
@@ -1255,20 +1256,18 @@ class SplisosmNP:
             Method for computing the null distribution of the test statistic:
 
             * ``"liu"`` (default): asymptotic chi-square mixture using
-              cumulants with Liu's method :cite:`liu2009new`.  Exact
+              cumulants with Liu's method :cite:`liu2009new`. Exact
               eigenvalue cumulants are used when cheap; large implicit
               kernels use Hutchinson Rademacher trace estimates controlled
               by ``null_configs["n_probes"]``.
-            * ``"welch"``: Welch-Satterthwaite moment matching.  Uses
-              tr(K') and tr(K'²) and approximates the null by a scaled
-              chi-squared ``g * chi2(h)`` with ``g = Var/(2*E)`` and
-              ``h = 2*E^2/Var``.  This replaces the old normal approximation
-              with more accurate right-tail p-values, typically closer to the
-              ``"liu"`` reference.
-            * ``"perm"``: permutation-based null distribution.  Supports
+            * ``"welch"``: Welch-Satterthwaite moment matching. It uses the
+              first two null cumulants and approximates the null by a scaled
+              chi-square variable ``g * chi2(h)``, where
+              ``g = Var / (2 * E)`` and ``h = 2 * E**2 / Var``.
+            * ``"perm"``: permutation null distribution. Supports
               optional ``null_configs["n_perms_per_gene"]`` (default 1000),
-              and ``null_configs["perm_batch_size"]`` (default 50, larger values
-              lead to more memory usage) for batch-wise null statistic computation.
+              and ``null_configs["perm_batch_size"]`` (default 50) for
+              batched null-statistic computation.
 
             ``"eig"`` is accepted as a deprecated alias for ``"liu"``.
             ``"clt"`` and ``"trace"`` are accepted as deprecated aliases for
@@ -1283,8 +1282,8 @@ class SplisosmNP:
               many Hutchinson Rademacher probes when exact eigenvalue or trace
               cumulants are unavailable. The same budget is used by ``"welch"``
               when the spatial kernel does not expose exact ``tr(K)`` and
-              ``tr(K^2)`` (for example implicit CAR kernels). Large implicit
-              kernels default to 60 probes.
+              ``tr(K**2)`` (for example implicit CAR kernels). Large implicit
+              kernels use 60 probes by default.
             * ``"approx_rank"``: int or None. Advanced diagnostic override to
               use the top-k spatial eigenvalues and a rank-consistent
               statistic. This is normally unnecessary for SV tests because the
@@ -1310,12 +1309,14 @@ class SplisosmNP:
         Returns
         -------
         dict or None
-            If `return_results` is True, returns dict with test statistics and p-values.
-            Otherwise, returns None and stores results in self._sv_test_results.
+            If ``return_results`` is ``True``, return a result dictionary with
+            test statistics and p-values. Otherwise, store results in
+            ``self._sv_test_results`` and return ``None``.
 
         Notes
         -----
-        To run the SPARK-X test, the R-package `SPARK` must be installed and accessible from Python via `rpy2`.
+        ``method="spark-x"`` requires the R package ``SPARK`` and Python
+        package ``rpy2``.
         """
 
         if self._skip_kernel_construction:
@@ -1467,24 +1468,24 @@ class SplisosmNP:
         print_progress: bool = True,
         return_results: bool = False,
     ) -> Optional[dict[str, Any]]:
-        """Test for spatial isoform differential usage.
+        """Test each gene for differential isoform usage.
 
-        Before running this function, the design matrix must be set up using :func:`setup_data`.
-        Each column of the design matrix corresponds to a covariate to test for differential
-        association with the isoform usage ratios of each gene.
-        Test statistics and p-values are computed per (gene, covariate) pair separately.
+        Call :meth:`setup_data` with ``design_mtx`` before running this
+        method. Each design-matrix column is tested against each gene's
+        isoform usage ratios, producing one statistic and p-value per
+        ``(gene, covariate)`` pair.
 
         Two types of association tests are supported:
 
         - Unconditional (``"hsic"``, ``"t-fisher"``, ``"t-tippett"``): test the
-          unconditional association between isoform usage ratios and the covariate.
+          association between isoform usage ratios and the covariate.
         - Conditional (``"hsic-gp"``): test the association conditioned on spatial
-          coordinates via Gaussian process regression.  See :cite:`zhang2012kernel`
-          for more details.
+          coordinates by residualizing with spatial GP regression.
+          See :cite:`zhang2012kernel`.
 
         Parameters
         ----------
-        method : str, optional
+        method : {"hsic", "hsic-gp", "t-fisher", "t-tippett"}, optional
             Method for association testing:
 
             * ``"hsic"``: Unconditional HSIC test (multivariate RV coefficient).
@@ -1493,18 +1494,17 @@ class SplisosmNP:
             * ``"hsic-gp"``: Conditional HSIC test.  Spatial effects are removed via
               Gaussian process regression before computing the HSIC statistic.
 
-            Or one of the T-tests (binary factors only):
-
             * ``"t-fisher"``, ``"t-tippett"``: each isoform is tested independently
-              and p-values are combined gene-wise via Fisher's or Tippett's method.
-        ratio_transformation : str, optional
+              for binary covariates only; p-values are combined gene-wise via
+              Fisher's or Tippett's method.
+        ratio_transformation : {"none", "clr", "ilr", "alr", "radial"}, optional
             Compositional transformation for isoform ratios.
             One of ``'none'``, ``'clr'``, ``'ilr'``, ``'alr'``, ``'radial'``
             :cite:`park2022kernel`.  See :func:`splisosm.utils.counts_to_ratios`.
-        nan_filling : str, optional
+        nan_filling : {"mean", "none"}, optional
             How to fill NaN values in isoform ratios.  One of ``'mean'`` or ``'none'``.
             See :func:`splisosm.utils.counts_to_ratios`.
-        gpr_backend : str, optional
+        gpr_backend : {"sklearn", "gpytorch", "nufft", "finufft"}, optional
             GPR backend to use for ``method='hsic-gp'``.
             One of ``'sklearn'`` (default), ``'gpytorch'``, ``'nufft'``, or
             ``'finufft'``.  The NUFFT aliases use FINUFFT for irregular 2-D
@@ -1513,37 +1513,36 @@ class SplisosmNP:
             :class:`~splisosm.hyptest_fft.SplisosmFFT` instead.
         gpr_configs : dict, optional
             Nested configuration dict for the GPR objects, with optional keys
-            ``'covariate'`` and/or ``'isoform'``.  Each sub-dict is forwarded to
-            :func:`splisosm.kernel_gpr.make_kernel_gpr`.  Unspecified keys use the
-            defaults from :data:`splisosm.kernel_gpr._DEFAULT_GPR_CONFIGS`.
+            ``"covariate"`` and/or ``"isoform"``. Each sub-dict configures the
+            selected ``gpr_backend``. Unspecified keys use SPLISOSM defaults.
             The shared defaults include ``constant_value=1.0``,
             ``constant_value_bounds=(1e-3, 1e3)``, ``length_scale=1.0``,
-            ``length_scale_bounds="fixed"``. Backend-irrelevant known keys are ignored by
-            :func:`splisosm.kernel_gpr.make_kernel_gpr`.
+            and ``length_scale_bounds="fixed"``. Backend-irrelevant known keys
+            are ignored.
 
             ``"n_inducing"`` *(int or None)* controls the scale of spatial GP
             fitting for the dense/sparse GP backends:
 
             * **sklearn** — maximum number of observations used for
-              hyperparameter fitting.  Full exact GP when ``n_obs ≤ n_inducing``
+              hyperparameter fitting. Full exact GP when
+              ``n_spots <= n_inducing``
               (or ``None``); a randomly sub-sampled **subset-of-data** of
               ``n_inducing`` points otherwise (**not** the same inducing-point
               approximation as gpytorch).  Default: ``5000``.  Set to ``None``
-              to use all observations (warns when ``n_obs > 10_000``).
+              to use all observations (warns when ``n_spots > 10_000``).
             * **gpytorch** — FITC sparse-GP inducing-point approximation with
               ``n_inducing`` points; set to ``None`` for exact GP.
               Default: ``5000``.
 
-            **nufft / finufft** has additional NUFFT-specific configuration options
-            for the RBF-GP fitting. See
-            :class:`splisosm.kernel_gpr.NUFFTKernelGPR` for a full list of
-            arguments and recommended defaults. Common options include:
+            **nufft / finufft** has additional NUFFT-specific options
+            for the RBF-GP fitting. See :class:`splisosm.gpr.NUFFTKernelGPR`
+            for the full backend signature. Common options include:
 
             * ``max_auto_modes`` - cap the size of the automatically inferred grid;
             * ``lml_approx_rank`` - approximate the irregular-coordinate GP likelihoods
               using only the leading eigenvalues and eigensummaries.
               Ignored when the input grid is already regular (full spectrum available via FFT).
-              It costs ``O(n_obs * lml_approx_rank)`` memory and uses a
+              It costs ``O(n_spots * lml_approx_rank)`` memory and uses a
               trace/trace(K^2)-corrected tail for the omitted spectrum.  In
               practice, ranks around ``32``-``64`` often beat same-time sklearn
               subset fits by a wide margin; increase the rank when memory
@@ -1554,13 +1553,13 @@ class SplisosmNP:
             ``method="hsic-gp"``:
 
             * ``"cov_only"`` (default): residualize covariates only; test
-              HSIC(Z_res, Y_raw).  Fastest; calibration matches ``"both"``
+              ``HSIC(Z_res, Y)``. Fastest; calibration matches ``"both"``
               when covariate GPR captures most spatial confounding.
             * ``"both"``: residualize both covariates and isoform ratios.
         n_jobs : int, optional
             Number of parallel workers for the per-gene loop.  ``-1`` uses all
             available CPUs.  Each worker densifies one sparse count tensor
-            (~4–40 MB at 100 K–1 M spots × 10 isoforms).  When
+            (about 4-40 MB for 100K-1M spots by 10 isoforms). When
             ``gpr_backend="gpytorch"`` and ``device != "cpu"``, the GPU is not
             thread-safe; parallelism is automatically disabled.  Default ``-1``.
         print_progress : bool, optional
@@ -1572,8 +1571,8 @@ class SplisosmNP:
         Returns
         -------
         results : dict or None
-            If ``return_results`` is True, returns dict with test statistics and
-            p-values. Otherwise, returns None and stores results in
+            If ``return_results`` is ``True``, return a dictionary with test
+            statistics and p-values. Otherwise, return ``None`` and store results in
             ``self._du_test_results``.
         """
         if self.design_mtx is None:

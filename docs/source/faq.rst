@@ -40,7 +40,7 @@ Platform compatibility
     # run HSIC-GC test (default: Liu's cumulant approximation for the null)
     # null_configs={"n_probes": m} controls the Hutchinson probe budget
     # Default is 60. Use a smaller m for faster computation
-    test_results = run_hsic_gc(gene_counts, coordinates)
+    test_results = run_hsic_gc(gene_counts, coordinates, n_jobs=-1)
     print(test_results['statistic'])  # test statistics, (n_gene,)
     print(test_results['pvalue'])     # p-values, (n_gene,)
 
@@ -54,6 +54,7 @@ Platform compatibility
         spatial_key="spatial",
         min_counts=1,      # optional: drop genes with fewer total counts
         min_bin_pct=0.05,  # optional: drop genes expressed in < 5% of spots
+        n_jobs=-1,         # optional: parallelize gene chunks
     )
 
 Choosing a model class
@@ -140,7 +141,7 @@ Choosing a model class
   The parametric test (:class:`~splisosm.hyptest_glmm.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
 
   Note that both conditional tests (``'hsic-gp'`` and ``'glmm'``) are computationally intensive and may take hours to run on large datasets. 
-  For ``'hsic-gp'``, inducing-point approximations and GPU acceleration (via the `gpytorch` backend) are available, and irregular 2-D coordinates can use the FINUFFT-backed ``gpr_backend="nufft"`` path to avoid dense GP matrices.
+  For ``'hsic-gp'``, inducing-point approximations and GPU acceleration (via the `gpytorch` backend) are available, and irregular 2-D coordinates can use the FINUFFT-backed ``gpr_backend="nufft"`` path to avoid dense GP matrices. See :doc:`gpr_api` for backend-specific options.
   For ``'glmm'``, model fitting is handled natively with PyTorch with GPU device support, and low-rank kernel approximation is also available (via ``SplisosmGLMM(approx_rank=...)``).
 
   .. code-block:: python

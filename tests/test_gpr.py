@@ -1,4 +1,4 @@
-"""Unit tests for splisosm.kernel_gpr."""
+"""Unit tests for internal Gaussian-process residualization helpers."""
 
 import unittest
 import warnings
@@ -7,20 +7,23 @@ import sys
 import numpy as np
 import torch
 
-from splisosm.kernel_gpr import (
+from splisosm._gpr import (
     DenseKernelOp,
     FFTKernelOp,
-    FFTKernelGPR,
     NUFFTKernelOp,
-    NUFFTKernelGPR,
     SpatialKernelOp,
-    SklearnKernelGPR,
-    GPyTorchKernelGPR,
-    make_kernel_gpr,
     linear_hsic_test,
     _build_rbf_kernel,
     _DEFAULT_GPR_CONFIGS,
     _kernel_residuals_from_eigdecomp,
+)
+from splisosm.gpr import (
+    FFTKernelGPR,
+    GPyTorchKernelGPR,
+    KernelGPR,
+    NUFFTKernelGPR,
+    SklearnKernelGPR,
+    make_kernel_gpr,
 )
 
 
@@ -51,6 +54,14 @@ class TestBuildRbfKernel(unittest.TestCase):
     def test_diagonal_equals_constant_value(self):
         K = _make_rbf_kernel(n=20, constant_value=2.5)
         self.assertTrue(torch.allclose(K.diag(), torch.full((20,), 2.5), atol=1e-5))
+
+
+class TestPublicGPRFacade(unittest.TestCase):
+    def test_backend_classes_are_publicly_importable(self):
+        self.assertTrue(issubclass(SklearnKernelGPR, KernelGPR))
+        self.assertTrue(issubclass(GPyTorchKernelGPR, KernelGPR))
+        self.assertTrue(issubclass(FFTKernelGPR, KernelGPR))
+        self.assertTrue(issubclass(NUFFTKernelGPR, KernelGPR))
 
 
 class TestDenseKernelOp(unittest.TestCase):
@@ -281,7 +292,7 @@ class TestSklearnKernelGPR(unittest.TestCase):
         self.assertTrue(torch.isnan(res[:5]).all())
 
     def test_get_kernel_op(self):
-        from splisosm.kernel_gpr import DenseKernelOp
+        from splisosm._gpr import DenseKernelOp
 
         gpr = self._make_gpr_fixed()
         op = gpr.get_kernel_op(self.coords)

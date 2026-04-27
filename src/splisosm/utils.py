@@ -553,8 +553,8 @@ def prepare_inputs_from_anndata(
     adj_key
         Key in ``adata.obsp`` for a pre-built adjacency matrix.
         When provided, it overrides the k-NN graph construction
-        from coordinates and be used directly to build the spatial kernel.
-        The adjacency matrix is symmetrized internally before returned.
+        from coordinates and is used directly to build the spatial kernel.
+        The adjacency matrix is symmetrized internally before being returned.
     min_counts
         Minimum total isoform count across spots required to retain an isoform.
     min_bin_pct
@@ -568,8 +568,9 @@ def prepare_inputs_from_anndata(
         If ``None``, the grouped gene IDs are used.
     design_mtx
         Design matrix for differential-usage tests.  Accepts a
-        tensor/array/dataframe of shape ``(n_spots, n_factors)``, a single
-        obs-column name (str), or a list of obs-column names.
+        tensor, array, sparse matrix, DataFrame of shape
+        ``(n_spots, n_factors)``, a single obs-column name, or a list of
+        obs-column names.
     covariate_names
         Explicit covariate names.  When ``design_mtx`` is given as column
         name(s) and this is ``None``, the column names are used automatically.
@@ -596,9 +597,9 @@ def prepare_inputs_from_anndata(
         Per-gene isoform count tensors, each of shape ``(n_spots, n_isos)``.
         Sparse ``adata.layers[layer]`` input yields sparse COO tensors.
     coordinates : torch.Tensor or None
-        Shape ``(n_spots, n_spatial_dims)`` spatial coordinates, dtype float32.  ``None``
-        when ``spatial_key`` is missing from ``adata.obsm`` and ``adj_key``
-        supplies the neighborhood graph instead.
+        Spatial coordinates with shape ``(n_spots, n_spatial_dims)`` and dtype
+        float32. ``None`` when ``spatial_key`` is missing from ``adata.obsm``
+        and ``adj_key`` supplies the neighborhood graph instead.
     resolved_gene_names : list[str]
         Display names for each gene in ``counts_list``.
     resolved_design : np.ndarray or tensor or None
@@ -1503,7 +1504,8 @@ def run_hsic_gc(
 ) -> dict[str, Any]:
     """Compute the HSIC-GC statistic for gene-level counts.
 
-    This function is designed to be a plugin replacement for SPARK-X.
+    This standalone helper runs the gene-count SV test used by
+    ``method="hsic-gc"`` without constructing a ``SplisosmNP`` model.
 
     Parameters
     ----------
@@ -1539,7 +1541,8 @@ def run_hsic_gc(
         Maximum number of gene-count response columns to process in one
         spatial-kernel application. ``"auto"`` (default) estimates a
         memory-safe cap from a 2 GiB live-memory budget and caps the result
-        at 32 columns for per-feature runtime.
+        at 32 columns for per-feature runtime. Genes are never split across
+        chunks.
     n_jobs : int, optional
         Number of joblib workers for chunked gene-level HSIC computation.
         ``1`` (default) runs serially.  Use ``-1`` to use all available CPUs.
@@ -1548,11 +1551,11 @@ def run_hsic_gc(
     min_component_size : int, optional
         Minimum number of spots a connected component must contain to be
         retained.  Spots that belong to components smaller than this
-        threshold are removed from all data structures (counts, coordinates,
-        design matrix) before the spatial kernel is built. Components are detected
-        on the same k-NN graph used for the spatial kernel (controlled by ``k_neighbors``).
-        The default value of ``1`` disables filtering.
-        A ``UserWarning`` is issued whenever spots are removed.
+        threshold are removed before the spatial kernel is built. Components
+        are detected on the same k-NN graph used for the spatial kernel
+        (controlled by ``k_neighbors``), unless ``adj_key`` supplies a graph.
+        The default value of ``1`` disables filtering. A ``UserWarning`` is
+        issued whenever spots are removed.
     adata : AnnData or None, optional
         If provided, use ``adata.X`` (when ``layer=None``) or
         ``adata.layers[layer]`` as ``counts_gene`` — a ``(n_spots, n_genes)``
@@ -1575,7 +1578,8 @@ def run_hsic_gc(
     min_counts : int, optional
         Minimum total count to retain a gene in AnnData mode.  Default 0.
     min_bin_pct : float, optional
-        Minimum fraction of spots expressing a gene (count > 0).  Default 0.
+        Minimum fraction of spots expressing a gene (count > 0). Default
+        ``0.0``.
     **spatial_kernel_kwargs
         Additional arguments forwarded to :class:`~splisosm.kernel.SpatialCovKernel`.
         For example, ``standardize_cov=True`` (default) standardises the CAR

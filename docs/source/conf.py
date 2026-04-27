@@ -62,7 +62,6 @@ extensions = [
     'sphinx.ext.autosummary',
     'sphinx.ext.intersphinx',
     'sphinx.ext.autosectionlabel',
-    'autoapi.extension',
     'sphinx.ext.napoleon',
     'sphinxcontrib.bibtex',
     'sphinx.ext.mathjax',
@@ -73,19 +72,6 @@ nb_execution_mode = "off"
 
 # Citation bibtex file
 bibtex_bibfiles = ["refs.bib"]
-
-# AutoAPI configuration
-autoapi_dirs = ['../../splisosm']
-autoapi_add_toctree_entry = False
-autoapi_python_class_content = 'both'
-autoapi_ignore = ['**/.ipynb_checkpoints/*', '**/*-checkpoint.py']
-autoapi_options = [
-    'members',
-    'undoc-members',
-    'show-inheritance',
-    'show-module-summary',
-]
-autoapi_member_order = 'groupwise'
 
 # Napoleon configuration
 napoleon_numpy_docstring = True
