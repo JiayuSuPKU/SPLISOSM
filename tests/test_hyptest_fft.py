@@ -367,6 +367,37 @@ class TestSplisosmFFT(unittest.TestCase):
         self.assertEqual(res_dict["null_method"], "liu")
         self.assertTrue(np.all(np.isfinite(res_dict["pvalue"])))
 
+    def test_spatial_variability_chunk_size_matches_single_channel(self):
+        """FFT SV chunking matches one-channel/singleton execution."""
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+        )
+
+        ref = model.test_spatial_variability(
+            method="hsic-ic",
+            chunk_size=1,
+            n_jobs=1,
+            print_progress=False,
+            return_results=True,
+        )
+        res = model.test_spatial_variability(
+            method="hsic-ic",
+            chunk_size="auto",
+            n_jobs=1,
+            print_progress=False,
+            return_results=True,
+        )
+        np.testing.assert_allclose(
+            res["statistic"], ref["statistic"], rtol=1e-6, atol=1e-8
+        )
+        np.testing.assert_allclose(res["pvalue"], ref["pvalue"], rtol=1e-6, atol=1e-8)
+        self.assertLessEqual(res["chunk_size"], 32)
+
     def test_setup_data_filter_single_iso_genes_false(self):
         """filter_single_iso_genes=False keeps genes with only one passing isoform."""
         # The default fixture has 2 genes each with 3 probes.

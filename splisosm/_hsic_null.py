@@ -6,10 +6,17 @@ import warnings
 from typing import Any, Literal, Optional
 
 import numpy as np
+import scipy.sparse
 import torch
 from scipy.stats import chi2 as _chi2_dist
 
-from splisosm.kernel import FFTKernel, IdentityKernel, Kernel, SpatialCovKernel
+from splisosm.kernel import (
+    FFTKernel,
+    IdentityKernel,
+    Kernel,
+    SpatialCovKernel,
+    _MaskedSpatialKernel,
+)
 from splisosm.likelihood import liu_sf_from_cumulants
 
 _DELTA = 1e-10
@@ -39,6 +46,11 @@ def _kernel_has_exact_c12(kernel: Kernel) -> bool:
         # Hutchinson estimators, so callers should use their configured probe
         # budget instead of treating these as analytic substitutions.
         return kernel.K_sp is not None
+    if isinstance(kernel, _MaskedSpatialKernel):
+        # The masked kernel can compute exact traces only by applying the
+        # operator to a dense identity block.  For per-gene NaN masks we want
+        # the configured Hutchinson budget instead.
+        return False
     return isinstance(kernel, (FFTKernel, IdentityKernel)) or (
         hasattr(kernel, "trace") and hasattr(kernel, "square_trace")
     )
@@ -80,10 +92,54 @@ def _normalize_hsic_null_method(null_method: str, allow_perm: bool = False) -> s
     return null_method
 
 
-def _feature_cumulants_from_data(y: np.ndarray | torch.Tensor) -> dict[int, float]:
-    """Return cumulants of the small feature Gram matrix ``Y.T @ Y``."""
+def _feature_cumulants_from_data(
+    y: np.ndarray | torch.Tensor | scipy.sparse.spmatrix,
+    *,
+    centered: bool = True,
+) -> dict[int, float]:
+    """Return cumulants of the small feature Gram matrix ``Y.T @ Y``.
+
+    Parameters
+    ----------
+    y
+        Response matrix of shape ``(n_spots, n_features)``.
+    centered
+        Whether columns of ``y`` are already centred.  When ``False``, the
+        centred Gram matrix is computed without materializing dense centred
+        sparse responses.
+    """
+    if scipy.sparse.issparse(y):
+        y_csc = y.tocsc(copy=False)
+        gram = y_csc.T @ y_csc
+        gram_np = gram.toarray() if scipy.sparse.issparse(gram) else np.asarray(gram)
+        if not centered:
+            sums = np.asarray(y_csc.sum(axis=0)).ravel().astype(float)
+            gram_np = gram_np - np.outer(sums, sums) / float(y_csc.shape[0])
+        gram_np = np.asarray(gram_np, dtype=float)
+        try:
+            eigvals_np = np.linalg.eigvalsh(gram_np)
+        except np.linalg.LinAlgError:
+            eigvals_np = np.linalg.eigvalsh(
+                gram_np + 1e-6 * np.eye(gram_np.shape[0], dtype=float)
+            )
+        return _cumulants_from_eigenvalues(eigvals_np)
+
     if isinstance(y, torch.Tensor):
-        gram = y.detach().cpu().T @ y.detach().cpu()
+        y_cpu = y.detach().cpu()
+        if y_cpu.layout != torch.strided:
+            if y_cpu.layout != torch.sparse_coo and hasattr(y_cpu, "to_sparse_coo"):
+                y_cpu = y_cpu.to_sparse_coo()
+            y_cpu = y_cpu.coalesce()
+            idx = y_cpu.indices().numpy()
+            vals = y_cpu.values().numpy()
+            y_sp = scipy.sparse.coo_matrix(
+                (vals, (idx[0], idx[1])),
+                shape=tuple(y_cpu.shape),
+            ).tocsc()
+            return _feature_cumulants_from_data(y_sp, centered=centered)
+        if not centered:
+            y_cpu = y_cpu - y_cpu.mean(dim=0, keepdim=True)
+        gram = y_cpu.T @ y_cpu
         try:
             eigvals = torch.linalg.eigvalsh(gram)
         except torch._C._LinAlgError:
@@ -92,6 +148,10 @@ def _feature_cumulants_from_data(y: np.ndarray | torch.Tensor) -> dict[int, floa
         return _cumulants_from_eigenvalues(eigvals, threshold=1e-5)
 
     arr = np.asarray(y, dtype=float)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    if not centered:
+        arr = arr - arr.mean(axis=0, keepdims=True)
     gram_np = arr.T @ arr
     try:
         eigvals_np = np.linalg.eigvalsh(gram_np)
@@ -300,15 +360,6 @@ def _kernel_cumulants_for_null(
         ),
         kernel_approx_rank,
     )
-
-
-def _dense_kernel_cumulants(K: np.ndarray | torch.Tensor) -> dict[int, float]:
-    """Return cumulants for a dense kernel matrix."""
-    if isinstance(K, torch.Tensor):
-        eigvals = torch.linalg.eigvalsh(K)
-    else:
-        eigvals = np.linalg.eigvalsh(np.asarray(K, dtype=float))
-    return _cumulants_from_eigenvalues(eigvals)
 
 
 def _hsic_mixture_cumulants(

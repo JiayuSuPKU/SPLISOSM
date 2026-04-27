@@ -12,7 +12,9 @@ import scipy.stats
 import torch
 from anndata import AnnData
 from unittest.mock import patch
+from splisosm._chunking import pack_gene_chunks
 from splisosm.utils import (
+    auto_chunk_size,
     counts_to_ratios,
     false_discovery_control,
     load_visium_sp_meta,
@@ -20,7 +22,6 @@ from splisosm.utils import (
     extract_gene_level_statistics,
     run_hsic_gc,
     run_sparkx,
-    _index_rows_sparse_coo,
 )
 
 
@@ -244,6 +245,41 @@ class TestUtils(unittest.TestCase):
         np.testing.assert_allclose(
             res_np["statistic"], res_torch_sparse["statistic"], rtol=1e-4
         )
+
+    def test_auto_chunk_size_and_gene_packing(self):
+        """Auto chunking caps response columns and keeps genes whole."""
+        self.assertEqual(auto_chunk_size(100, backend="np"), 32)
+        self.assertEqual(auto_chunk_size(100, backend="fft"), 32)
+        self.assertEqual(
+            auto_chunk_size(
+                1_000_000,
+                backend="fft",
+                memory_budget=64 * (1 << 20),
+            ),
+            1,
+        )
+
+        chunks = pack_gene_chunks([3, 4, 40, 2, 30], 32)
+        self.assertEqual(chunks, [[0, 1], [2], [3, 4]])
+
+    def test_run_hsic_gc_chunk_size_matches_single_column(self):
+        """Chunked HSIC-GC matches one-column execution for sparse input."""
+        np.random.seed(101)
+        n_spots, n_genes = 60, 7
+        counts = np.random.poisson(1.0, size=(n_spots, n_genes)).astype(np.float32)
+        counts[counts < 2] = 0
+        coords = np.random.rand(n_spots, 2).astype(np.float32)
+        counts_sp = scipy.sparse.csr_matrix(counts)
+
+        res_one = run_hsic_gc(counts_sp, coords, chunk_size=1)
+        res_chunk = run_hsic_gc(counts_sp, coords, chunk_size=32)
+        np.testing.assert_allclose(
+            res_one["statistic"], res_chunk["statistic"], rtol=1e-5, atol=1e-8
+        )
+        np.testing.assert_allclose(
+            res_one["pvalue"], res_chunk["pvalue"], rtol=1e-5, atol=1e-8
+        )
+        self.assertEqual(res_chunk["chunk_size"], 32)
 
     def test_run_hsic_gc_anndata_mode(self):
         """AnnData mode loads adata.X / adata.layers[layer] as gene-level counts."""
@@ -686,39 +722,6 @@ class TestUtils(unittest.TestCase):
         self.assertIn("method", out)
         self.assertEqual(out["method"], "spark-x")
         self.assertEqual(len(out["pvalue"]), 2)
-
-
-class TestIndexRowsSparseCoo(unittest.TestCase):
-    def test_correctness(self):
-        """_index_rows_sparse_coo must match dense row indexing without densifying."""
-        torch.manual_seed(0)
-        n, m = 20, 5
-        mask = torch.rand(n, m) < 0.3
-        dense = torch.randn(n, m) * mask.float()
-        sparse = dense.to_sparse()
-        keep_indices = np.array([0, 3, 7, 11, 15, 19], dtype=np.int64)
-        result = _index_rows_sparse_coo(sparse, keep_indices)
-        self.assertEqual(result.shape, torch.Size([len(keep_indices), m]))
-        torch.testing.assert_close(result.to_dense(), dense[keep_indices])
-
-    def test_uncoalesced(self):
-        """Helper must handle uncoalesced (duplicate-index) COO tensors."""
-        indices = torch.tensor([[0, 0, 1, 2], [0, 0, 1, 2]], dtype=torch.long)
-        values = torch.tensor([1.0, 2.0, 3.0, 4.0])
-        t = torch.sparse_coo_tensor(indices, values, size=(4, 3))
-        self.assertFalse(t.is_coalesced())
-        keep_indices = np.array([0, 2], dtype=np.int64)
-        result = _index_rows_sparse_coo(t, keep_indices)
-        torch.testing.assert_close(
-            result.to_dense(), t.coalesce().to_dense()[keep_indices]
-        )
-
-    def test_empty_keep(self):
-        """Keeping zero rows yields an empty sparse tensor."""
-        t = torch.eye(5).to_sparse()
-        result = _index_rows_sparse_coo(t, np.array([], dtype=np.int64))
-        self.assertEqual(result.shape, torch.Size([0, 5]))
-        self.assertEqual(result.to_dense().numel(), 0)
 
 
 class TestRunHsicGc(unittest.TestCase):

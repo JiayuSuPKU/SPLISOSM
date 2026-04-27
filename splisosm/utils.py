@@ -13,6 +13,7 @@ from tqdm import tqdm
 import pandas as pd
 import torch
 from anndata import AnnData
+from splisosm._chunking import auto_chunk_size, pack_gene_chunks, resolve_chunk_size
 from splisosm._hsic_null import (
     _feature_cumulants_from_data,
     _hsic_liu_pvalue,
@@ -32,48 +33,10 @@ __all__ = [
     "extract_counts_n_ratios",
     "compute_feature_summaries",
     "extract_gene_level_statistics",
+    "auto_chunk_size",
     "run_sparkx",
     "run_hsic_gc",
 ]
-
-
-def _index_rows_sparse_coo(t: torch.Tensor, keep_indices: np.ndarray) -> torch.Tensor:
-    """Row-index a 2-D sparse COO tensor without densifying.
-
-    Operates entirely on the stored indices and values so memory usage is
-    proportional to the number of retained non-zeros, not to ``n × m``.
-
-    Parameters
-    ----------
-    t : torch.Tensor
-        Sparse COO tensor of shape ``(n, m)``.  Need not be coalesced.
-    keep_indices : np.ndarray
-        1-D integer array of row positions to retain, in ascending order
-        (as returned by ``np.where(mask)[0]``).
-
-    Returns
-    -------
-    torch.Tensor
-        Sparse COO tensor of shape ``(len(keep_indices), m)`` with the same
-        dtype as *t*.
-    """
-    t = t.coalesce()
-    n = t.shape[0]
-
-    # Build old_row → new_row lookup (-1 means the row is dropped)
-    row_map = torch.full((n,), -1, dtype=torch.long)
-    keep_t = torch.from_numpy(keep_indices.astype(np.int64))
-    row_map[keep_t] = torch.arange(len(keep_indices), dtype=torch.long)
-
-    row_idx = t.indices()[0]  # (nnz,)
-    new_rows = row_map[row_idx]
-    mask = new_rows >= 0  # entries that survive
-
-    new_indices = torch.stack([new_rows[mask], t.indices()[1][mask]])
-    new_values = t.values()[mask]
-    new_size = torch.Size([len(keep_indices), t.shape[1]])
-
-    return torch.sparse_coo_tensor(new_indices, new_values, new_size, dtype=t.dtype)
 
 
 def get_cov_sp(
@@ -232,11 +195,15 @@ def counts_to_ratios(
 
     # apply transformation
     if transformation == "clr":
-        y = torch.from_numpy(clr(y)).float()  # (n_spots, n_isos)
+        y = torch.from_numpy(clr(y.detach().cpu().numpy())).float()  # (n_spots, n_isos)
     elif transformation == "ilr":
-        y = torch.from_numpy(ilr(y)).float()  # (n_spots, n_isos - 1)
+        y = torch.from_numpy(
+            ilr(y.detach().cpu().numpy())
+        ).float()  # (n_spots, n_isos - 1)
     elif transformation == "alr":
-        y = torch.from_numpy(alr(y)).float()  # (n_spots, n_isos - 1)
+        y = torch.from_numpy(
+            alr(y.detach().cpu().numpy())
+        ).float()  # (n_spots, n_isos - 1)
     elif transformation == "radial":
         y = y / y.norm(dim=1, keepdim=True)  # NaN rows stay NaN
 
@@ -1458,6 +1425,7 @@ def run_hsic_gc(
     coordinates: "np.ndarray | torch.Tensor | None" = None,
     null_method: Literal["liu", "welch", "eig", "clt", "trace"] = "liu",
     null_configs: Optional[dict[str, Any]] = None,
+    chunk_size: int | Literal["auto"] = "auto",
     min_component_size: int = 1,
     adata: "AnnData | None" = None,
     layer: "str | None" = None,
@@ -1501,6 +1469,11 @@ def run_hsic_gc(
         kernel has no exact trace path; implicit CAR kernels default to 60
         probes. ``"n_probes"`` is stochastic trace control, not a low-rank
         approximation.
+    chunk_size : int or {"auto"}, optional
+        Maximum number of gene-count response columns to process in one
+        spatial-kernel application. ``"auto"`` (default) estimates a
+        memory-safe cap from a 2 GiB live-memory budget and caps the result
+        at 32 columns for per-feature runtime.
     min_component_size : int, optional
         Minimum number of spots a connected component must contain to be
         retained.  Spots that belong to components smaller than this
@@ -1746,16 +1719,13 @@ def run_hsic_gc(
     else:
         raise ValueError(f"null_method must be 'liu' or 'welch', got {null_method!r}")
 
-    # compute the HSIC-GC statistic per-gene
+    # compute the HSIC-GC statistic in response-column chunks
     is_scipy_sparse = scipy.sparse.issparse(counts_gene)
     is_torch_sparse = isinstance(counts_gene, torch.Tensor) and counts_gene.is_sparse
 
     if is_scipy_sparse:
         n_spots, n_genes = counts_gene.shape
-        # Ensure efficient column slicing
-        if not scipy.sparse.isspmatrix_csc(
-            counts_gene
-        ) and not scipy.sparse.isspmatrix_csr(counts_gene):
+        if not scipy.sparse.isspmatrix_csc(counts_gene):
             counts_gene = counts_gene.tocsc()
     elif is_torch_sparse:
         n_spots, n_genes = counts_gene.shape
@@ -1763,35 +1733,39 @@ def run_hsic_gc(
             counts_gene = counts_gene.float()
         if not counts_gene.is_coalesced():
             counts_gene = counts_gene.coalesce()
-        # Pre-allocate selection vector for column extraction
-        selection_vec = torch.zeros(
-            n_genes, 1, device=counts_gene.device, dtype=counts_gene.dtype
+        idx = counts_gene.indices().detach().cpu().numpy()
+        vals = counts_gene.values().detach().cpu().numpy()
+        counts_gene = scipy.sparse.coo_matrix(
+            (vals, (idx[0], idx[1])),
+            shape=tuple(counts_gene.shape),
         )
+        counts_gene = counts_gene.tocsc()
+        is_scipy_sparse = True
     else:
-        if not isinstance(counts_gene, torch.Tensor):
-            counts_gene = torch.from_numpy(counts_gene).float()  # (n_spots, n_genes)
+        if isinstance(counts_gene, torch.Tensor):
+            counts_gene = counts_gene.detach().cpu().numpy()
+        counts_gene = np.asarray(counts_gene, dtype=np.float64)
         n_spots, n_genes = counts_gene.shape
-        y_dense = counts_gene - counts_gene.mean(
-            0, keepdim=True
-        )  # center the counts, (n_spots, n_genes)
 
-    hsic_list, pvals_list = [], []
-    for i in tqdm(range(n_genes), desc="Genes", total=n_genes):
+    column_cap = resolve_chunk_size(
+        chunk_size,
+        n_observations=n_spots,
+        backend="np",
+        n_jobs=1,
+        dtype_bytes=8,
+    )
+    gene_chunks = pack_gene_chunks([1] * n_genes, column_cap)
+    hsic_arr = np.empty(n_genes, dtype=float)
+    pvals_arr = np.empty(n_genes, dtype=float)
+
+    for chunk in tqdm(gene_chunks, desc="Genes", total=len(gene_chunks)):
+        cols = np.asarray(chunk, dtype=int)
         if is_scipy_sparse:
-            col = counts_gene[:, i].toarray()  # dense (n_spots, 1)
-            counts = torch.from_numpy(col).float()
-            counts = counts - counts.mean()
-        elif is_torch_sparse:
-            # Extract column i using Sparse x Dense matrix multiplication
-            # (N, G) @ (G, 1) -> (N, 1)
-            # This is efficient and avoids densifying the full matrix
-            selection_vec.zero_()
-            selection_vec[i, 0] = 1.0
-
-            col = torch.sparse.mm(counts_gene, selection_vec)
-            counts = col - col.mean()
+            sparse_block = counts_gene[:, cols]
+            dense_block = sparse_block.toarray().astype(np.float64, copy=False)
         else:
-            counts = y_dense[:, i : i + 1]  # (n_spots, 1)
+            sparse_block = None
+            dense_block = np.asarray(counts_gene[:, cols], dtype=np.float64)
 
         # Compute HSIC test statistic.
         # When `liu` null is used with an explicit low rank, use the
@@ -1799,36 +1773,57 @@ def run_hsic_gc(
         # on the same (rank-k) scale — preventing the p=0 scale-mismatch bug.
         # Otherwise fall back to the exact full-kernel quadratic form.
         if null_method == "liu" and kernel_approx_rank is not None:
-            hsic_scaled = torch.trace(K_sp.xtKx_approx(counts, k=kernel_approx_rank))
+            q_input = (
+                sparse_block
+                if sparse_block is not None
+                else torch.from_numpy(dense_block.astype(np.float32, copy=False))
+            )
+            q_mat = K_sp.xtKx_approx(q_input, k=kernel_approx_rank)
         else:
-            hsic_scaled = torch.trace(K_sp.xtKx_exact(counts))
-
-        if null_method == "liu":
-            feature_cumulants = _feature_cumulants_from_data(counts)
-            pval = _hsic_liu_pvalue(
-                float(hsic_scaled),
-                kernel_cumulants,
-                feature_cumulants,
-                n_spots,
+            q_input = (
+                sparse_block
+                if sparse_block is not None
+                else torch.from_numpy(dense_block.astype(np.float32, copy=False))
             )
-        else:  # "welch"
-            feature_cumulants = _feature_cumulants_from_data(counts)
-            pval = _hsic_welch_pvalue(
-                float(hsic_scaled),
-                kernel_cumulants,
-                feature_cumulants,
-                n_spots,
-            )
+            q_mat = K_sp.xtKx_exact(q_input)
+        if isinstance(q_mat, torch.Tensor):
+            q_cols = torch.diagonal(q_mat).detach().cpu().numpy().astype(float)
+        elif scipy.sparse.issparse(q_mat):
+            q_cols = np.asarray(q_mat.diagonal(), dtype=float)
+        else:
+            q_cols = np.diag(np.asarray(q_mat, dtype=float))
 
-        hsic_list.append(hsic_scaled / (n_spots - 1) ** 2)  # HSIC statistic
-        pvals_list.append(pval)
+        centered_block = dense_block - dense_block.mean(axis=0, keepdims=True)
+        for local_idx, gene_idx in enumerate(cols):
+            hsic_scaled = float(q_cols[local_idx])
+            counts = centered_block[:, local_idx : local_idx + 1]
+            feature_cumulants = _feature_cumulants_from_data(counts)
+
+            if null_method == "liu":
+                pval = _hsic_liu_pvalue(
+                    hsic_scaled,
+                    kernel_cumulants,
+                    feature_cumulants,
+                    n_spots,
+                )
+            else:  # "welch"
+                pval = _hsic_welch_pvalue(
+                    hsic_scaled,
+                    kernel_cumulants,
+                    feature_cumulants,
+                    n_spots,
+                )
+
+            hsic_arr[gene_idx] = hsic_scaled / (n_spots - 1) ** 2
+            pvals_arr[gene_idx] = pval
 
     sv_test_results = {
-        "statistic": torch.tensor(hsic_list).numpy(),
-        "pvalue": torch.tensor(pvals_list).numpy(),
+        "statistic": hsic_arr,
+        "pvalue": pvals_arr,
         "method": "hsic-gc",
         "null_method": null_method,
         "n_spots": n_spots,
+        "chunk_size": column_cap,
     }
 
     # calculate adjusted p-values

@@ -5,11 +5,18 @@ import numpy as np
 import scipy.sparse
 import pandas as pd
 from anndata import AnnData
+from unittest.mock import patch
 from splisosm.utils import run_hsic_gc
 from splisosm.hyptest_np import (
     SplisosmNP,
     _calc_ttest_differential_usage,
+    _prepare_np_response,
+    _quadratic_columns_exact,
+    _sparse_counts_to_ratios_centered,
 )
+from splisosm._hsic_null import _feature_cumulants_from_data
+from splisosm.kernel import SpatialCovKernel
+from splisosm.utils import counts_to_ratios
 from splisosm.simulation import simulate_isoform_counts
 
 
@@ -346,6 +353,154 @@ class TestSplisosmNP(unittest.TestCase):
                 print(sv_results.head())
                 self.assertIn(method, str(model))
 
+    def test_spatial_variability_chunk_size_matches_single_column(self):
+        """Column-chunked NP SV matches one-column/singleton execution."""
+        adata = self.adata_10g.copy()
+        adata.layers["counts"] = scipy.sparse.csr_matrix(adata.layers["counts"])
+
+        ref = None
+        last = None
+        for chunk_size in (1, 2, "auto"):
+            model = SplisosmNP()
+            model.setup_data(
+                adata=adata,
+                layer="counts",
+                spatial_key="spatial",
+                group_iso_by="gene_symbol",
+                gene_names="gene_label",
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
+            )
+            res = model.test_spatial_variability(
+                method="hsic-ic",
+                chunk_size=chunk_size,
+                n_jobs=1,
+                return_results=True,
+                print_progress=False,
+            )
+            if ref is None:
+                ref = res
+            else:
+                np.testing.assert_allclose(
+                    res["statistic"], ref["statistic"], rtol=1e-5, atol=1e-8
+                )
+                np.testing.assert_allclose(
+                    res["pvalue"], ref["pvalue"], rtol=1e-5, atol=1e-8
+                )
+            last = res
+        self.assertLessEqual(last["chunk_size"], 32)
+
+    def test_sparse_ratio_response_matches_dense_ratio_statistic(self):
+        """Sparse HSIC-IR ratios avoid dense counts while matching dense math."""
+        counts_dense = np.array(
+            [
+                [2.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 3.0, 0.0],
+                [0.0, 4.0, 4.0],
+                [0.0, 0.0, 0.0],
+                [5.0, 0.0, 5.0],
+            ],
+            dtype=np.float32,
+        )
+        kernel = SpatialCovKernel.from_coordinates(
+            np.column_stack([np.arange(counts_dense.shape[0]), np.zeros(6)]),
+            k_neighbors=2,
+            rho=0.9,
+            centering=True,
+        )
+        counts_sparse = torch.from_numpy(counts_dense).to_sparse()
+
+        for transformation in ("none", "clr", "ilr", "alr", "radial"):
+            with self.subTest(transformation=transformation):
+                sparse_centered, nan_mask = _sparse_counts_to_ratios_centered(
+                    scipy.sparse.csr_matrix(counts_dense),
+                    transformation=transformation,
+                    nan_filling="mean",
+                )
+                self.assertIsNone(nan_mask)
+                response, is_centered = _prepare_np_response(
+                    counts_sparse,
+                    method="hsic-ir",
+                    ratio_transformation=transformation,
+                )
+                dense_ref = counts_to_ratios(
+                    torch.from_numpy(counts_dense),
+                    transformation=transformation,
+                    nan_filling="mean",
+                    fill_before_transform=False,
+                ).numpy()
+                dense_ref = dense_ref - dense_ref.mean(axis=0, keepdims=True)
+                np.testing.assert_allclose(
+                    sparse_centered.toarray(), dense_ref, atol=1e-6
+                )
+                self.assertTrue(is_centered)
+                self.assertTrue(scipy.sparse.issparse(response))
+                np.testing.assert_allclose(response.toarray(), dense_ref, atol=1e-6)
+                self.assertEqual(response[1].nnz, 0)
+                self.assertEqual(response[4].nnz, 0)
+
+                q_sparse = _quadratic_columns_exact(kernel, response)
+                kx = np.asarray(kernel.Kx(dense_ref), dtype=float)
+                q_dense = np.sum(dense_ref * kx, axis=0)
+                np.testing.assert_allclose(q_sparse, q_dense, rtol=1e-6, atol=1e-8)
+
+    def test_sparse_counts_to_ratios_centered_nan_mask(self):
+        """Sparse ratio helper returns centered expressed rows plus NaN mask."""
+        counts_dense = np.array(
+            [
+                [3.0, 0.0],
+                [0.0, 0.0],
+                [1.0, 1.0],
+                [0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        sparse, nan_mask = _sparse_counts_to_ratios_centered(
+            scipy.sparse.csr_matrix(counts_dense),
+            transformation="none",
+            nan_filling="none",
+        )
+        np.testing.assert_array_equal(nan_mask, np.array([False, True, False, True]))
+        dense_ref = counts_to_ratios(
+            torch.from_numpy(counts_dense),
+            transformation="none",
+            nan_filling="none",
+            fill_before_transform=False,
+        )
+        keep = ~torch.isnan(dense_ref).any(1)
+        dense_ref = dense_ref[keep].numpy()
+        dense_ref = dense_ref - dense_ref.mean(axis=0, keepdims=True)
+        np.testing.assert_allclose(sparse[~nan_mask].toarray(), dense_ref, atol=1e-7)
+        self.assertEqual(sparse[nan_mask].nnz, 0)
+
+    def test_sparse_feature_cumulants_match_dense_centering(self):
+        """Sparse feature cumulants compute centered Gram without densifying rows."""
+        counts_dense = np.array(
+            [
+                [2.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 3.0, 0.0],
+                [0.0, 4.0, 4.0],
+                [5.0, 0.0, 5.0],
+            ],
+            dtype=np.float64,
+        )
+        sparse_counts = scipy.sparse.csc_matrix(counts_dense)
+        dense_centered = counts_dense - counts_dense.mean(axis=0, keepdims=True)
+        sparse_cumulants = _feature_cumulants_from_data(
+            sparse_counts,
+            centered=False,
+        )
+        dense_cumulants = _feature_cumulants_from_data(dense_centered)
+        for power in (1, 2, 3, 4):
+            self.assertAlmostEqual(
+                sparse_cumulants[power],
+                dense_cumulants[power],
+                places=5,
+            )
+
     def test_sparse_data_handling(self):
         n_spots = self.n_spots
         n_isos_per_gene = [3, 2]
@@ -622,6 +777,34 @@ class TestSplisosmNP(unittest.TestCase):
         )
         sv_results = model.get_formatted_test_results("sv")
         self.assertEqual(len(sv_results), self.n_genes)
+
+    def test_sv_nan_filling_none_avoids_kernel_realization(self):
+        """The masked-kernel path should not realize a dense parent kernel."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata_5g,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            gene_names="gene_label",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+        with patch.object(
+            model.sp_kernel,
+            "realization",
+            side_effect=AssertionError("dense realization should not be called"),
+        ):
+            res = model.test_spatial_variability(
+                method="hsic-ir",
+                nan_filling="none",
+                null_configs={"n_probes": 8},
+                return_results=True,
+                print_progress=False,
+            )
+        self.assertEqual(len(res["pvalue"]), model.n_genes)
+        self.assertTrue(np.all(np.isfinite(res["pvalue"])))
 
     def test_sv_null_methods(self):
         """All three null methods should run and return valid p-values."""

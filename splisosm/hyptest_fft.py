@@ -29,6 +29,7 @@ from anndata import AnnData
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
+from splisosm._chunking import pack_gene_chunks, resolve_chunk_size
 from splisosm.kernel import FFTKernel  # noqa: F401 — re-export for backward compat
 from splisosm._hsic_null import (
     _cumulants_from_eigenvalues,
@@ -202,60 +203,99 @@ def _du_worker_fft(
     return stats, pvals
 
 
-def _sv_worker_fft(
-    raster_layer: Any,
+def _sv_response_width_fft(
     iso_names: list[str],
+    method: Literal["hsic-ir", "hsic-ic", "hsic-gc"],
+    ratio_transformation: str,
+) -> int:
+    """Return response-channel width contributed by one FFT gene."""
+    if method == "hsic-gc":
+        return 1
+    n_iso = len(iso_names)
+    if method == "hsic-ir" and ratio_transformation in {"ilr", "alr"}:
+        return max(1, n_iso - 1)
+    return max(1, n_iso)
+
+
+def _sv_chunk_worker_fft(
+    raster_layer: Any,
+    iso_names_chunk: list[list[str]],
     kernel: FFTKernel,
     kernel_cumulants: dict[int, float],
     method: Literal["hsic-ir", "hsic-ic", "hsic-gc"],
     ratio_transformation: str,
-) -> tuple[float, float]:
-    """Compute one gene-level FFT-HSIC statistic and p-value from rasterized channels."""
-    data = raster_layer.sel(c=iso_names).values  # (c, ny, nx)
-    counts_cube = np.moveaxis(np.asarray(data, dtype=float), 0, -1)
+) -> list[tuple[float, float]]:
+    """Compute FFT-HSIC statistics for one response-channel chunk."""
+    flat_iso_names = [iso for iso_names in iso_names_chunk for iso in iso_names]
+    data = raster_layer.sel(c=flat_iso_names).values  # (c, ny, nx)
+    counts_all = np.moveaxis(np.asarray(data, dtype=float), 0, -1)
 
-    # Single-isoform gene: HSIC-IR has no ratio variation → pval=1.
-    # HSIC-IC and HSIC-GC test count-level SV and proceed normally.
-    if method == "hsic-ir" and counts_cube.shape[2] <= 1:
-        return 0.0, 1.0
+    y_blocks: list[np.ndarray] = []
+    slices: list[slice | None] = []
+    start = 0
+    channel_start = 0
+    results: list[tuple[float, float] | None] = [None] * len(iso_names_chunk)
 
-    if method == "hsic-ic":
-        y_cube = counts_cube
-    elif method == "hsic-gc":
-        y_cube = counts_cube.sum(axis=2, keepdims=True)
-    else:
-        counts_flat = counts_cube.reshape(kernel.n_grid, counts_cube.shape[2])
-        ratios = counts_to_ratios(
-            torch.from_numpy(counts_flat).float(),
-            transformation=ratio_transformation,
-            nan_filling="none",
-            fill_before_transform=False,
-        )
-        y_cube = ratios.numpy().reshape(kernel.ny, kernel.nx, -1)
+    for pos, iso_names in enumerate(iso_names_chunk):
+        n_iso = len(iso_names)
+        counts_cube = counts_all[:, :, channel_start : channel_start + n_iso]
+        channel_start += n_iso
 
-    # manually center the data and replace NaN with zeros (i.e., mean padding)
-    y_cube = y_cube - np.nanmean(y_cube, axis=(0, 1), keepdims=True)
-    y_cube = np.nan_to_num(y_cube, nan=0.0, posinf=0.0, neginf=0.0)
+        if method == "hsic-ir" and n_iso <= 1:
+            results[pos] = (0.0, 1.0)
+            slices.append(None)
+            continue
 
-    q = np.atleast_1d(np.asarray(kernel.xtKx(y_cube), dtype=float))
-    hsic_scaled = float(np.sum(q))
-    stat = hsic_scaled / ((kernel.n_grid - 1) ** 2)
+        if method == "hsic-ic":
+            y_cube = counts_cube
+        elif method == "hsic-gc":
+            y_cube = counts_cube.sum(axis=2, keepdims=True)
+        else:
+            counts_flat = counts_cube.reshape(kernel.n_grid, n_iso)
+            ratios = counts_to_ratios(
+                torch.from_numpy(counts_flat).float(),
+                transformation=ratio_transformation,
+                nan_filling="none",
+                fill_before_transform=False,
+            )
+            y_cube = ratios.numpy().reshape(kernel.ny, kernel.nx, -1)
 
-    y_flat = y_cube.reshape(kernel.n_grid, -1)
-    if not np.isfinite(y_flat).all():
-        return stat, 1.0
+        y_cube = y_cube - np.nanmean(y_cube, axis=(0, 1), keepdims=True)
+        y_cube = np.nan_to_num(y_cube, nan=0.0, posinf=0.0, neginf=0.0)
+        stop = start + y_cube.shape[2]
+        y_blocks.append(y_cube)
+        slices.append(slice(start, stop))
+        start = stop
 
-    feature_cumulants = _feature_cumulants_from_data(y_flat)
-    if feature_cumulants[2] <= 0.0 or kernel_cumulants[2] <= 0.0:
-        return stat, 1.0
+    if y_blocks:
+        y_all = np.concatenate(y_blocks, axis=2)
+        q_cols = np.atleast_1d(np.asarray(kernel.xtKx(y_all), dtype=float))
+        y_flat = y_all.reshape(kernel.n_grid, -1)
 
-    pvalue = _hsic_liu_pvalue(
-        hsic_scaled,
-        kernel_cumulants,
-        feature_cumulants,
-        kernel.n_grid,
-    )
-    return stat, pvalue
+        for pos, sl in enumerate(slices):
+            if sl is None:
+                continue
+            hsic_scaled = float(np.sum(q_cols[sl]))
+            stat = hsic_scaled / ((kernel.n_grid - 1) ** 2)
+            y_gene = y_flat[:, sl]
+            if not np.isfinite(y_gene).all():
+                results[pos] = (stat, 1.0)
+                continue
+
+            feature_cumulants = _feature_cumulants_from_data(y_gene)
+            if feature_cumulants[2] <= 0.0 or kernel_cumulants[2] <= 0.0:
+                results[pos] = (stat, 1.0)
+                continue
+
+            pvalue = _hsic_liu_pvalue(
+                hsic_scaled,
+                kernel_cumulants,
+                feature_cumulants,
+                kernel.n_grid,
+            )
+            results[pos] = (stat, pvalue)
+
+    return [r if r is not None else (0.0, 1.0) for r in results]
 
 
 class SplisosmFFT:
@@ -745,6 +785,7 @@ class SplisosmFFT:
         self,
         method: Literal["hsic-ir", "hsic-ic", "hsic-gc"] = "hsic-ir",
         ratio_transformation: Literal["none", "clr", "ilr", "alr", "radial"] = "none",
+        chunk_size: int | Literal["auto"] = "auto",
         n_jobs: int = -1,
         return_results: bool = False,
         print_progress: bool = True,
@@ -758,6 +799,13 @@ class SplisosmFFT:
             or ``"hsic-gc"`` (gene counts).
         ratio_transformation : {"none", "clr", "ilr", "alr", "radial"}, optional
             Ratio transform used when ``method="hsic-ir"``.
+        chunk_size : int or {"auto"}, optional
+            Maximum number of response channels to process in one FFT kernel
+            call. ``"auto"`` (default) estimates a memory-safe cap using a
+            2 GiB live-memory budget per worker and caps the result at 32
+            channels for per-feature runtime.  Genes are never split across
+            chunks; a single gene with more channels than the cap is processed
+            as a singleton chunk.
         n_jobs : int, optional
             Number of joblib workers. ``-1`` uses all available CPUs.
         return_results : bool, optional
@@ -792,25 +840,38 @@ class SplisosmFFT:
         # oversubscription: scipy.fft.fft2 spawns `workers` threads internally,
         # so total threads = n_jobs × workers without this cap.
         self.sp_kernel.workers = max(1, (os.cpu_count() or 1) // n_jobs)
+        column_cap = resolve_chunk_size(
+            chunk_size,
+            n_observations=self.n_grid,
+            backend="fft",
+            n_jobs=n_jobs,
+            dtype_bytes=8,
+        )
+        widths = [
+            _sv_response_width_fft(iso_names, method, ratio_transformation)
+            for iso_names in self._gene_iso_names
+        ]
+        gene_chunks = pack_gene_chunks(widths, column_cap)
 
         iterator = tqdm(
-            self._gene_iso_names,
+            gene_chunks,
             desc=f"SV [{method}]",
-            total=len(self._gene_iso_names),
+            total=len(gene_chunks),
             disable=not print_progress,
         )
 
-        results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_sv_worker_fft)(
+        chunk_results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_sv_chunk_worker_fft)(
                 self._raster_layer,
-                iso_names,
+                [self._gene_iso_names[i] for i in chunk],
                 self.sp_kernel,
                 self._kernel_cumulants,
                 method,
                 ratio_transformation,
             )
-            for iso_names in iterator
+            for chunk in iterator
         )
+        results = [res for chunk in chunk_results for res in chunk]
 
         stats = np.asarray([r[0] for r in results], dtype=float)
         pvals_np = np.asarray([r[1] for r in results], dtype=float)
@@ -822,6 +883,7 @@ class SplisosmFFT:
             "method": method,
             "null_method": "liu",
             "use_perm_null": False,
+            "chunk_size": column_cap,
         }
 
         if return_results:
