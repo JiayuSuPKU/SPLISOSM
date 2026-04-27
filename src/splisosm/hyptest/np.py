@@ -820,6 +820,120 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
             raise RuntimeError("Data not initialised. Call setup_data() first.")
         return self._filtered_adata
 
+    def _store_prepared_anndata(
+        self,
+        adata: AnnData,
+        layer: str,
+        group_iso_by: str,
+        data: list[torch.Tensor],
+        coordinates: Optional[torch.Tensor],
+        gene_names: list[str],
+        filtered_adata: AnnData,
+    ) -> None:
+        """Store prepared AnnData inputs and reset derived caches."""
+        self.adata = adata
+        self._setup_input_mode = "anndata"
+        self._counts_layer = layer
+        self._group_iso_by = group_iso_by
+        self._filtered_adata = filtered_adata
+        self._gene_summary = None
+        self._isoform_summary = None
+
+        self.n_genes = len(data)
+        self.n_spots = filtered_adata.shape[0]
+        self.n_isos_per_gene = [g.shape[1] for g in data]
+        self.gene_names = gene_names
+        self._data = [g.float() for g in data]
+        self._coordinates = coordinates
+
+    def _build_setup_spatial_kernel(
+        self,
+        coordinates: Optional[torch.Tensor],
+        adj_matrix: Optional[scipy.sparse.spmatrix],
+        adj_key: Optional[str],
+        spatial_key: str,
+        skip_spatial_kernel: bool,
+    ) -> None:
+        """Build or skip the setup spatial kernel."""
+        self._skip_kernel_construction = skip_spatial_kernel
+        if skip_spatial_kernel:
+            self.sp_kernel = IdentityKernel(self.n_spots, centering=True)
+            self._kernel_source = "identity (skip_spatial_kernel=True)"
+        elif adj_matrix is not None:
+            self.sp_kernel = SpatialCovKernel(
+                coords=None,
+                adj_matrix=adj_matrix,
+                rho=self._rho,
+                standardize_cov=self._standardize_cov,
+                centering=True,
+            )
+            self._kernel_source = (
+                f"adj_key='{adj_key}'"
+                if adj_key is not None
+                else f"spatial_key='{spatial_key}' (component-filtered)"
+            )
+        else:
+            self.sp_kernel = SpatialCovKernel(
+                coords=coordinates,
+                adj_matrix=None,
+                k_neighbors=self._k_neighbors,
+                rho=self._rho,
+                standardize_cov=self._standardize_cov,
+                centering=True,
+            )
+            self._kernel_source = f"spatial_key='{spatial_key}'"
+
+    def _store_design_matrix(
+        self,
+        resolved_design: Optional[Any],
+        resolved_cov_names: Optional[list[str]],
+    ) -> None:
+        """Store a prepared DU design matrix and warn on near-constant factors."""
+        if resolved_design is None:
+            self.design_mtx = None
+            self.n_factors = 0
+            self.covariate_names = None
+            return
+
+        n_factors = resolved_design.shape[1]
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            if scipy.sparse.issparse(resolved_design):
+                means = np.asarray(resolved_design.mean(axis=0)).ravel()
+                sq_means = np.asarray(resolved_design.power(2).mean(axis=0)).ravel()
+                zero_var_indices = np.where(
+                    np.sqrt(np.maximum(sq_means - means**2, 0.0)) < 1e-5
+                )[0]
+            else:
+                design_mtx_t = torch.from_numpy(
+                    np.asarray(resolved_design, dtype=np.float32)
+                )
+                if design_mtx_t.dim() == 1:
+                    design_mtx_t = design_mtx_t.unsqueeze(1)
+                zero_var_indices = torch.where(design_mtx_t.std(dim=0) < 1e-5)[
+                    0
+                ].numpy()
+            for idx in zero_var_indices:
+                cov_name = (
+                    resolved_cov_names[int(idx)]
+                    if resolved_cov_names is not None
+                    else str(int(idx))
+                )
+                warnings.warn(
+                    f"Covariate '{cov_name}' has near-zero variance "
+                    "(std < 1e-5). Consider removing it.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        self.design_mtx = (
+            resolved_design.tocsr()
+            if scipy.sparse.issparse(resolved_design)
+            else design_mtx_t
+        )
+        self.n_factors = n_factors
+        self.covariate_names = resolved_cov_names
+
     def setup_data(
         self,
         adata: AnnData,
@@ -956,106 +1070,23 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
             return_filtered_anndata=True,
         )
 
-        self.adata = adata
-        self._setup_input_mode = "anndata"
-        self._counts_layer = layer
-        self._group_iso_by = group_iso_by
-        self._filtered_adata = filtered_adata
-        self._gene_summary = None
-        self._isoform_summary = None
-
-        self.n_genes = len(data)
-        # Derive n_spots from the filtered anndata
-        self.n_spots = filtered_adata.shape[0]
-        self.n_isos_per_gene = [g.shape[1] for g in data]
-        self.gene_names = resolved_gene_names
-
-        # Convert to float tensors
-        self._data = [g.float() for g in data]
-        self._coordinates = coordinates
-
-        # Build spatial kernel from the adjacency returned by prepare_inputs_from_anndata.
-        # adj_matrix is not None when:
-        # (1) min_component_size > 1, or,
-        # (2) adj_key is provided
-        self._skip_kernel_construction = skip_spatial_kernel
-        if skip_spatial_kernel:
-            self.sp_kernel = IdentityKernel(self.n_spots, centering=True)
-            self._kernel_source = "identity (skip_spatial_kernel=True)"
-        elif adj_matrix is not None:
-            self.sp_kernel = SpatialCovKernel(
-                coords=None,
-                adj_matrix=adj_matrix,
-                rho=self._rho,
-                standardize_cov=self._standardize_cov,
-                centering=True,
-            )
-            self._kernel_source = (
-                f"adj_key='{adj_key}'"
-                if adj_key is not None
-                else f"spatial_key='{spatial_key}' (component-filtered)"
-            )
-        else:
-            self.sp_kernel = SpatialCovKernel(
-                coords=coordinates,
-                adj_matrix=None,
-                k_neighbors=self._k_neighbors,
-                rho=self._rho,
-                standardize_cov=self._standardize_cov,
-                centering=True,
-            )
-            self._kernel_source = f"spatial_key='{spatial_key}'"
-
-        # Process design matrix from _process_design_mtx.
-        # resolved_design is a numpy float32 array, a scipy sparse CSR matrix, or None.
-        # Sparse design matrices are kept as scipy CSR to avoid densifying large
-        # one-hot-encoded covariate tables; columns are extracted one at a time during
-        # hypothesis testing.
-        if resolved_design is not None:
-            n_factors = resolved_design.shape[1]
-
-            # Check for constant/zero-variance covariates without densifying
-            with warnings.catch_warnings():
-                warnings.simplefilter("always")
-                if scipy.sparse.issparse(resolved_design):
-                    _means = np.asarray(resolved_design.mean(axis=0)).ravel()
-                    _sq_means = np.asarray(
-                        resolved_design.power(2).mean(axis=0)
-                    ).ravel()
-                    _stds = np.sqrt(np.maximum(_sq_means - _means**2, 0.0))
-                    zero_var_indices = np.where(_stds < 1e-5)[0]
-                else:
-                    design_mtx_t = torch.from_numpy(
-                        np.asarray(resolved_design, dtype=np.float32)
-                    )
-                    if design_mtx_t.dim() == 1:
-                        design_mtx_t = design_mtx_t.unsqueeze(1)
-                    _stds_t = design_mtx_t.std(dim=0)
-                    zero_var_indices = torch.where(_stds_t < 1e-5)[0].numpy()
-                for idx in zero_var_indices:
-                    _cname = (
-                        resolved_cov_names[int(idx)]
-                        if resolved_cov_names is not None
-                        else str(int(idx))
-                    )
-                    warnings.warn(
-                        f"Covariate '{_cname}' has near-zero variance "
-                        "(std < 1e-5). Consider removing it.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-
-            # Store: sparse CSR when the input was sparse; dense torch tensor otherwise.
-            if scipy.sparse.issparse(resolved_design):
-                self.design_mtx = resolved_design.tocsr()
-            else:
-                self.design_mtx = design_mtx_t  # already constructed above
-            self.n_factors = n_factors
-            self.covariate_names = resolved_cov_names
-        else:
-            self.design_mtx = None
-            self.n_factors = 0
-            self.covariate_names = None
+        self._store_prepared_anndata(
+            adata=adata,
+            layer=layer,
+            group_iso_by=group_iso_by,
+            data=data,
+            coordinates=coordinates,
+            gene_names=resolved_gene_names,
+            filtered_adata=filtered_adata,
+        )
+        self._build_setup_spatial_kernel(
+            coordinates=coordinates,
+            adj_matrix=adj_matrix,
+            adj_key=adj_key,
+            spatial_key=spatial_key,
+            skip_spatial_kernel=skip_spatial_kernel,
+        )
+        self._store_design_matrix(resolved_design, resolved_cov_names)
 
     def _get_design_col(self, factor_idx: int) -> torch.Tensor:
         """Extract one covariate column as a dense (n_spots, 1) float32 tensor.
@@ -1067,6 +1098,406 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
             col = np.asarray(self.design_mtx.getcol(factor_idx).todense()).ravel()
             return torch.from_numpy(col.astype(np.float32)).unsqueeze(1)
         return self.design_mtx[:, factor_idx].clone().float().unsqueeze(1)
+
+    def _validate_sv_args(
+        self,
+        method: str,
+        ratio_transformation: str,
+        nan_filling: str,
+        null_method: str,
+    ) -> str:
+        """Validate SV arguments and return the normalized null method."""
+        if self._skip_kernel_construction:
+            raise RuntimeError(
+                "setup_data was called with skip_spatial_kernel=True; the spatial "
+                "kernel is a placeholder IdentityKernel. Re-run setup_data with "
+                "skip_spatial_kernel=False to enable spatial variability testing."
+            )
+
+        valid_methods = ["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"]
+        valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
+        valid_nan_filling = ["mean", "none"]
+        null_method = _normalize_hsic_null_method(null_method, allow_perm=True)
+        valid_null_methods = ["liu", "welch", "perm"]
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
+        if null_method not in valid_null_methods:
+            raise ValueError(
+                f"Invalid null method. Must be one of {valid_null_methods}."
+            )
+        if ratio_transformation not in valid_transformations:
+            raise ValueError(
+                "Invalid ratio transformation. "
+                f"Must be one of {valid_transformations}."
+            )
+        if nan_filling not in valid_nan_filling:
+            raise ValueError(
+                f"Invalid NaN filling method. Must be one of {valid_nan_filling}."
+            )
+        if nan_filling == "none" and method == "hsic-ir":
+            warnings.warn(
+                "nan_filling='none' with method='hsic-ir' uses a per-gene "
+                "masked spatial kernel. This avoids dense spatial-kernel "
+                "materialization but is slower than nan_filling='mean' because "
+                "kernel cumulants are recomputed for each valid-spot subset.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return null_method
+
+    def _run_sparkx_sv(self) -> dict[str, Any]:
+        """Run the SPARK-X gene-count SV path."""
+        if self._coordinates is None:
+            raise ValueError(
+                "method='spark-x' requires raw spatial coordinates, but "
+                "setup_data was called on an AnnData without "
+                "`obsm[spatial_key]`. Re-run setup_data with spatial "
+                "coordinates, or choose the kernel-based 'hsic-gc'."
+            )
+        counts_g = torch.concat(
+            [_counts.sum(1, keepdim=True) for _counts in self._data], axis=1
+        )
+        return run_sparkx(counts_g.numpy(), self._coordinates.numpy())
+
+    def _run_hsic_sv(
+        self,
+        method: str,
+        ratio_transformation: str,
+        nan_filling: str,
+        null_method: str,
+        null_configs: Optional[dict[str, Any]],
+        chunk_size: int | Literal["auto"],
+        n_jobs: int,
+        print_progress: bool,
+    ) -> dict[str, Any]:
+        """Run chunked HSIC-based NP spatial variability tests."""
+        if n_jobs == -1:
+            n_jobs = os.cpu_count() or 1
+        column_cap = resolve_chunk_size(
+            chunk_size,
+            n_observations=self.n_spots,
+            backend="np",
+            n_jobs=n_jobs,
+            dtype_bytes=8,
+        )
+
+        n_spots = self.n_spots
+        configs = null_configs or {}
+        kernel_cumulants = None
+        kernel_approx_rank = None
+        n_nulls = 0
+        perm_batch_size = 1
+        if null_method in ("liu", "welch"):
+            kernel_cumulants, kernel_approx_rank = _kernel_cumulants_for_null(
+                self.sp_kernel,
+                null_method=null_method,
+                n_spots=n_spots,
+                null_configs=configs,
+                dense_threshold=getattr(SpatialCovKernel, "DENSE_THRESHOLD", 5000),
+            )
+        elif null_method == "perm":
+            n_nulls = int(configs.get("n_perms_per_gene", 1000))
+            perm_batch_size = int(configs.get("perm_batch_size", 50))
+
+        widths = [
+            _response_width_np(counts, method, ratio_transformation)
+            for counts in self._data
+        ]
+        gene_chunks = pack_gene_chunks(widths, column_cap)
+        n_probes = int(configs.get("n_probes", 60))
+        rng_seed = int(configs.get("rng_seed", 0))
+
+        chunk_results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_sv_chunk_worker_np)(
+                [self._data[i] for i in chunk],
+                method,
+                ratio_transformation,
+                nan_filling,
+                null_method,
+                n_spots,
+                self.sp_kernel,
+                (kernel_cumulants if null_method in ("liu", "welch") else None),
+                kernel_approx_rank if null_method == "liu" else None,
+                n_nulls if null_method == "perm" else 0,
+                perm_batch_size if null_method == "perm" else 1,
+                n_probes,
+                rng_seed,
+            )
+            for chunk in tqdm(
+                gene_chunks,
+                desc=f"SV [{method}]",
+                total=len(gene_chunks),
+                disable=not print_progress,
+            )
+        )
+        sv_results = [res for chunk in chunk_results for res in chunk]
+        pvals = np.array([r[1] for r in sv_results], dtype=float)
+        return {
+            "statistic": np.array([r[0] for r in sv_results], dtype=float),
+            "pvalue": pvals,
+            "method": method,
+            "null_method": null_method,
+            "chunk_size": column_cap,
+            "pvalue_adj": false_discovery_control(pvals),
+        }
+
+    def _validate_du_args(
+        self,
+        method: str,
+        ratio_transformation: str,
+        nan_filling: str,
+        residualize: str,
+    ) -> tuple[int, int]:
+        """Validate DU arguments and return design matrix shape."""
+        if self.design_mtx is None:
+            raise ValueError(
+                "Cannot find the design matrix. Perhaps you forgot to set it up using setup_data()."
+            )
+
+        n_spots, n_factors = self.design_mtx.shape
+        valid_methods = ["hsic", "hsic-gp", "t-fisher", "t-tippett"]
+        valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
+        valid_nan_filling = ["none", "mean"]
+        valid_residualize = ["cov_only", "both"]
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
+        if ratio_transformation not in valid_transformations:
+            raise ValueError(
+                f"Invalid transformation. Must be one of {valid_transformations}."
+            )
+        if nan_filling not in valid_nan_filling:
+            raise ValueError(
+                f"Invalid nan_filling. Must be one of {valid_nan_filling}."
+            )
+        if residualize not in valid_residualize:
+            raise ValueError(
+                f"Invalid residualize. Must be one of {valid_residualize}."
+            )
+        return n_spots, n_factors
+
+    def _prepare_hsic_covariates(self, n_factors: int) -> list[Any]:
+        """Prepare covariate columns for unconditional HSIC without densifying sparse input."""
+        z_list = []
+        for factor_idx in range(n_factors):
+            if scipy.sparse.issparse(self.design_mtx):
+                z = self.design_mtx.getcol(factor_idx)
+                mean = float(z.mean())
+                sq_mean = float(z.multiply(z).mean())
+                std = float(np.sqrt(max(sq_mean - mean**2, 0.0)))
+            else:
+                z = self._get_design_col(factor_idx)
+                std = float(z.std())
+            if std <= 1e-5:
+                raise ValueError(
+                    "The factor of interest "
+                    f"{self.covariate_names[factor_idx]} has zero variance."
+                )
+            z_list.append(z)
+        return z_list
+
+    def _resolve_gpr_configs(
+        self, gpr_configs: Optional[dict[str, Any]]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Merge DU GPR user overrides onto backend defaults."""
+        cov_config = {**_DEFAULT_GPR_CONFIGS["covariate"]}
+        iso_config = {**_DEFAULT_GPR_CONFIGS["isoform"]}
+        if gpr_configs is None:
+            return cov_config, iso_config
+        if gpr_configs.keys() - {"covariate", "isoform"}:
+            raise ValueError(
+                "gpr_configs must have a nested structure. Use keys "
+                "'covariate' and/or 'isoform' for the respective GPR configurations."
+            )
+        if "covariate" in gpr_configs:
+            cov_config.update(gpr_configs["covariate"])
+        if "isoform" in gpr_configs:
+            iso_config.update(gpr_configs["isoform"])
+        return cov_config, iso_config
+
+    def _normalized_coordinates(self) -> torch.Tensor:
+        """Return z-scored spatial coordinates for GP residualization."""
+        if self._coordinates is None:
+            raise ValueError(
+                "method='hsic-gp' fits a Gaussian process on raw spatial "
+                "coordinates, but setup_data was called on an AnnData "
+                "without `obsm[spatial_key]`. Re-run setup_data with "
+                "spatial coordinates, or use an unconditional DU method "
+                "(e.g. method='hsic', 't-fisher', 't-tippett')."
+            )
+        x = torch.as_tensor(self._coordinates, dtype=torch.float64).clone()
+        return (x - x.mean(0)) / x.std(0).clamp(min=1e-8)
+
+    def _fit_covariate_gp_residuals(
+        self,
+        x: torch.Tensor,
+        n_factors: int,
+        gpr_backend: str,
+        cov_config: dict[str, Any],
+        print_progress: bool,
+    ) -> list[torch.Tensor]:
+        """Fit one spatial GP per covariate and return standardized residuals."""
+        gpr_cov = make_kernel_gpr(gpr_backend, **cov_config)
+        z_res_list = []
+        for factor_idx in tqdm(
+            range(n_factors),
+            desc="Covariates",
+            total=n_factors,
+            disable=not print_progress,
+        ):
+            z = self._get_design_col(factor_idx).squeeze(1)
+            if z.std() <= 0:
+                raise ValueError(
+                    "The factor of interest "
+                    f"{self.covariate_names[factor_idx]} has zero variance."
+                )
+            z = (z - z.mean()) / z.std()
+            z_res_list.append(gpr_cov.fit_residuals(x, z.unsqueeze(1)))
+        return z_res_list
+
+    def _empty_du_arrays(
+        self, n_factors: int, *, torch_output: bool
+    ) -> tuple[Any, Any]:
+        """Allocate DU result arrays with the expected shape."""
+        if torch_output:
+            return torch.empty(self.n_genes, n_factors), torch.empty(
+                self.n_genes, n_factors
+            )
+        return np.empty((self.n_genes, n_factors)), np.empty((self.n_genes, n_factors))
+
+    def _run_du_hsic(
+        self,
+        n_factors: int,
+        ratio_transformation: str,
+        nan_filling: str,
+        n_jobs: int,
+        print_progress: bool,
+    ) -> dict[str, Any]:
+        """Run unconditional HSIC DU tests."""
+        z_list = self._prepare_hsic_covariates(n_factors)
+        hsic_all, pvals_all = self._empty_du_arrays(n_factors, torch_output=True)
+        du_results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_du_hsic_gene_worker_np)(
+                counts, z_list, ratio_transformation, nan_filling
+            )
+            for counts in tqdm(
+                self._data,
+                desc="DU [hsic]",
+                total=self.n_genes,
+                disable=not print_progress,
+            )
+        )
+        for gene_idx, (h_row, p_row) in enumerate(du_results):
+            hsic_all[gene_idx] = h_row
+            pvals_all[gene_idx] = p_row
+        return {
+            "statistic": hsic_all.numpy(),
+            "pvalue": pvals_all.numpy(),
+            "method": "hsic",
+        }
+
+    def _run_du_hsic_gp(
+        self,
+        n_factors: int,
+        ratio_transformation: str,
+        nan_filling: str,
+        gpr_backend: str,
+        gpr_configs: Optional[dict[str, Any]],
+        residualize: str,
+        n_jobs: int,
+        print_progress: bool,
+    ) -> dict[str, Any]:
+        """Run conditional HSIC DU tests with spatial GP residualization."""
+        cov_config, iso_config = self._resolve_gpr_configs(gpr_configs)
+        x = self._normalized_coordinates()
+        z_res_list = self._fit_covariate_gp_residuals(
+            x, n_factors, gpr_backend, cov_config, print_progress
+        )
+
+        gpr_iso = None
+        if residualize == "both":
+            gpr_iso = make_kernel_gpr(gpr_backend, **iso_config)
+            if (
+                hasattr(gpr_iso, "precompute_shared_kernel")
+                and gpr_iso.signal_bounds_fixed
+            ):
+                gpr_iso.precompute_shared_kernel(x)
+
+        effective_n_jobs = (
+            1
+            if gpr_backend == "gpytorch" and iso_config.get("device", "cpu") != "cpu"
+            else n_jobs
+        )
+        hsic_all, pvals_all = self._empty_du_arrays(n_factors, torch_output=True)
+        du_results = Parallel(n_jobs=effective_n_jobs, prefer="threads")(
+            delayed(_du_hsic_gp_gene_worker_np)(
+                counts,
+                gpr_iso if residualize == "both" else None,
+                x,
+                z_res_list,
+                ratio_transformation,
+                nan_filling,
+                residualize,
+            )
+            for counts in tqdm(
+                self._data,
+                desc="DU [hsic-gp]",
+                total=self.n_genes,
+                disable=not print_progress,
+            )
+        )
+        for gene_idx, (h_row, p_row) in enumerate(du_results):
+            hsic_all[gene_idx] = h_row
+            pvals_all[gene_idx] = p_row
+        return {
+            "statistic": hsic_all.numpy(),
+            "pvalue": pvals_all.numpy(),
+            "method": "hsic-gp",
+        }
+
+    def _run_du_ttest(
+        self,
+        method: str,
+        n_factors: int,
+        ratio_transformation: str,
+        nan_filling: str,
+        n_jobs: int,
+        print_progress: bool,
+    ) -> dict[str, Any]:
+        """Run two-sample t-test based DU tests."""
+        combine_method = re.findall(r"^t-(.+)", method)[0]
+        stats_all, pvals_all = self._empty_du_arrays(n_factors, torch_output=False)
+        design_is_sparse = scipy.sparse.issparse(self.design_mtx)
+        groups_list = [
+            (
+                self.design_mtx.getcol(factor_idx)
+                if design_is_sparse
+                else self.design_mtx[:, factor_idx]
+            )
+            for factor_idx in range(n_factors)
+        ]
+        du_results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_du_ttest_gene_worker_np)(
+                counts,
+                groups_list,
+                ratio_transformation,
+                nan_filling,
+                combine_method,
+            )
+            for counts in tqdm(
+                self._data,
+                desc=f"DU [{method}]",
+                total=self.n_genes,
+                disable=not print_progress,
+            )
+        )
+        for gene_idx, (s_row, p_row) in enumerate(du_results):
+            stats_all[gene_idx] = s_row
+            pvals_all[gene_idx] = p_row
+        return {
+            "statistic": stats_all,
+            "pvalue": pvals_all,
+            "method": method,
+        }
 
     def test_spatial_variability(
         self,
@@ -1170,145 +1601,26 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
         package ``rpy2``.
         """
 
-        if self._skip_kernel_construction:
-            raise RuntimeError(
-                "setup_data was called with skip_spatial_kernel=True; the spatial "
-                "kernel is a placeholder IdentityKernel. Re-run setup_data with "
-                "skip_spatial_kernel=False to enable spatial variability testing."
-            )
-
-        valid_methods = ["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"]
-        null_method = _normalize_hsic_null_method(null_method, allow_perm=True)
-        valid_null_methods = ["liu", "welch", "perm"]
-        valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
-        valid_nan_filling = ["mean", "none"]
-        if method not in valid_methods:
-            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
-        if null_method not in valid_null_methods:
-            raise ValueError(
-                f"Invalid null method. Must be one of {valid_null_methods}."
-            )
-        if ratio_transformation not in valid_transformations:
-            raise ValueError(
-                "Invalid ratio transformation. "
-                f"Must be one of {valid_transformations}."
-            )
-        if nan_filling not in valid_nan_filling:
-            raise ValueError(
-                f"Invalid NaN filling method. Must be one of {valid_nan_filling}."
-            )
-
-        if nan_filling == "none" and method == "hsic-ir":
-            warnings.warn(
-                "nan_filling='none' with method='hsic-ir' uses a per-gene "
-                "masked spatial kernel. This avoids dense spatial-kernel "
-                "materialization but is slower than nan_filling='mean' because "
-                "kernel cumulants are recomputed for each valid-spot subset.",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        if method == "spark-x":  # run the gene-level SPARK-X test
-            if self._coordinates is None:
-                raise ValueError(
-                    "method='spark-x' requires raw spatial coordinates, but "
-                    "setup_data was called on an AnnData without "
-                    "`obsm[spatial_key]`. Re-run setup_data with spatial "
-                    "coordinates, or choose the kernel-based 'hsic-gc'."
-                )
-            # prepare the data in gene-level counts
-            counts_g = torch.concat(
-                [_counts.sum(1, keepdim=True) for _counts in self._data], axis=1
-            )  # tensor(n_spots, n_genes)
-            self._sv_test_results = run_sparkx(
-                counts_g.numpy(), self._coordinates.numpy()
-            )
+        null_method = self._validate_sv_args(
+            method, ratio_transformation, nan_filling, null_method
+        )
+        if method == "spark-x":
+            self._sv_test_results = self._run_sparkx_sv()
         else:
-            if n_jobs == -1:
-                n_jobs = os.cpu_count() or 1
-            column_cap = resolve_chunk_size(
-                chunk_size,
-                n_observations=self.n_spots,
-                backend="np",
+            self._sv_test_results = self._run_hsic_sv(
+                method=method,
+                ratio_transformation=ratio_transformation,
+                nan_filling=nan_filling,
+                null_method=null_method,
+                null_configs=null_configs,
+                chunk_size=chunk_size,
                 n_jobs=n_jobs,
-                dtype_bytes=8,
+                print_progress=print_progress,
             )
 
-            # use a global spatial kernel unless nan_filling is 'none'
-            n_spots = self.n_spots
-            K_sp = self.sp_kernel  # the Kernel class object was already centered
-
-            # pre-compute null distribution inputs (once, before per-gene loop)
-            kernel_cumulants = None
-            kernel_approx_rank = None
-            n_nulls = 0
-            _perm_batch_size = 1
-            configs = null_configs or {}
-            if null_method in ("liu", "welch"):
-                kernel_cumulants, kernel_approx_rank = _kernel_cumulants_for_null(
-                    self.sp_kernel,
-                    null_method=null_method,
-                    n_spots=n_spots,
-                    null_configs=configs,
-                    dense_threshold=getattr(SpatialCovKernel, "DENSE_THRESHOLD", 5000),
-                )
-            elif null_method == "perm":
-                n_nulls = int(configs.get("n_perms_per_gene", 1000))
-                _perm_batch_size = int(configs.get("perm_batch_size", 50))
-
-            widths = [
-                _response_width_np(counts, method, ratio_transformation)
-                for counts in self._data
-            ]
-            gene_chunks = pack_gene_chunks(widths, column_cap)
-            n_probes = int(configs.get("n_probes", 60))
-            rng_seed = int(configs.get("rng_seed", 0))
-
-            # parallel column-chunk SV test; shared objects are read-only
-            chunk_results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(_sv_chunk_worker_np)(
-                    [self._data[i] for i in chunk],
-                    method,
-                    ratio_transformation,
-                    nan_filling,
-                    null_method,
-                    n_spots,
-                    K_sp,
-                    (kernel_cumulants if null_method in ("liu", "welch") else None),
-                    kernel_approx_rank if null_method == "liu" else None,
-                    n_nulls if null_method == "perm" else 0,
-                    _perm_batch_size if null_method == "perm" else 1,
-                    n_probes,
-                    rng_seed,
-                )
-                for chunk in tqdm(
-                    gene_chunks,
-                    desc=f"SV [{method}]",
-                    total=len(gene_chunks),
-                    disable=not print_progress,
-                )
-            )
-            _sv_results = [res for chunk in chunk_results for res in chunk]
-            hsic_arr = np.array([r[0] for r in _sv_results], dtype=float)
-            pvals_arr = np.array([r[1] for r in _sv_results], dtype=float)
-
-            # store results after the loop (NP-12 fix: no longer rebuilt per gene)
-            self._sv_test_results = {
-                "statistic": hsic_arr,
-                "pvalue": pvals_arr,
-                "method": method,
-                "null_method": null_method,
-                "chunk_size": column_cap,
-            }
-
-            # calculate adjusted p-values
-            self._sv_test_results["pvalue_adj"] = false_discovery_control(
-                self._sv_test_results["pvalue"]
-            )
-
-        # return results
         if return_results:
             return self._sv_test_results
+        return None
 
     def test_differential_usage(
         self,
@@ -1429,230 +1741,44 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
             statistics and p-values. Otherwise, return ``None`` and store results in
             ``self._du_test_results``.
         """
-        if self.design_mtx is None:
-            raise ValueError(
-                "Cannot find the design matrix. Perhaps you forgot to set it up using setup_data()."
-            )
-
-        n_spots, n_factors = self.design_mtx.shape
-
-        # check the validity of the specified method and transformation
-        valid_methods = ["hsic", "hsic-gp", "t-fisher", "t-tippett"]
-        valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
-        valid_nan_filling = ["none", "mean"]
-        valid_residualize = ["cov_only", "both"]
-        if method not in valid_methods:
-            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
-        if ratio_transformation not in valid_transformations:
-            raise ValueError(
-                f"Invalid transformation. Must be one of {valid_transformations}."
-            )
-        if nan_filling not in valid_nan_filling:
-            raise ValueError(
-                f"Invalid nan_filling. Must be one of {valid_nan_filling}."
-            )
-        if residualize not in valid_residualize:
-            raise ValueError(
-                f"Invalid residualize. Must be one of {valid_residualize}."
-            )
-
-        n_genes = self.n_genes
+        _, n_factors = self._validate_du_args(
+            method, ratio_transformation, nan_filling, residualize
+        )
         if n_jobs == -1:
             n_jobs = os.cpu_count() or 1
 
-        if method == "hsic":  # unconditional HSIC test (multivariate RV coefficient)
-            # Pre-compute covariates: keep sparse when design_mtx is scipy sparse
-            # so that linear_hsic_test can use the memory-efficient sparse-X path.
-            z_list = []
-            for _ind in range(n_factors):
-                if scipy.sparse.issparse(self.design_mtx):
-                    z = self.design_mtx.getcol(_ind)  # scipy sparse (n_spots, 1)
-                    _mean = float(z.mean())
-                    _sq_mean = float(z.multiply(z).mean())
-                    _std = float(np.sqrt(max(_sq_mean - _mean**2, 0.0)))
-                else:
-                    z = self._get_design_col(_ind)  # dense (n_spots, 1) tensor
-                    _std = float(z.std())
-                if _std <= 1e-5:
-                    raise ValueError(
-                        "The factor of interest "
-                        f"{self.covariate_names[_ind]} has zero variance."
-                    )
-                z_list.append(z)
-
-            hsic_all = torch.empty(n_genes, n_factors)
-            pvals_all = torch.empty(n_genes, n_factors)
-
-            _du_results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(_du_hsic_gene_worker_np)(
-                    counts, z_list, ratio_transformation, nan_filling
-                )
-                for counts in tqdm(
-                    self._data,
-                    desc=f"DU [{method}]",
-                    total=self.n_genes,
-                    disable=not print_progress,
-                )
+        if method == "hsic":
+            self._du_test_results = self._run_du_hsic(
+                n_factors=n_factors,
+                ratio_transformation=ratio_transformation,
+                nan_filling=nan_filling,
+                n_jobs=n_jobs,
+                print_progress=print_progress,
             )
-            for _g, (h_row, p_row) in enumerate(_du_results):
-                hsic_all[_g] = h_row
-                pvals_all[_g] = p_row
-
-            self._du_test_results = {
-                "statistic": hsic_all.numpy(),
-                "pvalue": pvals_all.numpy(),
-                "method": method,
-            }
-
-        elif method == "hsic-gp":  # conditional HSIC via GP regression residuals
-            if self._coordinates is None:
-                raise ValueError(
-                    "method='hsic-gp' fits a Gaussian process on raw spatial "
-                    "coordinates, but setup_data was called on an AnnData "
-                    "without `obsm[spatial_key]`. Re-run setup_data with "
-                    "spatial coordinates, or use an unconditional DU method "
-                    "(e.g. method='hsic', 't-fisher', 't-tippett')."
-                )
-            # Build GPR configs (merge user overrides over defaults)
-            cov_config = {**_DEFAULT_GPR_CONFIGS["covariate"]}
-            iso_config = {**_DEFAULT_GPR_CONFIGS["isoform"]}
-            if gpr_configs is not None:
-                if gpr_configs.keys() - {"covariate", "isoform"}:
-                    raise ValueError(
-                        "gpr_configs must have a nested structure. Use keys "
-                        "'covariate' and/or 'isoform' for the respective GPR configurations."
-                    )
-                if "covariate" in gpr_configs:
-                    cov_config.update(gpr_configs["covariate"])
-                if "isoform" in gpr_configs:
-                    iso_config.update(gpr_configs["isoform"])
-
-            # Normalize spatial coordinates once
-            x = torch.as_tensor(
-                self._coordinates, dtype=torch.float64
-            ).clone()  # (n_spots, n_dims)
-            x = (x - x.mean(0)) / x.std(0).clamp(min=1e-8)
-
-            # Fit GPR for covariates and get residuals (n_factors small tensors, never sparse)
-            gpr_cov = make_kernel_gpr(gpr_backend, **cov_config)
-            z_res_list = []
-            for _ind in tqdm(
-                range(n_factors),
-                desc="Covariates",
-                total=n_factors,
-                disable=not print_progress,
-            ):
-                z = self._get_design_col(_ind).squeeze(1)
-                if z.std() <= 0:
-                    raise ValueError(
-                        "The factor of interest "
-                        f"{self.covariate_names[_ind]} has zero variance."
-                    )
-                z = (z - z.mean()) / z.std()
-                z_res_list.append(gpr_cov.fit_residuals(x, z.unsqueeze(1)))
-
-            # Optionally fit GPR for isoform ratios to residualize spatial effects in the response as well.
-            gpr_iso = None
-            if residualize == "both":
-                gpr_iso = make_kernel_gpr(gpr_backend, **iso_config)
-                # Warm up the shared eigendecomposition for backends that support it
-                # (e.g. sklearn with fixed signal bounds) so the first gene does not
-                # pay the cost of a redundant full GP fit.
-                if (
-                    hasattr(gpr_iso, "precompute_shared_kernel")
-                    and gpr_iso.signal_bounds_fixed
-                ):
-                    gpr_iso.precompute_shared_kernel(x)
-
-            # GPU guard: CUDA operations are not thread-safe across threads
-            _iso_device = iso_config.get("device", "cpu")
-            if gpr_backend == "gpytorch" and _iso_device != "cpu":
-                _effective_n_jobs = 1  # sequential fallback for GPU backend
-            else:
-                _effective_n_jobs = n_jobs
-
-            # --- Main loop: densify and process one gene at a time ---
-            hsic_all = torch.empty(n_genes, n_factors)
-            pvals_all = torch.empty(n_genes, n_factors)
-
-            _gpr_iso_for_worker = gpr_iso if residualize == "both" else None
-            _du_gp_results = Parallel(n_jobs=_effective_n_jobs, prefer="threads")(
-                delayed(_du_hsic_gp_gene_worker_np)(
-                    counts,
-                    _gpr_iso_for_worker,
-                    x,
-                    z_res_list,
-                    ratio_transformation,
-                    nan_filling,
-                    residualize,
-                )
-                for counts in tqdm(
-                    self._data,
-                    desc=f"DU [{method}]",
-                    total=self.n_genes,
-                    disable=not print_progress,
-                )
+        elif method == "hsic-gp":
+            self._du_test_results = self._run_du_hsic_gp(
+                n_factors=n_factors,
+                ratio_transformation=ratio_transformation,
+                nan_filling=nan_filling,
+                gpr_backend=gpr_backend,
+                gpr_configs=gpr_configs,
+                residualize=residualize,
+                n_jobs=n_jobs,
+                print_progress=print_progress,
             )
-            for _g, (h_row, p_row) in enumerate(_du_gp_results):
-                hsic_all[_g] = h_row
-                pvals_all[_g] = p_row
-
-            self._du_test_results = {
-                "statistic": hsic_all.numpy(),
-                "pvalue": pvals_all.numpy(),
-                "method": method,
-            }
-
-        else:  # two-sample t-test
-            # method to combine p-values across isoforms, either 'fisher' or 'tippett'
-            combine_method = re.findall(r"^t-(.+)", method)[0]
-
-            stats_all = np.empty((n_genes, n_factors))
-            pvals_all = np.empty((n_genes, n_factors))
-
-            # Pre-extract group columns once (sparse or dense) to avoid repeated
-            # column lookups inside the gene loop.
-            _design_is_sparse = scipy.sparse.issparse(self.design_mtx)
-            groups_list = [
-                (
-                    self.design_mtx.getcol(_ind)  # scipy sparse (n, 1)
-                    if _design_is_sparse
-                    else self.design_mtx[:, _ind]
-                )  # dense 1-D tensor
-                for _ind in range(n_factors)
-            ]
-
-            # Parallel per-gene t-test
-            _du_tt_results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(_du_ttest_gene_worker_np)(
-                    counts,
-                    groups_list,
-                    ratio_transformation,
-                    nan_filling,
-                    combine_method,
-                )
-                for counts in tqdm(
-                    self._data,
-                    desc=f"DU [{method}]",
-                    total=self.n_genes,
-                    disable=not print_progress,
-                )
+        else:
+            self._du_test_results = self._run_du_ttest(
+                method=method,
+                n_factors=n_factors,
+                ratio_transformation=ratio_transformation,
+                nan_filling=nan_filling,
+                n_jobs=n_jobs,
+                print_progress=print_progress,
             )
-            for _g, (s_row, p_row) in enumerate(_du_tt_results):
-                stats_all[_g] = s_row
-                pvals_all[_g] = p_row
 
-            self._du_test_results = {
-                "statistic": stats_all,  # (n_genes, n_factors)
-                "pvalue": pvals_all,  # (n_genes, n_factors)
-                "method": method,
-            }
-
-        # calculate adjusted p-values (independently for each factor)
         self._du_test_results["pvalue_adj"] = false_discovery_control(
             self._du_test_results["pvalue"], axis=0
         )
-
-        # return the results if needed
         if return_results:
             return self._du_test_results
+        return None

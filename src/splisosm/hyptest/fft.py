@@ -59,6 +59,118 @@ def _require_spatialdata() -> Any:
     return sd
 
 
+def _load_fft_ratio_cube(
+    raster_layer: Any,
+    iso_names: list[str],
+    ratio_transformation: str,
+) -> tuple[np.ndarray, int, int]:
+    """Load one gene's rasterized counts and return a ratio cube."""
+    data = raster_layer.sel(c=iso_names).values
+    counts_cube = np.moveaxis(np.asarray(data, dtype=float), 0, -1)
+    ny_g, nx_g = counts_cube.shape[:2]
+    n_grid = ny_g * nx_g
+    n_iso = counts_cube.shape[2]
+    counts_flat = counts_cube.reshape(n_grid, n_iso)
+    ratios = counts_to_ratios(
+        torch.from_numpy(counts_flat).float(),
+        transformation=ratio_transformation,
+        nan_filling="none",
+        fill_before_transform=False,
+    )
+    return ratios.numpy().reshape(ny_g, nx_g, -1), n_grid, n_iso
+
+
+def _du_hsic_worker_fft(
+    y_cube: np.ndarray,
+    method: str,
+    gpr_iso_cfg: Optional[dict],
+    z_list: list[np.ndarray],
+    spacing: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute FFT DU statistics for HSIC and HSIC-GP."""
+    n_factors = len(z_list)
+    stats = np.zeros(n_factors)
+    pvals = np.ones(n_factors)
+    n_grid = int(np.prod(y_cube.shape[:2]))
+
+    if method == "hsic-gp" and gpr_iso_cfg is not None:
+        gpr_iso = FFTKernelGPR(**gpr_iso_cfg)
+        y_res_cube, _ = gpr_iso.fit_residuals_cube(y_cube, spacing=spacing)
+    else:
+        y_res_cube = y_cube - np.nanmean(y_cube, axis=(0, 1), keepdims=True)
+        y_res_cube = np.nan_to_num(y_res_cube, nan=0.0)
+
+    y_res = y_res_cube.reshape(n_grid, -1)
+    gram_y = y_res.T @ y_res
+    if not np.isfinite(gram_y).all():
+        return stats, pvals
+    try:
+        lambda_y = np.linalg.eigvalsh(gram_y)
+    except np.linalg.LinAlgError:
+        return stats, pvals
+    lambda_y = lambda_y[lambda_y > 1e-8]
+
+    for factor_idx, z_cube in enumerate(z_list):
+        z_flat = z_cube.ravel()[:, None]
+        cross = y_res.T @ z_flat
+        hsic_scaled = float(np.sum(cross**2))
+        stats[factor_idx] = hsic_scaled / (n_grid - 1) ** 2
+        lambda_z = np.linalg.eigvalsh(z_flat.T @ z_flat)
+        lambda_z = lambda_z[lambda_z > 1e-8]
+        if lambda_z.size == 0 or lambda_y.size == 0:
+            continue
+        lambda_mix = (lambda_z[:, None] * lambda_y[None, :]).reshape(-1)
+        pvals[factor_idx] = float(liu_sf(hsic_scaled * n_grid, lambda_mix))
+
+    return stats, pvals
+
+
+def _du_ttest_worker_fft(
+    y_cube: np.ndarray,
+    method: str,
+    z_list: list[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute FFT DU statistics for binary-covariate t-test methods."""
+    from scipy.stats import chi2 as _chi2_dist
+    from scipy.stats import ttest_ind as _ttest_ind
+
+    n_factors = len(z_list)
+    stats = np.zeros(n_factors)
+    pvals = np.ones(n_factors)
+    y_flat = y_cube.reshape(-1, y_cube.shape[2])
+    n_iso = y_cube.shape[2]
+
+    for factor_idx, z_cube in enumerate(z_list):
+        z_flat = z_cube.ravel()
+        valid_mask = np.isfinite(z_flat)
+        unique_vals = np.unique(z_flat[valid_mask])
+        threshold = (unique_vals[0] + unique_vals[1]) / 2.0
+        g0_mask = valid_mask & (z_flat < threshold)
+        g1_mask = valid_mask & (z_flat >= threshold)
+        pvals_iso = np.ones(n_iso)
+
+        for iso_idx in range(n_iso):
+            y_k = y_flat[:, iso_idx]
+            y0 = y_k[g0_mask & np.isfinite(y_k)]
+            y1 = y_k[g1_mask & np.isfinite(y_k)]
+            if len(y0) < 3 or len(y1) < 3:
+                continue
+            t_stat, pval = _ttest_ind(y0, y1)
+            if np.isfinite(t_stat) and np.isfinite(pval):
+                pvals_iso[iso_idx] = float(pval)
+
+        if method == "t-fisher":
+            chi2_stat = float(-2.0 * np.sum(np.log(pvals_iso + 1e-300)))
+            stats[factor_idx] = chi2_stat
+            pvals[factor_idx] = float(_chi2_dist.sf(chi2_stat, df=2 * n_iso))
+        else:
+            min_p = float(np.min(pvals_iso))
+            stats[factor_idx] = float(-np.log10(min_p + 1e-300))
+            pvals[factor_idx] = float(1.0 - (1.0 - min_p) ** n_iso)
+
+    return stats, pvals
+
+
 def _du_worker_fft(
     raster_layer: Any,
     iso_names: list[str],
@@ -110,8 +222,6 @@ def _du_worker_fft(
     stats : np.ndarray, shape (n_covariates,)
     pvals : np.ndarray, shape (n_covariates,)
     """
-    from scipy.stats import chi2 as _chi2_dist
-
     n_factors = len(z_list)
     stats = np.zeros(n_factors)
     pvals = np.ones(n_factors)
@@ -120,95 +230,10 @@ def _du_worker_fft(
     if len(iso_names) <= 1:
         return stats, pvals
 
-    # ── Load isoform ratios on-the-fly ────────────────────────────────────
-    data = raster_layer.sel(c=iso_names).values  # (n_iso, ny, nx)
-    counts_cube = np.moveaxis(np.asarray(data, dtype=float), 0, -1)  # (ny, nx, n_iso)
-    ny_g, nx_g = counts_cube.shape[:2]
-    n_grid = ny_g * nx_g
-    n_iso = counts_cube.shape[2]
-
-    counts_flat = counts_cube.reshape(n_grid, n_iso)
-    ratios = counts_to_ratios(
-        torch.from_numpy(counts_flat).float(),
-        transformation=ratio_transformation,
-        nan_filling="none",
-        fill_before_transform=False,
-    )
-    y_cube = ratios.numpy().reshape(ny_g, nx_g, -1)
-
-    # ── HSIC-based methods (hsic-gp and hsic) ────────────────────────────
+    y_cube, _, _ = _load_fft_ratio_cube(raster_layer, iso_names, ratio_transformation)
     if method in ("hsic-gp", "hsic"):
-        if method == "hsic-gp" and gpr_iso_cfg is not None:
-            gpr_iso = FFTKernelGPR(**gpr_iso_cfg)
-            y_res_cube, _ = gpr_iso.fit_residuals_cube(y_cube, spacing=spacing)
-        else:
-            y_res_cube = y_cube - np.nanmean(y_cube, axis=(0, 1), keepdims=True)
-            y_res_cube = np.nan_to_num(y_res_cube, nan=0.0)
-
-        y_res = y_res_cube.reshape(n_grid, -1)  # (n_grid, n_iso)
-
-        gram_y = y_res.T @ y_res
-        if not np.isfinite(gram_y).all():
-            return stats, pvals
-        try:
-            lambda_y = np.linalg.eigvalsh(gram_y)
-        except np.linalg.LinAlgError:
-            return stats, pvals
-        lambda_y = lambda_y[lambda_y > 1e-8]
-
-        for _f, z_cube in enumerate(z_list):
-            z_flat = z_cube.ravel()[:, None]
-            cross = y_res.T @ z_flat
-            hsic_scaled = float(np.sum(cross**2))
-            stats[_f] = hsic_scaled / (n_grid - 1) ** 2
-            lambda_z = np.linalg.eigvalsh(z_flat.T @ z_flat)
-            lambda_z = lambda_z[lambda_z > 1e-8]
-            if lambda_z.size == 0 or lambda_y.size == 0:
-                continue
-            lambda_mix = (lambda_z[:, None] * lambda_y[None, :]).reshape(-1)
-            pvals[_f] = float(liu_sf(hsic_scaled * n_grid, lambda_mix))
-
-    # ── Per-isoform two-sample t-test (binary covariates only) ───────────
-    else:
-        from scipy.stats import ttest_ind as _ttest_ind
-
-        # Use raw isoform ratios (not centered) for two-group comparison
-        y_flat = y_cube.reshape(n_grid, -1)  # (n_grid, n_iso)
-
-        for _f, z_cube_f in enumerate(z_list):
-            z_flat = z_cube_f.ravel()  # (n_grid,) — raw binary values, NaN for missing
-
-            # Identify the two binary groups from valid (non-NaN) pixels.
-            # Binariness has already been validated by the caller.
-            valid_mask = np.isfinite(z_flat)
-            unique_vals = np.unique(z_flat[valid_mask])
-            threshold = (unique_vals[0] + unique_vals[1]) / 2.0
-            g0_mask = valid_mask & (z_flat < threshold)
-            g1_mask = valid_mask & (z_flat >= threshold)
-
-            pvals_iso = np.ones(n_iso)
-
-            for k in range(n_iso):
-                y_k = y_flat[:, k]
-                y0 = y_k[g0_mask & np.isfinite(y_k)]
-                y1 = y_k[g1_mask & np.isfinite(y_k)]
-
-                if len(y0) < 3 or len(y1) < 3:
-                    continue
-                t_stat, p = _ttest_ind(y0, y1)
-                if np.isfinite(t_stat) and np.isfinite(p):
-                    pvals_iso[k] = float(p)
-
-            if method == "t-fisher":
-                chi2_stat = float(-2.0 * np.sum(np.log(pvals_iso + 1e-300)))
-                stats[_f] = chi2_stat
-                pvals[_f] = float(_chi2_dist.sf(chi2_stat, df=2 * n_iso))
-            else:  # t-tippett: corrected minimum p-value
-                min_p = float(np.min(pvals_iso))
-                stats[_f] = float(-np.log10(min_p + 1e-300))
-                pvals[_f] = float(1.0 - (1.0 - min_p) ** n_iso)
-
-    return stats, pvals
+        return _du_hsic_worker_fft(y_cube, method, gpr_iso_cfg, z_list, spacing)
+    return _du_ttest_worker_fft(y_cube, method, z_list)
 
 
 def _sv_response_width_fft(
@@ -500,6 +525,222 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
         self.sdata[img_key] = rasterized
         return img_key
 
+    def _validate_setup_inputs(
+        self,
+        sdata: Any,
+        table_name: str,
+        layer: str,
+        group_iso_by: str,
+        row_key: str,
+        col_key: str,
+        gene_names: Optional[str],
+        min_counts: int,
+        min_bin_pct: float,
+    ) -> AnnData:
+        """Validate SpatialData setup inputs and return the source AnnData table."""
+        _require_spatialdata()
+        if not hasattr(sdata, "tables"):
+            raise ValueError("`sdata` must provide a `tables` attribute.")
+        if table_name not in sdata.tables:
+            raise ValueError(f"Table `{table_name}` was not found in `sdata.tables`.")
+
+        adata = sdata.tables[table_name]
+        if not isinstance(adata, AnnData):
+            raise ValueError(f"`sdata.tables[{table_name}]` must be an AnnData object.")
+        if layer not in adata.layers:
+            raise ValueError(f"Layer `{layer}` was not found in the AnnData table.")
+        if min_counts < 0:
+            raise ValueError("`min_counts` must be >= 0.")
+        if min_bin_pct < 0 or min_bin_pct > 100:
+            raise ValueError(
+                "`min_bin_pct` must be between 0 and 1, or between 0 and 100."
+            )
+        missing_var = [
+            col
+            for col in [group_iso_by, gene_names]
+            if col is not None and col not in adata.var.columns
+        ]
+        if missing_var:
+            missing = missing_var[0]
+            message = (
+                f"`gene_names` column '{missing}' was not found in `adata.var`."
+                if missing == gene_names
+                else f"`{missing}` was not found in `adata.var`."
+            )
+            raise ValueError(message)
+
+        missing_obs = [
+            col for col in [row_key, col_key] if col not in adata.obs.columns
+        ]
+        if missing_obs:
+            raise ValueError(f"`{missing_obs[0]}` was not found in `adata.obs`.")
+        return adata
+
+    def _group_fft_isoforms(
+        self,
+        adata: AnnData,
+        layer: str,
+        group_iso_by: str,
+        gene_names: Optional[str],
+        min_counts: int,
+        min_bin_pct: float,
+        filter_single_iso_genes: bool,
+    ) -> tuple[list[list[str]], list[str]]:
+        """Filter and group raster channels by gene."""
+        min_bin_frac = float(min_bin_pct)
+        if min_bin_frac > 1.0:
+            min_bin_frac /= 100.0
+
+        layer_counts = adata.layers[layer]
+        total_counts = np.asarray(layer_counts.sum(axis=0)).ravel()
+        if sp.issparse(layer_counts):
+            bin_pct = np.asarray((layer_counts > 0).sum(axis=0)).ravel() / adata.n_obs
+        else:
+            bin_pct = (
+                np.count_nonzero(np.asarray(layer_counts) > 0, axis=0) / adata.n_obs
+            )
+
+        var_df = adata.var.copy()
+        var_df["__iso_name__"] = adata.var_names.astype(str)
+        var_df["__total_counts__"] = total_counts
+        var_df["__bin_pct__"] = bin_pct
+
+        grouped_iso_names: list[list[str]] = []
+        grouped_gene_names: list[str] = []
+        for gene, group in var_df.groupby(group_iso_by, observed=True, sort=False):
+            group = group[
+                (group["__total_counts__"] >= min_counts)
+                & (group["__bin_pct__"] >= min_bin_frac)
+            ]
+            if filter_single_iso_genes and group.shape[0] < 2:
+                continue
+            if group.shape[0] < 1:
+                continue
+            grouped_gene_names.append(
+                str(group[gene_names].iloc[0]) if gene_names is not None else str(gene)
+            )
+            grouped_iso_names.append(group["__iso_name__"].tolist())
+
+        if len(grouped_iso_names) == 0:
+            raise ValueError("No genes remained after grouping/filtering isoforms.")
+        return grouped_iso_names, grouped_gene_names
+
+    def _initialize_fft_kernel(self, ny: int, nx: int) -> None:
+        """Initialize the FFT spatial kernel and cached cumulants."""
+        self.sp_kernel = FFTKernel(
+            shape=(ny, nx),
+            spacing=self._spacing,
+            rho=self._rho,
+            neighbor_degree=self._neighbor_degree,
+            workers=self._workers,
+            centering=True,
+        )
+        eigvals = self.sp_kernel.eigenvalues()
+        self._kernel_eigvals = eigvals[eigvals > 1e-8]
+        self._kernel_cumulants = _cumulants_from_eigenvalues(eigvals)
+
+    def _design_obs_for_table(
+        self,
+        adata: AnnData,
+        bins: str,
+        row_key: str,
+        col_key: str,
+    ) -> pd.DataFrame:
+        """Return obs metadata needed for rasterizing a generated design table."""
+        obs_cols = [row_key, col_key]
+        attrs = adata.uns.get("spatialdata_attrs", {})
+        region_key_col = attrs.get("region_key", "region")
+        instance_key_col = attrs.get("instance_key", "instance_id")
+        for col in [region_key_col, instance_key_col]:
+            if col in adata.obs.columns:
+                obs_cols.append(col)
+        obs_for_design = adata.obs[obs_cols].copy()
+        if region_key_col not in obs_for_design.columns:
+            obs_for_design[region_key_col] = pd.Categorical(
+                [bins] * len(obs_for_design)
+            )
+        if instance_key_col not in obs_for_design.columns:
+            obs_for_design[instance_key_col] = np.arange(len(obs_for_design), dtype=int)
+        return obs_for_design
+
+    def _setup_design_table(
+        self,
+        sdata: Any,
+        adata: AnnData,
+        bins: str,
+        table_name: str,
+        row_key: str,
+        col_key: str,
+        design_mtx: Optional[Union[np.ndarray, "pd.DataFrame", str, list[str]]],
+        covariate_names: Optional[list[str]],
+    ) -> None:
+        """Resolve DU design input and store/rasterize metadata for later use."""
+        if design_mtx is None:
+            self._design_table_name = None
+            self.design_mtx = None
+            self.covariate_names = list(covariate_names) if covariate_names else []
+            self.n_factors = 0
+            return
+
+        if isinstance(design_mtx, str) and design_mtx in sdata.tables:
+            ref_table = sdata.tables[design_mtx]
+            if ref_table.n_obs != adata.n_obs:
+                raise ValueError(
+                    f"Design table '{design_mtx}' has {ref_table.n_obs} observations "
+                    f"but the isoform table has {adata.n_obs}."
+                )
+            if covariate_names is None:
+                covariate_names = list(ref_table.var_names)
+            elif len(covariate_names) != ref_table.n_vars:
+                raise ValueError(
+                    f"covariate_names length ({len(covariate_names)}) must match "
+                    f"design table n_vars ({ref_table.n_vars})."
+                )
+            self._design_table_name = design_mtx
+            self.design_mtx = ref_table
+            self.covariate_names = list(covariate_names)
+            self.n_factors = ref_table.n_vars
+            return
+
+        from scipy import sparse as _sp
+        from splisosm.utils.preprocessing import _process_design_mtx
+
+        dm_np, covariate_names = _process_design_mtx(adata, design_mtx, covariate_names)
+        if _sp.issparse(dm_np):
+            density = dm_np.nnz / (dm_np.shape[0] * dm_np.shape[1])
+            x_data = dm_np.tocsr() if density < 0.5 else dm_np.toarray()
+        else:
+            density = np.count_nonzero(dm_np) / dm_np.size if dm_np.size > 0 else 1.0
+            x_data = _sp.csr_matrix(dm_np) if density < 0.5 else dm_np
+
+        design_adata = AnnData(
+            X=x_data,
+            obs=self._design_obs_for_table(adata, bins, row_key, col_key),
+        )
+        design_adata.var_names = list(covariate_names)
+
+        attrs = adata.uns.get("spatialdata_attrs", {})
+        region_key_col = attrs.get("region_key", "region")
+        instance_key_col = attrs.get("instance_key", "instance_id")
+        try:
+            from spatialdata.models import TableModel
+
+            design_adata = TableModel.parse(
+                design_adata,
+                region=bins,
+                region_key=region_key_col,
+                instance_key=instance_key_col,
+            )
+        except Exception:
+            pass
+
+        design_key = f"_splisosm_design_{table_name}"
+        sdata[design_key] = design_adata
+        self._design_table_name = design_key
+        self.design_mtx = design_adata
+        self.covariate_names = list(covariate_names)
+        self.n_factors = dm_np.shape[1]
+
     def setup_data(
         self,
         sdata: Any,
@@ -589,80 +830,27 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
             AnnData-based setup for data with general geometry.
 
         """
-        _require_spatialdata()
-
-        if not hasattr(sdata, "tables"):
-            raise ValueError("`sdata` must provide a `tables` attribute.")
-        if table_name not in sdata.tables:
-            raise ValueError(f"Table `{table_name}` was not found in `sdata.tables`.")
-
-        adata = sdata.tables[table_name]
-        if not isinstance(adata, AnnData):
-            raise ValueError(f"`sdata.tables[{table_name}]` must be an AnnData object.")
-        if layer not in adata.layers:
-            raise ValueError(f"Layer `{layer}` was not found in the AnnData table.")
-        if min_counts < 0:
-            raise ValueError("`min_counts` must be >= 0.")
-        if min_bin_pct < 0 or min_bin_pct > 100:
-            raise ValueError(
-                "`min_bin_pct` must be between 0 and 1, or between 0 and 100."
-            )
-        if group_iso_by not in adata.var.columns:
-            raise ValueError(f"`{group_iso_by}` was not found in `adata.var`.")
-        if row_key not in adata.obs.columns:
-            raise ValueError(f"`{row_key}` was not found in `adata.obs`.")
-        if col_key not in adata.obs.columns:
-            raise ValueError(f"`{col_key}` was not found in `adata.obs`.")
-        if gene_names is not None and gene_names not in adata.var.columns:
-            raise ValueError(
-                f"`gene_names` column '{gene_names}' was not found in `adata.var`."
-            )
-
-        # Ensure selected layer is used by SpatialData rasterization.
+        adata = self._validate_setup_inputs(
+            sdata=sdata,
+            table_name=table_name,
+            layer=layer,
+            group_iso_by=group_iso_by,
+            row_key=row_key,
+            col_key=col_key,
+            gene_names=gene_names,
+            min_counts=min_counts,
+            min_bin_pct=min_bin_pct,
+        )
         adata.X = adata.layers[layer]
-
-        min_bin_frac = float(min_bin_pct)
-        if min_bin_frac > 1.0:
-            min_bin_frac /= 100.0
-
-        # Per-isoform total counts for low-expression filtering.
-        layer_counts = adata.layers[layer]
-        total_counts = np.asarray(layer_counts.sum(axis=0)).ravel()
-        if sp.issparse(layer_counts):
-            bin_pct = np.asarray((layer_counts > 0).sum(axis=0)).ravel() / adata.n_obs
-        else:
-            bin_pct = (
-                np.count_nonzero(np.asarray(layer_counts) > 0, axis=0) / adata.n_obs
-            )
-
-        var_df = adata.var.copy()
-        var_df["__iso_name__"] = adata.var_names.astype(str)
-        var_df["__total_counts__"] = total_counts
-        var_df["__bin_pct__"] = bin_pct
-        grouped = var_df.groupby(group_iso_by, observed=True, sort=False)
-
-        grouped_iso_names: list[list[str]] = []
-        grouped_gene_names: list[str] = []
-        for gene, group in grouped:
-            # Filter isoforms below the minimum count and prevalence thresholds.
-            group = group[
-                (group["__total_counts__"] >= min_counts)
-                & (group["__bin_pct__"] >= min_bin_frac)
-            ]
-            # Genes with fewer than two isoforms cannot have within-gene ratios
-            # unless the caller explicitly keeps single-isoform genes.
-            if filter_single_iso_genes and group.shape[0] < 2:
-                continue
-            if group.shape[0] < 1:
-                continue
-            display_name = (
-                str(group[gene_names].iloc[0]) if gene_names is not None else str(gene)
-            )
-            grouped_gene_names.append(display_name)
-            grouped_iso_names.append(group["__iso_name__"].tolist())
-
-        if len(grouped_iso_names) == 0:
-            raise ValueError("No genes remained after grouping/filtering isoforms.")
+        grouped_iso_names, grouped_gene_names = self._group_fft_isoforms(
+            adata=adata,
+            layer=layer,
+            group_iso_by=group_iso_by,
+            gene_names=gene_names,
+            min_counts=min_counts,
+            min_bin_pct=min_bin_pct,
+            filter_single_iso_genes=filter_single_iso_genes,
+        )
 
         self.sdata = sdata
         self._adata = adata
@@ -691,102 +879,17 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
         self.n_isos_per_gene = [len(v) for v in grouped_iso_names]
         self.gene_names = grouped_gene_names
 
-        self.sp_kernel = FFTKernel(
-            shape=(ny, nx),
-            spacing=self._spacing,
-            rho=self._rho,
-            neighbor_degree=self._neighbor_degree,
-            workers=self._workers,
-            centering=True,
+        self._initialize_fft_kernel(ny, nx)
+        self._setup_design_table(
+            sdata=sdata,
+            adata=adata,
+            bins=bins,
+            table_name=table_name,
+            row_key=row_key,
+            col_key=col_key,
+            design_mtx=design_mtx,
+            covariate_names=covariate_names,
         )
-        eigvals = self.sp_kernel.eigenvalues()
-        self._kernel_eigvals = eigvals[eigvals > 1e-8]
-        self._kernel_cumulants = _cumulants_from_eigenvalues(eigvals)
-
-        # --- Process design_mtx: store as properly-structured AnnData table ---
-        import scipy.sparse as _sp
-        from splisosm.utils.preprocessing import _process_design_mtx
-
-        design_key = f"_splisosm_design_{table_name}"
-        if design_mtx is not None:
-            # Mode A: str matching an existing sdata table — no duplication
-            if isinstance(design_mtx, str) and design_mtx in sdata.tables:
-                ref_table = sdata.tables[design_mtx]
-                if ref_table.n_obs != adata.n_obs:
-                    raise ValueError(
-                        f"Design table '{design_mtx}' has {ref_table.n_obs} observations "
-                        f"but the isoform table has {adata.n_obs}."
-                    )
-                if covariate_names is None:
-                    covariate_names = list(ref_table.var_names)
-                elif len(covariate_names) != ref_table.n_vars:
-                    raise ValueError(
-                        f"covariate_names length ({len(covariate_names)}) must match "
-                        f"design table n_vars ({ref_table.n_vars})."
-                    )
-                self._design_table_name = design_mtx
-                self.design_mtx = ref_table
-                n_factors = ref_table.n_vars
-            else:
-                # Mode B/C: obs column names or pre-computed matrix
-                dm_np, covariate_names = _process_design_mtx(
-                    adata, design_mtx, covariate_names
-                )
-
-                # Use sparse X when density < 50%
-                density = (
-                    np.count_nonzero(dm_np) / dm_np.size if dm_np.size > 0 else 1.0
-                )
-                x_data = _sp.csr_matrix(dm_np) if density < 0.5 else dm_np
-
-                # Build obs with spatial indexing columns + spatialdata link columns
-                obs_cols = [row_key, col_key]
-                attrs = adata.uns.get("spatialdata_attrs", {})
-                region_key_col = attrs.get("region_key", "region")
-                instance_key_col = attrs.get("instance_key", "instance_id")
-                for _col in [region_key_col, instance_key_col]:
-                    if _col in adata.obs.columns:
-                        obs_cols.append(_col)
-                obs_for_design = adata.obs[obs_cols].copy()
-
-                # Add region/instance columns if absent (required by TableModel)
-                if region_key_col not in obs_for_design.columns:
-                    obs_for_design[region_key_col] = pd.Categorical(
-                        [bins] * len(obs_for_design)
-                    )
-                if instance_key_col not in obs_for_design.columns:
-                    obs_for_design[instance_key_col] = np.arange(
-                        len(obs_for_design), dtype=int
-                    )
-
-                design_adata = AnnData(X=x_data, obs=obs_for_design)
-                design_adata.var_names = list(covariate_names)
-
-                # Parse with TableModel to establish spatialdata link
-                try:
-                    from spatialdata.models import TableModel
-
-                    design_adata = TableModel.parse(
-                        design_adata,
-                        region=bins,
-                        region_key=region_key_col,
-                        instance_key=instance_key_col,
-                    )
-                except Exception:
-                    pass  # Store without metadata if TableModel unavailable
-
-                sdata[design_key] = design_adata
-                self._design_table_name = design_key
-                self.design_mtx = design_adata
-                n_factors = dm_np.shape[1]
-
-            self.covariate_names = list(covariate_names)
-            self.n_factors = n_factors
-        else:
-            self._design_table_name = None
-            self.design_mtx = None
-            self.covariate_names = list(covariate_names) if covariate_names else []
-            self.n_factors = 0
 
     def _feature_summary_adata(self) -> AnnData:
         """Return the filtered AnnData table used for feature summaries."""
@@ -794,6 +897,267 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
             raise RuntimeError("Data is not initialized. Call setup_data() first.")
         kept_isos = [iso for gene_isos in self._gene_iso_names for iso in gene_isos]
         return self._adata[:, kept_isos]
+
+    def _require_ready_for_fft_tests(self) -> None:
+        """Ensure FFT setup has produced the kernel and raster layer."""
+        if self._adata is None or self.sp_kernel is None or self._raster_layer is None:
+            raise RuntimeError("Data not initialized. Call setup_data() first.")
+
+    def _set_fft_worker_budget(self, n_jobs: int) -> int:
+        """Resolve joblib workers and coordinate scipy.fft worker threads."""
+        if n_jobs == -1:
+            n_jobs = os.cpu_count() or 1
+        self.sp_kernel.workers = max(1, (os.cpu_count() or 1) // n_jobs)
+        return n_jobs
+
+    def _validate_sv_args(
+        self,
+        method: str,
+        ratio_transformation: str,
+    ) -> None:
+        """Validate FFT spatial-variability arguments."""
+        self._require_ready_for_fft_tests()
+        valid_methods = ["hsic-ir", "hsic-ic", "hsic-gc"]
+        valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
+        if ratio_transformation not in valid_transformations:
+            raise ValueError(
+                f"Invalid ratio transformation. Must be one of {valid_transformations}."
+            )
+
+    def _run_fft_sv(
+        self,
+        method: str,
+        ratio_transformation: str,
+        chunk_size: int | Literal["auto"],
+        n_jobs: int,
+        print_progress: bool,
+    ) -> dict[str, Any]:
+        """Run chunked FFT spatial variability tests."""
+        n_jobs = self._set_fft_worker_budget(n_jobs)
+        column_cap = resolve_chunk_size(
+            chunk_size,
+            n_observations=self.n_grid,
+            backend="fft",
+            n_jobs=n_jobs,
+            dtype_bytes=8,
+        )
+        widths = [
+            _sv_response_width_fft(iso_names, method, ratio_transformation)
+            for iso_names in self._gene_iso_names
+        ]
+        gene_chunks = pack_gene_chunks(widths, column_cap)
+
+        chunk_results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_sv_chunk_worker_fft)(
+                self._raster_layer,
+                [self._gene_iso_names[i] for i in chunk],
+                self.sp_kernel,
+                self._kernel_cumulants,
+                method,
+                ratio_transformation,
+            )
+            for chunk in tqdm(
+                gene_chunks,
+                desc=f"SV [{method}]",
+                total=len(gene_chunks),
+                disable=not print_progress,
+            )
+        )
+        results = [res for chunk in chunk_results for res in chunk]
+        pvals = np.asarray([r[1] for r in results], dtype=float)
+        return {
+            "statistic": np.asarray([r[0] for r in results], dtype=float),
+            "pvalue": pvals,
+            "pvalue_adj": false_discovery_control(pvals),
+            "method": method,
+            "null_method": "liu",
+            "use_perm_null": False,
+            "chunk_size": column_cap,
+        }
+
+    def _validate_du_args(
+        self,
+        method: str,
+        residualize: str,
+        ratio_transformation: str,
+    ) -> None:
+        """Validate FFT differential-usage arguments."""
+        self._require_ready_for_fft_tests()
+        if self._design_table_name is None:
+            raise RuntimeError(
+                "No design matrix found. Pass `design_mtx` to setup_data() before "
+                "calling test_differential_usage()."
+            )
+        valid_methods = ["hsic", "hsic-gp", "t-fisher", "t-tippett"]
+        if method not in valid_methods:
+            raise ValueError(f"method must be one of {valid_methods}.")
+        valid_residualize = ["cov_only", "both"]
+        if residualize not in valid_residualize:
+            raise ValueError(f"residualize must be one of {valid_residualize}.")
+        valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
+        if ratio_transformation not in valid_transformations:
+            raise ValueError(
+                f"ratio_transformation must be one of {valid_transformations}."
+            )
+
+    def _factor_names(self) -> list[str]:
+        """Return user-facing covariate names, filling defaults if needed."""
+        if self.covariate_names is not None and len(self.covariate_names) > 0:
+            return self.covariate_names
+        return [f"factor_{i}" for i in range(self.n_factors)]
+
+    def _resolve_fft_gpr_configs(
+        self,
+        method: str,
+        residualize: str,
+        gpr_configs: Optional[dict[str, Any]],
+    ) -> tuple[Optional[FFTKernelGPR], Optional[dict[str, Any]]]:
+        """Create FFT GPR objects/configs needed by DU testing."""
+        if method != "hsic-gp":
+            return None, None
+
+        cov_cfg = {**_DEFAULT_GPR_CONFIGS["covariate"]}
+        iso_cfg = {**_DEFAULT_GPR_CONFIGS["isoform"]}
+        if gpr_configs is not None:
+            if "covariate" in gpr_configs:
+                cov_cfg.update(gpr_configs["covariate"])
+            if "isoform" in gpr_configs:
+                iso_cfg.update(gpr_configs["isoform"])
+
+        gpr_cov = FFTKernelGPR(
+            constant_value=cov_cfg["constant_value"],
+            constant_value_bounds=cov_cfg["constant_value_bounds"],
+            length_scale=cov_cfg["length_scale"],
+            length_scale_bounds=cov_cfg["length_scale_bounds"],
+        )
+        if residualize != "both":
+            return gpr_cov, None
+        return gpr_cov, {
+            "constant_value": iso_cfg["constant_value"],
+            "constant_value_bounds": iso_cfg["constant_value_bounds"],
+            "length_scale": iso_cfg["length_scale"],
+            "length_scale_bounds": iso_cfg["length_scale_bounds"],
+        }
+
+    def _prepare_fft_covariate_chunk(
+        self,
+        chunk_vals: np.ndarray,
+        chunk_names: list[str],
+        method: str,
+        gpr_cov: Optional[FFTKernelGPR],
+        spacing: tuple[float, float],
+    ) -> list[np.ndarray]:
+        """Prepare one rasterized covariate chunk for the selected DU method."""
+        z_chunk: list[np.ndarray] = []
+        for idx, chunk_name in enumerate(chunk_names):
+            z_cube = chunk_vals[:, :, idx]
+            if method == "hsic-gp":
+                z_res, _ = gpr_cov.fit_residuals_cube(z_cube, spacing=spacing)
+                z_res = z_res - z_res.mean()
+                std = z_res.std()
+                if std > 0:
+                    z_res /= std
+            elif method == "hsic":
+                z_res = z_cube - np.nanmean(z_cube)
+                z_res = np.nan_to_num(z_res, nan=0.0)
+            else:
+                unique_vals = np.unique(z_cube[np.isfinite(z_cube)])
+                if len(unique_vals) > 2:
+                    raise ValueError(
+                        f"More than two groups detected for factor "
+                        f"'{chunk_name}'. Only binary covariates "
+                        "(exactly two distinct values) are supported for "
+                        f"'{method}'."
+                    )
+                z_res = z_cube.copy()
+            z_chunk.append(z_res)
+        return z_chunk
+
+    def _run_fft_du(
+        self,
+        method: str,
+        ratio_transformation: str,
+        gpr_configs: Optional[dict[str, Any]],
+        residualize: str,
+        n_jobs: int,
+        print_progress: bool,
+    ) -> dict[str, Any]:
+        """Run FFT differential-usage tests in covariate chunks."""
+        factor_names = self._factor_names()
+        n_factors = self.n_factors
+        spacing = (self.sp_kernel.dy, self.sp_kernel.dx)
+        gpr_cov, gpr_iso_cfg = self._resolve_fft_gpr_configs(
+            method, residualize, gpr_configs
+        )
+
+        sd = _require_spatialdata()
+        dm_raster = sd.rasterize_bins(
+            self.sdata,
+            self._bins_name,
+            self._design_table_name,
+            self._col_key,
+            self._row_key,
+        )
+
+        n_jobs = self._set_fft_worker_budget(n_jobs)
+        fft_workers = self.sp_kernel.workers
+        if gpr_cov is not None:
+            gpr_cov._workers = fft_workers
+        if gpr_iso_cfg is not None:
+            gpr_iso_cfg = {**gpr_iso_cfg, "workers": fft_workers}
+
+        stats = np.zeros((len(self._gene_iso_names), n_factors))
+        pvals = np.ones((len(self._gene_iso_names), n_factors))
+        cov_chunk_size = 100
+        n_chunks = max(1, (n_factors + cov_chunk_size - 1) // cov_chunk_size)
+        show_gene_bar = print_progress and n_chunks == 1
+        show_chunk_bar = print_progress and n_chunks > 1
+
+        for f_start in tqdm(
+            range(0, n_factors, cov_chunk_size),
+            desc="Covariates",
+            total=n_chunks,
+            disable=not show_chunk_bar,
+        ):
+            f_end = min(f_start + cov_chunk_size, n_factors)
+            chunk_names = factor_names[f_start:f_end]
+            chunk_vals = np.moveaxis(
+                np.asarray(dm_raster.sel(c=chunk_names).values, dtype=float), 0, -1
+            )
+            z_chunk = self._prepare_fft_covariate_chunk(
+                chunk_vals, chunk_names, method, gpr_cov, spacing
+            )
+            chunk_results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_du_worker_fft)(
+                    self._raster_layer,
+                    iso_names,
+                    method,
+                    gpr_iso_cfg,
+                    z_chunk,
+                    ratio_transformation,
+                    spacing,
+                )
+                for iso_names in tqdm(
+                    self._gene_iso_names,
+                    desc=f"DU [{method}]",
+                    total=len(self._gene_iso_names),
+                    disable=not show_gene_bar,
+                )
+            )
+            for gene_idx, (stat_row, pval_row) in enumerate(chunk_results):
+                stats[gene_idx, f_start:f_end] = stat_row
+                pvals[gene_idx, f_start:f_end] = pval_row
+
+        return {
+            "statistic": stats,
+            "pvalue": pvals,
+            "pvalue_adj": np.column_stack(
+                [false_discovery_control(pvals[:, f]) for f in range(n_factors)]
+            ),
+            "method": method,
+        }
 
     def test_spatial_variability(
         self,
@@ -837,69 +1201,14 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
         :meth:`splisosm.SplisosmNP.test_spatial_variability`
             Non-FFT implementation for arbitrary spatial geometries.
         """
-        if self._adata is None or self.sp_kernel is None or self._raster_layer is None:
-            raise RuntimeError("Data not initialized. Call setup_data() first.")
-
-        valid_methods = ["hsic-ir", "hsic-ic", "hsic-gc"]
-        valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
-        if method not in valid_methods:
-            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
-        if ratio_transformation not in valid_transformations:
-            raise ValueError(
-                f"Invalid ratio transformation. Must be one of {valid_transformations}."
-            )
-
-        if n_jobs == -1:
-            n_jobs = os.cpu_count() or 1
-        # Auto-coordinate FFT workers with joblib n_jobs to prevent thread
-        # oversubscription: scipy.fft.fft2 spawns `workers` threads internally,
-        # so total threads = n_jobs × workers without this cap.
-        self.sp_kernel.workers = max(1, (os.cpu_count() or 1) // n_jobs)
-        column_cap = resolve_chunk_size(
-            chunk_size,
-            n_observations=self.n_grid,
-            backend="fft",
+        self._validate_sv_args(method, ratio_transformation)
+        self._sv_test_results = self._run_fft_sv(
+            method=method,
+            ratio_transformation=ratio_transformation,
+            chunk_size=chunk_size,
             n_jobs=n_jobs,
-            dtype_bytes=8,
+            print_progress=print_progress,
         )
-        widths = [
-            _sv_response_width_fft(iso_names, method, ratio_transformation)
-            for iso_names in self._gene_iso_names
-        ]
-        gene_chunks = pack_gene_chunks(widths, column_cap)
-
-        iterator = tqdm(
-            gene_chunks,
-            desc=f"SV [{method}]",
-            total=len(gene_chunks),
-            disable=not print_progress,
-        )
-
-        chunk_results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_sv_chunk_worker_fft)(
-                self._raster_layer,
-                [self._gene_iso_names[i] for i in chunk],
-                self.sp_kernel,
-                self._kernel_cumulants,
-                method,
-                ratio_transformation,
-            )
-            for chunk in iterator
-        )
-        results = [res for chunk in chunk_results for res in chunk]
-
-        stats = np.asarray([r[0] for r in results], dtype=float)
-        pvals_np = np.asarray([r[1] for r in results], dtype=float)
-
-        self._sv_test_results = {
-            "statistic": stats,
-            "pvalue": pvals_np,
-            "pvalue_adj": false_discovery_control(pvals_np),
-            "method": method,
-            "null_method": "liu",
-            "use_perm_null": False,
-            "chunk_size": column_cap,
-        }
 
         if return_results:
             return self._sv_test_results
@@ -1006,171 +1315,15 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
         :meth:`splisosm.SplisosmNP.test_differential_usage`
             Non-FFT implementation for arbitrary spatial geometries.
         """
-        if self._adata is None or self.sp_kernel is None or self._raster_layer is None:
-            raise RuntimeError("Data not initialized. Call setup_data() first.")
-        if self._design_table_name is None:
-            raise RuntimeError(
-                "No design matrix found. Pass `design_mtx` to setup_data() before "
-                "calling test_differential_usage()."
-            )
-
-        valid_methods = ["hsic", "hsic-gp", "t-fisher", "t-tippett"]
-        if method not in valid_methods:
-            raise ValueError(f"method must be one of {valid_methods}.")
-        valid_residualize = ["cov_only", "both"]
-        if residualize not in valid_residualize:
-            raise ValueError(f"residualize must be one of {valid_residualize}.")
-        valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
-        if ratio_transformation not in valid_transformations:
-            raise ValueError(
-                f"ratio_transformation must be one of {valid_transformations}."
-            )
-
-        factor_names = (
-            self.covariate_names
-            if self.covariate_names is not None and len(self.covariate_names) > 0
-            else [f"factor_{i}" for i in range(self.n_factors)]
+        self._validate_du_args(method, residualize, ratio_transformation)
+        self._du_test_results = self._run_fft_du(
+            method=method,
+            ratio_transformation=ratio_transformation,
+            gpr_configs=gpr_configs,
+            residualize=residualize,
+            n_jobs=n_jobs,
+            print_progress=print_progress,
         )
-        n_factors = self.n_factors
-        spacing = (self.sp_kernel.dy, self.sp_kernel.dx)
-
-        # GPR is only needed for "hsic-gp"
-        use_gpr_cov = method == "hsic-gp"
-        gpr_cov = None
-        gpr_iso_cfg = None
-        if use_gpr_cov:
-            _cov_cfg = {**_DEFAULT_GPR_CONFIGS["covariate"]}
-            _iso_cfg = {**_DEFAULT_GPR_CONFIGS["isoform"]}
-            if gpr_configs is not None:
-                if "covariate" in gpr_configs:
-                    _cov_cfg.update(gpr_configs["covariate"])
-                if "isoform" in gpr_configs:
-                    _iso_cfg.update(gpr_configs["isoform"])
-            gpr_cov = FFTKernelGPR(
-                constant_value=_cov_cfg["constant_value"],
-                constant_value_bounds=_cov_cfg["constant_value_bounds"],
-                length_scale=_cov_cfg["length_scale"],
-                length_scale_bounds=_cov_cfg["length_scale_bounds"],
-            )
-            if residualize == "both":
-                gpr_iso_cfg = dict(
-                    constant_value=_iso_cfg["constant_value"],
-                    constant_value_bounds=_iso_cfg["constant_value_bounds"],
-                    length_scale=_iso_cfg["length_scale"],
-                    length_scale_bounds=_iso_cfg["length_scale_bounds"],
-                )
-
-        # Lazy-rasterize design table once; channels loaded per-chunk below
-        sd = _require_spatialdata()
-        dm_raster = sd.rasterize_bins(
-            self.sdata,
-            self._bins_name,
-            self._design_table_name,
-            self._col_key,
-            self._row_key,
-        )
-
-        if n_jobs == -1:
-            n_jobs = os.cpu_count() or 1
-
-        # Auto-coordinate FFT workers with joblib n_jobs to prevent thread
-        # oversubscription (same rationale as in test_spatial_variability).
-        _fft_workers = max(1, (os.cpu_count() or 1) // n_jobs)
-        self.sp_kernel.workers = _fft_workers
-        if gpr_cov is not None:
-            gpr_cov._workers = _fft_workers
-        if gpr_iso_cfg is not None:
-            gpr_iso_cfg = {**gpr_iso_cfg, "workers": _fft_workers}
-
-        n_genes = len(self._gene_iso_names)
-        stats = np.zeros((n_genes, n_factors))
-        pvals = np.ones((n_genes, n_factors))
-
-        # Process factors in chunks (≤100) to bound covariate-residual memory
-        _COV_CHUNK = 100
-        n_chunks = max(1, (n_factors + _COV_CHUNK - 1) // _COV_CHUNK)
-        show_gene_bar = print_progress and n_chunks == 1
-        show_chunk_bar = print_progress and n_chunks > 1
-
-        chunk_range = tqdm(
-            range(0, n_factors, _COV_CHUNK),
-            desc="Covariates",
-            total=n_chunks,
-            disable=not show_chunk_bar,
-        )
-
-        for f_start in chunk_range:
-            f_end = min(f_start + _COV_CHUNK, n_factors)
-            chunk_names = factor_names[f_start:f_end]
-            chunk_size = f_end - f_start
-
-            # Load this covariate chunk from lazy raster: (ny, nx, chunk_size)
-            chunk_vals = np.moveaxis(
-                np.asarray(dm_raster.sel(c=chunk_names).values, dtype=float), 0, -1
-            )
-            z_chunk: list[np.ndarray] = []
-            for _i in range(chunk_size):
-                z_cube = chunk_vals[:, :, _i]
-                if use_gpr_cov:
-                    # GPR-residualize and standardize for "hsic-gp"
-                    z_res, _ = gpr_cov.fit_residuals_cube(z_cube, spacing=spacing)
-                    z_res = z_res - z_res.mean()
-                    _std = z_res.std()
-                    if _std > 0:
-                        z_res /= _std
-                elif method == "hsic":
-                    # Center for "hsic" (HSIC requires zero-mean inputs)
-                    z_res = z_cube - np.nanmean(z_cube)
-                    z_res = np.nan_to_num(z_res, nan=0.0)
-                else:
-                    # "t-fisher" / "t-tippett": validate binary covariate then
-                    # pass raw values so that group membership is preserved.
-                    z_valid_vals = z_cube[np.isfinite(z_cube)]
-                    unique_vals = np.unique(z_valid_vals)
-                    if len(unique_vals) > 2:
-                        raise ValueError(
-                            f"More than two groups detected for factor "
-                            f"'{chunk_names[_i]}'. Only binary covariates "
-                            "(exactly two distinct values) are supported for "
-                            f"'{method}'."
-                        )
-                    z_res = z_cube.copy()
-                z_chunk.append(z_res)
-
-            gene_iter = tqdm(
-                self._gene_iso_names,
-                desc=f"DU [{method}]",
-                total=len(self._gene_iso_names),
-                disable=not show_gene_bar,
-            )
-
-            chunk_results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(_du_worker_fft)(
-                    self._raster_layer,
-                    iso_names,
-                    method,
-                    gpr_iso_cfg,
-                    z_chunk,
-                    ratio_transformation,
-                    spacing,
-                )
-                for iso_names in gene_iter
-            )
-
-            for _g, (s, p) in enumerate(chunk_results):
-                stats[_g, f_start:f_end] = s
-                pvals[_g, f_start:f_end] = p
-
-        pvals_adj = np.column_stack(
-            [false_discovery_control(pvals[:, _f]) for _f in range(n_factors)]
-        )
-
-        self._du_test_results = {
-            "statistic": stats,
-            "pvalue": pvals,
-            "pvalue_adj": pvals_adj,
-            "method": method,
-        }
         if return_results:
             return self._du_test_results
         return None

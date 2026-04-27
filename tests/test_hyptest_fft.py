@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from anndata import AnnData
 
 import splisosm.hyptest.fft as hyptest_fft
@@ -668,6 +669,31 @@ class TestSplisosmFFT(unittest.TestCase):
         self.assertEqual(model.design_mtx.shape, (adata.n_obs, 2))
         # The design table is registered in sdata
         self.assertIn(model._design_table_name, self.sdata.tables)
+
+    def test_setup_data_with_sparse_design_mtx(self):
+        """Sparse design_mtx is preserved in the generated design table."""
+        adata = self.sdata.tables[self.table_name]
+        rows = np.arange(0, adata.n_obs, 3)
+        cols = rows % 2
+        design = sp.csr_matrix(
+            (np.ones(len(rows), dtype=np.float32), (rows, cols)),
+            shape=(adata.n_obs, 2),
+        )
+
+        model = SplisosmFFT(rho=0.9, neighbor_degree=1)
+        model.setup_data(
+            self.sdata,
+            bins="grid_bins",
+            table_name=self.table_name,
+            col_key="array_col",
+            row_key="array_row",
+            design_mtx=design,
+            covariate_names=["sparse_A", "sparse_B"],
+        )
+
+        self.assertEqual(model.n_factors, 2)
+        self.assertTrue(sp.issparse(model.design_mtx.X))
+        self.assertEqual(model.design_mtx.shape, (adata.n_obs, 2))
 
     def test_setup_data_design_mtx_from_obs_columns(self):
         """design_mtx specified as obs column names is extracted from adata.obs."""

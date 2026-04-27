@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass
 from typing import Any, Optional, Literal
 from scipy.sparse.csgraph import connected_components as _connected_components
 
@@ -381,6 +382,305 @@ def _process_design_mtx(
     return resolved_design, resolved_cov_names
 
 
+@dataclass
+class _SpatialInputs:
+    adata: AnnData
+    coordinates: Optional[torch.Tensor]
+    adj_matrix: Optional[scipy.sparse.spmatrix]
+    design_mtx: Optional[Any]
+
+
+@dataclass
+class _FeatureGroups:
+    counts_list: list[torch.Tensor]
+    gene_names: list[str]
+    iso_names: list[str]
+
+
+def _validate_prepare_inputs(
+    adata: AnnData,
+    layer: str,
+    group_iso_by: str,
+    spatial_key: str,
+    adj_key: Optional[str],
+    min_counts: int,
+    min_bin_pct: float,
+    gene_names: Optional[str],
+    design_mtx: Optional[Any],
+    min_component_size: int,
+) -> None:
+    """Validate public AnnData preprocessing arguments."""
+    if not isinstance(adata, AnnData):
+        raise ValueError("`adata` must be an AnnData object.")
+    if layer not in adata.layers:
+        raise ValueError(f"Layer `{layer}` was not found in `adata.layers`.")
+    if group_iso_by not in adata.var.columns:
+        raise ValueError(f"`{group_iso_by}` was not found in `adata.var`.")
+    if min_counts < 0:
+        raise ValueError("`min_counts` must be >= 0.")
+    if min_bin_pct < 0 or min_bin_pct > 100:
+        raise ValueError("`min_bin_pct` must be between 0 and 1, or between 0 and 100.")
+    if isinstance(gene_names, list):
+        raise ValueError(
+            "In AnnData mode, `gene_names` must be a var-column name (str) or None."
+        )
+    if not isinstance(min_component_size, int) or min_component_size < 1:
+        raise ValueError("`min_component_size` must be an integer >= 1.")
+    if hasattr(design_mtx, "shape") and design_mtx.shape[0] != adata.n_obs:
+        raise ValueError(
+            f"Design matrix row count ({design_mtx.shape[0]}) "
+            f"must match number of spots ({adata.n_obs})."
+        )
+    if spatial_key not in adata.obsm and not (
+        adj_key is not None and adj_key in adata.obsp
+    ):
+        raise ValueError(
+            f"Neither `adata.obsm['{spatial_key}']` nor `adata.obsp['{adj_key}']` "
+            "is available. Provide spatial coordinates via `spatial_key` and/or "
+            "a pre-built adjacency via `adj_key`."
+        )
+
+
+def _resolve_coordinates(
+    adata: AnnData,
+    spatial_key: str,
+    adj_key: Optional[str],
+) -> Optional[torch.Tensor]:
+    """Return coordinates when present, allowing adjacency-only inputs."""
+    if spatial_key in adata.obsm:
+        coordinates = torch.as_tensor(
+            np.asarray(adata.obsm[spatial_key]), dtype=torch.float32
+        )
+        if coordinates.dim() != 2:
+            raise ValueError(
+                "Coordinates in `adata.obsm[spatial_key]` must be a 2D array."
+            )
+        return coordinates
+    if adj_key is not None and adj_key in adata.obsp:
+        return None
+    raise ValueError(
+        f"Neither `adata.obsm['{spatial_key}']` nor `adata.obsp['{adj_key}']` "
+        "is available. Provide spatial coordinates via `spatial_key` and/or "
+        "a pre-built adjacency via `adj_key`."
+    )
+
+
+def _load_or_build_adjacency(
+    adata: AnnData,
+    coordinates: Optional[torch.Tensor],
+    adj_key: Optional[str],
+    min_component_size: int,
+    k_neighbors: int,
+) -> Optional[scipy.sparse.spmatrix]:
+    """Load a supplied adjacency or build one for component filtering."""
+    if adj_key is not None:
+        if adj_key not in adata.obsp:
+            raise ValueError(f"`adj_key` '{adj_key}' was not found in `adata.obsp`.")
+        adj_raw = adata.obsp[adj_key]
+        adj_out = (
+            adj_raw.tocsc()
+            if scipy.sparse.issparse(adj_raw)
+            else scipy.sparse.csc_matrix(adj_raw)
+        )
+        if not (adj_out != adj_out.T).nnz == 0:
+            adj_out = (adj_out + adj_out.T) / 2
+            warnings.warn(
+                "Provided adjacency matrix is not symmetric; symmetrising by averaging with its transpose.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return adj_out
+
+    if min_component_size <= 1:
+        return None
+    if coordinates is None:
+        raise ValueError(
+            "`min_component_size > 1` without `adj_key` requires spatial "
+            "coordinates via `spatial_key`.  Either provide `adj_key` or "
+            "set `min_component_size=1`."
+        )
+
+    from splisosm.kernel import _build_adj_from_coords
+
+    return _build_adj_from_coords(
+        coordinates, k_neighbors=k_neighbors, mutual_neighbors=True
+    ).tocsc()
+
+
+def _filter_small_components(
+    adata: AnnData,
+    coordinates: Optional[torch.Tensor],
+    adj_matrix: Optional[scipy.sparse.spmatrix],
+    design_mtx: Optional[Any],
+    spatial_key: str,
+    min_component_size: int,
+) -> _SpatialInputs:
+    """Filter spots in small graph components from all aligned inputs."""
+    if min_component_size <= 1:
+        return _SpatialInputs(adata, coordinates, adj_matrix, design_mtx)
+    if adj_matrix is None:
+        raise ValueError("Internal error: component filtering requires an adjacency.")
+
+    _, labels = _connected_components(adj_matrix, directed=False)
+    comp_sizes = np.bincount(labels)
+    keep_mask = comp_sizes[labels] >= min_component_size
+    n_removed = int((~keep_mask).sum())
+    if n_removed == 0:
+        return _SpatialInputs(adata, coordinates, adj_matrix, design_mtx)
+
+    n_remaining = int(keep_mask.sum())
+    if n_remaining == 0:
+        raise ValueError(
+            "No spots remained after filtering small graph components. "
+            "Lower `min_component_size` or check your coordinate/adjacency matrix."
+        )
+
+    adata = adata[keep_mask, :].copy()
+    coordinates = (
+        torch.as_tensor(np.asarray(adata.obsm[spatial_key]), dtype=torch.float32)
+        if coordinates is not None and spatial_key in adata.obsm
+        else None
+    )
+    adj_matrix = adj_matrix[keep_mask][:, keep_mask].tocsc()
+
+    if design_mtx is not None:
+        if isinstance(design_mtx, pd.DataFrame):
+            design_mtx = design_mtx.iloc[keep_mask].copy()
+        elif isinstance(design_mtx, torch.Tensor):
+            design_mtx = design_mtx[keep_mask].clone()
+        elif scipy.sparse.issparse(design_mtx):
+            design_mtx = design_mtx.tocsr()[keep_mask].copy()
+        elif isinstance(design_mtx, np.ndarray):
+            design_mtx = design_mtx[keep_mask, :].copy()
+
+    warnings.warn(
+        f"Removed {n_removed} spot(s) belonging to graph components "
+        f"with fewer than {min_component_size} member(s). "
+        f"{n_remaining} spot(s) remain.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return _SpatialInputs(adata, coordinates, adj_matrix, design_mtx)
+
+
+def _filtered_feature_table(
+    adata: AnnData,
+    layer: str,
+    group_iso_by: str,
+    min_counts: int,
+    min_bin_pct: float,
+    filter_single_iso_genes: bool,
+    gene_names: Optional[str],
+) -> tuple[pd.DataFrame, Any, bool]:
+    """Return filtered isoform metadata and normalized count storage."""
+    iso_counts = adata.layers[layer]
+    min_bin_frac = float(min_bin_pct)
+    if min_bin_frac > 1.0:
+        min_bin_frac /= 100.0
+
+    is_sparse_input = scipy.sparse.issparse(iso_counts)
+    if is_sparse_input and not (
+        scipy.sparse.isspmatrix_csr(iso_counts)
+        or scipy.sparse.isspmatrix_csc(iso_counts)
+    ):
+        iso_counts = iso_counts.tocsr()
+
+    total_counts = np.asarray(iso_counts.sum(axis=0)).ravel()
+    if is_sparse_input:
+        bin_pct = iso_counts.getnnz(axis=0).astype(np.float64) / adata.n_obs
+    else:
+        counts_arr_for_stats = np.asarray(iso_counts)
+        bin_pct = np.count_nonzero(counts_arr_for_stats, axis=0) / adata.n_obs
+
+    needed_var_cols = [group_iso_by]
+    if gene_names is not None:
+        if gene_names not in adata.var.columns:
+            raise ValueError(
+                f"`gene_names` column `{gene_names}` was not found in `adata.var`."
+            )
+        if gene_names != group_iso_by:
+            needed_var_cols.append(gene_names)
+
+    var_df = adata.var[needed_var_cols].copy()
+    var_df["__total_counts__"] = total_counts
+    var_df["__bin_pct__"] = bin_pct
+    var_df = var_df[
+        (var_df["__total_counts__"] >= min_counts)
+        & (var_df["__bin_pct__"] >= min_bin_frac)
+    ]
+    if var_df.shape[0] == 0:
+        raise ValueError(
+            "No features remained after applying `min_counts`/`min_bin_pct` filtering."
+        )
+
+    if filter_single_iso_genes:
+        n_iso_per_gene = var_df.groupby(group_iso_by, observed=True).size()
+        keep_genes = n_iso_per_gene[n_iso_per_gene >= 2].index
+        var_df = var_df[var_df[group_iso_by].isin(keep_genes)]
+        if var_df.shape[0] == 0:
+            raise ValueError("No genes with >=2 isoforms remained after filtering.")
+
+    return var_df, iso_counts, is_sparse_input
+
+
+def _build_feature_groups(
+    adata: AnnData,
+    iso_counts: Any,
+    var_df: pd.DataFrame,
+    group_iso_by: str,
+    gene_names: Optional[str],
+    is_sparse_input: bool,
+) -> _FeatureGroups:
+    """Build per-gene torch count tensors without repeated full-matrix slicing."""
+    iso_groups = list(var_df.groupby(group_iso_by, observed=True, sort=False))
+    if len(iso_groups) == 0:
+        raise ValueError("No genes remained after extracting isoform counts.")
+
+    all_iso_names_flat: list[str] = []
+    gene_slice_offsets: list[tuple[int, int]] = []
+    resolved_gene_names: list[str] = []
+    pos = 0
+    for gene_id, group in iso_groups:
+        iso_names = group.index.astype(str).tolist()
+        all_iso_names_flat.extend(iso_names)
+        gene_slice_offsets.append((pos, pos + len(iso_names)))
+        pos += len(iso_names)
+        resolved_gene_names.append(
+            str(group[gene_names].iloc[0]) if gene_names is not None else str(gene_id)
+        )
+
+    var_index = pd.Index(adata.var_names)
+    all_iso_indices = var_index.get_indexer(all_iso_names_flat)
+    if (all_iso_indices < 0).any():
+        missing = [n for n, idx in zip(all_iso_names_flat, all_iso_indices) if idx < 0]
+        raise ValueError(
+            f"Could not locate {len(missing)} isoform name(s) in adata.var_names "
+            f"(first few: {missing[:5]}). This indicates an internal inconsistency."
+        )
+
+    if is_sparse_input:
+        sub_csc = iso_counts[:, all_iso_indices].tocsc().astype(np.float32, copy=False)
+    else:
+        sub_arr = np.ascontiguousarray(iso_counts[:, all_iso_indices], dtype=np.float32)
+        sub_tensor = torch.from_numpy(sub_arr)
+
+    counts_list: list[torch.Tensor] = []
+    for start, end in gene_slice_offsets:
+        if is_sparse_input:
+            coo = sub_csc[:, start:end].tocoo()
+            indices = torch.from_numpy(
+                np.vstack((coo.row, coo.col)).astype(np.int64, copy=False)
+            )
+            values = torch.from_numpy(coo.data)
+            with torch.sparse.check_sparse_tensor_invariants(False):
+                counts = torch.sparse_coo_tensor(indices, values, torch.Size(coo.shape))
+        else:
+            counts = sub_tensor[:, start:end]
+        counts_list.append(counts)
+
+    return _FeatureGroups(counts_list, resolved_gene_names, all_iso_names_flat)
+
+
 def prepare_inputs_from_anndata(
     adata: AnnData,
     layer: str,
@@ -508,268 +808,72 @@ def prepare_inputs_from_anndata(
         If required fields are missing from ``adata``, no isoforms survive
         filtering, or argument values are out of range.
     """
-    if not isinstance(adata, AnnData):
-        raise ValueError("`adata` must be an AnnData object.")
-    if layer not in adata.layers:
-        raise ValueError(f"Layer `{layer}` was not found in `adata.layers`.")
-    if group_iso_by not in adata.var.columns:
-        raise ValueError(f"`{group_iso_by}` was not found in `adata.var`.")
-    if min_counts < 0:
-        raise ValueError("`min_counts` must be >= 0.")
-    if min_bin_pct < 0 or min_bin_pct > 100:
-        raise ValueError("`min_bin_pct` must be between 0 and 1, or between 0 and 100.")
-    if isinstance(gene_names, list):
-        raise ValueError(
-            "In AnnData mode, `gene_names` must be a var-column name (str) or None."
-        )
-    if not isinstance(min_component_size, int) or min_component_size < 1:
-        raise ValueError("`min_component_size` must be an integer >= 1.")
-    if hasattr(design_mtx, "shape") and design_mtx.shape[0] != adata.n_obs:
-        raise ValueError(
-            f"Design matrix row count ({design_mtx.shape[0]}) "
-            f"must match number of spots ({adata.n_obs})."
-        )
-    # Extract spatial coordinates if available.  When `adj_key` is provided we
-    # accept non-spatial AnnData (no `obsm[spatial_key]`): downstream kernel
-    # construction can proceed from the adjacency matrix alone.  Operations
-    # that genuinely require raw coordinates (SPARK-X, GP-conditional DU)
-    # raise targeted errors later, at call time.
-    if spatial_key in adata.obsm:
-        coordinates = adata.obsm[spatial_key]
-        coordinates = torch.as_tensor(np.asarray(coordinates), dtype=torch.float32)
-        if coordinates.dim() != 2:
-            raise ValueError(
-                "Coordinates in `adata.obsm[spatial_key]` must be a 2D array."
-            )
-    elif adj_key is not None and adj_key in adata.obsp:
-        coordinates = None
-    else:
-        raise ValueError(
-            f"Neither `adata.obsm['{spatial_key}']` nor `adata.obsp['{adj_key}']` "
-            "is available. Provide spatial coordinates via `spatial_key` and/or "
-            "a pre-built adjacency via `adj_key`."
-        )
+    _validate_prepare_inputs(
+        adata=adata,
+        layer=layer,
+        group_iso_by=group_iso_by,
+        spatial_key=spatial_key,
+        adj_key=adj_key,
+        min_counts=min_counts,
+        min_bin_pct=min_bin_pct,
+        gene_names=gene_names,
+        design_mtx=design_mtx,
+        min_component_size=min_component_size,
+    )
 
-    # Load/build adjacency and filter disconnected components if needed
-    _adj_out: Optional[scipy.sparse.spmatrix] = None
+    coordinates = _resolve_coordinates(adata, spatial_key, adj_key)
+    adj_matrix = _load_or_build_adjacency(
+        adata=adata,
+        coordinates=coordinates,
+        adj_key=adj_key,
+        min_component_size=min_component_size,
+        k_neighbors=k_neighbors,
+    )
+    spatial_inputs = _filter_small_components(
+        adata=adata,
+        coordinates=coordinates,
+        adj_matrix=adj_matrix,
+        design_mtx=design_mtx,
+        spatial_key=spatial_key,
+        min_component_size=min_component_size,
+    )
+    adata = spatial_inputs.adata
+    coordinates = spatial_inputs.coordinates
+    adj_matrix = spatial_inputs.adj_matrix
+    design_mtx = spatial_inputs.design_mtx
 
-    # Load adj from adata.obsp if adj_key is provided
-    if adj_key is not None:
-        if adj_key not in adata.obsp:
-            raise ValueError(f"`adj_key` '{adj_key}' was not found in `adata.obsp`.")
-        _adj_raw = adata.obsp[adj_key]
-        _adj_out = (
-            _adj_raw.tocsc()
-            if scipy.sparse.issparse(_adj_raw)
-            else scipy.sparse.csc_matrix(_adj_raw)
-        )
+    var_df, iso_counts, is_sparse_input = _filtered_feature_table(
+        adata=adata,
+        layer=layer,
+        group_iso_by=group_iso_by,
+        min_counts=min_counts,
+        min_bin_pct=min_bin_pct,
+        filter_single_iso_genes=filter_single_iso_genes,
+        gene_names=gene_names,
+    )
+    features = _build_feature_groups(
+        adata=adata,
+        iso_counts=iso_counts,
+        var_df=var_df,
+        group_iso_by=group_iso_by,
+        gene_names=gene_names,
+        is_sparse_input=is_sparse_input,
+    )
 
-        # Symmetrize the adjacency matrix if it's not already symmetric
-        if not (_adj_out != _adj_out.T).nnz == 0:
-            _adj_out = (_adj_out + _adj_out.T) / 2
-            warnings.warn(
-                "Provided adjacency matrix is not symmetric; symmetrising by averaging with its transpose.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-    elif min_component_size > 1:
-        # Build k-NN graph from coordinates for component filtering.  This path
-        # requires raw coordinates; with no `adj_key` and no `spatial_key` the
-        # upstream check already raised, so `coordinates` must be non-None here.
-        if coordinates is None:
-            raise ValueError(
-                "`min_component_size > 1` without `adj_key` requires spatial "
-                "coordinates via `spatial_key`.  Either provide `adj_key` or "
-                "set `min_component_size=1`."
-            )
-        from splisosm.kernel import _build_adj_from_coords
-
-        _adj_out = _build_adj_from_coords(
-            coordinates, k_neighbors=k_neighbors, mutual_neighbors=True
-        ).tocsc()
-
-    # Spot-level filtering
-    if min_component_size > 1:
-        # Count connected components
-        _, _labels = _connected_components(_adj_out, directed=False)
-        _comp_sizes = np.bincount(_labels)
-        _keep_mask = _comp_sizes[_labels] >= min_component_size
-        _n_removed = int((~_keep_mask).sum())
-
-        # filter out spots in small components from adata, coords, adj, and design_mtx
-        if _n_removed > 0:
-            _n_remaining = int(_keep_mask.sum())
-            if _n_remaining == 0:
-                raise ValueError(
-                    "No spots remained after filtering small graph components. "
-                    "Lower `min_component_size` or check your coordinate/adjacency matrix."
-                )
-            adata = adata[
-                _keep_mask, :
-            ].copy()  # filter adata to keep only the retained spots
-            # Preserve coordinates only if they were available before filtering.
-            if coordinates is not None and spatial_key in adata.obsm:
-                coordinates = torch.as_tensor(
-                    np.asarray(adata.obsm[spatial_key]), dtype=torch.float32
-                )
-            else:
-                coordinates = None
-            _adj_out = _adj_out[_keep_mask][:, _keep_mask].tocsc()
-
-            # Filter design matrix if provided as array-like
-            if design_mtx is not None:
-                if isinstance(design_mtx, pd.DataFrame):
-                    design_mtx = design_mtx.iloc[_keep_mask].copy()
-                elif isinstance(design_mtx, torch.Tensor):
-                    design_mtx = design_mtx[_keep_mask].clone()
-                elif scipy.sparse.issparse(design_mtx):
-                    design_mtx = design_mtx.tocsr()[_keep_mask].copy()
-                elif isinstance(design_mtx, np.ndarray):
-                    design_mtx = design_mtx[_keep_mask, :].copy()
-
-            warnings.warn(
-                f"Removed {_n_removed} spot(s) belonging to graph components "
-                f"with fewer than {min_component_size} member(s). "
-                f"{_n_remaining} spot(s) remain.",
-                UserWarning,
-                stacklevel=2,
-            )
-
-    # Feature-level filtering
-    iso_counts = adata.layers[layer]
-    min_bin_frac = float(min_bin_pct)
-    if min_bin_frac > 1.0:
-        min_bin_frac /= 100.0
-
-    is_sparse_input = scipy.sparse.issparse(iso_counts)
-
-    # Normalise sparse format to CSR/CSC once, upfront — avoids repeated conversions.
-    if is_sparse_input and not (
-        scipy.sparse.isspmatrix_csr(iso_counts)
-        or scipy.sparse.isspmatrix_csc(iso_counts)
-    ):
-        iso_counts = iso_counts.tocsr()
-
-    # Compute per-isoform stats efficiently.
-    total_counts = np.asarray(iso_counts.sum(axis=0)).ravel()
-    if is_sparse_input:
-        # getnnz reads directly from the sparse internal arrays — no intermediate
-        # boolean matrix compared to (iso_counts > 0).sum(axis=0).
-        bin_pct = iso_counts.getnnz(axis=0).astype(np.float64) / adata.n_obs
-    else:
-        counts_arr_for_stats = np.asarray(iso_counts)
-        bin_pct = np.count_nonzero(counts_arr_for_stats, axis=0) / adata.n_obs
-
-    # Copy only the columns needed from adata.var — avoids duplicating potentially
-    # hundreds of annotation columns that are irrelevant here.
-    needed_var_cols = [group_iso_by]
-    if gene_names is not None:
-        if gene_names not in adata.var.columns:
-            raise ValueError(
-                f"`gene_names` column `{gene_names}` was not found in `adata.var`."
-            )
-        if gene_names != group_iso_by:
-            needed_var_cols.append(gene_names)
-
-    # var_df index == adata.var_names (isoform names)
-    var_df = adata.var[needed_var_cols].copy()
-    var_df["__total_counts__"] = total_counts
-    var_df["__bin_pct__"] = bin_pct
-
-    # Remove isoforms that do not meet the count and bin percentage thresholds.
-    var_df = var_df[
-        (var_df["__total_counts__"] >= min_counts)
-        & (var_df["__bin_pct__"] >= min_bin_frac)
-    ]
-    if var_df.shape[0] == 0:
-        raise ValueError(
-            "No features remained after applying `min_counts`/`min_bin_pct` filtering."
-        )
-
-    # Remove genes with fewer than 2 isoforms if requested.
-    if filter_single_iso_genes:
-        n_iso_per_gene = var_df.groupby(group_iso_by, observed=True).size()
-        keep_genes = n_iso_per_gene[n_iso_per_gene >= 2].index
-        var_df = var_df[var_df[group_iso_by].isin(keep_genes)]
-        if var_df.shape[0] == 0:
-            raise ValueError("No genes with >=2 isoforms remained after filtering.")
-
-    # Prepare per-gene spot-by-isoform count tensors.
-    # We also resolve gene display names here to avoid a second groupby call.
-    iso_groups = list(var_df.groupby(group_iso_by, observed=True, sort=False))
-    if len(iso_groups) == 0:
-        raise ValueError("No genes remained after extracting isoform counts.")
-
-    all_iso_names_flat: list[str] = []
-    gene_slice_offsets: list[tuple[int, int]] = []
-    grouped_genes: list[str] = []
-    resolved_gene_names: list[str] = []
-    pos = 0
-    for gene_id, group in iso_groups:
-        # group.index contains the isoform names for this gene (== adata.var_names subset)
-        iso_names = group.index.astype(str).tolist()
-        all_iso_names_flat.extend(iso_names)
-        gene_slice_offsets.append((pos, pos + len(iso_names)))
-        pos += len(iso_names)
-        grouped_genes.append(str(gene_id))
-        resolved_gene_names.append(
-            str(group[gene_names].iloc[0]) if gene_names is not None else str(gene_id)
-        )
-
-    # Vectorised column-index lookup. This is much faster than a Python dict
-    # comprehension loop for large var_df
-    var_index = pd.Index(adata.var_names)
-    all_iso_indices = var_index.get_indexer(all_iso_names_flat)
-    if (all_iso_indices < 0).any():
-        missing = [n for n, idx in zip(all_iso_names_flat, all_iso_indices) if idx < 0]
-        raise ValueError(
-            f"Could not locate {len(missing)} isoform name(s) in adata.var_names "
-            f"(first few: {missing[:5]}). This indicates an internal inconsistency."
-        )
-
-    # Single upfront column slice + one format conversion
-    if is_sparse_input:
-        # Build a CSC sub-matrix (fast per-gene column access) in float32.
-        sub_csc = iso_counts[:, all_iso_indices].tocsc().astype(np.float32, copy=False)
-    else:
-        # One contiguous float32 copy; per-gene views share this memory (no per-gene copy).
-        sub_arr = np.ascontiguousarray(iso_counts[:, all_iso_indices], dtype=np.float32)
-        sub_tensor = torch.from_numpy(sub_arr)  # zero-copy
-
-    # Per-gene extraction: fast positional slices from the small sub-matrix
-    counts_list: list[torch.Tensor] = []
-    for (_, _group), (start, end) in zip(iso_groups, gene_slice_offsets):
-        if is_sparse_input:
-            _coo = sub_csc[:, start:end].tocoo()
-            # torch.from_numpy avoids an extra copy vs torch.LongTensor/FloatTensor
-            _i = torch.from_numpy(
-                np.vstack((_coo.row, _coo.col)).astype(np.int64, copy=False)
-            )
-            _v = torch.from_numpy(_coo.data)  # already float32
-            with torch.sparse.check_sparse_tensor_invariants(False):
-                _counts = torch.sparse_coo_tensor(_i, _v, torch.Size(_coo.shape))
-        else:
-            _counts = sub_tensor[:, start:end]  # zero-copy view
-        counts_list.append(_counts)
-
-    # Process design matrix (handles column extraction, categorical encoding, etc.)
     resolved_design, resolved_covariates = _process_design_mtx(
         adata, design_mtx, covariate_names
     )
-
-    # Optionally build filtered adata: spots retained after component filtering, isoforms
-    # in the same order as all_iso_names_flat (matches counts_list gene/iso ordering).
     filtered_adata = (
-        adata[:, all_iso_names_flat].copy() if return_filtered_anndata else None
+        adata[:, features.iso_names].copy() if return_filtered_anndata else None
     )
 
     return (
-        counts_list,
+        features.counts_list,
         coordinates,
-        resolved_gene_names,
+        features.gene_names,
         resolved_design,
         resolved_covariates,
-        _adj_out,
+        adj_matrix,
         filtered_adata,
     )
 

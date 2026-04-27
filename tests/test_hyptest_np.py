@@ -1613,6 +1613,33 @@ class TestSplisosmNP(unittest.TestCase):
             )
         self.assertEqual(model.design_mtx.shape[0], n_kept)
 
+    def test_min_component_size_sparse_design_mtx_filtered(self):
+        """Sparse design_mtx stays sparse and is spot-filtered."""
+        import warnings as _warnings
+
+        frag_adata, n_total = self._make_fragmented_adata()
+        design = scipy.sparse.csr_matrix(
+            frag_adata.obs[["cov_1", "cov_2"]].to_numpy(dtype=np.float32)
+        )
+
+        model = SplisosmNP()
+        with _warnings.catch_warnings(record=True):
+            _warnings.simplefilter("always")
+            model.setup_data(
+                adata=frag_adata,
+                layer="counts",
+                spatial_key="spatial",
+                group_iso_by="gene_symbol",
+                design_mtx=design,
+                min_counts=0,
+                min_bin_pct=0.0,
+                filter_single_iso_genes=False,
+                min_component_size=3,
+            )
+
+        self.assertTrue(scipy.sparse.issparse(model.design_mtx))
+        self.assertEqual(model.design_mtx.shape, (n_total - 2, 2))
+
     def test_min_component_size_1_is_noop(self):
         """min_component_size=1 (default) keeps all spots, no warning."""
         import warnings as _warnings
