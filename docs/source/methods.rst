@@ -190,14 +190,17 @@ and the p-value is :math:`\mathbb{P}\!\left(\chi^2_h \geq Q/g\right)`.
      retained as deprecated aliases and automatically use this Welch
      approximation.
    - Using only the first two cumulants :math:`\mathrm{tr}(K)` and :math:`\mathrm{tr}(K^2)`,
-     Welch is typically less accurate in the right tail (i.e., smaller p-values) than the 
-     :ref:`Liu approximation <null-liu>`, which uses for cumulants. In practice the difference is small.
+     Welch is typically less accurate in the right tail (small p-values) than
+     the :ref:`Liu approximation <null-liu>`, which uses four cumulants.
+     In practice the difference is often small.
 
 .. _null-perm:
 
 **3. Batched permutation test**: ``null_method='perm'``
 
 Generates a null distribution by repeatedly permuting the rows of :math:`Y` (breaking the spatial structure) and recomputing :math:`\mathrm{tr}(Y_\pi^\top K Y_\pi)` for each permutation :math:`\pi`.
+P-values use the finite-permutation correction
+:math:`(1 + \#\{Q_\pi \ge Q_{\mathrm{obs}}\}) / (B + 1)`.
 
 To avoid :math:`O(n^2)` memory, SPLISOSM batches :math:`B` permutations into a single :math:`(n, Bp)` matrix and calls :meth:`~splisosm.kernel.SpatialCovKernel.xtKx` once per batch.
 Per-permutation traces are recovered as diagonal blocks of the :math:`(Bp, Bp)` result matrix without materialising the full kernel.
@@ -238,11 +241,9 @@ Furthermore, the spatial eigenvalues :math:`\{\lambda_{(h,w)}^K\}` are shared ac
 
 .. note::
 
-   For irregularly spaced 2D and 3D coordinates, the SV test statistic and its null can be computed using a
-   `non-uniform FFT (NUFFT) <https://en.wikipedia.org/wiki/Non-uniform_discrete_Fourier_transform>`_ approach,
-   which also scales as :math:`O(n \log n)`. Because the current implementation is already highly efficient
-   (processing 100K spots in under a minute), extending the SV test with NUFFT is deferred to future work.
-   Please open an `issue <https://github.com/JiayuSuPKU/splisosm/issues>`_ if you are interested in this feature.
+   For irregular coordinates, use :class:`~splisosm.SplisosmNP` for SV tests.
+   The FINUFFT backend described below is currently used for GP residualization
+   in conditional DU tests, not for the SV spatial kernel.
 
 Differential Isoform Usage (DU) Tests
 ---------------------------------------
@@ -288,7 +289,8 @@ Specifically, SPLISOSM first **residualises** the covariate against a Gaussian P
 2. **Compute covariate residuals** :math:`\tilde{Z} = Z - \hat{f}(X)`, capturing the part of covariate variation *not explained by* spatial position.
 
 3. **Test** :math:`\widehat{\mathrm{HSIC}}(\tilde{Z},\, Y)` using the rank-1 linear covariate kernel :math:`K_{\tilde{Z}} = \tilde{Z}\tilde{Z}^\top` and a similar linear kernel :math:`K_Y = Y Y^\top` for the response.
-   Since both kernels are low-rank, the null distribution can be efficiently computed via the eigenvalue method.
+   Since both kernels are low-rank, the Liu null can be computed from the
+   nonzero covariate and response eigenvalues.
 
 .. note::
 
@@ -307,13 +309,13 @@ For flexibility, we provide optional control via the ``residualize`` argument:
    The GP fitting step is the dominant computational cost of the DU test.
    Three backend families are supported:
 
-   - ``gpr_backend='sklearn'`` (default): uses ``GaussianProcessRegressor`` from sklearn with an RBF kernel and optional subset-of-data hyperparameter fitting.
-   - ``gpr_backend='gpytorch'``: Exact or sparse GP with ``n_inducing`` inducing points.
-   - ``gpr_backend='nufft'`` / ``'finufft'`` (fastest): FINUFFT-backed implicit RBF grid-kernel for irregular 2-D coordinates, recommended for large-scale spatial data.
+   - ``gpr_backend='sklearn'`` (default): dense sklearn ``GaussianProcessRegressor`` with optional subset-of-data hyperparameter fitting.
+   - ``gpr_backend='gpytorch'``: exact or FITC sparse GP with ``n_inducing`` inducing points and optional GPU support.
+   - ``gpr_backend='nufft'`` / ``'finufft'``: FINUFFT-backed implicit RBF grid-kernel for irregular 2-D coordinates, recommended for large-scale spatial data.
 
-   For very large datasets, pass ``gpr_configs={"covariate": {"n_inducing": 1000}}`` to control the number of inducing points for the sklearn/gpytorch backends. 
+   For sklearn and gpytorch, pass ``gpr_configs={"covariate": {"n_inducing": 1000}}`` to control the subset or inducing-point budget.
    For the NUFFT backend, ``max_auto_modes`` caps the automatically inferred full effective grid, and ``lml_approx_rank`` controls the irregular-grid likelihood approximation used during hyperparameter fitting.
-   These options are passed through ``gpr_configs``; see :meth:`splisosm.SplisosmNP.test_differential_usage` for the user-facing configuration table and :doc:`gpr_api` for backend class details.
+   These options are passed through ``gpr_configs``; see :meth:`splisosm.SplisosmNP.test_differential_usage` for the user-facing configuration table and :doc:`api/gpr` for backend class details.
 
 NUFFT backend for irregular-coordinate GP residualization
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -404,7 +406,7 @@ and :math:`U = (u_1, \ldots, u_n)^\top \in \mathbb{R}^{n \times q}` stacks the p
 
 .. note::
 
-   The SV test (H₀: :math:`\theta = 0`) is implemented as a likelihood ratio test (LRT) in :func:`~splisosm.SplisosmGLMM.test_spatial_variability`. 
+   The SV test (H₀: :math:`\theta = 0`) is implemented as a likelihood ratio test (LRT) in :meth:`~splisosm.SplisosmGLMM.test_spatial_variability`.
    However, it is not well-calibrated due to technical challenges in model fitting. 
    The equivalent score test version also takes a quadratic form similar to the HSIC test statistic but with spot-specific adjustments. 
    See :cite:`su2026consistent` for detailed analysis.

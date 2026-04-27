@@ -77,11 +77,12 @@ class NUFFTKernelGPR(KernelGPR):
     -----
     Requires ``finufft`` (optional dependency)::
 
-        pip install gpytorch
+        pip install "splisosm[gp]"
 
-    Results should agree exactly with :class:`FFTKernelGPR` on compatible regular grids.
-    Compared with :class:`SklearnKernelGPR`, differences near the bounding-box edges are
-    expected because this backend uses periodic boundary conditions.
+    Results should match :class:`FFTKernelGPR` on compatible regular grids up
+    to numerical tolerance. Compared with :class:`SklearnKernelGPR`,
+    differences near the bounding-box edges are expected because this backend
+    uses periodic boundary conditions.
     """
 
     def __init__(

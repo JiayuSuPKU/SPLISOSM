@@ -1869,7 +1869,7 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
 
         See also
         --------
-        :func:`splisosm.hyptest.np.SplisosmNP.test_spatial_variability` for non-parametric tests.
+        :meth:`splisosm.SplisosmNP.test_spatial_variability` for non-parametric tests.
         """
 
         self._validate_sv_test(method)
@@ -1901,12 +1901,12 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
     ) -> Optional[dict[str, Any]]:
         """Parametric test for spatial isoform differential usage.
 
-        Before running this function, the design matrix must be set up using :func:`setup_data`.
+        Before running this function, the design matrix must be set up using :meth:`setup_data`.
         Each column of the design matrix corresponds to a covariate to test for differential association
         with the isoform usage ratios of each gene.
         Test statistics and p-values are computed per (gene, covariate) pair separately.
 
-        Similar to :func:`splisosm.hyptest.np.SplisosmNP.test_differential_usage`, here we also support two types of association tests but **implicitly**:
+        Similar to :meth:`splisosm.SplisosmNP.test_differential_usage`, here we also support two types of association tests but **implicitly**:
 
         - Unconditional (when ``model_type='glm'``): test the unconditional association between isoform usage ratios and the covariate of interest (H_0: ``beta`` = 0).
         - Conditional (when ``model_type='glmm-full'``): test for association (H_0: ``beta`` = 0) conditioned on the spatial random effect.

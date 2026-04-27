@@ -44,7 +44,7 @@ Summary of class features:
      - AnnData
      - any
      - fast
-     - for DU, use inducing points or the NUFFT GPR backend.
+     - SV uses 32-column chunks; for DU on large irregular 2-D data, use the NUFFT GPR backend.
    * - :class:`~splisosm.SplisosmFFT`
      - ✓
      - ✓
@@ -360,7 +360,7 @@ SPLISOSM tests for statistical independence between isoform expression and spati
 Testing for differential isoform usage (DU)
 --------------------------------------------
 
-DU tests identify genes whose isoform usage is associated with a covariate (e.g., spatial domain, RBP expression), conditioned on spatial correlation.
+DU tests identify genes whose isoform usage is associated with a covariate (e.g., spatial domain, RBP expression), optionally after removing spatial autocorrelation.
 
 **SplisosmNP** (non-parametric, HSIC-based)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -414,7 +414,7 @@ Uses Gaussian process regression (GPR) to remove spatial autocorrelation.
        nan_filling="mean",            # if 'none', use only non-zero spots per gene (slow)
        residualize="cov_only",        # 'cov_only' (faster) | 'both' (more conservative)
        gpr_backend="sklearn",         # 'sklearn' | 'gpytorch' | 'nufft'/'finufft'
-       gpr_configs=None,              # e.g. {"covariate": {"n_inducing": 500}}
+       gpr_configs=None,              # e.g. {"covariate": {"lml_approx_rank": 64}} for NUFFT
        n_jobs=-1,                     # gene-level parallelism; -1 = all CPUs
        print_progress=True,
    )
@@ -583,7 +583,7 @@ adjust them only when you hit performance or accuracy limits.
      - Trade-off
    * - **Ratio transformation**
      - ``ratio_transformation=`` in ``test_spatial_variability`` / ``test_differential_usage``
-     - ``"none"`` (no compositional constraint)
+     - ``"none"`` (raw usage ratios)
      - log-based transformations (``"clr"``, ``"ilr"``, ``"alr"``) require pseudocounts to handle zero ratios; 
        ``"radial"`` is not calibrated. Performance of ``"none"`` is better in most cases.
    * - **SV null approximation**
@@ -612,9 +612,9 @@ adjust them only when you hit performance or accuracy limits.
      - ``standardize_cov=`` at construction and ``min_component_size=`` at ``setup_data``;
        for ``run_hsic_gc``, pass ``standardize_cov`` and ``min_component_size`` directly
      - ``standardize_cov=True``, ``min_component_size=1``
-     - Covariance standardisation ensures all spots have the same leverage on the test statistic, 
+     - Covariance standardisation gives all spots the same kernel diagonal,
        reducing influence from spatial graph outliers (e.g., tiny disconnected tissue fragments), 
-       but also slowing setup. Alternatively, ``min_component_size > 1`` filter out small
+       but it also slows setup. Alternatively, ``min_component_size > 1`` filters out small
        connected components in a data-driven manner.
    * - **Conditional DU test** (``method="hsic-gp"``)
      - ``residualize=`` in ``test_differential_usage``
@@ -631,12 +631,13 @@ adjust them only when you hit performance or accuracy limits.
        For large irregular 2-D data, prefer ``"nufft"`` / ``"finufft"``,
        which uses FINUFFT matvecs for an implicit RBF grid kernel
        (roughly :math:`O(n \log n)`) without forming a dense GP matrix.
-       See :doc:`gpr_api` for backend class signatures and options.
+       See :doc:`api/gpr` for backend class signatures and options.
    * - **GPR inducing points** (DU, ``method="hsic-gp"``)
      - ``gpr_configs={"covariate": {"n_inducing": M}}`` in
        ``test_differential_usage``
      - ``5000`` (subset-of-data for sklearn; FITC for gpytorch)
-     - Reduces GP fitting cost from O(*n*³) to O(*nM*²).
+     - For sklearn, fits hyperparameters on a subset of up to *M* observations
+       instead of all spots. For gpytorch, uses *M* FITC inducing points.
        Accuracy degrades if *M* is too small.
        Set to ``None`` for exact GP (warns when ``n_spots > 10000``).
        This option is ignored by the NUFFT backend.
@@ -659,7 +660,7 @@ adjust them only when you hit performance or accuracy limits.
        is automatically disabled (CUDA not thread-safe).
    * - **Other GPR configuration**
      - ``gpr_configs=`` in ``test_differential_usage``
-     - See :func:`test_differential_usage <splisosm.SplisosmNP.test_differential_usage>` and :doc:`gpr_api` for details
+     - See :func:`test_differential_usage <splisosm.SplisosmNP.test_differential_usage>` and :doc:`api/gpr` for details
      - Adjust ``constant_value_bounds`` or ``length_scale_bounds`` to tune the hyperparameter
        searching ranges.
 

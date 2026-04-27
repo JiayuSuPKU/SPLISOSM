@@ -66,7 +66,7 @@ Choosing a model class
 
   - :class:`~splisosm.SplisosmNP` — **non-parametric HSIC tests** using a sparse CAR spatial kernel.
     Supports both SV and DU testing, works on arbitrary geometries (irregular spots, single cells,
-    segmented tissue), and accepts ``AnnData`` or raw tensor inputs.
+    segmented tissue), and accepts ``AnnData`` input.
     *Recommended default for most datasets.*
 
   - :class:`~splisosm.SplisosmFFT` — **FFT-accelerated HSIC tests** on **regular grids** (Visium HD,
@@ -92,8 +92,8 @@ Choosing a model class
   :class:`~splisosm.SplisosmFFT` treats the grid as periodic (block-circulant kernel), which means bins at
   opposite edges of the grid are treated as spatial neighbours. 
   In contrast, :class:`~splisosm.SplisosmNP` builds a k-NN graph from the actual coordinates and has no wrap-around. 
-  Note that in most cases, the tissue does not occupy the entire grid; the periodic assumption
-  holds since the boundary bins are mostly unobserved (zero-padded).
+  The boundary effect is usually small when tissue occupies the interior of a
+  larger zero-padded grid.
 
   2. **Rasterisation and zero-padding.**
   :class:`~splisosm.SplisosmFFT` operates on the full :math:`H \times W` raster grid.  Unobserved bins
@@ -120,12 +120,11 @@ Choosing a model class
   threshold, although gene rankings are usually largely consistent.
 
   At first glance, the legacy low-rank approach may appear to have higher
-  statistical power because it often identifies more SVP genes.  This difference
-  comes from a deliberate design choice: low-rank approximations prioritize
-  global, low-frequency spatial patterns, but they sacrifice sensitivity to
-  local, high-frequency patterns and can have effectively zero power for those
-  signals.  Since real spatial datasets often contain strong global patterns,
-  the low-rank test can naturally produce smaller p-values in those scenarios.
+  statistical power because it often identifies more SVP genes.  This happens
+  because low-rank approximations keep broad, low-frequency spatial patterns
+  and drop finer local variation.  Since real spatial datasets often contain
+  strong global patterns, the low-rank test can naturally produce smaller
+  p-values in those scenarios.
 
   For applications that intentionally prioritize global patterns, prefer
   adjusting the spatial kernel instead of returning to rank truncation; for
@@ -141,7 +140,10 @@ Choosing a model class
   The parametric test (:class:`~splisosm.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
 
   Note that both conditional tests (``'hsic-gp'`` and ``'glmm'``) are computationally intensive and may take hours to run on large datasets. 
-  For ``'hsic-gp'``, inducing-point approximations and GPU acceleration (via the `gpytorch` backend) are available, and irregular 2-D coordinates can use the FINUFFT-backed ``gpr_backend="nufft"`` path to avoid dense GP matrices. See :doc:`gpr_api` for backend-specific options.
+  For ``'hsic-gp'``, irregular 2-D coordinates can use the FINUFFT-backed
+  ``gpr_backend="nufft"`` path to avoid dense GP matrices.  The sklearn and
+  gpytorch backends also support subset or inducing-point controls via
+  ``n_inducing``. See :doc:`api/gpr` for backend-specific options.
   For ``'glmm'``, model fitting is handled natively with PyTorch with GPU device support, and low-rank kernel approximation is also available (via ``SplisosmGLMM(approx_rank=...)``).
 
   .. code-block:: python
@@ -153,9 +155,9 @@ Choosing a model class
     model_np.test_differential_usage(
         method="hsic-gp", 
         residualize="cov_only",
-        # or gpr_backend="nufft" for irregular 2-D data;
-        # tune irregular-grid NUFFT LML with {"covariate": {"lml_approx_rank": 64}}
-        gpr_configs={"covariate": {"n_inducing": 1000}}
+        # recommended for large irregular 2-D data
+        gpr_backend="nufft",
+        gpr_configs={"covariate": {"lml_approx_rank": 64}},
     )
 
   Alternatively, consider the faster unconditional tests (``'hsic'`` or ``'glm'``). While they do not account for spatial autocorrelation and may be anti-conservative (inflated false-positive rate),

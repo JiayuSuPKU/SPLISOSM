@@ -30,7 +30,7 @@ SPLISOSM is platform-agnostic. Confirmed-compatible data types include:
 | Long-read ST           | 10x Visium / Visium HD + ONT                           | Full-length transcript isoform  |
 | Short-read 3′ ST       | 10x Visium / Visium HD (fresh-frozen), Slide-seqV2     | TREND peak (alt. polyadenylation) |
 | Short-read targeted ST | 10x Visium (CytAssist) / Visium HD FFPE, Flex          | Exon/junction probe usage       |
-| In situ targeted ST    | 10x Xenium Prime 5K                                    | Codeword (exon/junction probe)  |
+| In situ targeted ST    | 10x Xenium Prime 5K, 10x Atera                         | Codeword (exon/junction probe)  |
 
 SPLISOSM does **not** perform isoform quantification itself. See the
 [Feature Quantification guide](https://splisosm.readthedocs.io/en/latest/txquant.html)
