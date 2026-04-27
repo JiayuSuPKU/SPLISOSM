@@ -122,7 +122,11 @@ def counts_to_ratios(
     Log-ratio-based transformations (clr, ilr, alr) are implemented via ``scikit-bio``, with
     a pseudocount of 1% of the global mean per isoform to avoid zeros in the ratio.
     """
-    assert transformation in ["none", "clr", "ilr", "alr", "radial"]
+    valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
+    if transformation not in valid_transformations:
+        raise ValueError(
+            f"Invalid ratio transformation. Must be one of {valid_transformations}."
+        )
     if transformation in ["clr", "ilr", "alr"]:
         try:
             from skbio.stats.composition import (
@@ -138,7 +142,11 @@ def counts_to_ratios(
             )
             transformation = "none"
 
-    assert nan_filling in ["mean", "none"]
+    valid_nan_filling = ["mean", "none"]
+    if nan_filling not in valid_nan_filling:
+        raise ValueError(
+            f"Invalid NaN filling method. Must be one of {valid_nan_filling}."
+        )
 
     # Resolve fill timing; warn when the new default differs from old behaviour.
     if fill_before_transform is None:

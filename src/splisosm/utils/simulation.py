@@ -158,8 +158,16 @@ def simulate_isoform_counts_single_gene(
     ## calculate expected isoform ratio
     if design_mtx is not None or beta_true is not None:
         n_factors = design_mtx.shape[1]
-        assert beta_true.shape == (n_factors, n_isos - 1)
-        assert n_spots == design_mtx.shape[0]
+        if beta_true.shape != (n_factors, n_isos - 1):
+            raise ValueError(
+                "`beta_true` must have shape "
+                f"({n_factors}, {n_isos - 1}); got {tuple(beta_true.shape)}."
+            )
+        if n_spots != design_mtx.shape[0]:
+            raise ValueError(
+                "`design_mtx` row count must match the number of spots "
+                f"({n_spots}); got {design_mtx.shape[0]}."
+            )
         eta_fixed = design_mtx @ beta_true  # n_spots x (n_isos - 1)
     else:
         eta_fixed = torch.zeros((n_spots, n_isos - 1))
@@ -262,8 +270,16 @@ def simulate_isoform_counts(
     ## calculate expected isoform ratio
     if design_mtx is not None or beta_true is not None:
         n_factors = design_mtx.shape[1]
-        assert beta_true.shape == (n_factors, n_isos - 1)
-        assert n_spots == design_mtx.shape[0]
+        if beta_true.shape != (n_factors, n_isos - 1):
+            raise ValueError(
+                "`beta_true` must have shape "
+                f"({n_factors}, {n_isos - 1}); got {tuple(beta_true.shape)}."
+            )
+        if n_spots != design_mtx.shape[0]:
+            raise ValueError(
+                "`design_mtx` row count must match the number of spots "
+                f"({n_spots}); got {design_mtx.shape[0]}."
+            )
         eta_fixed = design_mtx @ beta_true  # n_spots x (n_isos - 1)
     else:
         eta_fixed = torch.zeros((n_spots, n_isos - 1))

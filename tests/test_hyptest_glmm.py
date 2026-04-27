@@ -857,8 +857,7 @@ class TestIsoModelEdgeCases(unittest.TestCase):
     def test_iso_null_no_sp_var_unsupported_method_raises_error(self):
         """Test that IsoNullNoSpVar raises error with unsupported method."""
         # joint_newton is not supported because Newton's method requires sigma to be optimized
-        # This raises AssertionError from the parent class, not ValueError
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             _ = IsoNullNoSpVar(
                 fitting_method="joint_newton", fitting_configs=self.model_configs
             )

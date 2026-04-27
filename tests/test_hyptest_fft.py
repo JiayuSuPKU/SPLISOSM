@@ -194,11 +194,11 @@ class TestSplisosmFFT(unittest.TestCase):
     def setUp(self):
         self.table_name = "isoform_table"
         self.sdata = _build_test_sdata(table_name=self.table_name)
-        self._old_sd = hyptest_fft.sd
-        hyptest_fft.sd = _SpatialDataModuleStub()
+        self._old_require_spatialdata = hyptest_fft._require_spatialdata
+        hyptest_fft._require_spatialdata = lambda: _SpatialDataModuleStub()
 
     def tearDown(self):
-        hyptest_fft.sd = self._old_sd
+        hyptest_fft._require_spatialdata = self._old_require_spatialdata
 
     def test_setup_data(self):
         model = SplisosmFFT(rho=0.9, neighbor_degree=1)

@@ -5,7 +5,7 @@ import numpy as np
 import scipy.sparse
 import torch
 import itertools
-from splisosm.utils._hsic_null import _hutchinson_cumulants
+from splisosm.utils.hsic import _hutchinson_cumulants
 from splisosm.kernel import (
     Kernel,
     SpatialCovKernel,

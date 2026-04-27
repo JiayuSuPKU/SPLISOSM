@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from splisosm.glmm.model import MultinomGLM, MultinomGLMM
+from splisosm.glmm import MultinomGLM, MultinomGLMM
 
 # ---------------------------------------------------------------------------
 # Model subclasses
@@ -189,7 +189,9 @@ def _fit_model_one_gene(
     pars : dict
         The fitted parameters extracted.
     """
-    assert model_type in ["glmm-full", "glmm-null", "glm"]
+    valid_model_types = ["glmm-full", "glmm-null", "glm"]
+    if model_type not in valid_model_types:
+        raise ValueError(f"Invalid model type. Must be one of {valid_model_types}.")
 
     if counts.is_sparse:
         counts = counts.to_dense()
@@ -465,7 +467,8 @@ def _calc_wald_differential_usage(fitted_full_model: MultinomGLM):
         fitted_full_model.n_factors,
         fitted_full_model.n_isos,
     )
-    assert n_factors > 0, "No factor is included in the model."
+    if n_factors <= 0:
+        raise ValueError("No factor is included in the model.")
 
     # extract the Hessian for beta per factor
     # beta_bias_hess.shape = (n_genes, (n_factors + 1)*(n_isos - 1), (n_factors + 1)*(n_isos - 1))
@@ -518,8 +521,7 @@ def _calc_score_differential_usage(fitted_full_model: MultinomGLM, covar_to_test
         fitted_full_model.n_factors,
         fitted_full_model.n_isos,
     )
-    # assert n_factors == 0, "No factor should be included in the model."
-
+    # Score tests are defined for models with one or more covariates.
     # in case of a single covariate, expand the design matrix
     if covar_to_test.dim() == 1:
         covar_to_test = covar_to_test.unsqueeze(-1)  # (n_spots, 1)

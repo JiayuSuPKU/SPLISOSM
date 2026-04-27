@@ -8,18 +8,13 @@ import os
 import warnings
 from typing import Any, Literal, Optional, Union
 
-# Suppress deprecations from SpatialData stack before importing it.
+# Suppress deprecations from SpatialData stack before optional imports.
 warnings.filterwarnings(
     "ignore", category=FutureWarning, message=".*legacy Dask DataFrame.*"
 )
 warnings.filterwarnings(
     "ignore", category=UserWarning, message=".*pkg_resources is deprecated.*"
 )
-
-try:
-    import spatialdata as sd
-except ImportError:
-    sd = None
 
 import numpy as np
 import pandas as pd
@@ -32,7 +27,7 @@ from tqdm import tqdm
 from splisosm.hyptest._base import _FeatureSummaryMixin, _ResultsMixin
 from splisosm.utils._chunking import pack_gene_chunks, resolve_chunk_size
 from splisosm.kernel import FFTKernel
-from splisosm.utils._hsic_null import (
+from splisosm.utils.hsic import (
     _cumulants_from_eigenvalues,
     _feature_cumulants_from_data,
     _hsic_liu_pvalue,
@@ -50,6 +45,18 @@ from splisosm.utils.stats import (
 )
 
 __all__ = ["SplisosmFFT"]
+
+
+def _require_spatialdata() -> Any:
+    """Import spatialdata lazily for FFT setup/rasterization paths."""
+    try:
+        import spatialdata as sd
+    except ImportError as exc:
+        raise ImportError(
+            "spatialdata is required for SplisosmFFT. "
+            "Please install it via 'pip install spatialdata'."
+        ) from exc
+    return sd
 
 
 def _du_worker_fft(
@@ -473,10 +480,9 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
 
     def _rasterize_bins(self, bins, table_name, col_key, row_key) -> str:
         """Rasterize bins and cache image key in sdata."""
-        if sd is None:
-            raise ImportError("spatialdata is required.")
         if self.sdata is None:
             raise RuntimeError("Call setup_data() first.")
+        sd = _require_spatialdata()
 
         adata = self.sdata.tables[table_name]
         if hasattr(adata, "X") and not isinstance(adata.X, np.ndarray):
@@ -583,10 +589,7 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
             AnnData-based setup for data with general geometry.
 
         """
-        if sd is None:
-            raise ImportError(
-                "spatialdata is required for SplisosmFFT. Please install it via 'pip install spatialdata'."
-            )
+        _require_spatialdata()
 
         if not hasattr(sdata, "tables"):
             raise ValueError("`sdata` must provide a `tables` attribute.")
@@ -1058,6 +1061,7 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
                 )
 
         # Lazy-rasterize design table once; channels loaded per-chunk below
+        sd = _require_spatialdata()
         dm_raster = sd.rasterize_bins(
             self.sdata,
             self._bins_name,

@@ -1,32 +1,30 @@
-"""Public GLMM internals for advanced SPLISOSM workflows."""
+"""Advanced GLMM internals used by :class:`splisosm.SplisosmGLMM`.
+
+Most users interact with :class:`splisosm.SplisosmGLMM`. The classes and
+helpers exported here are available for advanced model inspection, custom
+fitting workflows, and tests.
+"""
 
 from __future__ import annotations
 
-from splisosm.glmm.dataset import GroupedIsoDataset, IsoDataset, UngroupedIsoDataset
+from splisosm.glmm.dataset import IsoDataset
+from splisosm.glmm.glm import MultinomGLM
+from splisosm.glmm.glmm import MultinomGLMM
 from splisosm.glmm.likelihood import (
-    log_prob_dm,
-    log_prob_fastdm,
     log_prob_fastmult,
     log_prob_fastmult_batched,
     log_prob_fastmvn,
     log_prob_fastmvn_batched,
-    log_prob_mult,
-    log_prob_mvn,
 )
-from splisosm.glmm.model import MultinomGLM, MultinomGLMM
+from splisosm.glmm.logger import PatienceLogger
 
 __all__ = [
-    "GroupedIsoDataset",
     "IsoDataset",
-    "UngroupedIsoDataset",
     "MultinomGLM",
     "MultinomGLMM",
-    "log_prob_mult",
+    "PatienceLogger",
     "log_prob_fastmult",
     "log_prob_fastmult_batched",
-    "log_prob_dm",
-    "log_prob_fastdm",
-    "log_prob_mvn",
     "log_prob_fastmvn",
     "log_prob_fastmvn_batched",
 ]

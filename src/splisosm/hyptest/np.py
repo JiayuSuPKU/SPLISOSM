@@ -29,19 +29,16 @@ from splisosm.utils.stats import (
 )
 from splisosm.utils._chunking import pack_gene_chunks, resolve_chunk_size
 from splisosm.kernel import IdentityKernel, SpatialCovKernel, _MaskedSpatialKernel
-from splisosm.utils._hsic_null import (
+from splisosm.utils.hsic import (
     _feature_cumulants_from_data,
     _hutchinson_cumulants,
     _hsic_liu_pvalue,
     _hsic_welch_pvalue,
     _kernel_cumulants_for_null,
     _normalize_hsic_null_method,
-)
-from splisosm.gpr import (
     linear_hsic_test,
-    make_kernel_gpr,
-    _DEFAULT_GPR_CONFIGS,
 )
+from splisosm.gpr import make_kernel_gpr, _DEFAULT_GPR_CONFIGS
 
 __all__ = ["SplisosmNP"]
 
@@ -1185,18 +1182,21 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
         valid_null_methods = ["liu", "welch", "perm"]
         valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
         valid_nan_filling = ["mean", "none"]
-        assert (
-            method in valid_methods
-        ), f"Invalid method. Must be one of {valid_methods}."
-        assert (
-            null_method in valid_null_methods
-        ), f"Invalid null method. Must be one of {valid_null_methods}."
-        assert (
-            ratio_transformation in valid_transformations
-        ), f"Invalid ratio transformation. Must be one of {valid_transformations}."
-        assert (
-            nan_filling in valid_nan_filling
-        ), f"Invalid NaN filling method. Must be one of {valid_nan_filling}."
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
+        if null_method not in valid_null_methods:
+            raise ValueError(
+                f"Invalid null method. Must be one of {valid_null_methods}."
+            )
+        if ratio_transformation not in valid_transformations:
+            raise ValueError(
+                "Invalid ratio transformation. "
+                f"Must be one of {valid_transformations}."
+            )
+        if nan_filling not in valid_nan_filling:
+            raise ValueError(
+                f"Invalid NaN filling method. Must be one of {valid_nan_filling}."
+            )
 
         if nan_filling == "none" and method == "hsic-ir":
             warnings.warn(
@@ -1441,18 +1441,20 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
         valid_transformations = ["none", "clr", "ilr", "alr", "radial"]
         valid_nan_filling = ["none", "mean"]
         valid_residualize = ["cov_only", "both"]
-        assert (
-            method in valid_methods
-        ), f"Invalid method. Must be one of {valid_methods}."
-        assert (
-            ratio_transformation in valid_transformations
-        ), f"Invalid transformation. Must be one of {valid_transformations}."
-        assert (
-            nan_filling in valid_nan_filling
-        ), f"Invalid nan_filling. Must be one of {valid_nan_filling}."
-        assert (
-            residualize in valid_residualize
-        ), f"Invalid residualize. Must be one of {valid_residualize}."
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
+        if ratio_transformation not in valid_transformations:
+            raise ValueError(
+                f"Invalid transformation. Must be one of {valid_transformations}."
+            )
+        if nan_filling not in valid_nan_filling:
+            raise ValueError(
+                f"Invalid nan_filling. Must be one of {valid_nan_filling}."
+            )
+        if residualize not in valid_residualize:
+            raise ValueError(
+                f"Invalid residualize. Must be one of {valid_residualize}."
+            )
 
         n_genes = self.n_genes
         if n_jobs == -1:
@@ -1471,9 +1473,11 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
                 else:
                     z = self._get_design_col(_ind)  # dense (n_spots, 1) tensor
                     _std = float(z.std())
-                assert (
-                    _std > 1e-5
-                ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
+                if _std <= 1e-5:
+                    raise ValueError(
+                        "The factor of interest "
+                        f"{self.covariate_names[_ind]} has zero variance."
+                    )
                 z_list.append(z)
 
             hsic_all = torch.empty(n_genes, n_factors)
@@ -1539,9 +1543,11 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
                 disable=not print_progress,
             ):
                 z = self._get_design_col(_ind).squeeze(1)
-                assert (
-                    z.std() > 0
-                ), f"The factor of interest {self.covariate_names[_ind]} have zero variance."
+                if z.std() <= 0:
+                    raise ValueError(
+                        "The factor of interest "
+                        f"{self.covariate_names[_ind]} has zero variance."
+                    )
                 z = (z - z.mean()) / z.std()
                 z_res_list.append(gpr_cov.fit_residuals(x, z.unsqueeze(1)))
 

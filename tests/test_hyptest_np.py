@@ -14,7 +14,7 @@ from splisosm.hyptest.np import (
     _quadratic_columns_exact,
     _sparse_counts_to_ratios_centered,
 )
-from splisosm.utils._hsic_null import _feature_cumulants_from_data
+from splisosm.utils.hsic import _feature_cumulants_from_data
 from splisosm.kernel import SpatialCovKernel
 from splisosm.utils import counts_to_ratios
 from splisosm.utils.simulation import simulate_isoform_counts

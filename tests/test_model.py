@@ -413,7 +413,7 @@ class TestMultinomGLMEdgeCases(unittest.TestCase):
         counts = torch.tensor([[[10, 20], [30, 40], [50, 60]]], dtype=torch.float32)
         design_mtx = torch.ones(2, 3, 2)  # batch size 2, not supported
         model = MultinomGLM()
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             model.setup_data(counts, design_mtx=design_mtx)
 
     def test_design_mtx_shape_mismatch_raises_error(self):
@@ -421,7 +421,7 @@ class TestMultinomGLMEdgeCases(unittest.TestCase):
         counts = torch.tensor([[[10, 20], [30, 40], [50, 60]]], dtype=torch.float32)
         design_mtx = torch.ones(2, 2)  # 2 spots instead of 3
         model = MultinomGLM()
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             model.setup_data(counts, design_mtx=design_mtx)
 
     def test_no_design_mtx_creates_empty_design(self):

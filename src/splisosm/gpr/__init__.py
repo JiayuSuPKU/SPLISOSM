@@ -10,27 +10,25 @@ or residualizing custom response matrices.
 
 from __future__ import annotations
 
-from splisosm.gpr.backends import (
-    FFTKernelGPR,
-    GPyTorchKernelGPR,
-    KernelGPR,
-    NUFFTKernelGPR,
-    SklearnKernelGPR,
-    _DEFAULT_GPR_CONFIGS,
-    make_kernel_gpr,
-)
+from splisosm.gpr.base import KernelGPR
+from splisosm.gpr.config import _DEFAULT_GPR_CONFIGS
+from splisosm.gpr.factory import make_kernel_gpr
+from splisosm.gpr.fft import FFTKernelGPR
+from splisosm.gpr.gpytorch import GPyTorchKernelGPR
+from splisosm.gpr.nufft import NUFFTKernelGPR
 from splisosm.gpr.operators import (
     DenseKernelOp,
     FFTKernelOp,
     NUFFTKernelOp,
     SpatialKernelOp,
 )
-from splisosm.gpr.statistics import (
+from splisosm.gpr.sklearn import (
+    SklearnKernelGPR,
     _build_rbf_cross_kernel,
     _build_rbf_kernel,
     _kernel_residuals_from_eigdecomp,
-    linear_hsic_test,
 )
+from splisosm.utils.hsic import linear_hsic_test
 
 __all__ = [
     "SpatialKernelOp",

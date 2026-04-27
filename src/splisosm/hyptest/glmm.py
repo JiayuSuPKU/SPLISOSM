@@ -210,7 +210,9 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
         :class:`splisosm.glmm.MultinomGLMM` for more details on the model configurations.
         """
         # specify the model type to fit
-        assert model_type in ["glmm-full", "glmm-null", "glm"]
+        valid_model_types = ["glmm-full", "glmm-null", "glm"]
+        if model_type not in valid_model_types:
+            raise ValueError(f"Invalid model type. Must be one of {valid_model_types}.")
         self._model_type = model_type
 
         self._model_configs = {
@@ -1034,7 +1036,10 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
                 batch["x"],
                 batch["gene_name"],
             )
-            assert b_n_isos[0] == grouped_m.n_isos
+            if b_n_isos[0] != grouped_m.n_isos:
+                raise RuntimeError(
+                    "Fitted model isoform count does not match the grouped batch."
+                )
 
             # add the gene names to the list
             gene_names_ungroupped.extend(b_gene_names)
@@ -1673,9 +1678,8 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
         """
 
         valid_methods = ["llr"]
-        assert (
-            method in valid_methods
-        ), f"Invalid method. Must be one of {valid_methods}."
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
 
         # Parametric likelihood ratio test for spatial variability. Need to fit the null and full models.
         if len(self._fitted_states["glmm-null"]) == 0:
@@ -1796,9 +1800,8 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
 
         # check the validity of the specified method and transformation
         valid_methods = ["wald", "score"]
-        assert (
-            method in valid_methods
-        ), f"Invalid method. Must be one of {valid_methods}."
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method. Must be one of {valid_methods}.")
 
         if method == "score":  # Score test
             # extract the fitted full models

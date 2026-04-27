@@ -1,4 +1,4 @@
-"""Cumulant-based null approximations for HSIC spatial variability tests."""
+"""HSIC test statistics and null approximations shared by SPLISOSM."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from typing import Any, Literal, Optional
 import numpy as np
 import scipy.sparse
 import torch
+from numpy.typing import ArrayLike
 from scipy.stats import chi2 as _chi2_dist
+from scipy.stats import ncx2
 
 from splisosm.kernel import (
     FFTKernel,
@@ -18,8 +20,264 @@ from splisosm.kernel import (
     _MaskedSpatialKernel,
 )
 
+__all__ = ["linear_hsic_test", "liu_sf", "liu_sf_from_cumulants"]
+
 _DELTA = 1e-10
 _EIGVAL_THRESHOLD = 1e-8
+
+
+def liu_sf(
+    t: ArrayLike,
+    lambs: ArrayLike,
+    dofs: Optional[ArrayLike] = None,
+    deltas: Optional[ArrayLike] = None,
+    kurtosis: bool = False,
+) -> np.ndarray:
+    """Compute p-values for weighted chi-squared sums using Liu's approximation.
+
+    Parameters
+    ----------
+    t
+        Observed test statistic value(s).
+    lambs
+        Mixture weights.
+    dofs
+        Degrees of freedom for each component. Defaults to one.
+    deltas
+        Noncentrality parameters for each component. Defaults to zero.
+    kurtosis
+        If ``True``, use the kurtosis-matching edge-case branch.
+
+    Returns
+    -------
+    numpy.ndarray
+        Survival probabilities ``Pr(X > t)``.
+    """
+    coeffs = _liu_prepare(
+        lambs,
+        dofs=dofs,
+        deltas=deltas,
+        kurtosis=kurtosis,
+    )
+    return _liu_apply(t, coeffs)
+
+
+def liu_sf_from_cumulants(
+    t: ArrayLike,
+    cumulants: dict[int, float],
+    kurtosis: bool = False,
+) -> np.ndarray:
+    """Compute Liu p-values from chi-squared-mixture cumulants."""
+    return _liu_apply(
+        t,
+        _liu_prepare_from_cumulants(
+            cumulants,
+            kurtosis=kurtosis,
+        ),
+    )
+
+
+def _liu_prepare(
+    lambs: ArrayLike,
+    dofs: Optional[ArrayLike] = None,
+    deltas: Optional[ArrayLike] = None,
+    kurtosis: bool = False,
+) -> dict[str, float]:
+    """Precompute Liu shifted-chi-squared coefficients from eigenvalues."""
+    if dofs is None:
+        dofs = np.ones_like(lambs)
+    if deltas is None:
+        deltas = np.zeros_like(lambs)
+
+    lambs = np.asarray(lambs, float)
+    dofs = np.asarray(dofs, float)
+    deltas = np.asarray(deltas, float)
+    lambs_power = {i: lambs**i for i in range(1, 5)}
+
+    c = {
+        i: float(np.sum(lambs_power[i] * dofs) + i * np.sum(lambs_power[i] * deltas))
+        for i in range(1, 5)
+    }
+    return _liu_prepare_from_cumulants(c, kurtosis=kurtosis)
+
+
+def _liu_prepare_from_cumulants(
+    cumulants: dict[int, float],
+    kurtosis: bool = False,
+) -> dict[str, float]:
+    """Precompute Liu shifted-chi-squared coefficients from cumulants."""
+    c = {i: float(cumulants.get(i, 0.0)) for i in range(1, 5)}
+
+    if c[2] <= _DELTA or not np.isfinite(c[2]):
+        return {
+            "mu_q": float(c[1]),
+            "sigma_q": 0.0,
+            "mu_x": 1.0,
+            "sigma_x": np.sqrt(2.0),
+            "dof_x": 1.0,
+            "delta_x": 0.0,
+        }
+
+    s1 = c[3] / (np.sqrt(c[2]) ** 3 + _DELTA)
+    s2 = c[4] / (c[2] ** 2 + _DELTA)
+
+    s12 = s1**2
+    if s12 > s2:
+        denom = s1 - np.sqrt(s12 - s2)
+        if abs(denom) < _DELTA:
+            delta_x = 0.0
+            dof_x = 1 / (s2 + _DELTA)
+        else:
+            a = 1 / denom
+            delta_x = s1 * a**3 - a**2
+            dof_x = a**2 - 2 * delta_x
+    else:
+        delta_x = 0
+        if kurtosis:
+            a = 1 / np.sqrt(s2)
+            dof_x = 1 / s2
+        else:
+            a = 1 / (s1 + _DELTA)
+            dof_x = 1 / (s12 + _DELTA)
+
+    dof_x = max(float(dof_x), _DELTA)
+    delta_x = max(float(delta_x), 0.0)
+
+    var_q = 2.0 * c[2]
+    mu_x = dof_x + delta_x
+    sigma_x = np.sqrt(2 * (dof_x + 2 * delta_x))
+
+    return {
+        "mu_q": float(c[1]),
+        "sigma_q": float(np.sqrt(max(var_q, 0.0))),
+        "mu_x": float(mu_x),
+        "sigma_x": float(sigma_x),
+        "dof_x": float(dof_x),
+        "delta_x": float(delta_x),
+    }
+
+
+def _liu_apply(t: ArrayLike, coeffs: dict[str, float]) -> np.ndarray:
+    """Apply cached Liu coefficients to one or more statistics."""
+    t = np.asarray(t, float)
+    if coeffs["sigma_q"] <= _DELTA:
+        return np.where(t > coeffs["mu_q"] + _DELTA, 0.0, 1.0)
+    t_star = (t - coeffs["mu_q"]) / (coeffs["sigma_q"] + _DELTA)
+    tfinal = t_star * coeffs["sigma_x"] + coeffs["mu_x"]
+    return ncx2.sf(tfinal, coeffs["dof_x"], max(coeffs["delta_x"], 1e-9))
+
+
+def linear_hsic_test(
+    X: "torch.Tensor | scipy.sparse.spmatrix",
+    Y: "torch.Tensor | scipy.sparse.spmatrix",
+    centering: bool = True,
+) -> tuple[float, float]:
+    """The linear HSIC test (multivariate RV coefficient).
+
+    Equivalent to a multivariate extension of Pearson correlation.
+
+    Supports sparse inputs for memory and speed efficiency:
+
+    * **Sparse X** (scipy sparse matrix, shape ``(n, p)``): the cross-product
+      ``Y_c.T @ X_c`` is computed via a sparse matrix multiply
+      (``X.T.dot(Y_c)``).  Because ``Y`` is mean-centred, the ``X`` centering
+      correction reduces to zero, so only the original sparse ``X`` is needed.
+      ``X_c.T @ X_c`` is obtained as ``X.T @ X  -  n * mean_X ⊗ mean_X``,
+      keeping the first term sparse.
+    * **Sparse Y** (scipy sparse or torch sparse COO): densified once upfront
+      before any computation.
+
+    Parameters
+    ----------
+    X : torch.Tensor or scipy.sparse.spmatrix, shape (n_samples, n_x)
+    Y : torch.Tensor or scipy.sparse.spmatrix, shape (n_samples, n_y)
+    centering : bool
+        Whether to mean-centre X and Y before computing the statistic.
+
+    Returns
+    -------
+    hsic : float
+        HSIC test statistic (scaled by 1 / (n - 1)**2).
+    pvalue : float
+        P-value from the asymptotic chi-squared mixture distribution.
+    """
+    eigv_th = 1e-5
+
+    # ── Normalise Y to a dense float32 tensor ─────────────────────────────
+    if scipy.sparse.issparse(Y):
+        Y = torch.from_numpy(np.asarray(Y.todense(), dtype=np.float32))
+    elif isinstance(Y, torch.Tensor) and Y.is_sparse:
+        Y = Y.to_dense().float()
+    elif isinstance(Y, np.ndarray):
+        Y = torch.from_numpy(Y.astype(np.float32))
+    else:
+        Y = Y.float()
+
+    X_is_sparse = scipy.sparse.issparse(X)
+
+    # ── NaN filtering ─────────────────────────────────────────────────────
+    is_nan_y = torch.isnan(Y).any(1)
+    if X_is_sparse:
+        # Sparse matrices contain no NaN by construction.
+        is_nan = is_nan_y
+    else:
+        if isinstance(X, np.ndarray):
+            X = torch.from_numpy(X.astype(np.float32))
+        else:
+            X = X.float()
+        is_nan = is_nan_y | torch.isnan(X).any(1)
+
+    if is_nan.any():
+        keep = ~is_nan
+        Y = Y[keep]
+        if X_is_sparse:
+            X = X[keep.numpy()]
+        else:
+            X = X[keep]
+
+    n = Y.shape[0]
+
+    # ── Sparse-X path ─────────────────────────────────────────────────────
+    if X_is_sparse:
+        X_sp = X.tocsr()
+        if centering:
+            Y = Y - Y.mean(0)
+
+        # Key identity: when Y is centred, Y_c.T @ X_c == Y_c.T @ X
+        # because the correction term Y_c.sum(0) == 0 vanishes.
+        # So we can use the original (non-centred) sparse X directly.
+        YcTX = torch.from_numpy(
+            X_sp.T.dot(Y.numpy()).astype(np.float32)
+        ).T  # (n_y, n_x)
+        hsic_scaled = YcTX.pow(2).sum()
+
+        # X_c.T @ X_c = X.T @ X - n * mean_X.outer(mean_X)
+        X_mean = np.asarray(X_sp.mean(axis=0), dtype=np.float32).ravel()
+        XcTXc = torch.from_numpy(
+            X_sp.T.dot(X_sp).toarray().astype(np.float32) - n * np.outer(X_mean, X_mean)
+        )
+        lambda_x = torch.linalg.eigvalsh(XcTXc)
+        lambda_x = lambda_x[lambda_x > eigv_th]
+        lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
+        lambda_y = lambda_y[lambda_y > eigv_th]
+
+    # ── Dense-X path (original) ───────────────────────────────────────────
+    else:
+        if centering:
+            X = X - X.mean(0)
+            Y = Y - Y.mean(0)
+
+        hsic_scaled = torch.norm(Y.T @ X, p="fro").pow(2)
+
+        lambda_x = torch.linalg.eigvalsh(X.T @ X)
+        lambda_x = lambda_x[lambda_x > eigv_th]
+        lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
+        lambda_y = lambda_y[lambda_y > eigv_th]
+
+    lambda_xy = (lambda_x.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
+    pval = liu_sf((hsic_scaled * n).numpy(), lambda_xy.numpy())
+
+    return float(hsic_scaled / (n - 1) ** 2), pval
 
 
 def _cumulants_from_eigenvalues(
@@ -47,7 +305,7 @@ def _kernel_has_exact_c12(kernel: Kernel) -> bool:
         return kernel.K_sp is not None
     if isinstance(kernel, _MaskedSpatialKernel):
         # The masked kernel can compute exact traces only by applying the
-        # operator to a dense identity block.  For per-gene NaN masks we want
+        # operator to a dense identity block. For per-gene NaN masks we want
         # the configured Hutchinson budget instead.
         return False
     return isinstance(kernel, (FFTKernel, IdentityKernel)) or (
@@ -96,17 +354,7 @@ def _feature_cumulants_from_data(
     *,
     centered: bool = True,
 ) -> dict[int, float]:
-    """Return cumulants of the small feature Gram matrix ``Y.T @ Y``.
-
-    Parameters
-    ----------
-    y
-        Response matrix of shape ``(n_spots, n_features)``.
-    centered
-        Whether columns of ``y`` are already centred.  When ``False``, the
-        centred Gram matrix is computed without materializing dense centred
-        sparse responses.
-    """
+    """Return cumulants of the small feature Gram matrix ``Y.T @ Y``."""
     if scipy.sparse.issparse(y):
         y_csc = y.tocsc(copy=False)
         gram = y_csc.T @ y_csc
@@ -167,32 +415,7 @@ def _hutchinson_cumulants(
     rng_seed: int = 0,
     max_power: Literal[2, 4] = 4,
 ) -> dict[int, float]:
-    """Estimate ``trace(K**p)`` with Rademacher probes.
-
-    ``max_power=2`` estimates only ``c1`` and ``c2`` and uses one kernel
-    application per probe.  ``max_power=4`` also estimates ``c3`` and ``c4`` and
-    uses two applications per probe.  ``c1`` and ``c2`` are replaced
-    automatically only for backends with known exact/analytic trace methods.
-    Dense CAR kernels have exact traces because they store ``K_sp``; implicit
-    CAR kernels keep the probe estimates because they store only the sparse
-    precision and their trace methods are themselves stochastic estimators.
-
-    Parameters
-    ----------
-    kernel
-        SPLISOSM kernel exposing :meth:`Kx`.
-    n_probes
-        Number of iid Rademacher probe vectors.
-    rng_seed
-        Seed for reproducible probe draws.
-    max_power
-        Highest cumulant power to return. Must be ``2`` or ``4``.
-
-    Returns
-    -------
-    dict
-        Mapping ``{1: c1, ..., max_power: c_max_power}``.
-    """
+    """Estimate ``trace(K**p)`` with Rademacher probes."""
     if max_power not in (2, 4):
         raise ValueError("`max_power` must be 2 or 4.")
     if n_probes < 1:
@@ -289,12 +512,7 @@ def _kernel_cumulants_for_null(
     null_configs: Optional[dict[str, Any]] = None,
     dense_threshold: int = 5000,
 ) -> tuple[dict[int, float], Optional[int]]:
-    """Resolve SV null config and return kernel cumulants plus stat rank.
-
-    The returned rank is non-``None`` only when ``null_method="liu"`` uses an
-    explicit low-rank spatial spectrum; callers should use that same rank for
-    the observed statistic.
-    """
+    """Resolve SV null config and return kernel cumulants plus statistic rank."""
     configs = null_configs or {}
     rng_seed = int(configs.get("rng_seed", 0))
 
@@ -399,8 +617,6 @@ def _hsic_liu_pvalue(
     n_spots: int,
 ) -> float:
     """Compute a Liu p-value for an HSIC spatial-variability statistic."""
-    from splisosm.utils.stats import liu_sf_from_cumulants
-
     c = _hsic_mixture_cumulants(kernel_cumulants, feature_cumulants, n_spots)
     if c[2] <= _DELTA:
         return 1.0
