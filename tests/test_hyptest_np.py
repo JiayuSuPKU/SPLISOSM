@@ -7,7 +7,7 @@ import pandas as pd
 from anndata import AnnData
 from unittest.mock import patch
 from splisosm.utils import run_hsic_gc
-from splisosm.hyptest_np import (
+from splisosm.hyptest.np import (
     SplisosmNP,
     _calc_ttest_differential_usage,
     _prepare_np_response,

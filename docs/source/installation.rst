@@ -53,7 +53,7 @@ To install these additional dependencies, you can use the following command:
   `finufft` multi-threading on MacOS is currently suppressed due to a known OMP parallelization issue when `torch`and `finufft` are both installed. 
   The root cause is duplicated `libomp.dylib` installations (shipped along with `torch`).
 
-For spatially variable gene expression testing, we also provide a Python wrapper, :func:`splisosm.utils.run_sparkx`, for `SPARK-X <https://xzhoulab.github.io/SPARK/04_installation/>`_.
+For spatially variable gene expression testing, we also provide a Python wrapper, :func:`splisosm.utils.stats.run_sparkx`, for `SPARK-X <https://xzhoulab.github.io/SPARK/04_installation/>`_.
 To use this functionality, ensure that the conda environment where SPLISOSM is installed has R (>=4.0) available in ``PATH``, and that the R package `SPARK-X <https://xzhoulab.github.io/SPARK/04_installation/>`_ is properly installed.
 
 .. code-block:: zsh
@@ -67,16 +67,16 @@ To use this functionality, ensure that the conda environment where SPLISOSM is i
   $ pip install splisosm # if not already installed
 
   # test whether SPARK-X is correctly configured
-  $ python -c "import numpy as np; from splisosm.utils import run_sparkx; run_sparkx(np.random.randn(10,5), np.random.rand(10,2))"
+  $ python -c "import numpy as np; from splisosm.utils.stats import run_sparkx; run_sparkx(np.random.randn(10,5), np.random.rand(10,2))"
 
 .. note::
 
-  Our new gene-level spatial variability test, *HSIC-GC*, is available as a standalone function (:func:`splisosm.utils.run_hsic_gc`).
+  Our new gene-level spatial variability test, *HSIC-GC*, is available as a standalone function (:func:`splisosm.utils.stats.run_hsic_gc`).
   It can be used as a drop-in replacement for SPARK-X, where we optimize the spatial kernel to achieve higher statistical power while maintaining computational efficiency.
 
 .. code-block:: python
 
-   from splisosm.utils import run_hsic_gc
+   from splisosm.utils.stats import run_hsic_gc
    import numpy as np
 
    # gene expression matrix: (n_spot, n_gene)

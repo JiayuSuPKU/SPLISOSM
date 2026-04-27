@@ -36,7 +36,7 @@ class SpatialKernelOp(ABC):
     ``DenseKernelOp``
         Stores K explicitly as a ``torch.Tensor``; solves via Cholesky.
         Suitable for n <= ~10,000.
-    ``FFTKernelOp`` (``splisosm.hyptest_fft``)
+    ``FFTKernelOp`` (``splisosm.hyptest.fft``)
         Operates entirely in the spectral domain; O(N log N) per operation;
         no n x n matrix formed at any point.
 

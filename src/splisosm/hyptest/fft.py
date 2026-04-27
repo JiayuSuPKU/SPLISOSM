@@ -29,6 +29,7 @@ from anndata import AnnData
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
+from splisosm.hyptest._base import _FeatureSummaryMixin, _ResultsMixin
 from splisosm.utils._chunking import pack_gene_chunks, resolve_chunk_size
 from splisosm.kernel import FFTKernel
 from splisosm.utils._hsic_null import (
@@ -41,7 +42,6 @@ from splisosm.gpr import (
     _DEFAULT_GPR_CONFIGS,
 )
 from splisosm.utils.preprocessing import (
-    compute_feature_summaries,
     counts_to_ratios,
 )
 from splisosm.utils.stats import (
@@ -299,7 +299,7 @@ def _sv_chunk_worker_fft(
     return [r if r is not None else (0.0, 1.0) for r in results]
 
 
-class SplisosmFFT:
+class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
     """FFT-accelerated SPLISOSM model for rasterized spatial isoform testing.
 
     ``SplisosmFFT`` follows the same non-parametric workflow as
@@ -785,6 +785,13 @@ class SplisosmFFT:
             self.covariate_names = list(covariate_names) if covariate_names else []
             self.n_factors = 0
 
+    def _feature_summary_adata(self) -> AnnData:
+        """Return the filtered AnnData table used for feature summaries."""
+        if self._adata is None:
+            raise RuntimeError("Data is not initialized. Call setup_data() first.")
+        kept_isos = [iso for gene_isos in self._gene_iso_names for iso in gene_isos]
+        return self._adata[:, kept_isos]
+
     def test_spatial_variability(
         self,
         method: Literal["hsic-ir", "hsic-ic", "hsic-gc"] = "hsic-ir",
@@ -1163,154 +1170,3 @@ class SplisosmFFT:
         if return_results:
             return self._du_test_results
         return None
-
-    def get_formatted_test_results(
-        self,
-        test_type: Literal["sv", "du"],
-        with_gene_summary: bool = False,
-    ) -> pd.DataFrame:
-        """Get formatted test results as a pandas DataFrame.
-
-        Parameters
-        ----------
-        test_type : {"sv", "du"}
-            Test type: ``"sv"`` for spatial variability or ``"du"`` for
-            differential usage.
-        with_gene_summary : bool, optional
-            If ``True``, append gene-level summary statistics from
-            :meth:`extract_feature_summary`.
-
-        Returns
-        -------
-        pandas.DataFrame
-            Formatted result table.
-        """
-        if test_type not in {"sv", "du"}:
-            raise ValueError("Invalid test type. Must be one of 'sv' or 'du'.")
-
-        if test_type == "sv":
-            if len(self._sv_test_results) == 0:
-                raise ValueError(
-                    "No spatial variability results found. Run test_spatial_variability() first."
-                )
-            df = pd.DataFrame(
-                {
-                    "gene": self.gene_names,
-                    "statistic": self._sv_test_results["statistic"],
-                    "pvalue": self._sv_test_results["pvalue"],
-                    "pvalue_adj": self._sv_test_results["pvalue_adj"],
-                }
-            )
-        else:
-            if len(self._du_test_results) == 0:
-                raise ValueError(
-                    "No differential usage results found. Run test_differential_usage() first."
-                )
-            covariate_names = (
-                self.covariate_names
-                if self.covariate_names is not None and len(self.covariate_names) > 0
-                else [f"factor_{i}" for i in range(self.n_factors)]
-            )
-            df = pd.DataFrame(
-                {
-                    "gene": np.repeat(self.gene_names, self.n_factors),
-                    "covariate": np.tile(covariate_names, self.n_genes),
-                    "statistic": self._du_test_results["statistic"].reshape(-1),
-                    "pvalue": self._du_test_results["pvalue"].reshape(-1),
-                    "pvalue_adj": self._du_test_results["pvalue_adj"].reshape(-1),
-                }
-            )
-
-        if with_gene_summary:
-            gene_df = self.extract_feature_summary(level="gene", print_progress=False)
-            df = df.merge(gene_df, left_on="gene", right_index=True, how="left")
-
-        return df
-
-    def _compute_feature_summaries(self, print_progress: bool = True) -> None:
-        """Compute and cache both gene-level and isoform-level summaries."""
-        if self._adata is None:
-            raise RuntimeError("Data is not initialized. Call setup_data() first.")
-        if self._gene_summary is not None and self._isoform_summary is not None:
-            return
-        # self._adata is the full unfiltered table; restrict to filtered isoforms
-        kept_isos = [iso for gene_isos in self._gene_iso_names for iso in gene_isos]
-        filtered_adata = self._adata[:, kept_isos]
-        self._gene_summary, self._isoform_summary = compute_feature_summaries(
-            filtered_adata,
-            self.gene_names,
-            layer=self._counts_layer,
-            group_iso_by=self._group_iso_by,
-            print_progress=print_progress,
-        )
-
-    def extract_feature_summary(
-        self,
-        level: Literal["gene", "isoform"] = "gene",
-        print_progress: bool = True,
-    ) -> pd.DataFrame:
-        """Compute filtered feature-level summary statistics.
-
-        Gene-level statistics are aggregated across all isoforms that passed
-        the filters applied in :meth:`setup_data`.  Isoform-level statistics
-        are computed per isoform and augmented onto the corresponding rows of
-        ``adata.var``.
-
-        Results are cached: repeated calls with the same ``level`` return the
-        cached :class:`pandas.DataFrame` without recomputation.
-
-        Parameters
-        ----------
-        level
-            Summary granularity.
-            ``'gene'``: one row per gene.
-            ``'isoform'``: one row per isoform that passed filtering.
-        print_progress
-            Whether to show a progress bar.
-
-        Returns
-        -------
-        pandas.DataFrame
-            For ``level='gene'``, the index is the gene display name and the
-            columns are:
-
-            - ``'n_isos'``: int. Number of isoforms retained after filtering.
-            - ``'perplexity'``: float. Effective number of isoforms based on
-              the marginal isoform usage entropy.
-            - ``'pct_bin_on'``: float. Fraction of bins with non-zero total
-              gene counts.
-            - ``'count_avg'``: float. Mean per-spot total count for the gene.
-            - ``'count_std'``: float. Std of per-spot total count for the gene.
-
-            For ``level='isoform'``, the index is the isoform name (matching
-            ``adata.var_names``) and the columns are the original ``adata.var``
-            columns plus:
-
-            - ``'pct_bin_on'``: float. Fraction of bins with count > 0.
-            - ``'count_total'``: float. Total counts across all bins.
-            - ``'count_avg'``: float. Mean count per bin.
-            - ``'count_std'``: float. Std of count per bin.
-            - ``'ratio_total'``: float. Fraction of total gene counts
-              attributable to this isoform.
-            - ``'ratio_avg'``: float. Mean per-bin isoform usage ratio
-              (computed over bins with non-zero gene coverage).
-            - ``'ratio_std'``: float. Std of per-bin isoform usage ratio
-              (computed over bins with non-zero gene coverage).
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`setup_data` has not been called.
-        ValueError
-            If ``level`` is not ``'gene'`` or ``'isoform'``.
-        """
-        if self._adata is None:
-            raise RuntimeError("Call setup_data() first.")
-        if level not in {"gene", "isoform"}:
-            raise ValueError("`level` must be one of 'gene' or 'isoform'.")
-
-        self._compute_feature_summaries(print_progress=print_progress)
-
-        if level == "gene":
-            return self._gene_summary
-        return self._isoform_summary

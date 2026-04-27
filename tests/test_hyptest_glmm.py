@@ -12,7 +12,7 @@ from splisosm.glmm import MultinomGLMM
 
 from splisosm.utils.simulation import simulate_isoform_counts
 
-from splisosm.hyptest_glmm import (
+from splisosm.hyptest.glmm import (
     IsoFullModel,
     IsoNullNoSpVar,
     _fit_model_one_gene,
@@ -1070,7 +1070,7 @@ class TestIsoModelEdgeCases(unittest.TestCase):
 
 
 class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
-    """Target uncovered branches in splisosm.hyptest_glmm."""
+    """Target uncovered branches in splisosm.hyptest.glmm."""
 
     def setUp(self):
         data = get_simulation_data(n_genes=2, n_isos=3, n_spots_per_dim=8)
@@ -1114,11 +1114,11 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
 
         with (
             patch(
-                "splisosm.hyptest_glmm.torch.linalg.eigh",
+                "splisosm.hyptest.glmm.torch.linalg.eigh",
                 side_effect=RuntimeError("forced eigh failure"),
             ),
             patch(
-                "splisosm.hyptest_glmm.torch.linalg.eig",
+                "splisosm.hyptest.glmm.torch.linalg.eig",
                 return_value=(eigvals, eigvecs),
             ),
         ):
@@ -1533,7 +1533,7 @@ class TestSplisosmGLMMNewFeatures(unittest.TestCase):
 
     def test_approx_rank_stored_on_init(self):
         """approx_rank is stored as _approx_rank attribute."""
-        import splisosm.hyptest_glmm as hg
+        import splisosm.hyptest.glmm as hg
 
         model_auto = SplisosmGLMM()
         self.assertIs(model_auto._approx_rank, hg._APPROX_RANK_AUTO)

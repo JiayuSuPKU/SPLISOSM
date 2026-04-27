@@ -4,8 +4,8 @@ import numpy as np
 import pandas as pd
 from anndata import AnnData
 
-import splisosm.hyptest_fft as hyptest_fft
-from splisosm.hyptest_fft import FFTKernel, SplisosmFFT
+import splisosm.hyptest.fft as hyptest_fft
+from splisosm.hyptest.fft import FFTKernel, SplisosmFFT
 
 
 class _SpatialDataStub:
@@ -282,7 +282,7 @@ class TestSplisosmFFT(unittest.TestCase):
         adata.var_names = ["isoA0", "isoA1", "isoB0", "isoB1"]
         adata.var["gene_symbol"] = ["gA", "gA", "gB", "gB"]
 
-        from splisosm.hyptest_fft import SplisosmFFT
+        from splisosm.hyptest.fft import SplisosmFFT
 
         sdata = _SpatialDataStub(table_name="tbl", adata=adata)
         model = SplisosmFFT()
@@ -825,7 +825,7 @@ class TestSplisosmFFT(unittest.TestCase):
         should be rank-correlated (Spearman rho > 0 on combined null+signal).
         """
         from scipy.stats import spearmanr
-        from splisosm.hyptest_np import SplisosmNP
+        from splisosm.hyptest.np import SplisosmNP
 
         adata = self.sdata.tables[self.table_name]
         rng = np.random.default_rng(42)

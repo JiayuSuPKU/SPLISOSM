@@ -124,7 +124,7 @@ object whose table follows the same conventions, plus rasterisation metadata:
 
 See the :doc:`Feature Quantification page <txquant>` for platform-specific
 loaders and preprocessing recipes, and
-:func:`splisosm.utils.prepare_inputs_from_anndata` for parsing details.
+:func:`splisosm.utils.preprocessing.prepare_inputs_from_anndata` for parsing details.
 
 Setting up a model
 ~~~~~~~~~~~~~~~~~~
@@ -659,7 +659,7 @@ adjust them only when you hit performance or accuracy limits.
        is automatically disabled (CUDA not thread-safe).
    * - **Other GPR configuration**
      - ``gpr_configs=`` in ``test_differential_usage``
-     - See :func:`test_differential_usage <splisosm.hyptest_np.SplisosmNP.test_differential_usage>` and :doc:`gpr_api` for details
+     - See :func:`test_differential_usage <splisosm.SplisosmNP.test_differential_usage>` and :doc:`gpr_api` for details
      - Adjust ``constant_value_bounds`` or ``length_scale_bounds`` to tune the hyperparameter
        searching ranges.
 
@@ -717,7 +717,7 @@ adjust them only when you hit performance or accuracy limits.
        ratios.
    * - **Other GPR configuration**
      - ``gpr_configs=`` in ``test_differential_usage``
-     - See :func:`test_differential_usage <splisosm.hyptest_fft.SplisosmFFT.test_differential_usage>` docstring for details
+     - See :func:`test_differential_usage <splisosm.SplisosmFFT.test_differential_usage>` docstring for details
      - Adjust ``constant_value_bounds`` or ``length_scale_bounds`` to tune the hyperparameter
        searching ranges.
 

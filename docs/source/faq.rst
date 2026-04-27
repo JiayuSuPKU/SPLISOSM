@@ -22,12 +22,12 @@ Platform compatibility
 
 **2. I am not interested in isoform-level analysis. Can I use SPLISOSM for gene-level spatial variability testing?**
 
-  Yes. The gene-level spatial variability test, *HSIC-GC*, is also available as a standalone function, :func:`splisosm.utils.run_hsic_gc`.
+  Yes. The gene-level spatial variability test, *HSIC-GC*, is also available as a standalone function, :func:`splisosm.utils.stats.run_hsic_gc`.
   It can be used as a drop-in replacement for other spatial gene expression analysis tools like SPARK-X.
 
   .. code-block:: python
 
-    from splisosm.utils import run_hsic_gc
+    from splisosm.utils.stats import run_hsic_gc
     import numpy as np
 
     # ── matrix mode ──────────────────────────────────────────────────
@@ -137,8 +137,8 @@ Choosing a model class
 
 **6. Which differential usage test method should I use: parametric or non-parametric?**
 
-  We recommend using the non-parametric test (:class:`~splisosm.hyptest_np.SplisosmNP` with ``method='hsic-gp'``) as the default choice. It is more robust to model misspecification and generally provides better control of the false positive rate.
-  The parametric test (:class:`~splisosm.hyptest_glmm.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
+  We recommend using the non-parametric test (:class:`~splisosm.SplisosmNP` with ``method='hsic-gp'``) as the default choice. It is more robust to model misspecification and generally provides better control of the false positive rate.
+  The parametric test (:class:`~splisosm.SplisosmGLMM`) allows for the inclusion of covariates and confounders, which can be useful in specific experimental designs.
 
   Note that both conditional tests (``'hsic-gp'`` and ``'glmm'``) are computationally intensive and may take hours to run on large datasets. 
   For ``'hsic-gp'``, inducing-point approximations and GPU acceleration (via the `gpytorch` backend) are available, and irregular 2-D coordinates can use the FINUFFT-backed ``gpr_backend="nufft"`` path to avoid dense GP matrices. See :doc:`gpr_api` for backend-specific options.
@@ -146,7 +146,7 @@ Choosing a model class
 
   .. code-block:: python
 
-    from splisosm.hyptest_np import SplisosmNP
+    from splisosm import SplisosmNP
 
     model_np = SplisosmNP()
     model_np.setup_data(...)
@@ -163,8 +163,7 @@ Choosing a model class
 
   .. code-block:: python
 
-    from splisosm.hyptest_np import SplisosmNP
-    from splisosm.hyptest_glmm import SplisosmGLMM
+    from splisosm import SplisosmGLMM, SplisosmNP
 
     # non-parametric DU test (unconditional)
     model_np = SplisosmNP()
@@ -225,7 +224,8 @@ Interpretation of Results
 
   .. code-block:: python
 
-    from splisosm.utils import counts_to_ratios, run_hsic_gc
+    from splisosm.utils.preprocessing import counts_to_ratios
+    from splisosm.utils.stats import run_hsic_gc
     import numpy as np
 
     # example data

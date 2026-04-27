@@ -8,10 +8,21 @@ def test_top_level_model_exports(monkeypatch):
     monkeypatch.setenv("NUMBA_DISABLE_JIT", "1")
 
     from splisosm import SplisosmFFT, SplisosmGLMM, SplisosmNP
+    from splisosm.hyptest import (
+        SplisosmFFT as HyptestFFT,
+        SplisosmGLMM as HyptestGLMM,
+        SplisosmNP as HyptestNP,
+    )
+    from splisosm.hyptest.fft import SplisosmFFT as ModuleFFT
+    from splisosm.hyptest.glmm import SplisosmGLMM as ModuleGLMM
+    from splisosm.hyptest.np import SplisosmNP as ModuleNP
 
     assert SplisosmNP.__name__ == "SplisosmNP"
     assert SplisosmFFT.__name__ == "SplisosmFFT"
     assert SplisosmGLMM.__name__ == "SplisosmGLMM"
+    assert SplisosmNP is HyptestNP is ModuleNP
+    assert SplisosmFFT is HyptestFFT is ModuleFFT
+    assert SplisosmGLMM is HyptestGLMM is ModuleGLMM
 
 
 def test_curated_helper_modules_import():

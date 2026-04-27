@@ -16,8 +16,8 @@ import torch.multiprocessing as mp
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
+from splisosm.hyptest._base import _FeatureSummaryMixin, _ResultsMixin
 from splisosm.utils.preprocessing import (
-    compute_feature_summaries,
     prepare_inputs_from_anndata,
 )
 from splisosm.utils.stats import false_discovery_control
@@ -54,7 +54,7 @@ class _FittedGeneState:
     n_isos: int
 
 
-class SplisosmGLMM:
+class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
     """Parametric spatial isoform statistical modeling using GLMM.
 
     This is a convenience class that wraps around the :class:`splisosm.glmm.MultinomGLMM`
@@ -701,156 +701,6 @@ class SplisosmGLMM:
             return "glm"
         raise ValueError(f"Invalid model type {mt!r}.")
 
-    # ------------------------------------------------------------------
-    # Feature summaries
-    # ------------------------------------------------------------------
-
-    def _compute_feature_summaries(self, print_progress: bool = True) -> None:
-        """Compute and cache both gene-level and isoform-level summaries."""
-        if self._filtered_adata is None:
-            raise RuntimeError("Data is not initialized. Call setup_data() first.")
-        if self._gene_summary is not None and self._isoform_summary is not None:
-            return
-        self._gene_summary, self._isoform_summary = compute_feature_summaries(
-            self._filtered_adata,
-            self.gene_names,
-            layer=self._counts_layer,
-            group_iso_by=self._group_iso_by,
-            print_progress=print_progress,
-        )
-
-    def extract_feature_summary(
-        self,
-        level: Literal["gene", "isoform"] = "gene",
-        print_progress: bool = True,
-    ) -> pd.DataFrame:
-        """Compute filtered feature-level summary statistics.
-
-        Gene-level statistics are aggregated across all isoforms that passed
-        the filters applied in :meth:`setup_data`.  Isoform-level statistics
-        are computed per isoform and augmented onto the corresponding rows of
-        ``adata.var``.
-
-        Results are cached: repeated calls with the same ``level`` return the
-        cached :class:`pandas.DataFrame` without recomputation.
-
-        Parameters
-        ----------
-        level
-            Summary granularity.
-            ``'gene'``: one row per gene.
-            ``'isoform'``: one row per isoform that passed filtering.
-        print_progress
-            Whether to show a progress bar.
-
-        Returns
-        -------
-        pandas.DataFrame
-            For ``level='gene'``, the index is the gene display name and the
-            columns are:
-
-            - ``'n_isos'``: int. Number of isoforms retained after filtering.
-            - ``'perplexity'``: float. Effective number of isoforms based on
-              the marginal isoform usage entropy.
-            - ``'pct_bin_on'``: float. Fraction of spots with non-zero total
-              gene counts.
-            - ``'count_avg'``: float. Mean per-spot total count for the gene.
-            - ``'count_std'``: float. Std of per-spot total count for the gene.
-
-            For ``level='isoform'``, the index is the isoform name (matching
-            ``adata.var_names``) and the columns are the original ``adata.var``
-            columns plus:
-
-            - ``'pct_bin_on'``: float. Fraction of spots with count > 0.
-            - ``'count_total'``: float. Total counts across all spots.
-            - ``'count_avg'``: float. Mean count per spot.
-            - ``'count_std'``: float. Std of count per spot.
-            - ``'ratio_total'``: float. Fraction of total gene counts
-              attributable to this isoform.
-            - ``'ratio_avg'``: float. Mean per-spot isoform usage ratio
-              (computed over spots with non-zero gene coverage).
-            - ``'ratio_std'``: float. Std of per-spot isoform usage ratio
-              (computed over spots with non-zero gene coverage).
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`setup_data` has not been called.
-        ValueError
-            If ``level`` is not ``'gene'`` or ``'isoform'``.
-        """
-        if self._filtered_adata is None:
-            raise RuntimeError("Data is not initialized. Call setup_data() first.")
-        if level not in {"gene", "isoform"}:
-            raise ValueError("`level` must be one of 'gene' or 'isoform'.")
-
-        self._compute_feature_summaries(print_progress=print_progress)
-
-        if level == "gene":
-            return self._gene_summary
-        return self._isoform_summary
-
-    def get_formatted_test_results(
-        self,
-        test_type: Literal["sv", "du"],
-        with_gene_summary: bool = False,
-    ) -> pd.DataFrame:
-        """Get the formatted test results as data frame.
-
-        Parameters
-        ----------
-        test_type : {"sv", "du"}
-            Type of test results to retrieve.
-        with_gene_summary : bool, optional
-            If ``True``, append gene-level summary statistics from
-            :meth:`extract_feature_summary`.
-
-        Returns
-        -------
-        pandas.DataFrame
-            Formatted test results.
-        """
-        if test_type not in {"sv", "du"}:
-            raise ValueError("test_type must be 'sv' or 'du'.")
-        if test_type == "sv":
-            if len(self._sv_test_results) == 0:
-                raise ValueError(
-                    "No spatial variability results. Run test_spatial_variability() first."
-                )
-            df = pd.DataFrame(
-                {
-                    "gene": self.gene_names,
-                    "statistic": self._sv_test_results["statistic"],
-                    "pvalue": self._sv_test_results["pvalue"],
-                    "pvalue_adj": self._sv_test_results["pvalue_adj"],
-                }
-            )
-        else:
-            if len(self._du_test_results) == 0:
-                raise ValueError(
-                    "No differential usage results. Run test_differential_usage() first."
-                )
-            covariate_names = (
-                self.covariate_names
-                if self.covariate_names is not None and len(self.covariate_names) > 0
-                else [f"factor_{i}" for i in range(self.n_factors)]
-            )
-            df = pd.DataFrame(
-                {
-                    "gene": np.repeat(self.gene_names, self.n_factors),
-                    "covariate": np.tile(covariate_names, self.n_genes),
-                    "statistic": self._du_test_results["statistic"].reshape(-1),
-                    "pvalue": self._du_test_results["pvalue"].reshape(-1),
-                    "pvalue_adj": self._du_test_results["pvalue_adj"].reshape(-1),
-                }
-            )
-
-        if with_gene_summary:
-            gene_df = self.extract_feature_summary(level="gene", print_progress=False)
-            df = df.merge(gene_df, left_on="gene", right_index=True, how="left")
-
-        return df
-
     def fit(
         self,
         n_jobs: int = 1,
@@ -1000,8 +850,8 @@ class SplisosmGLMM:
         Returns
         -------
         models: list of fitted models
-            - ``model_type='glmm-full'``: list[splisosm.hyptest_glmm.IsoFullModel]
-            - ``model_type='glmm-null'``: list[splisosm.hyptest_glmm.IsoNullNoSpVar]
+            - ``model_type='glmm-full'``: list[splisosm.hyptest.glmm.IsoFullModel]
+            - ``model_type='glmm-null'``: list[splisosm.hyptest.glmm.IsoNullNoSpVar]
             - ``model_type='glm'``: list[splisosm.glmm.MultinomGLM]
         """
         key = self._model_key_for_type()
@@ -1787,7 +1637,7 @@ class SplisosmGLMM:
 
         .. caution::
             The likelihood ratio statistic is not well-calibrated for sparse data.
-            We recommend the non-parametric HSIC-based tests in :class:`splisosm.hyptest_np.SplisosmNP`
+            We recommend the non-parametric HSIC-based tests in :class:`splisosm.hyptest.np.SplisosmNP`
             for spatial variability testing.
 
         Note that the parametric and non-parametric tests are assymptotically equivalent under the null.
@@ -1819,7 +1669,7 @@ class SplisosmGLMM:
 
         See also
         --------
-        :func:`splisosm.hyptest_np.SplisosmNP.test_spatial_variability` for non-parametric tests.
+        :func:`splisosm.hyptest.np.SplisosmNP.test_spatial_variability` for non-parametric tests.
         """
 
         valid_methods = ["llr"]
@@ -1909,7 +1759,7 @@ class SplisosmGLMM:
         with the isoform usage ratios of each gene.
         Test statistics and p-values are computed per (gene, covariate) pair separately.
 
-        Similar to :func:`splisosm.hyptest_np.SplisosmNP.test_differential_usage`, here we also support two types of association tests but **implicitly**:
+        Similar to :func:`splisosm.hyptest.np.SplisosmNP.test_differential_usage`, here we also support two types of association tests but **implicitly**:
 
         - Unconditional (when ``model_type='glm'``): test the unconditional association between isoform usage ratios and the covariate of interest (H_0: ``beta`` = 0).
         - Conditional (when ``model_type='glmm-full'``): test for association (H_0: ``beta`` = 0) conditioned on the spatial random effect.

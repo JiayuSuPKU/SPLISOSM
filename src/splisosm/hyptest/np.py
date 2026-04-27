@@ -18,8 +18,8 @@ import torch
 from tqdm import tqdm
 from anndata import AnnData
 
+from splisosm.hyptest._base import _FeatureSummaryMixin, _ResultsMixin
 from splisosm.utils.preprocessing import (
-    compute_feature_summaries,
     counts_to_ratios,
     prepare_inputs_from_anndata,
 )
@@ -662,7 +662,7 @@ def _du_ttest_gene_worker_np(
     return stats_row, pvals_row
 
 
-class SplisosmNP:
+class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
     """Non-parametric SPLISOSM model for arbitrary spatial geometries.
 
     ``SplisosmNP`` works directly on spot- or cell-level coordinates and a
@@ -1071,154 +1071,6 @@ class SplisosmNP:
             return torch.from_numpy(col.astype(np.float32)).unsqueeze(1)
         return self.design_mtx[:, factor_idx].clone().float().unsqueeze(1)
 
-    def _compute_feature_summaries(self, print_progress: bool = True) -> None:
-        """Compute and cache both gene-level and isoform-level summaries."""
-        if self._filtered_adata is None:
-            raise RuntimeError("Data is not initialized. Call setup_data() first.")
-        if self._gene_summary is not None and self._isoform_summary is not None:
-            return
-        self._gene_summary, self._isoform_summary = compute_feature_summaries(
-            self._filtered_adata,
-            self.gene_names,
-            layer=self._counts_layer,
-            group_iso_by=self._group_iso_by,
-            print_progress=print_progress,
-        )
-
-    def extract_feature_summary(
-        self,
-        level: Literal["gene", "isoform"] = "gene",
-        print_progress: bool = True,
-    ) -> pd.DataFrame:
-        """Compute filtered feature-level summary statistics.
-
-        Gene-level statistics are aggregated across all isoforms that passed
-        the filters applied in :meth:`setup_data`.  Isoform-level statistics
-        are computed per isoform and augmented onto the corresponding rows of
-        ``adata.var``.
-
-        Results are cached: repeated calls with the same ``level`` return the
-        cached :class:`pandas.DataFrame` without recomputation.
-
-        Parameters
-        ----------
-        level
-            Summary granularity.
-            ``'gene'``: one row per gene.
-            ``'isoform'``: one row per isoform that passed filtering.
-        print_progress
-            Whether to show a progress bar.
-
-        Returns
-        -------
-        pandas.DataFrame
-            For ``level='gene'``, the index is the gene display name and the
-            columns are:
-
-            - ``'n_isos'``: int. Number of isoforms retained after filtering.
-            - ``'perplexity'``: float. Effective number of isoforms based on
-              the marginal isoform usage entropy.
-            - ``'pct_bin_on'``: float. Fraction of spots with non-zero total
-              gene counts.
-            - ``'count_avg'``: float. Mean per-spot total count for the gene.
-            - ``'count_std'``: float. Std of per-spot total count for the gene.
-
-            For ``level='isoform'``, the index is the isoform name (matching
-            ``adata.var_names``) and the columns are the original ``adata.var``
-            columns plus:
-
-            - ``'pct_bin_on'``: float. Fraction of spots with count > 0.
-            - ``'count_total'``: float. Total counts across all spots.
-            - ``'count_avg'``: float. Mean count per spot.
-            - ``'count_std'``: float. Std of count per spot.
-            - ``'ratio_total'``: float. Fraction of total gene counts
-              attributable to this isoform.
-            - ``'ratio_avg'``: float. Mean per-spot isoform usage ratio
-              (computed over spots with non-zero gene coverage).
-            - ``'ratio_std'``: float. Std of per-spot isoform usage ratio
-              (computed over spots with non-zero gene coverage).
-
-        Raises
-        ------
-        RuntimeError
-            If :meth:`setup_data` has not been called.
-        ValueError
-            If ``level`` is not ``'gene'`` or ``'isoform'``.
-        """
-        if self._filtered_adata is None:
-            raise RuntimeError("Data is not initialized. Call setup_data() first.")
-        if level not in {"gene", "isoform"}:
-            raise ValueError("`level` must be one of 'gene' or 'isoform'.")
-
-        self._compute_feature_summaries(print_progress=print_progress)
-
-        if level == "gene":
-            return self._gene_summary
-        return self._isoform_summary
-
-    def get_formatted_test_results(
-        self,
-        test_type: Literal["sv", "du"],
-        with_gene_summary: bool = False,
-    ) -> pd.DataFrame:
-        """Get formatted test results as a pandas DataFrame.
-
-        Parameters
-        ----------
-        test_type : {"sv", "du"}
-            Which results to retrieve: ``"sv"`` for spatial variability or
-            ``"du"`` for differential usage.
-        with_gene_summary : bool, optional
-            If ``True``, append gene-level summary statistics from
-            :meth:`extract_feature_summary` (columns: ``n_isos``,
-            ``perplexity``, ``pct_bin_on``, ``count_avg``, ``count_std``).
-
-        Returns
-        -------
-        pandas.DataFrame
-            Formatted test results.
-        """
-        if test_type not in {"sv", "du"}:
-            raise ValueError("test_type must be 'sv' or 'du'.")
-        if test_type == "sv":
-            if len(self._sv_test_results) == 0:
-                raise ValueError(
-                    "No spatial variability results. Run test_spatial_variability() first."
-                )
-            df = pd.DataFrame(
-                {
-                    "gene": self.gene_names,
-                    "statistic": self._sv_test_results["statistic"],
-                    "pvalue": self._sv_test_results["pvalue"],
-                    "pvalue_adj": self._sv_test_results["pvalue_adj"],
-                }
-            )
-        else:
-            if len(self._du_test_results) == 0:
-                raise ValueError(
-                    "No differential usage results. Run test_differential_usage() first."
-                )
-            covariate_names = (
-                self.covariate_names
-                if self.covariate_names is not None and len(self.covariate_names) > 0
-                else [f"factor_{i}" for i in range(self.n_factors)]
-            )
-            df = pd.DataFrame(
-                {
-                    "gene": np.repeat(self.gene_names, self.n_factors),
-                    "covariate": np.tile(covariate_names, self.n_genes),
-                    "statistic": self._du_test_results["statistic"].reshape(-1),
-                    "pvalue": self._du_test_results["pvalue"].reshape(-1),
-                    "pvalue_adj": self._du_test_results["pvalue_adj"].reshape(-1),
-                }
-            )
-
-        if with_gene_summary:
-            gene_df = self.extract_feature_summary(level="gene", print_progress=False)
-            df = df.merge(gene_df, left_on="gene", right_index=True, how="left")
-
-        return df
-
     def test_spatial_variability(
         self,
         method: Literal["hsic-ir", "hsic-ic", "hsic-gc", "spark-x"] = "hsic-ir",
@@ -1512,7 +1364,7 @@ class SplisosmNP:
             ``'finufft'``.  The NUFFT aliases use FINUFFT for irregular 2-D
             coordinates with an implicit periodic RBF kernel.
             For FFT-accelerated spatial GP on regular grids use
-            :class:`~splisosm.hyptest_fft.SplisosmFFT` instead.
+            :class:`~splisosm.hyptest.fft.SplisosmFFT` instead.
         gpr_configs : dict, optional
             Nested configuration dict for the GPR objects, with optional keys
             ``"covariate"`` and/or ``"isoform"``. Each sub-dict configures the

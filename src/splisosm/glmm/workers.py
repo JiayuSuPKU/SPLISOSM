@@ -1,6 +1,6 @@
 """Private worker functions and model subclasses for SplisosmGLMM.
 
-Not part of the public API.  Imported by :mod:`splisosm.hyptest_glmm`.
+Not part of the public API.  Imported by :mod:`splisosm.hyptest.glmm`.
 """
 
 from __future__ import annotations

@@ -139,7 +139,7 @@ Under the null, :math:`Q` asymptotically follows a weighted sum of independent :
 where the double sum runs over all pairs of spatial and response eigenvalues.
 SPLISOSM evaluates :cite:t:`liu2009new` from the first four cumulants
 :math:`c_r = \mathrm{tr}(K^r)\mathrm{tr}((Y^\top Y)^r)/(n-1)^r`, so it does not need to materialize the full pairwise eigenvalue product.
-See :func:`splisosm.likelihood.liu_sf_from_cumulants` for implementation details.
+See :func:`splisosm.utils.stats.liu_sf_from_cumulants` for implementation details.
 
 .. note::
 
@@ -413,7 +413,7 @@ and :math:`U = (u_1, \ldots, u_n)^\top \in \mathbb{R}^{n \times q}` stacks the p
 For DU testing, we use a **score test** comparing coefficient gradients at the null model (no fixed-effect covariates, :math:`\beta = 0`), which avoids fitting the full model for each covariate.
 However, it still requires estimating nuisance parameters (intercept :math:`b`, total variance :math:`\sigma^2`, and spatial variance proportion :math:`\theta`).
 To compute the maximum likelihood estimates, we approximate the marginal likelihood via **Laplace's method** at the mode of the random effects.
-See :class:`splisosm.model.MultinomGLMM` for implementation details.
+See :class:`splisosm.glmm.MultinomGLMM` for implementation details.
 
 Compared to :class:`~splisosm.SplisosmNP`, the GLMM approach:
 

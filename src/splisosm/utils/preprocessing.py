@@ -399,8 +399,8 @@ def prepare_inputs_from_anndata(
 ]:
     """Extract and filter isoform count tensors from an AnnData object.
 
-    Shared helper used by both :class:`splisosm.hyptest_np.SplisosmNP` and
-    :class:`splisosm.hyptest_glmm.SplisosmGLMM` to prepare legacy-compatible
+    Shared helper used by both :class:`splisosm.hyptest.np.SplisosmNP` and
+    :class:`splisosm.hyptest.glmm.SplisosmGLMM` to prepare legacy-compatible
     tensors from an AnnData input.  Feature filtering, sparse/dense handling,
     coordinate extraction, and design-matrix resolution are all performed here.
 
