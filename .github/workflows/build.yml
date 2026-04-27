@@ -64,7 +64,7 @@ jobs:
         shell: bash
 
       - name: Check metadata (twine)
-        run: python -m twine check dist/*
+        run: python -m twine check dist/*.tar.gz dist/*.whl
 
       - name: Test install from built wheel (clean venv)
         shell: bash

@@ -59,7 +59,7 @@ __pycache__/
 .vscode
 
 *.egg-info
-splisosm/_version.py
+src/splisosm/_version.py
 
 # notebook checkpoints
 .ipynb_checkpoints

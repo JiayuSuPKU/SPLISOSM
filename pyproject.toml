@@ -65,8 +65,9 @@ docs = [
 repository = "https://github.com/JiayuSuPKU/SPLISOSM"
 
 [tool.setuptools]
-packages.find = {where = ["."], exclude = ["docs", "docs.*", "tests", "tests.*", "scripts", "scripts.*"]}
+package-dir = {"" = "src"}
+packages.find = {where = ["src"]}
 
 [tool.setuptools_scm]
-write_to = "splisosm/_version.py"
+write_to = "src/splisosm/_version.py"
 fallback_version = "1.2.0rc1"

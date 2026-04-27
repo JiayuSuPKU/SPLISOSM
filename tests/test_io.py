@@ -11,7 +11,7 @@ import pandas as pd
 import scipy.sparse
 from anndata import AnnData
 
-_IO_PATH = Path(__file__).resolve().parents[1] / "splisosm" / "io.py"
+_IO_PATH = Path(__file__).resolve().parents[1] / "src" / "splisosm" / "io.py"
 _IO_SPEC = importlib.util.spec_from_file_location("splisosm_io_test_module", _IO_PATH)
 if _IO_SPEC is None or _IO_SPEC.loader is None:
     raise RuntimeError(f"Could not load module spec for {_IO_PATH}")
