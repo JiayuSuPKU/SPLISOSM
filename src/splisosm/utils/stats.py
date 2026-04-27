@@ -27,6 +27,34 @@ __all__ = [
 ]
 
 
+def _empirical_permutation_pvalue(
+    observed: ArrayLike | torch.Tensor,
+    null: ArrayLike | torch.Tensor,
+    *,
+    axis: int = 0,
+) -> np.ndarray | torch.Tensor:
+    """Return finite-sample empirical permutation p-values.
+
+    The estimate is ``(1 + # null >= observed) / (n_perm + 1)`` along
+    ``axis``. Inputs may be NumPy-like arrays or torch tensors; the return
+    type follows the tensor/array family of the inputs.
+    """
+    if isinstance(observed, torch.Tensor) or isinstance(null, torch.Tensor):
+        null_t = torch.as_tensor(null)
+        observed_t = torch.as_tensor(observed, dtype=null_t.dtype, device=null_t.device)
+        if null_t.shape[axis] < 1:
+            raise ValueError("`null` must contain at least one permutation.")
+        exceed = (null_t >= observed_t).sum(dim=axis)
+        return (1 + exceed) / (null_t.shape[axis] + 1)
+
+    null_arr = np.asarray(null)
+    observed_arr = np.asarray(observed)
+    if null_arr.shape[axis] < 1:
+        raise ValueError("`null` must contain at least one permutation.")
+    exceed = np.sum(null_arr >= observed_arr, axis=axis)
+    return (1 + exceed) / (null_arr.shape[axis] + 1)
+
+
 # From scipy v1.13.1
 # https://github.com/scipy/scipy/blob/v1.13.1/scipy/stats/_morestats.py#L4737
 def false_discovery_control(

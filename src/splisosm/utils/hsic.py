@@ -167,6 +167,113 @@ def _liu_apply(t: ArrayLike, coeffs: dict[str, float]) -> np.ndarray:
     return ncx2.sf(tfinal, coeffs["dof_x"], max(coeffs["delta_x"], 1e-9))
 
 
+def _to_dense_float_tensor(
+    x: torch.Tensor | np.ndarray | scipy.sparse.spmatrix,
+) -> torch.Tensor:
+    """Return a dense float tensor, densifying sparse inputs once."""
+    if scipy.sparse.issparse(x):
+        return torch.from_numpy(np.asarray(x.toarray(), dtype=np.float32))
+    if isinstance(x, torch.Tensor):
+        if x.is_sparse:
+            x = x.to_dense()
+        return x.float()
+    return torch.from_numpy(np.asarray(x, dtype=np.float32))
+
+
+def _normalise_linear_hsic_inputs(
+    X: torch.Tensor | np.ndarray | scipy.sparse.spmatrix,
+    Y: torch.Tensor | np.ndarray | scipy.sparse.spmatrix,
+) -> tuple[torch.Tensor | scipy.sparse.spmatrix, torch.Tensor, bool]:
+    """Normalize HSIC inputs and preserve SciPy sparsity for X."""
+    Y_tensor = _to_dense_float_tensor(Y)
+    X_is_sparse = scipy.sparse.issparse(X)
+    if X_is_sparse:
+        return X, Y_tensor.detach().cpu(), True
+
+    X_tensor = _to_dense_float_tensor(X)
+    if Y_tensor.device != X_tensor.device:
+        Y_tensor = Y_tensor.to(X_tensor.device)
+    return X_tensor, Y_tensor, False
+
+
+def _drop_linear_hsic_nan_rows(
+    X: torch.Tensor | scipy.sparse.spmatrix,
+    Y: torch.Tensor,
+    *,
+    X_is_sparse: bool,
+) -> tuple[torch.Tensor | scipy.sparse.spmatrix, torch.Tensor]:
+    """Drop rows with NaNs from dense Y and dense X when present."""
+    is_nan_y = torch.isnan(Y).any(1)
+    if X_is_sparse:
+        is_nan = is_nan_y
+    else:
+        is_nan = is_nan_y | torch.isnan(X).any(1)
+
+    if not bool(is_nan.any()):
+        return X, Y
+
+    keep = ~is_nan
+    Y = Y[keep]
+    if X_is_sparse:
+        X = X[keep.detach().cpu().numpy()]
+    else:
+        X = X[keep]
+    return X, Y
+
+
+def _linear_hsic_sparse_x_components(
+    X: scipy.sparse.spmatrix,
+    Y: torch.Tensor,
+    *,
+    centering: bool,
+    eigv_th: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return statistic and null eigenvalues for sparse-X linear HSIC."""
+    X_sp = X.tocsr()
+    if centering:
+        Y = Y - Y.mean(0)
+
+    # When Y is centred, Y_c.T @ X_c == Y_c.T @ X because
+    # the correction term Y_c.sum(0) vanishes.
+    YcTX = torch.from_numpy(X_sp.T.dot(Y.numpy()).astype(np.float32)).T
+    hsic_scaled = YcTX.pow(2).sum()
+
+    XTX = X_sp.T.dot(X_sp).toarray().astype(np.float32)
+    if centering:
+        X_mean = np.asarray(X_sp.mean(axis=0), dtype=np.float32).ravel()
+        XTX = XTX - Y.shape[0] * np.outer(X_mean, X_mean)
+
+    lambda_x = torch.linalg.eigvalsh(torch.from_numpy(XTX))
+    lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
+    return (
+        hsic_scaled,
+        lambda_x[lambda_x > eigv_th],
+        lambda_y[lambda_y > eigv_th],
+    )
+
+
+def _linear_hsic_dense_components(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    *,
+    centering: bool,
+    eigv_th: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return statistic and null eigenvalues for dense linear HSIC."""
+    if centering:
+        X = X - X.mean(0)
+        Y = Y - Y.mean(0)
+
+    hsic_scaled = torch.norm(Y.T @ X, p="fro").pow(2)
+    lambda_x = torch.linalg.eigvalsh(X.T @ X)
+    lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
+    return (
+        hsic_scaled,
+        lambda_x[lambda_x > eigv_th],
+        lambda_y[lambda_y > eigv_th],
+    )
+
+
 def linear_hsic_test(
     X: "torch.Tensor | scipy.sparse.spmatrix",
     Y: "torch.Tensor | scipy.sparse.spmatrix",
@@ -203,78 +310,24 @@ def linear_hsic_test(
     """
     eigv_th = 1e-5
 
-    # ── Normalise Y to a dense float32 tensor ─────────────────────────────
-    if scipy.sparse.issparse(Y):
-        Y = torch.from_numpy(np.asarray(Y.todense(), dtype=np.float32))
-    elif isinstance(Y, torch.Tensor) and Y.is_sparse:
-        Y = Y.to_dense().float()
-    elif isinstance(Y, np.ndarray):
-        Y = torch.from_numpy(Y.astype(np.float32))
-    else:
-        Y = Y.float()
-
-    X_is_sparse = scipy.sparse.issparse(X)
-
-    # ── NaN filtering ─────────────────────────────────────────────────────
-    is_nan_y = torch.isnan(Y).any(1)
-    if X_is_sparse:
-        # Sparse matrices contain no NaN by construction.
-        is_nan = is_nan_y
-    else:
-        if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X.astype(np.float32))
-        else:
-            X = X.float()
-        is_nan = is_nan_y | torch.isnan(X).any(1)
-
-    if is_nan.any():
-        keep = ~is_nan
-        Y = Y[keep]
-        if X_is_sparse:
-            X = X[keep.numpy()]
-        else:
-            X = X[keep]
-
+    X, Y, X_is_sparse = _normalise_linear_hsic_inputs(X, Y)
+    X, Y = _drop_linear_hsic_nan_rows(X, Y, X_is_sparse=X_is_sparse)
     n = Y.shape[0]
 
-    # ── Sparse-X path ─────────────────────────────────────────────────────
     if X_is_sparse:
-        X_sp = X.tocsr()
-        Y = Y.detach().cpu()
-        if centering:
-            Y = Y - Y.mean(0)
-
-        # Key identity: when Y is centred, Y_c.T @ X_c == Y_c.T @ X
-        # because the correction term Y_c.sum(0) == 0 vanishes.
-        # So we can use the original (non-centred) sparse X directly.
-        YcTX = torch.from_numpy(
-            X_sp.T.dot(Y.numpy()).astype(np.float32)
-        ).T  # (n_y, n_x)
-        hsic_scaled = YcTX.pow(2).sum()
-
-        XTX = X_sp.T.dot(X_sp).toarray().astype(np.float32)
-        if centering:
-            # X_c.T @ X_c = X.T @ X - n * mean_X.outer(mean_X)
-            X_mean = np.asarray(X_sp.mean(axis=0), dtype=np.float32).ravel()
-            XTX = XTX - n * np.outer(X_mean, X_mean)
-        XcTXc = torch.from_numpy(XTX)
-        lambda_x = torch.linalg.eigvalsh(XcTXc)
-        lambda_x = lambda_x[lambda_x > eigv_th]
-        lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
-        lambda_y = lambda_y[lambda_y > eigv_th]
-
-    # ── Dense-X path (original) ───────────────────────────────────────────
+        hsic_scaled, lambda_x, lambda_y = _linear_hsic_sparse_x_components(
+            X,
+            Y,
+            centering=centering,
+            eigv_th=eigv_th,
+        )
     else:
-        if centering:
-            X = X - X.mean(0)
-            Y = Y - Y.mean(0)
-
-        hsic_scaled = torch.norm(Y.T @ X, p="fro").pow(2)
-
-        lambda_x = torch.linalg.eigvalsh(X.T @ X)
-        lambda_x = lambda_x[lambda_x > eigv_th]
-        lambda_y = torch.linalg.eigvalsh(Y.T @ Y)
-        lambda_y = lambda_y[lambda_y > eigv_th]
+        hsic_scaled, lambda_x, lambda_y = _linear_hsic_dense_components(
+            X,
+            Y,
+            centering=centering,
+            eigv_th=eigv_th,
+        )
 
     lambda_xy = (lambda_x.unsqueeze(0) * lambda_y.unsqueeze(1)).reshape(-1)
     pval = liu_sf(

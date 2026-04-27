@@ -12,15 +12,15 @@ import numpy as np
 from scipy.stats import chi2
 import torch
 from anndata import AnnData
-import torch.multiprocessing as mp
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
 from splisosm.hyptest._base import _FeatureSummaryMixin, _ResultsMixin
+from splisosm.utils._chunking import _resolve_n_jobs
 from splisosm.utils.preprocessing import (
     prepare_inputs_from_anndata,
 )
-from splisosm.utils.stats import false_discovery_control
+from splisosm.utils.stats import _empirical_permutation_pvalue, false_discovery_control
 from splisosm.glmm.dataset import IsoDataset
 from splisosm.glmm.glm import MultinomGLM
 from splisosm.kernel import IdentityKernel, SpatialCovKernel
@@ -688,7 +688,7 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
 
     def _resolve_fit_n_jobs(self, n_jobs: int) -> int:
         """Resolve CPU worker count and enforce non-CPU serial fitting."""
-        n_jobs = mp.cpu_count() if n_jobs == -1 else n_jobs
+        n_jobs = _resolve_n_jobs(n_jobs)
         if n_jobs > 1 and self._device != "cpu":
             warnings.warn(
                 f"Parallel fitting (n_jobs={n_jobs}) is not supported for "
@@ -1506,6 +1506,61 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
         )
         return self._llr_stats_from_fitted_model(new_model)
 
+    def _fit_sv_llr_perm_parallel(
+        self,
+        *,
+        n_perms: int,
+        n_jobs: int,
+        batch_size: int,
+        with_design_mtx: bool,
+        refit_null: bool,
+        random_seed: Optional[int],
+        print_progress: bool,
+    ) -> torch.Tensor:
+        """Fit batched SV permutations in parallel and return a per-gene matrix."""
+        n_batches, data = self._batch_loader(batch_size)
+        name_to_idx = {name: idx for idx, name in enumerate(self.gene_names)}
+        batch_infos = [
+            (
+                [name_to_idx[name] for name in batch["gene_name"]],
+                batch["x"],
+            )
+            for batch in data
+        ]
+
+        task_meta = []
+        tasks = []
+        for perm_idx in range(n_perms):
+            perm = torch.randperm(self.n_spots)
+            for gene_indices, counts in batch_infos:
+                task_meta.append((perm_idx, gene_indices))
+                tasks.append(
+                    delayed(_fit_perm_one_gene)(
+                        perm,
+                        self._model_configs,
+                        counts,
+                        self._corr_sp_eigvals,
+                        self._corr_sp_eigvecs,
+                        self._design_for_fit(with_design_mtx),
+                        refit_null=refit_null,
+                        random_seed=random_seed,
+                        device=self._device,
+                    )
+                )
+
+        perm_stats = Parallel(n_jobs=n_jobs)(
+            tqdm(
+                tasks,
+                desc="Permutations",
+                total=(n_batches * n_perms),
+                disable=not print_progress,
+            )
+        )
+        perm_matrix = torch.empty((n_perms, self.n_genes), dtype=torch.float32)
+        for (perm_idx, gene_indices), batch_stats in zip(task_meta, perm_stats):
+            perm_matrix[perm_idx, gene_indices] = batch_stats.detach().cpu().float()
+        return perm_matrix
+
     def _fit_sv_llr_perm(
         self,
         n_perms: int = 20,
@@ -1573,46 +1628,15 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
                     "Note: the progress bar is updated before each fitting, rather than when it finishes."
                 )
 
-            n_batches, data = self._batch_loader(batch_size)
-            name_to_idx = {name: idx for idx, name in enumerate(self.gene_names)}
-            batch_infos = [
-                (
-                    [name_to_idx[name] for name in batch["gene_name"]],
-                    batch["x"],
-                )
-                for batch in data
-            ]
-            task_meta = []
-            tasks = []
-            for perm_idx in range(n_perms):
-                perm = torch.randperm(self.n_spots)
-                for gene_indices, counts in batch_infos:
-                    task_meta.append((perm_idx, gene_indices))
-                    tasks.append(
-                        delayed(_fit_perm_one_gene)(
-                            perm,
-                            self._model_configs,
-                            counts,
-                            self._corr_sp_eigvals,
-                            self._corr_sp_eigvecs,
-                            self._design_for_fit(with_design_mtx),
-                            refit_null=refit_null,
-                            random_seed=random_seed,
-                            device=self._device,
-                        )
-                    )
-            perm_stats = Parallel(n_jobs=n_jobs)(
-                tqdm(
-                    tasks,
-                    desc="Permutations",
-                    total=(n_batches * n_perms),
-                    disable=not print_progress,
-                )
+            self._sv_llr_perm_stats = self._fit_sv_llr_perm_parallel(
+                n_perms=n_perms,
+                n_jobs=n_jobs,
+                batch_size=batch_size,
+                with_design_mtx=with_design_mtx,
+                refit_null=refit_null,
+                random_seed=random_seed,
+                print_progress=print_progress,
             )
-            perm_matrix = torch.empty((n_perms, self.n_genes), dtype=torch.float32)
-            for (perm_idx, gene_indices), batch_stats in zip(task_meta, perm_stats):
-                perm_matrix[perm_idx, gene_indices] = batch_stats.detach().cpu().float()
-            self._sv_llr_perm_stats = perm_matrix
 
         if print_progress:
             print(f"Fitting finished. Time elapsed: {timer() - t_start:.2f} seconds.")
@@ -1675,7 +1699,7 @@ class SplisosmGLMM(_ResultsMixin, _FeatureSummaryMixin):
                     "(n_perms, n_genes)."
                 )
             perm = perm.to(dtype=stats.dtype, device=stats.device)
-            pvals = (1 + (perm >= stats[None, :]).sum(dim=0)) / (perm.shape[0] + 1)
+            pvals = _empirical_permutation_pvalue(stats, perm, axis=0)
         else:
             pvals = torch.tensor(1 - chi2.cdf(stats.cpu(), df=dfs.cpu()))
 

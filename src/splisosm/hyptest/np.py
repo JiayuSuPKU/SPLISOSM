@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import warnings
 import re
+from dataclasses import dataclass
 from typing import Any, Optional, Union, Literal
 from joblib import Parallel, delayed
 from scipy.stats import (
@@ -24,10 +24,15 @@ from splisosm.utils.preprocessing import (
     prepare_inputs_from_anndata,
 )
 from splisosm.utils.stats import (
+    _empirical_permutation_pvalue,
     false_discovery_control,
     run_sparkx,
 )
-from splisosm.utils._chunking import pack_gene_chunks, resolve_chunk_size
+from splisosm.utils._chunking import (
+    _resolve_n_jobs,
+    pack_gene_chunks,
+    resolve_chunk_size,
+)
 from splisosm.kernel import IdentityKernel, SpatialCovKernel, _MaskedSpatialKernel
 from splisosm.utils.hsic import (
     _feature_cumulants_from_data,
@@ -279,6 +284,274 @@ def _quadratic_columns_approx(
     return torch.diagonal(mat).detach().cpu().numpy().astype(float)
 
 
+@dataclass(frozen=True)
+class _SVGeneInputs:
+    """Prepared inputs for one NP SV gene test."""
+
+    y: Any
+    y_is_centered: bool
+    n_spots_eff: int
+    stat_kernel: Any
+    null_kernel: Any
+    kernel_cumulants: Optional[dict[int, float]]
+    kernel_approx_rank: Optional[int]
+
+
+def _sv_uses_single_gene_path_np(
+    method: str,
+    nan_filling: str,
+    null_method: str,
+) -> bool:
+    """Return whether a chunk must be evaluated gene-by-gene."""
+    return null_method == "perm" or (method == "hsic-ir" and nan_filling == "none")
+
+
+def _prepare_masked_ir_inputs_np(
+    counts: torch.Tensor,
+    ratio_transformation: str,
+    K_sp: Any,
+) -> tuple[Any, bool, np.ndarray]:
+    """Prepare HSIC-IR responses and valid-spot mask for nan_filling='none'."""
+    if counts.is_sparse:
+        sparse_counts = _torch_sparse_to_scipy_csc(counts)
+        y_sparse, is_nan = _sparse_counts_to_ratios_centered(
+            sparse_counts,
+            transformation=ratio_transformation,
+            nan_filling="none",
+        )
+        keep_mask = ~is_nan
+        return y_sparse[keep_mask], True, keep_mask
+
+    y = counts_to_ratios(
+        counts,
+        transformation=ratio_transformation,
+        nan_filling="none",
+        fill_before_transform=False,
+    )
+    is_nan = torch.isnan(y).any(1)
+    keep_mask = (~is_nan).detach().cpu().numpy()
+    y = y[~is_nan]
+    y = y - y.mean(0, keepdim=True)
+    return y, True, keep_mask
+
+
+def _prepare_sv_gene_inputs_np(
+    counts: torch.Tensor,
+    method: str,
+    ratio_transformation: str,
+    nan_filling: str,
+    null_method: str,
+    n_spots: int,
+    K_sp: Any,
+    kernel_cumulants: Optional[dict[int, float]],
+    kernel_approx_rank: Optional[int],
+    n_probes: int,
+    rng_seed: int,
+) -> Optional[_SVGeneInputs]:
+    """Prepare one gene's response and matching statistic/null kernels."""
+    if method == "hsic-ir" and nan_filling == "none":
+        y, y_is_centered, keep_mask = _prepare_masked_ir_inputs_np(
+            counts,
+            ratio_transformation,
+            K_sp,
+        )
+        n_spots_eff = y.shape[0]
+        if n_spots_eff <= 1:
+            return None
+
+        K_sp_gene = _MaskedSpatialKernel(K_sp, keep_mask)
+        if null_method in ("liu", "welch"):
+            kernel_cumulants = _hutchinson_cumulants(
+                K_sp_gene,
+                n_probes=n_probes,
+                rng_seed=rng_seed,
+                max_power=4 if null_method == "liu" else 2,
+            )
+            kernel_approx_rank = None
+        return _SVGeneInputs(
+            y=y,
+            y_is_centered=y_is_centered,
+            n_spots_eff=n_spots_eff,
+            stat_kernel=K_sp_gene,
+            null_kernel=K_sp_gene,
+            kernel_cumulants=kernel_cumulants,
+            kernel_approx_rank=kernel_approx_rank,
+        )
+
+    y, y_is_centered = _prepare_np_response(counts, method, ratio_transformation)
+    return _SVGeneInputs(
+        y=y,
+        y_is_centered=y_is_centered,
+        n_spots_eff=n_spots,
+        stat_kernel=K_sp,
+        null_kernel=K_sp,
+        kernel_cumulants=kernel_cumulants,
+        kernel_approx_rank=kernel_approx_rank,
+    )
+
+
+def _response_to_torch_float(y: Any) -> torch.Tensor:
+    """Return response matrix as a dense float torch tensor."""
+    if scipy.sparse.issparse(y):
+        return torch.from_numpy(y.toarray()).float()
+    if isinstance(y, np.ndarray):
+        return torch.from_numpy(np.asarray(y, dtype=np.float32))
+    return y.float()
+
+
+def _xtKx_for_response_np(K_sp: Any, y: Any) -> torch.Tensor:
+    """Compute ``y.T @ K @ y`` for either tensor or Kernel-like K."""
+    if isinstance(K_sp, torch.Tensor):
+        y_t = _response_to_torch_float(y)
+        K_t = K_sp.to(dtype=y_t.dtype, device=y_t.device)
+        return y_t.T @ K_t @ y_t
+    return K_sp.xtKx(y)
+
+
+def _xtKx_exact_for_response_np(K_sp: Any, y: Any) -> torch.Tensor:
+    """Compute exact ``y.T @ K @ y`` for either tensor or Kernel-like K."""
+    if isinstance(K_sp, torch.Tensor):
+        return _xtKx_for_response_np(K_sp, y)
+    return K_sp.xtKx_exact(y)
+
+
+def _observed_hsic_scaled_np(
+    inputs: _SVGeneInputs,
+    null_method: str,
+) -> torch.Tensor:
+    """Return the unnormalised HSIC statistic for prepared gene inputs."""
+    if null_method == "liu" and inputs.kernel_approx_rank is not None:
+        return torch.trace(
+            inputs.stat_kernel.xtKx_approx(inputs.y, k=inputs.kernel_approx_rank)
+        )
+    return torch.trace(_xtKx_exact_for_response_np(inputs.stat_kernel, inputs.y))
+
+
+def _permuted_response_batch_np(y: Any, n_spots: int, batch_size: int) -> Any:
+    """Build a horizontally concatenated batch of permuted responses."""
+    if scipy.sparse.issparse(y):
+        return scipy.sparse.hstack(
+            [y[np.random.permutation(n_spots), :] for _ in range(batch_size)],
+            format="csc",
+        )
+    if isinstance(y, np.ndarray):
+        return np.concatenate(
+            [y[np.random.permutation(n_spots), :] for _ in range(batch_size)],
+            axis=1,
+        )
+    return torch.cat([y[torch.randperm(n_spots)] for _ in range(batch_size)], dim=1)
+
+
+def _permutation_null_stats_np(
+    y: Any,
+    K_sp_null: Any,
+    *,
+    n_spots_eff: int,
+    n_nulls: int,
+    perm_batch_size: int,
+) -> torch.Tensor:
+    """Return per-permutation HSIC null statistics for one gene response."""
+    p_isos = y.shape[1]
+    null_stats = []
+    for chunk_start in range(0, n_nulls, perm_batch_size):
+        batch_size = min(perm_batch_size, n_nulls - chunk_start)
+        y_batch = _permuted_response_batch_np(y, n_spots_eff, batch_size)
+        R = _xtKx_for_response_np(K_sp_null, y_batch)
+        null_stats.append(torch.diagonal(R).reshape(batch_size, p_isos).sum(dim=1))
+    return torch.cat(null_stats)
+
+
+def _stack_response_blocks_np(
+    response_blocks: list[np.ndarray | scipy.sparse.csc_matrix],
+) -> np.ndarray | scipy.sparse.csc_matrix:
+    """Stack prepared response blocks while preserving all-sparse chunks."""
+    if all(scipy.sparse.issparse(block) for block in response_blocks):
+        return scipy.sparse.hstack(response_blocks, format="csc")
+    return np.concatenate(
+        [
+            block.toarray() if scipy.sparse.issparse(block) else block
+            for block in response_blocks
+        ],
+        axis=1,
+    )
+
+
+def _response_is_finite_np(y: Any) -> bool:
+    """Return whether a dense or sparse response block has only finite values."""
+    if scipy.sparse.issparse(y):
+        return bool(np.isfinite(y.data).all())
+    return bool(np.isfinite(y).all())
+
+
+def _hsic_cumulant_pvalue_np(
+    hsic_scaled: float,
+    null_method: str,
+    kernel_cumulants: Optional[dict[int, float]],
+    feature_cumulants: dict[int, float],
+    n_spots: int,
+) -> float:
+    """Return Liu or Welch p-value from kernel/feature cumulants."""
+    if feature_cumulants[2] <= 0.0 or (kernel_cumulants or {}).get(2, 0.0) <= 0.0:
+        return 1.0
+    if null_method == "liu":
+        return _hsic_liu_pvalue(
+            hsic_scaled,
+            kernel_cumulants,
+            feature_cumulants,
+            n_spots,
+        )
+    return _hsic_welch_pvalue(
+        hsic_scaled,
+        kernel_cumulants,
+        feature_cumulants,
+        n_spots,
+    )
+
+
+def _fill_sv_chunk_results_np(
+    results: list[tuple[float, float] | None],
+    response_all: np.ndarray | scipy.sparse.csc_matrix,
+    q_cols: np.ndarray,
+    active_positions: list[int],
+    slices: list[slice],
+    centered_flags: list[bool],
+    *,
+    null_method: str,
+    kernel_cumulants: Optional[dict[int, float]],
+    n_spots: int,
+) -> list[tuple[float, float]]:
+    """Fill per-gene SV results from one stacked response chunk."""
+    is_response_all_sparse = scipy.sparse.issparse(response_all)
+    response_all_dense = (
+        None if is_response_all_sparse else np.asarray(response_all, dtype=np.float64)
+    )
+
+    for pos, sl, is_centered in zip(active_positions, slices, centered_flags):
+        y_gene = (
+            response_all[:, sl] if is_response_all_sparse else response_all_dense[:, sl]
+        )
+        if not _response_is_finite_np(y_gene):
+            results[pos] = (float("nan"), 1.0)
+            continue
+
+        hsic_scaled = float(np.sum(q_cols[sl]))
+        hsic_norm = float(hsic_scaled / (n_spots - 1) ** 2)
+        feature_cumulants = _feature_cumulants_from_data(
+            y_gene,
+            centered=is_centered,
+        )
+        pval = _hsic_cumulant_pvalue_np(
+            hsic_scaled,
+            null_method,
+            kernel_cumulants,
+            feature_cumulants,
+            n_spots,
+        )
+        results[pos] = (hsic_norm, pval)
+
+    return [r if r is not None else (0.0, 1.0) for r in results]
+
+
 def _sv_chunk_worker_np(
     counts_chunk: list[torch.Tensor],
     method: str,
@@ -295,9 +568,9 @@ def _sv_chunk_worker_np(
     rng_seed: int,
 ) -> list[tuple[float, float]]:
     """Process a response-column chunk for NP spatial variability."""
-    if null_method == "perm" or (method == "hsic-ir" and nan_filling == "none"):
+    if _sv_uses_single_gene_path_np(method, nan_filling, null_method):
         return [
-            _sv_gene_worker_np(
+            _evaluate_sv_gene_np(
                 counts,
                 method,
                 ratio_transformation,
@@ -339,69 +612,26 @@ def _sv_chunk_worker_np(
     if not response_blocks:
         return [(0.0, 1.0) if r is None else r for r in results]
 
-    if all(scipy.sparse.issparse(block) for block in response_blocks):
-        response_all = scipy.sparse.hstack(response_blocks, format="csc")
-    else:
-        response_all = np.concatenate(
-            [
-                block.toarray() if scipy.sparse.issparse(block) else block
-                for block in response_blocks
-            ],
-            axis=1,
-        )
-
-    is_response_all_sparse = scipy.sparse.issparse(response_all)
-    response_all_dense = (
-        None if is_response_all_sparse else np.asarray(response_all, dtype=np.float64)
-    )
-
+    response_all = _stack_response_blocks_np(response_blocks)
     if null_method == "liu" and kernel_approx_rank is not None:
         q_cols = _quadratic_columns_approx(K_sp, response_all, k=kernel_approx_rank)
     else:
         q_cols = _quadratic_columns_exact(K_sp, response_all)
 
-    for pos, sl, is_centered in zip(active_positions, slices, centered_flags):
-        y_gene = (
-            response_all[:, sl] if is_response_all_sparse else response_all_dense[:, sl]
-        )
-        is_finite = (
-            np.isfinite(y_gene.data).all()
-            if scipy.sparse.issparse(y_gene)
-            else np.isfinite(y_gene).all()
-        )
-        if not is_finite:
-            results[pos] = (float("nan"), 1.0)
-            continue
-
-        hsic_scaled = float(np.sum(q_cols[sl]))
-        hsic_norm = float(hsic_scaled / (n_spots - 1) ** 2)
-        feature_cumulants = _feature_cumulants_from_data(
-            y_gene,
-            centered=is_centered,
-        )
-
-        if feature_cumulants[2] <= 0.0 or (kernel_cumulants or {}).get(2, 0.0) <= 0.0:
-            pval = 1.0
-        elif null_method == "liu":
-            pval = _hsic_liu_pvalue(
-                hsic_scaled,
-                kernel_cumulants,
-                feature_cumulants,
-                n_spots,
-            )
-        else:
-            pval = _hsic_welch_pvalue(
-                hsic_scaled,
-                kernel_cumulants,
-                feature_cumulants,
-                n_spots,
-            )
-        results[pos] = (hsic_norm, pval)
-
-    return [r if r is not None else (0.0, 1.0) for r in results]
+    return _fill_sv_chunk_results_np(
+        results,
+        response_all,
+        q_cols,
+        active_positions,
+        slices,
+        centered_flags,
+        null_method=null_method,
+        kernel_cumulants=kernel_cumulants,
+        n_spots=n_spots,
+    )
 
 
-def _sv_gene_worker_np(
+def _evaluate_sv_gene_np(
     counts: "torch.Tensor",
     method: str,
     ratio_transformation: str,
@@ -416,17 +646,7 @@ def _sv_gene_worker_np(
     n_probes: int = 60,
     rng_seed: int = 0,
 ) -> "tuple[float, float]":
-    """Process a single gene for :meth:`SplisosmNP.test_spatial_variability`.
-
-    Shared objects (``K_sp`` and ``kernel_cumulants``) are passed by
-    reference and only read, making this safe for
-    ``joblib.Parallel(prefer="threads")``.
-
-    Returns
-    -------
-    tuple[float, float]
-        ``(hsic_norm, pval)`` for this gene.
-    """
+    """Evaluate one gene for singleton-only NP SV paths."""
     # Single-isoform gene with HSIC-IR: ratios are constant (all 1.0), so there is
     # no usage variation to detect.  Return stat=0, pval=1.
     # HSIC-IC and HSIC-GC still produce meaningful results for single-isoform genes
@@ -434,141 +654,46 @@ def _sv_gene_worker_np(
     if method == "hsic-ir" and counts.shape[1] <= 1:
         return (0.0, 1.0)
 
-    kernel_cumulants_eff = kernel_cumulants
-    kernel_approx_rank_eff = kernel_approx_rank
-    # By default, null-distribution inputs come from the global (already
-    # double-centred) K_sp.  The `hsic-ir + nan_filling='none'` branch below
-    # overrides these with per-gene values derived from K_sp_gene so that the
-    # statistic and the null reference the *same* (centred) kernel submatrix.
-    K_sp_null = K_sp
+    inputs = _prepare_sv_gene_inputs_np(
+        counts,
+        method,
+        ratio_transformation,
+        nan_filling,
+        null_method,
+        n_spots,
+        K_sp,
+        kernel_cumulants,
+        kernel_approx_rank,
+        n_probes,
+        rng_seed,
+    )
+    if inputs is None:
+        return (0.0, 1.0)
 
-    if method == "hsic-ir" and nan_filling == "none":
-        if counts.is_sparse:
-            sparse_counts = _torch_sparse_to_scipy_csc(counts)
-            y_sparse, is_nan = _sparse_counts_to_ratios_centered(
-                sparse_counts,
-                transformation=ratio_transformation,
-                nan_filling="none",
-            )
-            keep_mask = ~is_nan
-            y = y_sparse[keep_mask]
-            y_is_centered = True
-        else:
-            # per-gene spatial kernel: drop NaN spots and recompute K
-            y = counts_to_ratios(
-                counts,
-                transformation=ratio_transformation,
-                nan_filling="none",
-                fill_before_transform=False,
-            )
-            is_nan = torch.isnan(y).any(1)
-            keep_mask = (~is_nan).detach().cpu().numpy()
-            y = y[~is_nan]
-            y = y - y.mean(0, keepdim=True)
-            y_is_centered = True
-        n_spots_eff = y.shape[0]
-        if n_spots_eff <= 1:
-            return (0.0, 1.0)
-        K_sp_gene = _MaskedSpatialKernel(K_sp, keep_mask)
+    hsic_scaled = _observed_hsic_scaled_np(inputs, null_method)
+    hsic_norm = float(hsic_scaled / (inputs.n_spots_eff - 1) ** 2)
 
-        hsic_scaled = torch.trace(K_sp_gene.xtKx_exact(y))
-
-        # The passed-in null inputs describe the global
-        # K_sp; with per-gene NaN filtering they no longer match the statistic.
-        # Recompute them from the per-gene masked kernel.
-        if null_method in ("liu", "welch"):
-            kernel_cumulants_eff = _hutchinson_cumulants(
-                K_sp_gene,
-                n_probes=n_probes,
-                rng_seed=rng_seed,
-                max_power=4 if null_method == "liu" else 2,
-            )
-            kernel_approx_rank_eff = None
-        else:
-            K_sp_null = K_sp_gene
-
-    else:  # global spatial kernel shared across all genes
-        if counts.is_sparse:
-            sparse_counts = _torch_sparse_to_scipy_csc(counts)
-            if method == "hsic-ic":
-                y = sparse_counts
-                y_is_centered = False
-            elif method == "hsic-gc":
-                y = scipy.sparse.csc_matrix(sparse_counts.sum(axis=1))
-                y_is_centered = False
-            else:
-                y, _ = _sparse_counts_to_ratios_centered(
-                    sparse_counts,
-                    transformation=ratio_transformation,
-                    nan_filling="mean",
-                )
-                y_is_centered = True
-        else:
-            if method == "hsic-ic":
-                y = counts - counts.mean(0, keepdim=True)
-            elif method == "hsic-gc":
-                y = counts.sum(1, keepdim=True)
-                y = y - y.mean()
-            else:  # hsic-ir with mean nan_filling (global kernel case)
-                y = counts_to_ratios(
-                    counts,
-                    transformation=ratio_transformation,
-                    nan_filling="mean",
-                    fill_before_transform=False,
-                )
-                y = y - y.mean(0, keepdim=True)
-            y_is_centered = True
-
-        n_spots_eff = n_spots
-
-        if null_method == "liu" and kernel_approx_rank_eff is not None:
-            hsic_scaled = torch.trace(K_sp.xtKx_approx(y, k=kernel_approx_rank_eff))
-        else:
-            hsic_scaled = torch.trace(K_sp.xtKx_exact(y))
-
-    hsic_norm = float(hsic_scaled / (n_spots_eff - 1) ** 2)
-
-    if null_method == "liu":
-        feature_cumulants = _feature_cumulants_from_data(y, centered=y_is_centered)
-        pval = _hsic_liu_pvalue(
-            float(hsic_scaled),
-            kernel_cumulants_eff,
-            feature_cumulants,
-            n_spots_eff,
+    if null_method in ("liu", "welch"):
+        feature_cumulants = _feature_cumulants_from_data(
+            inputs.y,
+            centered=inputs.y_is_centered,
         )
-
-    elif null_method == "welch":
-        feature_cumulants = _feature_cumulants_from_data(y, centered=y_is_centered)
-        pval = _hsic_welch_pvalue(
+        pval = _hsic_cumulant_pvalue_np(
             float(hsic_scaled),
-            kernel_cumulants_eff,
+            null_method,
+            inputs.kernel_cumulants,
             feature_cumulants,
-            n_spots_eff,
+            inputs.n_spots_eff,
         )
-
-    else:  # null_method == "perm"
-        p_isos = y.shape[1]
-        null_stats = []
-        for chunk_start in range(0, n_nulls, perm_batch_size):
-            B = min(perm_batch_size, n_nulls - chunk_start)
-            if scipy.sparse.issparse(y):
-                y_batch = scipy.sparse.hstack(
-                    [y[np.random.permutation(n_spots_eff), :] for _ in range(B)],
-                    format="csc",
-                )
-            else:
-                y_batch = torch.cat(
-                    [y[torch.randperm(n_spots_eff)] for _ in range(B)], dim=1
-                )
-            if isinstance(K_sp_null, torch.Tensor):
-                if scipy.sparse.issparse(y_batch):
-                    y_batch = torch.from_numpy(y_batch.toarray()).float()
-                R = y_batch.T @ K_sp_null @ y_batch
-            else:
-                R = K_sp_null.xtKx(y_batch)
-            null_stats.append(torch.diagonal(R).reshape(B, p_isos).sum(dim=1))
-        null_m = torch.cat(null_stats)
-        pval = float((1 + (null_m >= hsic_scaled).sum()) / (n_nulls + 1))
+    else:
+        null_m = _permutation_null_stats_np(
+            inputs.y,
+            inputs.null_kernel,
+            n_spots_eff=inputs.n_spots_eff,
+            n_nulls=n_nulls,
+            perm_batch_size=perm_batch_size,
+        )
+        pval = float(_empirical_permutation_pvalue(hsic_scaled, null_m, axis=0))
 
     return hsic_norm, pval
 
@@ -1172,8 +1297,7 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
         print_progress: bool,
     ) -> dict[str, Any]:
         """Run chunked HSIC-based NP spatial variability tests."""
-        if n_jobs == -1:
-            n_jobs = os.cpu_count() or 1
+        n_jobs = _resolve_n_jobs(n_jobs)
         column_cap = resolve_chunk_size(
             chunk_size,
             n_observations=self.n_spots,
@@ -1199,6 +1323,10 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
         elif null_method == "perm":
             n_nulls = int(configs.get("n_perms_per_gene", 1000))
             perm_batch_size = int(configs.get("perm_batch_size", 50))
+            if n_nulls < 1:
+                raise ValueError("`n_perms_per_gene` must be positive.")
+            if perm_batch_size < 1:
+                raise ValueError("`perm_batch_size` must be positive.")
 
         widths = [
             _response_width_np(counts, method, ratio_transformation)
@@ -1745,8 +1873,7 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
         _, n_factors = self._validate_du_args(
             method, ratio_transformation, nan_filling, residualize
         )
-        if n_jobs == -1:
-            n_jobs = os.cpu_count() or 1
+        n_jobs = _resolve_n_jobs(n_jobs)
 
         if method == "hsic":
             self._du_test_results = self._run_du_hsic(

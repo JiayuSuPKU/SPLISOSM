@@ -10,10 +10,10 @@ from splisosm.utils import run_hsic_gc
 from splisosm.hyptest.np import (
     SplisosmNP,
     _calc_ttest_differential_usage,
+    _evaluate_sv_gene_np,
     _prepare_np_response,
     _quadratic_columns_exact,
     _sparse_counts_to_ratios_centered,
-    _sv_gene_worker_np,
 )
 from splisosm.utils.hsic import _feature_cumulants_from_data
 from splisosm.kernel import IdentityKernel, SpatialCovKernel
@@ -310,6 +310,24 @@ class TestSplisosmNP(unittest.TestCase):
         self.assertTrue(
             {"statistic", "pvalue", "pvalue_adj"}.issubset(sv_results.columns)
         )
+
+    def test_spatial_variability_n_jobs_zero_raises(self):
+        """NP SV uses shared joblib-style n_jobs validation."""
+        model = SplisosmNP()
+        model.setup_data(
+            adata=self.adata,
+            layer="counts",
+            spatial_key="spatial",
+            group_iso_by="gene_symbol",
+            min_counts=0,
+            min_bin_pct=0.0,
+            filter_single_iso_genes=False,
+        )
+
+        with self.assertRaises(ValueError):
+            model.test_spatial_variability(
+                method="hsic-ir", n_jobs=0, print_progress=False
+            )
 
     def test_docstring_example_differential_usage_workflow(self):
         model = SplisosmNP()
@@ -1858,7 +1876,7 @@ class TestSplisosmNP(unittest.TestCase):
             ]
         )
         n_nulls = 5
-        _, pval = _sv_gene_worker_np(
+        _, pval = _evaluate_sv_gene_np(
             counts,
             method="hsic-ir",
             ratio_transformation="none",

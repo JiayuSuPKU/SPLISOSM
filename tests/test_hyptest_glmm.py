@@ -1297,6 +1297,12 @@ class TestSplisosmGLMMCoverageBranches(unittest.TestCase):
 
         print_mock.assert_any_call("Using cached permutation results...")
 
+    def test_resolve_fit_n_jobs_zero_raises(self):
+        model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 1})
+
+        with self.assertRaises(ValueError):
+            model._resolve_fit_n_jobs(0)
+
     def test_sv_permutation_stats_are_stored_by_permutation_and_gene(self):
         model = SplisosmGLMM(model_type="glmm-full", fitting_configs={"max_epochs": 1})
         model.n_genes = 2
