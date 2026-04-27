@@ -457,13 +457,6 @@ def _as_numpy_coords_2d(coords: torch.Tensor | np.ndarray) -> np.ndarray:
     return arr
 
 
-def _mode_indices(n_modes: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
-    """Return FINUFFT/CMCL ordered mode indices for a 2-D mode shape."""
-    ky = np.arange(-(n_modes[0] // 2), n_modes[0] - n_modes[0] // 2, dtype=float)
-    kx = np.arange(-(n_modes[1] // 2), n_modes[1] - n_modes[1] // 2, dtype=float)
-    return np.meshgrid(ky, kx, indexing="ij")
-
-
 def _regular_grid_shape_spacing(
     coords: np.ndarray,
 ) -> Optional[tuple[int, int, float, float]]:
