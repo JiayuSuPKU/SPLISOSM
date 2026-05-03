@@ -54,6 +54,19 @@ class TestSpatialCovKernel(unittest.TestCase):
         # eigenvalues are sorted in descending order
         self.assertTrue((eigvals[:-1] >= eigvals[1:]).all())
 
+    def test_rho_range_validation(self):
+        # Boundary rho=0 is valid and gives an independent CAR precision.
+        K = SpatialCovKernel.from_coordinates(self.coords_small, rho=0.0)
+        self.assertEqual(K.shape(), (self.n_small, self.n_small))
+
+        for bad_rho in (-0.1, 1.0, 1.1, np.nan, np.inf):
+            with self.subTest(rho=bad_rho):
+                with self.assertRaisesRegex(ValueError, "0 <= rho < 1"):
+                    SpatialCovKernel.from_coordinates(
+                        self.coords_small,
+                        rho=bad_rho,
+                    )
+
     def test_from_adjacency(self):
         # Build adjacency matrix directly from coords
         W = _build_adj_from_coords(self.coords_small, k_neighbors=4)

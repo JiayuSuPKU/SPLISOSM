@@ -862,8 +862,9 @@ class SplisosmNP(_ResultsMixin, _FeatureSummaryMixin):
             Number of nearest neighbours used to build the spatial adjacency
             graph for the CAR kernel (default 4).
         rho : float, optional
-            Spatial autocorrelation strength in the CAR model (default 0.99).
-            Values close to 1 give a smoother spatial kernel.
+            Spatial autocorrelation coefficient for the CAR kernel.
+            Between 0 and 1 (default 0.99); higher values indicate stronger preference
+            for global patterns.
         standardize_cov : bool, optional
             Whether to standardise the spatial covariance matrix so that its
             diagonal entries are 1 (default ``True``).  This can reduce

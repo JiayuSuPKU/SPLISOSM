@@ -430,6 +430,8 @@ class SplisosmFFT(_ResultsMixin, _FeatureSummaryMixin):
         ----------
         rho : float, optional
             Spatial autocorrelation coefficient for the CAR kernel.
+            Between 0 and 1 (default 0.99); higher values indicate stronger preference
+            for global patterns.
         neighbor_degree : int, optional
             Neighbor-ring degree for CAR graph construction.
         spacing : tuple of float, optional

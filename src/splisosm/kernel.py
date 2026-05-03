@@ -353,18 +353,27 @@ def _build_car_precision_from_adj(
     adj : scipy.sparse.spmatrix
         Symmetric adjacency or weight matrix of shape ``(n_spots, n_spots)``.
     rho : float
-        Spatial autocorrelation coefficient (0 < rho < 1).
+        Spatial autocorrelation coefficient (0 <= rho < 1).
 
     Returns
     -------
     scipy.sparse.csc_matrix
         Sparse precision matrix of shape ``(n_spots, n_spots)``.
     """
+    rho = _validate_rho(rho)
     n = adj.shape[0]
     row_sums = np.asarray(adj.sum(axis=1)).ravel().clip(1e-12)
     inv_D_sqrt = scipy.sparse.diags(1.0 / np.sqrt(row_sums))
     W_norm = inv_D_sqrt @ adj @ inv_D_sqrt
     return (scipy.sparse.eye(n, format="csc") - rho * W_norm).tocsc()
+
+
+def _validate_rho(rho: float) -> float:
+    """Return ``rho`` as float after validating the CAR range."""
+    rho = float(rho)
+    if not np.isfinite(rho) or rho < 0.0 or rho >= 1.0:
+        raise ValueError("`rho` must be finite and satisfy 0 <= rho < 1.")
+    return rho
 
 
 class SpatialCovKernel(Kernel):
@@ -436,7 +445,7 @@ class SpatialCovKernel(Kernel):
             Number of nearest neighbours when building the graph from
             ``coords``.  Ignored when ``adj_matrix`` is provided.
         rho : float
-            CAR spatial autocorrelation coefficient (0 < rho < 1).
+            CAR spatial autocorrelation coefficient (0 <= rho < 1).
         standardize_cov : bool
             Scale the covariance to unit marginal variance.
         centering : bool
@@ -547,7 +556,7 @@ class SpatialCovKernel(Kernel):
         k_neighbors
             Number of nearest neighbours for the spatial graph.
         rho
-            CAR spatial autocorrelation coefficient (0 < rho < 1).
+            CAR spatial autocorrelation coefficient (0 <= rho < 1).
         standardize_cov
             Scale covariance to unit marginal variance.
         centering
@@ -590,7 +599,7 @@ class SpatialCovKernel(Kernel):
             ``(n_spots, n_spots)``.  Can be a dense ``np.ndarray`` or any
             ``scipy.sparse`` matrix.
         rho
-            CAR spatial autocorrelation coefficient (0 < rho < 1).
+            CAR spatial autocorrelation coefficient (0 <= rho < 1).
         standardize_cov
             Scale covariance to unit marginal variance.
         centering
@@ -1361,7 +1370,7 @@ class FFTKernel(Kernel):
     spacing
         Physical spacing ``(dy, dx)`` between neighbouring raster cells.
     rho
-        Spatial autocorrelation coefficient in CAR kernel.
+        Spatial autocorrelation coefficient in CAR kernel (0 <= rho < 1).
     neighbor_degree
         Neighbour ring degree for graph construction.
         ``1`` uses nearest neighbours in the periodic metric.
@@ -1398,7 +1407,7 @@ class FFTKernel(Kernel):
         self.n_grid = self.ny * self.nx
         self._n = self.n_grid
         self.neighbor_degree = int(neighbor_degree)
-        self.rho = min(float(rho), 0.99)
+        self.rho = _validate_rho(rho)
         self.workers = workers
         self._centering = bool(centering)
 

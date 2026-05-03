@@ -269,7 +269,7 @@ SPLISOSM tests for statistical independence between isoform expression and spati
 
    model = SplisosmNP(
        k_neighbors=4,        # k-NN graph degree for CAR spatial kernel
-       rho=0.99,             # spatial autocorrelation strength (0 < rho < 1)
+       rho=0.99,             # spatial autocorrelation strength (0 <= rho < 1)
        standardize_cov=True, # set kernel diagonal to 1 (to downweight outliers)
    )
    model.setup_data(

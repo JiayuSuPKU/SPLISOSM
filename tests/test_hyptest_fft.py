@@ -105,6 +105,18 @@ class TestFFTKernel(unittest.TestCase):
         self.assertTrue(np.all(np.diff(freq_bins) > 0))
         np.testing.assert_allclose(psd_1d, np.ones_like(psd_1d))
 
+    def test_rho_range_validation(self):
+        kernel = FFTKernel(shape=(6, 5), rho=0.999, neighbor_degree=1)
+        self.assertEqual(kernel.rho, 0.999)
+
+        kernel_099 = FFTKernel(shape=(6, 5), rho=0.99, neighbor_degree=1)
+        self.assertFalse(np.allclose(kernel.spectrum, kernel_099.spectrum))
+
+        for bad_rho in (-0.1, 1.0, 1.1, np.nan, np.inf):
+            with self.subTest(rho=bad_rho):
+                with self.assertRaisesRegex(ValueError, "0 <= rho < 1"):
+                    FFTKernel(shape=(6, 5), rho=bad_rho, neighbor_degree=1)
+
     def test_power_spectral_density_1d_matches_manual_bin_average(self):
         kernel = FFTKernel(shape=(5, 4), rho=0.9, neighbor_degree=2)
         bins = 6
