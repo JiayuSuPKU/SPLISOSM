@@ -133,6 +133,9 @@ Choosing a model class
   detect local patterns while increasing emphasis on global smooth structure.
   Use ``null_configs={"n_probes": m}`` only to tune the stochastic cumulant
   trace budget; it is not a low-rank approximation.
+  See the :doc:`Visium HD SV hyperparameter tutorial <tutorials/visiumhd_ffpe_svhp>`
+  for a benchmark comparing FFT, full-rank NP, smoother full-rank
+  NP, and the legacy low-rank diagnostic path.
 
 **6. Which differential usage test method should I use: parametric or non-parametric?**
 

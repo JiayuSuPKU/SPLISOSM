@@ -82,14 +82,13 @@ Summary of class features:
    </details>
 
 .. note::
-    Since ``v1.2.0``, low-rank approximation is no longer necessary for
-    :class:`~splisosm.SplisosmNP` SV tests, because the default Liu null is
-    evaluated from full-rank cumulant estimates instead of materialising the
-    full pairwise eigenvalue product. Pass ``null_configs={"n_probes": m}``
-    only to tune the Hutchinson Rademacher probe budget for large implicit CAR
-    kernels. For analyses that intentionally emphasize global smooth patterns,
-    prefer a smoother full-rank CAR kernel such as ``rho=0.999`` over spatial
-    rank truncation.
+    Since ``v1.2.0``, low-rank approximation is deprecated for
+    :class:`~splisosm.SplisosmNP` SV tests. Instead, the default Liu null is
+    evaluated from full-rank kernel cumulant estimates. Pass ``null_configs={"n_probes": m}``
+    to tune the Hutchinson Rademacher probe budget. When global smooth patterns
+    are preferred, please set ``rho=0.999`` rather than using rank truncation. See the
+    `SV hyperparameter tuning notebook <tutorials/visiumhd_ffpe_svhp>`_
+    for details.
 
 Inputs and outputs
 ------------------

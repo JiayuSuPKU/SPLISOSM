@@ -153,7 +153,9 @@ See :func:`splisosm.utils.hsic.liu_sf_from_cumulants` for implementation details
      approximation. This preserves sensitivity to both global and local spatial
      patterns. If the analysis should intentionally emphasize global smooth
      patterns, prefer increasing the CAR smoothness parameter (for example
-     ``rho=0.999``) instead of truncating the spatial rank.
+     ``rho=0.999``) instead of truncating the spatial rank. See the
+     :doc:`Visium HD SV hyperparameter tutorial <tutorials/visiumhd_ffpe_svhp>`
+     for a practical comparison against an FFT regular-grid reference.
    - When ``nan_filling='mean'`` (default), the spatial cumulants are cached once and reused for all subsequent genes.
    - When ``nan_filling='none'`` for HSIC-IR, SPLISOSM drops zero-coverage
      spots per gene and applies a masked implicit spatial kernel.  This avoids

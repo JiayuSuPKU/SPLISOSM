@@ -17,8 +17,8 @@ Or from GitHub (latest version):
   # install with the latest commit on the main branch
   $ pip install git+https://github.com/JiayuSuPKU/SPLISOSM.git#egg=splisosm
 
-  # or install with a specific release tag (e.g., v1.2.0rc1)
-  $ pip install "splisosm[sdata,gp] @ git+https://github.com/JiayuSuPKU/SPLISOSM.git@v1.2.0rc1"
+  # or install with a specific release tag (e.g., v1.2.0)
+  $ pip install "splisosm[sdata,gp] @ git+https://github.com/JiayuSuPKU/SPLISOSM.git@v1.2.0"
 
 
 Minimal software dependencies:

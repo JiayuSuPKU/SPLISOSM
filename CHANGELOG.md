@@ -1,12 +1,9 @@
 # Changelog
 
-## v1.2.0rc1 (2026-04-27, preview)
-
-Preview release for v1.2.0. This release candidate is intended for GitHub
-testing and is not uploaded to PyPI.
+## v1.2.0 (2026-05-03)
 
 ```bash
-pip install "splisosm[sdata,gp] @ git+https://github.com/JiayuSuPKU/SPLISOSM.git@v1.2.0rc1"
+pip install "splisosm[sdata,gp]"
 ```
 
 ### Behavioral changes
@@ -35,9 +32,10 @@ permutation nulls are kept per gene instead of being pooled across genes.
 
 Expect significant runtime and memory improvements for large datasets due to:
 
+- No eigensolver calls for the default NP SV null (**10x or more speedup** at 100K spots).
 - Memory-aware automatic feature chunking to reduce overhead and improve speed.
-- Sparse-preserving algrebra for kernel operations.
-- Joblib-based parallelism for the stand-alone `run_hsic_gc()` function.
+- Sparse-preserving algebra for kernel operations.
+- Joblib-based parallelism for the standalone `run_hsic_gc()` function.
 
 Estimated impact compared with v1.1.1; exact gains depend on sparsity, isoform
 counts per gene, `n_jobs`, and the spatial kernel.
@@ -97,6 +95,8 @@ counts per gene, `n_jobs`, and the spatial kernel.
 - FFT DU t-tests reject constant or all-NaN binary covariates during
   validation.
 - FFT `n_jobs=0` now receives the shared input-validation error.
+- `SpatialCovKernel` and `FFTKernel` now require `rho` in `[0, 1)`; invalid
+  values raise `ValueError` instead of being silently clipped.
 - Sparse linear HSIC keeps null eigenvalues consistent with `centering=False`.
 
 ### Docs and API
@@ -106,11 +106,14 @@ counts per gene, `n_jobs`, and the spatial kernel.
   is trace-estimation control, not low-rank approximation.
 - Added NUFFT GP methods/API documentation, including `lml_approx_rank`.
 - Reorganized API docs into Core API and Advanced Options.
+- Added a new SV hyperparameter optimization tutorial comparing kernel hyperparameters,
+  full-rank NP cumulant Liu, smoother full-rank NP, and
+  the legacy low-rank path.
 - Moved the package to a `src/splisosm` layout and grouped advanced helpers
   under `splisosm.gpr`, `splisosm.utils`, `splisosm.io`, `splisosm.glmm`, and
   `splisosm.hyptest`. Main imports such as
   `from splisosm import SplisosmNP, SplisosmFFT, SplisosmGLMM` are unchanged.
-- Tutorial notebooks were refreshed for the preview release.
+- Tutorial notebooks were refreshed for v1.2.0.
 
 ### Testing
 
@@ -118,7 +121,7 @@ counts per gene, `n_jobs`, and the spatial kernel.
   paths, `run_hsic_gc` parallelism, NUFFT GP agreement, public API imports, and
   removal of old internal import paths.
 - Sphinx docs, local links, package build, and tutorial outputs were refreshed
-  for the preview release.
+  for v1.2.0.
 
 ## v1.1.1 (2026-04-20)
 
@@ -193,7 +196,7 @@ reference `K_sp_gene` consistently.
   `txquant.rst`. New subsection documenting the non-spatial / single-cell workflow via `adj_key` + targeted errors for operations
   that still require coordinates.
 - **README** — platform/feature table, model-class decision tree, non-spatial path, paper + preprint references, and badges.
-- All tutorial notebooks: updated to v1.1.1. Add a new `visium_ffpe.ipynb` demo for 10x Visium FFPE (v2, CytAssit) data and for SplisosmNP vs SplisosmFFT comparison.
+- All tutorial notebooks: updated to v1.1.1. Add a new `visium_ffpe.ipynb` demo for 10x Visium FFPE (v2, CytAssist) data and for SplisosmNP vs SplisosmFFT comparison.
 
 ### Testing
 

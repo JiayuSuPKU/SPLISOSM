@@ -21,6 +21,7 @@ Scaling SPLISOSM to large-scale datasets with millions of spots
   visium_ffpe
   visiumhd_ffpe
   visiumhd_ffpe_du
+  visiumhd_ffpe_svhp
 
 
 Detecting variable transcript usage across ST platforms
